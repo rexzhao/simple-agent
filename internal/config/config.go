@@ -30,7 +30,6 @@ type Config struct {
 	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
 	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
 	Debug           DebugConfig                `json:"debug" yaml:"debug"`
-	Sessions        SessionsConfig             `json:"sessions" yaml:"sessions"`
 	Compaction      CompactionConfig           `json:"compaction" yaml:"compaction"`
 	MCPDir          string                     `json:"mcp_dir,omitempty" yaml:"mcp_dir,omitempty"`
 	MCPServers      map[string]MCPServerConfig `json:"mcp_servers,omitempty" yaml:"-"`
@@ -72,12 +71,6 @@ type LoggingConfig struct {
 
 type DebugConfig struct {
 	WebEvalEnabled bool `json:"web_eval_enabled" yaml:"web_eval_enabled"`
-}
-
-type SessionsConfig struct {
-	Enabled         bool   `json:"enabled" yaml:"enabled"`
-	Dir             string `json:"dir" yaml:"dir"`
-	SaveToolResults bool   `json:"save_tool_results" yaml:"save_tool_results"`
 }
 
 type CompactionConfig struct {
@@ -353,9 +346,6 @@ func LoadBase(configPath string) (*Config, error) {
 	cfg.AuthDir = resolvePath(configDir, cfg.AuthDir)
 	if cfg.Logging.Path != "" {
 		cfg.Logging.Path = resolvePath(configDir, cfg.Logging.Path)
-	}
-	if cfg.Sessions.Dir != "" {
-		cfg.Sessions.Dir = resolvePath(configDir, cfg.Sessions.Dir)
 	}
 	if cfg.MCPDir != "" {
 		cfg.MCPDir = resolvePath(configDir, cfg.MCPDir)
@@ -791,10 +781,6 @@ func defaultConfig() Config {
 		},
 		Tools: ToolsConfig{
 			Enabled: []string{},
-		},
-		Sessions: SessionsConfig{
-			Dir:             "sessions",
-			SaveToolResults: true,
 		},
 		Compaction: CompactionConfig{
 			ThresholdPercent: 80,

@@ -13,8 +13,12 @@ messages go to stderr, so stdout stays a pure session-record stream.
 Every durable fact about a session is one line in an append-only JSONL log:
 
 ```
-<server-root>/sessions/<session-id>/log.jsonl
+<server-root>/data/<project>/<session-id>/log.jsonl
 ```
+
+A project is the working directory the session runs in, identified by a
+deterministic hash of its path, so sessions group by workspace with no
+registration step.
 
 There is no update and no delete. Session state is a fold of the log,
 rebuilt on open and advanced incrementally as records are appended. See

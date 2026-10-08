@@ -7,8 +7,10 @@
 ## 设计
 
 破坏性重构后的数据模型只有一条规则：**会话的一切持久化事实都是
-`<server-root>/sessions/<id>/log.jsonl` 里的一行**。没有 update，没有
-delete，没有派生表。
+`<server-root>/data/<project>/<id>/log.jsonl` 里的一行**。没有 update，
+没有 delete，没有派生表。项目 ID 是工作目录路径的确定性哈希
+（`ProjectID`），同一目录在 CLI 与未来的 Web UI 中归入同一项目，无需
+注册。
 
 ```
 agent.Stream（internal/agent，复用，不感知存储）
@@ -82,7 +84,11 @@ go run ./cmd/sai [session-id]
 ```
 
 交互：`sai> ` 提示符读入一行输入；记录一经落盘立即打印到 stdout（ watcher
-实时尾随）；**仅当模型正在流式输出时** stderr 显示 `.` `..` `...` ``
+实时尾随）；**仅当模型正在流式输出时** stderr 显示 `
+.` `
+..` `
+...` `
+`
 （含空帧）循环光标，打印记录前先清掉光标行。等待首 token、工具执行期
 间不转。控制信息只走 stderr，stdout 是纯记录流，可直接重定向留存。
 

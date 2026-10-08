@@ -35,8 +35,9 @@ permissions. Windows access control continues to rely on the owning user's ACL.
       SKILL.md
   logs/                    # only when logging.path is configured
   data/
-    projects/
-    sessions/
+    <project>/             # project id = hash of the workspace directory
+      <session>/
+        log.jsonl          # append-only conversation log
 ```
 
 The default server root is `<os.UserConfigDir()>/<basename>`. A custom

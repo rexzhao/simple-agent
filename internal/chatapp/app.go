@@ -43,6 +43,7 @@ type App struct {
 	outputLimit    int
 	maxTurns       int
 	cwd            string
+	project        string
 	systemPrompt   string
 	fullAccess     bool
 	toolRegistry   *tools.Registry
@@ -102,7 +103,7 @@ func New(options Options) (*App, error) {
 		enabled = defaultTools
 	}
 
-	store, err := sessionlog.OpenStore(sessionStoreDir(options.ServerRoot, cfg))
+	store, err := sessionlog.OpenStore(filepath.Join(options.ServerRoot, "data"))
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +117,7 @@ func New(options Options) (*App, error) {
 		outputLimit:    resolved.OutputLimit,
 		maxTurns:       maxTurns,
 		cwd:            cwd,
+		project:        sessionlog.ProjectID(cwd),
 		fullAccess:     options.FullAccess,
 		toolRegistry:   tools.NewRegistry(),
 		defaultEnabled: enabled,
@@ -132,7 +134,7 @@ func New(options Options) (*App, error) {
 
 // NewSession creates a fresh session bound to the app's cwd and model.
 func (a *App) NewSession() (*Session, error) {
-	log, err := a.store.Create(a.resolved.ProviderName, a.resolved.ModelID, a.cwd)
+	log, err := a.store.Create(a.project, a.resolved.ProviderName, a.resolved.ModelID, a.cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -148,15 +150,15 @@ func (a *App) ResumeSession(id string) (*Session, error) {
 	return newSession(a, log), nil
 }
 
-// ListSessions returns stored session summaries, newest first.
-func (a *App) ListSessions() ([]sessionlog.Summary, error) { return a.store.List() }
+// ListSessions returns the current project's session summaries, newest
+// first.
+func (a *App) ListSessions() ([]sessionlog.Summary, error) { return a.store.List(a.project) }
 
-// SessionStoreRoot returns the sessions directory (diagnostics and tests).
+// SessionStoreRoot returns the data root directory (diagnostics and tests).
 func (a *App) SessionStoreRoot() string { return a.store.Root() }
 
-// SessionDir returns the on-disk directory of a stored session, for
-// revealing it in the system file manager.
-func (a *App) SessionDir(id string) string { return a.store.SessionDir(id) }
+// Project returns the project ID sessions are grouped under.
+func (a *App) Project() string { return a.project }
 
 // Config returns the loaded configuration (read-only use).
 func (a *App) Config() *config.Config { return a.cfg }
@@ -223,13 +225,6 @@ func resolveCWD(value string) (string, error) {
 		return "", fmt.Errorf("resolve cwd %q: %w", value, err)
 	}
 	return abs, nil
-}
-
-func sessionStoreDir(serverRoot string, cfg *config.Config) string {
-	if dir := strings.TrimSpace(cfg.Sessions.Dir); dir != "" {
-		return dir
-	}
-	return filepath.Join(serverRoot, "sessions")
 }
 
 var defaultTools = []string{

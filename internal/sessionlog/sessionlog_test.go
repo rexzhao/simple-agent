@@ -7,6 +7,9 @@ import (
 	"testing"
 )
 
+// project is the project fixture shared by the store tests.
+var project = ProjectID(`F:\work\simple-agent`)
+
 func appendRecord(t *testing.T, session *Session, record Record) Record {
 	t.Helper()
 	stored, err := session.Append(record)
@@ -22,7 +25,7 @@ func TestAppendAndReopenFold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := store.Create("paperhub", "glm-5.2", `F:\work\demo`)
+	session, err := store.Create(project, "paperhub", "glm-5.2", `F:\work\demo`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +147,7 @@ func TestInvalidCompleteLineIsTornTail(t *testing.T) {
 func TestRunFailedCreatesErrorItem(t *testing.T) {
 	root := t.TempDir()
 	store, _ := OpenStore(root)
-	session, _ := store.Create("p", "m", "")
+	session, _ := store.Create(project, "p", "m", "")
 	defer session.Close()
 	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "run-9", Content: "hi"})
 	appendRecord(t, session, Record{Type: TypeRunFailed, RunID: "run-9", Error: "provider exploded"})
@@ -162,7 +165,7 @@ func TestRunFailedCreatesErrorItem(t *testing.T) {
 func TestSubscribeNotifiesOnAppend(t *testing.T) {
 	root := t.TempDir()
 	store, _ := OpenStore(root)
-	session, _ := store.Create("p", "m", "")
+	session, _ := store.Create(project, "p", "m", "")
 	defer session.Close()
 	ch, unsubscribe := session.Subscribe()
 	defer unsubscribe()
@@ -184,7 +187,7 @@ func TestSubscribeNotifiesOnAppend(t *testing.T) {
 func TestUnknownRecordTypeIgnoredByFold(t *testing.T) {
 	root := t.TempDir()
 	store, _ := OpenStore(root)
-	session, _ := store.Create("p", "m", "")
+	session, _ := store.Create(project, "p", "m", "")
 	defer session.Close()
 	appendRecord(t, session, Record{Type: "future.event", Content: "irrelevant"})
 	state := session.Snapshot()
@@ -199,14 +202,14 @@ func TestUnknownRecordTypeIgnoredByFold(t *testing.T) {
 func TestListSessionsNewestFirst(t *testing.T) {
 	root := t.TempDir()
 	store, _ := OpenStore(root)
-	first, _ := store.Create("p", "m", "")
+	first, _ := store.Create(project, "p", "m", "")
 	appendRecord(t, first, Record{Type: TypeUserInput, RunID: "r", Content: "first session"})
 	first.Close()
-	second, _ := store.Create("p", "m", "")
+	second, _ := store.Create(project, "p", "m", "")
 	appendRecord(t, second, Record{Type: TypeUserInput, RunID: "r", Content: "second session"})
 	second.Close()
 
-	summaries, err := store.List()
+	summaries, err := store.List(project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,6 +219,25 @@ func TestListSessionsNewestFirst(t *testing.T) {
 	if summaries[0].ID != second.ID() || summaries[0].Title != "second session" {
 		t.Fatalf("newest summary = %+v", summaries[0])
 	}
+
+	// A different project's sessions are invisible; its directory does not
+	// even need to exist yet.
+	other := ProjectID(`F:\work\other`)
+	if summaries, err := store.List(other); err != nil || len(summaries) != 0 {
+		t.Fatalf("other project summaries = %v, %v", summaries, err)
+	}
+	third, _ := store.Create(other, "p", "m", "")
+	appendRecord(t, third, Record{Type: TypeUserInput, RunID: "r", Content: "other project"})
+	third.Close()
+	if summaries, err := store.List(other); err != nil || len(summaries) != 1 {
+		t.Fatalf("other project summaries = %v, %v", summaries, err)
+	}
+	// Opening by ID works without knowing the project: the store scans.
+	opened, err := store.Open(third.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened.Close()
 }
 
 func TestLegacyAssistantReadyStillFolds(t *testing.T) {
@@ -223,7 +245,7 @@ func TestLegacyAssistantReadyStillFolds(t *testing.T) {
 	// must still fold their assistant messages.
 	root := t.TempDir()
 	store, _ := OpenStore(root)
-	session, _ := store.Create("p", "m", "")
+	session, _ := store.Create(project, "p", "m", "")
 	defer session.Close()
 	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "r", Content: "q"})
 	appendRecord(t, session, Record{Type: TypeAssistantReady, RunID: "r", ItemID: "a-1", Content: "old spelling"})
@@ -271,7 +293,7 @@ func TestNewSessionIDsUniqueAndSorted(t *testing.T) {
 func TestLazyCreateTouchesNoDisk(t *testing.T) {
 	root := t.TempDir()
 	store, _ := OpenStore(root)
-	session, err := store.Create("paperhub", "glm-5.2", `F:\demo`)
+	session, err := store.Create(project, "paperhub", "glm-5.2", `F:\demo`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +309,7 @@ func TestLazyCreateTouchesNoDisk(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
-	summaries, err := store.List()
+	summaries, err := store.List(project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +330,7 @@ func TestLazyCreateTouchesNoDisk(t *testing.T) {
 func TestFirstAppendMaterializes(t *testing.T) {
 	root := t.TempDir()
 	store, _ := OpenStore(root)
-	session, _ := store.Create("paperhub", "glm-5.2", "cwd")
+	session, _ := store.Create(project, "paperhub", "glm-5.2", "cwd")
 	if _, err := session.Append(Record{Type: TypeUserInput, RunID: "r1", Content: "hello"}); err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +338,7 @@ func TestFirstAppendMaterializes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	records, err := readRecords(filepath.Join(store.SessionDir(session.ID()), logFileName))
+	records, err := readRecords(filepath.Join(root, project, session.ID(), logFileName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +368,7 @@ func TestManyEmptySessionsLeaveNoDirectories(t *testing.T) {
 	store, _ := OpenStore(root)
 	// Simulate /clear churn: sessions created and abandoned without input.
 	for i := 0; i < 5; i++ {
-		session, _ := store.Create("p", "m", "")
+		session, _ := store.Create(project, "p", "m", "")
 		session.Close()
 	}
 	entries, _ := os.ReadDir(root)
@@ -359,7 +381,7 @@ func TestRecordsAfter(t *testing.T) {
 	root := t.TempDir()
 	store, _ := OpenStore(root)
 	// Lazy session: no records before materialization.
-	session, _ := store.Create("p", "m", "")
+	session, _ := store.Create(project, "p", "m", "")
 	defer session.Close()
 	if records, err := session.RecordsAfter(0); err != nil || len(records) != 0 {
 		t.Fatalf("lazy RecordsAfter = %v, %v", records, err)
@@ -385,5 +407,25 @@ func TestRecordsAfter(t *testing.T) {
 	none, err := session.RecordsAfter(3)
 	if err != nil || len(none) != 0 {
 		t.Fatalf("RecordsAfter(4) = %v, %v", none, err)
+	}
+}
+
+func TestProjectIDDeterministicAndPathSafe(t *testing.T) {
+	left := ProjectID(`F:\work\simple-agent`)
+	right := ProjectID(`F:\work\simple-agent`)
+	if left != right {
+		t.Fatalf("ProjectID not deterministic: %q vs %q", left, right)
+	}
+	if !ValidProjectID(left) {
+		t.Fatalf("ProjectID %q is not valid", left)
+	}
+	// A different directory maps to a different project.
+	if ProjectID(`F:\work\other`) == left {
+		t.Fatal("different directories map to the same project")
+	}
+	// Relative and absolute spellings of the same directory agree.
+	wd, _ := os.Getwd()
+	if ProjectID(".") != ProjectID(wd) {
+		t.Fatalf("relative ProjectID %q != absolute %q", ProjectID("."), ProjectID(wd))
 	}
 }

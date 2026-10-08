@@ -58,16 +58,6 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 		t.Fatalf("Logging.Path = %q, want %q", cfg.Logging.Path, wantLogPath)
 	}
 
-	wantSessionsDir := filepath.Join(wantConfigDir, "sessions")
-	if cfg.Sessions.Enabled {
-		t.Fatal("Sessions.Enabled = true, want false default")
-	}
-	if cfg.Sessions.Dir != wantSessionsDir {
-		t.Fatalf("Sessions.Dir = %q, want %q", cfg.Sessions.Dir, wantSessionsDir)
-	}
-	if !cfg.Sessions.SaveToolResults {
-		t.Fatal("Sessions.SaveToolResults = false, want true default")
-	}
 
 	wantMCPDir := filepath.Join(wantConfigDir, "mcp")
 	if cfg.MCPDir != wantMCPDir {
@@ -589,8 +579,6 @@ logging:
   path: run-logs/sai.jsonl
   request_bodies: true
 
-sessions:
-  dir: saved-sessions
 `)
 	writeFile(t, filepath.Join(providersDir, "fake.yaml"), `name: fake
 base_url: http://127.0.0.1:1
@@ -636,44 +624,8 @@ models:
 	if !cfg.Logging.RequestBodies {
 		t.Fatal("Logging.RequestBodies = false, want true")
 	}
-	if cfg.Sessions.Dir != filepath.Join(rootDir, "saved-sessions") {
-		t.Fatalf("Sessions.Dir = %q", cfg.Sessions.Dir)
-	}
 	if _, ok := cfg.Providers["fake"]; !ok {
 		t.Fatalf("Providers = %#v, want fake", cfg.Providers)
-	}
-}
-
-func TestLoadResolvesCustomSessionsDir(t *testing.T) {
-	dir := writeConfigFixture(t)
-	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
-default_model: glm-5.2
-provider_dir: providers
-
-sessions:
-  enabled: true
-  dir: saved-sessions
-  save_tool_results: false
-`)
-
-	cfg, err := Load(rootConfigPath(dir))
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-
-	wantConfigDir, err := filepath.Abs(dir)
-	if err != nil {
-		t.Fatalf("filepath.Abs() error = %v", err)
-	}
-	wantSessionsDir := filepath.Join(filepath.Clean(wantConfigDir), "saved-sessions")
-	if !cfg.Sessions.Enabled {
-		t.Fatal("Sessions.Enabled = false, want true")
-	}
-	if cfg.Sessions.Dir != wantSessionsDir {
-		t.Fatalf("Sessions.Dir = %q, want %q", cfg.Sessions.Dir, wantSessionsDir)
-	}
-	if cfg.Sessions.SaveToolResults {
-		t.Fatal("Sessions.SaveToolResults = true, want false")
 	}
 }
 

@@ -34,7 +34,7 @@ const spinnerInterval = 250 * time.Millisecond
 func main() {
 	var (
 		showVersion = flag.Bool("version", false, "print version and exit")
-		serverRoot  = flag.String("server-root", "", "configuration namespace root (default: $SAI_SERVER_ROOT, else ./.<app>/sai.yaml if present, else user config dir/<app>)")
+		serverRoot  = flag.String("server-root", "", "configuration namespace root (default: $SAI_SERVER_ROOT, else user config dir/<app>)")
 		cwd         = flag.String("cwd", "", "working directory for tools (default: process cwd)")
 		provider    = flag.String("provider", "", "override default_provider")
 		model       = flag.String("model", "", "override default_model (model profile name)")
@@ -371,23 +371,17 @@ func displayTitle(title string) string {
 }
 
 // resolveServerRoot picks the configuration namespace root: an explicit
-// --server-root, then the SAI_SERVER_ROOT environment variable, then a
-// local .<app> directory in the current working directory (when it contains
-// sai.yaml), and finally the user configuration directory under the app
-// name.
+// --server-root, then the SAI_SERVER_ROOT environment variable, and finally
+// the user configuration directory under the app name.
 func resolveServerRoot() (string, error) {
 	if fromEnv := strings.TrimSpace(os.Getenv("SAI_SERVER_ROOT")); fromEnv != "" {
 		return fromEnv, nil
-	}
-	name := appName()
-	if _, err := os.Stat(filepath.Join("."+name, "sai.yaml")); err == nil {
-		return "." + name, nil
 	}
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("find user config directory: %w", err)
 	}
-	return filepath.Join(configDir, name), nil
+	return filepath.Join(configDir, appName()), nil
 }
 
 // appName derives the application name from the executable's base name:

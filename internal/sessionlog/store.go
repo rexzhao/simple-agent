@@ -2,10 +2,12 @@ package sessionlog
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -16,31 +18,68 @@ import (
 
 const logFileName = "log.jsonl"
 
-// Store manages the session directories under one root. Each session is a
-// directory holding a single append-only log.
+// Store manages sessions under a data root laid out as
+// <root>/<project>/<session>/log.jsonl. A project is a workspace directory
+// identified by ProjectID; a session is a directory holding one append-only
+// log.
 type Store struct {
 	root string
 }
 
-// OpenStore opens (creating if needed) the session root directory.
+// OpenStore opens (creating if needed) the data root directory.
 func OpenStore(root string) (*Store, error) {
 	if strings.TrimSpace(root) == "" {
-		return nil, fmt.Errorf("session root is required")
+		return nil, fmt.Errorf("data root is required")
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
-		return nil, fmt.Errorf("create session root: %w", err)
+		return nil, fmt.Errorf("create data root: %w", err)
 	}
 	return &Store{root: root}, nil
 }
 
-// Root returns the session root directory.
+// Root returns the data root directory.
 func (s *Store) Root() string { return s.root }
 
-// Create returns a new session. Creation is lazy: nothing touches the
-// disk, so an empty session (one never sent a message) leaves no directory
-// and never appears in List. The first Append materializes the log and
-// writes the session.created record ahead of the appended one.
-func (s *Store) Create(provider, model, cwd string) (*Session, error) {
+// ProjectID returns the stable project identifier for a workspace
+// directory: "p" followed by base32 of the first ten bytes of the SHA-256
+// of the normalized absolute path. The same directory always maps to the
+// same project, on the CLI and in the future Web UI alike, with no
+// registration step. Path case is folded on case-insensitive platforms.
+func ProjectID(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	abs = filepath.Clean(abs)
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		abs = strings.ToLower(abs)
+	}
+	digest := sha256.Sum256([]byte(abs))
+	return "p" + encodeBase32(digest[:10])
+}
+
+// ValidProjectID accepts the identifiers ProjectID generates.
+func ValidProjectID(id string) bool {
+	if len(id) != 17 || id[0] != 'p' {
+		return false
+	}
+	for _, char := range id[1:] {
+		if !strings.ContainsRune(base32Alphabet, char) {
+			return false
+		}
+	}
+	return true
+}
+
+// Create returns a new session inside the project. Creation is lazy:
+// nothing touches the disk, so an empty session (one never sent a message)
+// leaves no directory and never appears in List. The first Append
+// materializes the log and writes the session.created record ahead of the
+// appended one.
+func (s *Store) Create(projectID, provider, model, cwd string) (*Session, error) {
+	if !ValidProjectID(projectID) {
+		return nil, fmt.Errorf("invalid project id %q", projectID)
+	}
 	id := newSessionID()
 	createdAt := newTime()
 	state := newState(id)
@@ -52,34 +91,28 @@ func (s *Store) Create(provider, model, cwd string) (*Session, error) {
 		state.UpdatedAt = created
 	}
 	return &Session{
-		id:    id,
-		store: s,
-		state: state,
+		id:      id,
+		project: projectID,
+		store:   s,
+		state:   state,
 		pending: &pendingMeta{
 			provider: provider, model: model, cwd: cwd, createdAt: createdAt,
 		},
 	}, nil
 }
 
-// SessionDir returns the on-disk directory of a session ID. The directory
-// exists only once the session has been materialized by its first record.
-func (s *Store) SessionDir(id string) string { return filepath.Join(s.root, id) }
-
 // Open loads an existing session, recovering its folded state from the log.
-// A run which was interrupted by a crash needs no repair record: its user
-// input simply stays unanswered, and chatapp patches any dangling tool calls
-// before the next request.
+// The session ID is globally unique, so the project directory it lives in
+// is found by scanning the data root. A run which was interrupted by a
+// crash needs no repair record: its user input simply stays unanswered, and
+// chatapp patches any dangling tool calls before the next request.
 func (s *Store) Open(id string) (*Session, error) {
 	if !ValidSessionID(id) {
 		return nil, fmt.Errorf("invalid session id %q", id)
 	}
-	dir := filepath.Join(s.root, id)
-	info, err := os.Stat(dir)
+	dir, err := s.sessionDir(id)
 	if err != nil {
-		return nil, fmt.Errorf("open session %q: %w", id, err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("session %q is not a directory", id)
+		return nil, err
 	}
 	log, err := OpenLog(filepath.Join(dir, logFileName))
 	if err != nil {
@@ -90,11 +123,31 @@ func (s *Store) Open(id string) (*Session, error) {
 		log.Close()
 		return nil, err
 	}
-	session := &Session{id: id, log: log, state: newState(id)}
+	project := filepath.Base(filepath.Dir(dir))
+	session := &Session{id: id, project: project, log: log, state: newState(id)}
 	for _, record := range records {
 		fold(session.state, record)
 	}
 	return session, nil
+}
+
+// sessionDir locates the directory of a session ID by scanning the project
+// directories of the data root.
+func (s *Store) sessionDir(id string) (string, error) {
+	projects, err := os.ReadDir(s.root)
+	if err != nil {
+		return "", fmt.Errorf("read data root: %w", err)
+	}
+	for _, project := range projects {
+		if !project.IsDir() || !ValidProjectID(project.Name()) {
+			continue
+		}
+		dir := filepath.Join(s.root, project.Name(), id)
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir, nil
+		}
+	}
+	return "", fmt.Errorf("open session %q: not found", id)
 }
 
 // Summary describes one stored session for listing.
@@ -109,12 +162,18 @@ type Summary struct {
 	LastSeq      int64
 }
 
-// List returns summaries of every stored session, newest first. Sessions with
-// unreadable logs are skipped rather than failing the listing.
-func (s *Store) List() ([]Summary, error) {
-	entries, err := os.ReadDir(s.root)
+// List returns summaries of the project's stored sessions, newest first.
+// Sessions with unreadable logs are skipped rather than failing the listing.
+func (s *Store) List(projectID string) ([]Summary, error) {
+	if !ValidProjectID(projectID) {
+		return nil, fmt.Errorf("invalid project id %q", projectID)
+	}
+	entries, err := os.ReadDir(filepath.Join(s.root, projectID))
 	if err != nil {
-		return nil, fmt.Errorf("read session root: %w", err)
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read project directory: %w", err)
 	}
 	var ids []string
 	for _, entry := range entries {
@@ -124,7 +183,7 @@ func (s *Store) List() ([]Summary, error) {
 	}
 	summaries := make([]Summary, 0, len(ids))
 	for _, id := range ids {
-		records, err := readRecords(filepath.Join(s.root, id, logFileName))
+		records, err := readRecords(filepath.Join(s.root, projectID, id, logFileName))
 		if err != nil {
 			continue
 		}
@@ -157,9 +216,10 @@ func (s *Store) List() ([]Summary, error) {
 // Append writes a record and advances the fold atomically under the session
 // lock; Snapshot returns a deep copy safe for any reader.
 type Session struct {
-	id    string
-	store *Store
-	log   *Log
+	id      string
+	project string
+	store   *Store
+	log     *Log
 	// pending carries the creation metadata of a session which has not
 	// touched the disk yet; it is consumed by the first Append.
 	pending *pendingMeta
@@ -179,6 +239,13 @@ type pendingMeta struct {
 
 // ID returns the session ID.
 func (s *Session) ID() string { return s.id }
+
+// Project returns the project the session belongs to.
+func (s *Session) Project() string { return s.project }
+
+// Dir returns the session's directory on disk. It exists only once the
+// session has been materialized by its first record.
+func (s *Session) Dir() string { return filepath.Join(s.store.root, s.project, s.id) }
 
 // Append stores one record and advances the folded state, then notifies
 // subscribers. The first append on a lazily created session materializes the
@@ -211,7 +278,7 @@ func (s *Session) Append(record Record) (Record, error) {
 // materializeLocked creates the session directory and log and writes the
 // session.created record carrying the creation metadata. Callers hold s.mu.
 func (s *Session) materializeLocked() error {
-	log, err := OpenLog(filepath.Join(s.store.root, s.id, logFileName))
+	log, err := OpenLog(filepath.Join(s.store.root, s.project, s.id, logFileName))
 	if err != nil {
 		return err
 	}
