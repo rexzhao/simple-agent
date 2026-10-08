@@ -22,8 +22,8 @@ registration step.
 
 There is no update and no delete. Session state is a fold of the log,
 rebuilt on open and advanced incrementally as records are appended. See
-[docs/native-app.md](docs/native-app.md) for the event vocabulary, the fsync
-policy, and crash recovery.
+[docs/design.md](docs/design.md) for the record schema, the identity
+system, and the invariants.
 
 ## Run
 
@@ -34,8 +34,8 @@ go run ./cmd/sai [session-id]
 Options:
 
 ```text
---server-root dir   configuration namespace root (default: user config dir/sai)
---cwd dir           shell working directory (default: process cwd)
+--server-root dir   configuration namespace root (default: user config dir/<app>)
+--session id        resume a stored session by id (exit if not found)
 --provider name     override default_provider
 --model name        override default_model (model profile name)
 --version           print version
@@ -44,9 +44,13 @@ Options:
 An optional positional argument resumes a stored session. Slash commands:
 
 - `/clear` — start a new session (empty sessions are never written to disk)
-- `/resume` — list stored sessions; `/resume <id>` opens one
+- `/resume <id>` — reopen a stored session
 - `/stop` — stop the active run (Ctrl+C does the same)
 - `/quit` — exit (a second Ctrl+C when idle also exits)
+
+The working directory is the process cwd: the shell tool runs where you
+started `sai`. The session id prints at startup, and again at exit when the
+session was persisted, so it can be resumed later with `--session`.
 
 ## Server root and configuration
 
@@ -130,12 +134,17 @@ go test ./...
 
 ## Project layout
 
+The refactor baseline is [docs/design.md](docs/design.md); the layout below
+is the target structure (see the design doc for invariants and the record
+schema):
+
 ```
 cmd/sai              command-line interface (JSONL stream on stdout)
-internal/sessionlog  append-only JSONL session store + fold
-internal/chatapp     minimal orchestration (provider, tools, runs)
-internal/agent       transport-neutral agent loop
+internal/agent       state layer + agent loop (owns State, commit is the only write path)
+internal/storage     record schema + Fold + Store/Session interfaces
+  jsonl/             append-only JSONL file store (seq, torn-tail recovery)
+  memory/            in-memory store for tests and ephemeral sessions
 internal/model       provider adapters (OpenAI Chat/Responses, Anthropic)
 internal/tools       the shell tool (Bash on every platform, incl. Windows via Git Bash)
-internal/config      root + provider configuration
+internal/config      startup-time config parsing (cmd-only dependency)
 ```

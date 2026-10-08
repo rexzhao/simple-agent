@@ -1,4 +1,4 @@
-package sessionlog
+package jsonl
 
 import (
 	"bufio"
@@ -8,11 +8,13 @@ import (
 	"io"
 	"os"
 	"sync"
+
+	"github.com/rexzhao/simple-agent/internal/storage"
 )
 
 // Log is the append-only JSONL file of one session. It owns the file, the
-// sequence counter, and the durability policy. Append is safe for concurrent
-// use; readers go through Session.Snapshot.
+// sequence counter, and the durability policy. Append is safe for
+// concurrent use; readers go through Records.
 type Log struct {
 	path string
 
@@ -70,8 +72,8 @@ func (l *Log) recover() error {
 				offset += int64(len(line))
 				continue
 			}
-			var record Record
-			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr != nil || record.Validate() != nil {
+			var record storage.Record
+			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr != nil || record.Validate() != nil || record.Seq < 1 {
 				// An invalid complete line is treated like a torn tail: under
 				// the write-path invariant it can only be external corruption
 				// (see the comment on recover), and truncating from the first
@@ -100,7 +102,7 @@ func (l *Log) recover() error {
 			return fmt.Errorf("truncate torn session log tail: %w", err)
 		}
 		if info.Size()-offset > maxTornTailBytes {
-			fmt.Fprintf(os.Stderr, "sessionlog: %s: discarded %d bytes after seq %d; mid-file corruption, not a torn tail\n",
+			fmt.Fprintf(os.Stderr, "jsonl: %s: discarded %d bytes after seq %d; mid-file corruption, not a torn tail\n",
 				l.path, info.Size()-offset, lastSeq)
 		}
 	}
@@ -117,36 +119,36 @@ func (l *Log) recover() error {
 
 // Append assigns seq and time, writes the record as one line, and fsyncs when
 // the record class requires durability. It returns the stored record.
-func (l *Log) Append(record Record) (Record, error) {
+func (l *Log) Append(record storage.Record) (storage.Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
-		return Record{}, fmt.Errorf("session log is closed")
+		return storage.Record{}, fmt.Errorf("session log is closed")
 	}
 	record.Seq = l.lastSeq + 1
 	if record.Time == "" {
-		record.Time = newTime()
+		record.Time = storage.NewTime()
 	}
 	if err := record.Validate(); err != nil {
-		return Record{}, err
+		return storage.Record{}, err
 	}
 	encoded, err := json.Marshal(record)
 	if err != nil {
-		return Record{}, fmt.Errorf("encode record: %w", err)
+		return storage.Record{}, fmt.Errorf("encode record: %w", err)
 	}
-	if len(encoded) > maxRecordBytes {
-		return Record{}, fmt.Errorf("record of type %s is %d bytes, over the %d byte limit", record.Type, len(encoded), maxRecordBytes)
+	if len(encoded) > storage.MaxRecordBytes {
+		return storage.Record{}, fmt.Errorf("record of type %s is %d bytes, over the %d byte limit", record.Type, len(encoded), storage.MaxRecordBytes)
 	}
 	line := append(encoded, '\n')
 	if _, err := l.writer.Write(line); err != nil {
-		return Record{}, fmt.Errorf("append record: %w", err)
+		return storage.Record{}, fmt.Errorf("append record: %w", err)
 	}
 	if err := l.writer.Flush(); err != nil {
-		return Record{}, fmt.Errorf("flush record: %w", err)
+		return storage.Record{}, fmt.Errorf("flush record: %w", err)
 	}
-	if record.durable() {
+	if record.Durable() {
 		if err := l.file.Sync(); err != nil {
-			return Record{}, fmt.Errorf("sync record: %w", err)
+			return storage.Record{}, fmt.Errorf("sync record: %w", err)
 		}
 	}
 	l.lastSeq = record.Seq
@@ -154,7 +156,7 @@ func (l *Log) Append(record Record) (Record, error) {
 }
 
 // Records returns every stored record in sequence order.
-func (l *Log) Records() ([]Record, error) {
+func (l *Log) Records() ([]storage.Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
@@ -164,13 +166,6 @@ func (l *Log) Records() ([]Record, error) {
 		return nil, fmt.Errorf("flush session log: %w", err)
 	}
 	return readRecords(l.path)
-}
-
-// LastSeq returns the sequence of the last appended record.
-func (l *Log) LastSeq() int64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.lastSeq
 }
 
 // Close flushes and closes the file. It is idempotent.
@@ -191,7 +186,7 @@ func (l *Log) Close() error {
 	return err
 }
 
-func readRecords(path string) ([]Record, error) {
+func readRecords(path string) ([]storage.Record, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -200,15 +195,15 @@ func readRecords(path string) ([]Record, error) {
 		return nil, fmt.Errorf("open session log: %w", err)
 	}
 	defer file.Close()
-	var records []Record
+	var records []storage.Record
 	var lastSeq int64
 	reader := bufio.NewReaderSize(file, 64*1024)
 	for {
 		line, err := reader.ReadBytes('\n')
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) > 0 {
-			var record Record
-			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr != nil || record.Validate() != nil {
+			var record storage.Record
+			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr != nil || record.Validate() != nil || record.Seq < 1 {
 				return nil, fmt.Errorf("session log %s has an invalid line after seq %d", path, lastSeq)
 			}
 			if record.Seq <= lastSeq {
@@ -230,7 +225,7 @@ func readRecords(path string) ([]Record, error) {
 // maxTornTailBytes is the largest discard a crash mid-append can produce:
 // one buffered record just above the frame limit. Recovering more than this
 // means the file was damaged by something other than a torn append.
-const maxTornTailBytes = 2 * maxRecordBytes
+const maxTornTailBytes = 2 * storage.MaxRecordBytes
 
 func dirOf(path string) string {
 	for i := len(path) - 1; i >= 0; i-- {

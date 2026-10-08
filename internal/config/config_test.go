@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
 )
 
 func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
@@ -31,7 +30,6 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	if cfg.ProviderDir != wantProviderDir {
 		t.Fatalf("ProviderDir = %q, want %q", cfg.ProviderDir, wantProviderDir)
 	}
-
 
 	provider := cfg.Providers["paperhub"]
 	if provider.Name != "paperhub" {
@@ -75,7 +73,7 @@ func TestLoadBaseUsesAgentPromptAndRelativeSkillSchema(t *testing.T) {
 	writeFile(t, configPath, `default_provider: custom-provider
 default_model: custom-model
 agent:
-  max_turns: 6
+  max_iterations: 6
 prompt:
   system_prompt: |
     Review only the assigned scope.
@@ -86,8 +84,8 @@ prompt:
 		t.Fatalf("LoadBase() error = %v", err)
 	}
 
-	if cfg.Agent.MaxTurns != 6 {
-		t.Fatalf("Agent.MaxTurns = %d, want 6", cfg.Agent.MaxTurns)
+	if cfg.Agent.MaxIterations != 6 {
+		t.Fatalf("Agent.MaxIterations = %d, want 6", cfg.Agent.MaxIterations)
 	}
 	if cfg.Prompt.SystemPrompt != "Review only the assigned scope.\n" {
 		t.Fatalf("Prompt.SystemPrompt = %q, want child prompt", cfg.Prompt.SystemPrompt)
@@ -801,7 +799,7 @@ default_model: glm-5.2
 provider_dir: providers
 
 agent:
-  max_turns: 8
+  max_iterations: 8
   stream: true
   show_reasoning: false
 

@@ -224,6 +224,10 @@ func (ToolCallDoneEvent) Type() EventType {
 // before the executor runs. It maps to the runtime tool.started lifecycle.
 type ToolStartedEvent struct {
 	ToolCall ToolCall
+	// ItemID is the identity of the tool.result this call will produce,
+	// minted when execution starts, so observers can address the outcome
+	// before it exists.
+	ItemID string
 }
 
 func (ToolStartedEvent) Type() EventType {

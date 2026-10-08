@@ -62,7 +62,7 @@ mcp_dir: mcp
 agent:
   instruction_files:
     - $CWD/AGENTS.md
-  max_turns: 8
+  max_iterations: 8
   stream: true
   show_reasoning: false
 

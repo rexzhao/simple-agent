@@ -1,4 +1,4 @@
-package chatapp
+package main
 
 import (
 	"context"
@@ -17,9 +17,9 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model/openai_responses"
 )
 
-// newProvider builds the transport provider for a resolved model. It mirrors
-// execution.newProviderForRun minus request recording, which the minimal app
-// does not use.
+// newProvider builds the transport provider for a resolved model. This is
+// startup-time assembly: it lives in the command, not in the agent, so the
+// agent package stays free of config dependencies.
 func newProvider(resolved config.ResolvedModel) (model.Provider, error) {
 	provider := resolved.Provider
 	httpOptions, err := providerHTTPOptions(provider)
@@ -97,9 +97,8 @@ func providerHTTPOptions(provider config.ProviderConfig) (httpstream.Options, er
 	return options, nil
 }
 
-// providerHTTPClient returns nil for the default transport unless the provider
-// configures a proxy, matching the execution layer's behavior minus the
-// process-wide concurrency limiter.
+// providerHTTPClient returns nil for the default transport unless the
+// provider configures a proxy.
 func providerHTTPClient(provider config.ProviderConfig) (*http.Client, error) {
 	httpProxy, err := parseProviderProxyURL("http_proxy", provider.HTTPProxy)
 	if err != nil {

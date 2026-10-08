@@ -17,13 +17,13 @@ import (
 )
 
 type Config struct {
-	ConfigPath      string                     `json:"config_path" yaml:"-"`
-	DefaultProvider string                     `json:"default_provider" yaml:"default_provider"`
-	DefaultModel    string                     `json:"default_model" yaml:"default_model"`
-	ProviderDir     string                     `json:"provider_dir" yaml:"provider_dir"`
-	Agent           AgentConfig                `json:"agent" yaml:"agent"`
-	Prompt          PromptConfig               `json:"prompt" yaml:"prompt"`
-	Providers       map[string]ProviderConfig  `json:"providers" yaml:"providers"`
+	ConfigPath      string                    `json:"config_path" yaml:"-"`
+	DefaultProvider string                    `json:"default_provider" yaml:"default_provider"`
+	DefaultModel    string                    `json:"default_model" yaml:"default_model"`
+	ProviderDir     string                    `json:"provider_dir" yaml:"provider_dir"`
+	Agent           AgentConfig               `json:"agent" yaml:"agent"`
+	Prompt          PromptConfig              `json:"prompt" yaml:"prompt"`
+	Providers       map[string]ProviderConfig `json:"providers" yaml:"providers"`
 }
 
 const (
@@ -36,7 +36,7 @@ const (
 )
 
 type AgentConfig struct {
-	MaxTurns int `json:"max_turns" yaml:"max_turns"`
+	MaxIterations int `json:"max_iterations" yaml:"max_iterations"`
 }
 
 type PromptConfig struct {
@@ -119,15 +119,15 @@ type ModelInfo struct {
 }
 
 type ResolvedModel struct {
-	ProviderName   string
-	Provider       ProviderConfig
-	Profile        string
-	ModelID        string
-	Type           string
-	Compatibility  string
-	DeveloperRole  string
-	Parameters     map[string]any
-	OutputLimit    int
+	ProviderName    string
+	Provider        ProviderConfig
+	Profile         string
+	ModelID         string
+	Type            string
+	Compatibility   string
+	DeveloperRole   string
+	Parameters      map[string]any
+	OutputLimit     int
 	ReasoningConfig ReasoningConfig
 }
 
@@ -239,7 +239,6 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 	if err != nil {
 		return ResolvedModel{}, err
 	}
-
 
 	resolvedProvider := copyProvider(provider)
 	if modelType != ProviderTypeOpenAICodex {
@@ -506,12 +505,13 @@ func defaultConfig() Config {
 	return Config{
 		ProviderDir: "providers",
 		Agent: AgentConfig{
-			MaxTurns: defaultAgentMaxTurns,
+			MaxIterations: defaultAgentMaxIterations,
 		},
 		Providers: map[string]ProviderConfig{},
 	}
 }
-const defaultAgentMaxTurns = 8
+
+const defaultAgentMaxIterations = 8
 
 func LoadProviderConfigs(providerDir string) (map[string]ProviderConfig, error) {
 	return loadProviders(providerDir)

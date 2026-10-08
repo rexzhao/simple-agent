@@ -1,12 +1,17 @@
 // Command sai is the command-line chat interface for the agent. Records are
-// printed to stdout as soon as they are appended to the session log, one
-// JSONL line each. While the model streams, a dot spinner cycles on stderr;
-// control messages (prompts, notices, session lists) also go to stderr, so
-// stdout stays a pure session-record stream.
+// printed to stdout as soon as they are committed, one JSONL line each.
+// While the model streams, a dot spinner cycles on stderr; control
+// messages (prompts, notices) also go to stderr, so stdout stays a pure
+// session-record stream.
+//
+// Assembly happens here and only here: the config is read once, the
+// provider, tools, and storage are built, and the agent is constructed
+// with everything injected. The agent never reads configuration.
 package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,14 +24,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/chatapp"
+	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
+	"github.com/rexzhao/simple-agent/internal/tools"
 )
 
 var version = "dev"
 
-// spinnerFrames cycles ".", "..", "...", and an empty frame: the empty frame
-// makes the animation blink rather than crawl.
+// spinnerFrames cycles ".", "..", "...", and an empty frame: the empty
+// frame makes the animation blink rather than crawl.
 var spinnerFrames = []string{".", "..", "...", ""}
 
 const spinnerInterval = 250 * time.Millisecond
@@ -35,9 +44,9 @@ func main() {
 	var (
 		showVersion = flag.Bool("version", false, "print version and exit")
 		serverRoot  = flag.String("server-root", "", "configuration namespace root (default: $SAI_SERVER_ROOT, else user config dir/<app>)")
-		cwd         = flag.String("cwd", "", "working directory for tools (default: process cwd)")
+		sessionID   = flag.String("session", "", "resume a stored session by id")
 		provider    = flag.String("provider", "", "override default_provider")
-		model       = flag.String("model", "", "override default_model (model profile name)")
+		modelName   = flag.String("model", "", "override default_model (model profile name)")
 	)
 	flag.Parse()
 
@@ -54,24 +63,24 @@ func main() {
 		*serverRoot = root
 	}
 
-	app, err := chatapp.New(chatapp.Options{
-		ServerRoot: *serverRoot,
-		CWD:        *cwd,
-		Provider:   *provider,
-		Model:      *model,
-	})
+	ag, project, err := assemble(*serverRoot, *provider, *modelName)
 	if err != nil {
 		log.Fatalf("sai: %v", err)
 	}
 	// The root can be discovered from the environment or the working
 	// directory; say which one won so silent discovery never becomes silent
 	// configuration drift.
-	fmt.Fprintf(os.Stderr, "sai: server root %s, project %s (%s)\n", *serverRoot, app.Project(), *cwd)
+	fmt.Fprintf(os.Stderr, "sai: server root %s, project %s\n", *serverRoot, project)
 
-	cli := &cliApp{app: app, printer: &spinnerPrinter{}}
-	// An optional positional argument resumes a stored session directly.
-	if flag.NArg() > 0 {
-		if err := cli.resume(flag.Arg(0)); err != nil {
+	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}}
+	// A -session flag (or an optional positional argument) resumes a
+	// stored session directly; a session which cannot be found is fatal.
+	resumeID := strings.TrimSpace(*sessionID)
+	if resumeID == "" && flag.NArg() > 0 {
+		resumeID = strings.TrimSpace(flag.Arg(0))
+	}
+	if resumeID != "" {
+		if err := cli.resume(resumeID); err != nil {
 			log.Fatalf("sai: %v", err)
 		}
 	} else if err := cli.freshSession(); err != nil {
@@ -92,7 +101,7 @@ func main() {
 		}
 	}()
 
-	fmt.Fprintln(os.Stderr, "sai: /clear /resume [id] /stop /help /quit")
+	fmt.Fprintln(os.Stderr, "sai: /clear /resume <id> /stop /help /quit")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for {
@@ -108,6 +117,91 @@ func main() {
 			break
 		}
 	}
+	// On the way out, name the session to resume — but only if it was
+	// persisted: an empty session left nothing on disk to reopen.
+	if cli.session != nil && cli.session.Persisted() {
+		fmt.Fprintf(os.Stderr, "sai: session %s\n", cli.session.ID())
+	}
+}
+
+// assemble performs the one-time startup assembly: load the config,
+// resolve the model, build the provider, tools, and storage, and construct
+// the agent with everything injected.
+func assemble(serverRoot, providerName, modelName string) (*agent.Agent, string, error) {
+	configPath := filepath.Join(serverRoot, "sai.yaml")
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("load %s: %w", configPath, err)
+	}
+	resolved, err := cfg.ResolveModel(providerName, modelName)
+	if err != nil {
+		return nil, "", err
+	}
+	provider, err := newProvider(resolved)
+	if err != nil {
+		return nil, "", err
+	}
+
+	cwd, err := filepath.Abs(".")
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve working directory: %w", err)
+	}
+	parameters, err := config.ApplyReasoningLevel(resolved.Parameters, resolved.ReasoningConfig, "")
+	if err != nil {
+		return nil, "", fmt.Errorf("apply reasoning level: %w", err)
+	}
+	developerRole := model.MessageRoleDeveloper
+	if strings.TrimSpace(resolved.DeveloperRole) != "" {
+		developerRole = model.MessageRole(resolved.DeveloperRole)
+	}
+
+	store, err := jsonl.OpenStore(filepath.Join(serverRoot, "data"))
+	if err != nil {
+		return nil, "", err
+	}
+	project := jsonl.ProjectID(cwd)
+
+	shell, executor, err := tools.Shell(cwd)
+	if err != nil {
+		return nil, "", fmt.Errorf("register tools: %w", err)
+	}
+	systemPrompt, err := buildSystemPrompt(cfg, cwd)
+	if err != nil {
+		return nil, "", err
+	}
+
+	ag, err := agent.New(agent.Options{
+		Provider:      provider,
+		ProviderName:  resolved.ProviderName,
+		ModelID:       resolved.ModelID,
+		Storage:       store,
+		Tools:         []model.Tool{shell},
+		ToolExecutor:  namedExecutor{exec: executor},
+		SystemPrompt:  systemPrompt,
+		DeveloperRole: developerRole,
+		Parameters:    parameters,
+		MaxTokens:     resolved.OutputLimit,
+		MaxIterations: cfg.Agent.MaxIterations,
+		ProjectID:     project,
+		CWD:           cwd,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return ag, project, nil
+}
+
+// namedExecutor adapts the single-tool executor to the agent loop's
+// name-dispatching ToolExecutor interface.
+type namedExecutor struct {
+	exec tools.Executor
+}
+
+func (n namedExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
+	if name != tools.BuiltinShell {
+		return model.ToolResult{}, fmt.Errorf("unknown tool %q", name)
+	}
+	return n.exec.Execute(ctx, arguments)
 }
 
 // spinnerPrinter interleaves the stderr spinner with stdout record lines:
@@ -147,16 +241,11 @@ func (p *spinnerPrinter) line(line string) {
 	fmt.Println(line)
 }
 
-// cliApp holds the active session. Record printing and the last printed
-// sequence are shared between the main thread and the per-session watcher
-// goroutine.
+// cliApp holds the active session.
 type cliApp struct {
-	app     *chatapp.App
-	session *chatapp.Session
+	agent   *agent.Agent
+	session *agent.Session
 	printer *spinnerPrinter
-
-	mu      sync.Mutex
-	lastSeq int64
 	unwatch func()
 }
 
@@ -175,7 +264,7 @@ func (c *cliApp) dispatch(text string) bool {
 		c.session.Stop()
 		fmt.Fprintln(os.Stderr, "sai: stopping run")
 	case text == "/help":
-		fmt.Fprintln(os.Stderr, "sai: /clear new session · /resume [id] pick or open a session · /stop stop the run · /quit exit")
+		fmt.Fprintln(os.Stderr, "sai: /clear new session · /resume <id> reopen a stored session · /stop stop the run · /quit exit")
 	case strings.HasPrefix(text, "/resume"):
 		c.resumeCommand(strings.TrimSpace(strings.TrimPrefix(text, "/resume")))
 	default:
@@ -190,8 +279,8 @@ func (c *cliApp) dispatch(text string) bool {
 	return false
 }
 
-// send runs one agent turn: records print as they are appended, and the
-// spinner shows only while the model is streaming.
+// send runs one agent turn: records print as they are committed, and the
+// spinner shows only while the model streams.
 func (c *cliApp) send(text string) error {
 	if err := c.session.Send(text); err != nil {
 		return err
@@ -228,56 +317,17 @@ func (c *cliApp) send(text string) error {
 	}
 	c.printer.clear()
 	<-drained
-	// The watcher prints on append notifications; make sure the final
-	// records are flushed even if their notification raced the run ending.
-	c.tail()
 	return nil
 }
 
-// tail prints every record appended since the last print, one JSONL line
-// each, in sequence order.
-func (c *cliApp) tail() {
-	c.mu.Lock()
-	lastSeq := c.lastSeq
-	c.mu.Unlock()
-	records, err := c.session.RecordsAfter(lastSeq)
+// printRecord prints one committed record as a JSONL line.
+func (c *cliApp) printRecord(record storage.Record) {
+	line, err := json.Marshal(record)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
+		fmt.Fprintf(os.Stderr, "sai: encode record: %v\n", err)
 		return
 	}
-	for _, record := range records {
-		line, err := json.Marshal(record)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "sai: encode record: %v\n", err)
-			continue
-		}
-		c.printer.line(string(line))
-		c.mu.Lock()
-		c.lastSeq = record.Seq
-		c.mu.Unlock()
-	}
-}
-
-// watch prints records as they are appended, until the session is switched
-// away or closed.
-func (c *cliApp) watch() {
-	session := c.session
-	notify, unsubscribe := session.Subscribe()
-	c.unwatch = unsubscribe
-	go func() {
-		for range notify {
-			if c.currentSession() != session {
-				return
-			}
-			c.tail()
-		}
-	}()
-}
-
-func (c *cliApp) currentSession() *chatapp.Session {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.session
+	c.printer.line(string(line))
 }
 
 // closeSession stops the watcher and closes the session.
@@ -291,46 +341,26 @@ func (c *cliApp) closeSession() {
 
 // freshSession switches to a new empty session.
 func (c *cliApp) freshSession() error {
-	session, err := c.app.NewSession()
+	session, err := c.agent.NewSession()
 	if err != nil {
 		return err
 	}
-	if err := c.bind(session, false); err != nil {
-		session.Close()
-		return err
-	}
-	return nil
+	return c.bind(session)
 }
 
-// resume reopens a stored session and prints its existing records first.
+// resume reopens a stored session.
 func (c *cliApp) resume(id string) error {
-	session, err := c.app.ResumeSession(id)
+	session, err := c.agent.OpenSession(id)
 	if err != nil {
 		return err
 	}
-	if err := c.bind(session, true); err != nil {
-		session.Close()
-		return err
-	}
-	return nil
+	return c.bind(session)
 }
 
-// resumeCommand implements /resume: without an argument it lists stored
-// sessions; with one it opens that session.
+// resumeCommand implements /resume: it requires a session id.
 func (c *cliApp) resumeCommand(arg string) {
 	if arg == "" {
-		summaries, err := c.app.ListSessions()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
-			return
-		}
-		if len(summaries) == 0 {
-			fmt.Fprintln(os.Stderr, "sai: no stored sessions")
-			return
-		}
-		for _, summary := range summaries {
-			fmt.Fprintf(os.Stderr, "%s  %s  (%d messages)\n", summary.ID, displayTitle(summary.Title), summary.MessageCount)
-		}
+		fmt.Fprintln(os.Stderr, "sai: usage: /resume <session-id>")
 		return
 	}
 	if err := c.resume(arg); err != nil {
@@ -338,31 +368,34 @@ func (c *cliApp) resumeCommand(arg string) {
 	}
 }
 
-// bind switches to session. When printHistory is set, every stored record is
-// printed to stdout first so a resumed session continues the JSONL stream.
-func (c *cliApp) bind(session *chatapp.Session, printHistory bool) error {
+// bind switches to a session: existing records print first, then every
+// later commit prints as it happens. The session id prints immediately —
+// it exists from creation, before anything is written to disk.
+func (c *cliApp) bind(session *agent.Session) error {
 	if c.session != nil {
 		if c.session.Running() {
 			return fmt.Errorf("the current session is still running; /stop it first")
 		}
 		c.closeSession()
 	}
-	c.mu.Lock()
 	c.session = session
-	c.lastSeq = 0
-	c.mu.Unlock()
-	c.watch()
-	if printHistory {
-		c.tail()
+	sub := session.Subscribe()
+	c.unwatch = sub.Stop
+	go func() {
+		for {
+			select {
+			case record := <-sub.Records():
+				c.printRecord(record)
+			case <-sub.Done():
+				return
+			}
+		}
+	}()
+	fmt.Fprintf(os.Stderr, "sai: session %s\n", session.ID())
+	for _, record := range sub.Initial() {
+		c.printRecord(record)
 	}
 	return nil
-}
-
-func displayTitle(title string) string {
-	if strings.TrimSpace(title) == "" {
-		return "(empty session)"
-	}
-	return title
 }
 
 // resolveServerRoot picks the configuration namespace root: an explicit
