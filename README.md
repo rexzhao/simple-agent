@@ -4,9 +4,11 @@
 command-line interface. Type a message, the agent answers; it can read,
 and edit files in your project — all through its single tool: a Bash shell.
 
-While a run streams, a dot spinner shows progress; when the run settles, the
-session's appended JSONL records print to stdout, one line each. Control
-messages go to stderr, so stdout stays a pure session-record stream.
+While a run streams, a dot spinner shows progress; committed records
+render to stdout as human-readable blocks — a common header line (local
+time and record kind, e.g. `[10:06:21] assistant …`) followed by the
+content: message text, marked reasoning, tool calls and truncated tool
+output. Control messages go to stderr.
 
 ## Storage model
 
@@ -139,7 +141,7 @@ is the target structure (see the design doc for invariants and the record
 schema):
 
 ```
-cmd/sai              command-line interface (JSONL stream on stdout)
+cmd/sai              command-line interface (human-readable record blocks on stdout)
 internal/agent       state layer + agent loop (owns State, commit is the only write path)
 internal/storage     record schema + Fold + Store/Session interfaces
   jsonl/             append-only JSONL file store (torn-tail recovery)

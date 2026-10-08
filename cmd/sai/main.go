@@ -1,8 +1,8 @@
-// Command sai is the command-line chat interface for the agent. Records are
-// printed to stdout as soon as they are committed, one JSONL line each.
-// While the model streams, a dot spinner cycles on stderr; control
-// messages (prompts, notices) also go to stderr, so stdout stays a pure
-// session-record stream.
+// Command sai is the command-line chat interface for the agent. Committed
+// records render to stdout as human-readable blocks (a common header line
+// plus the record's content) as soon as they are committed. While the
+// model streams, a dot spinner cycles on stderr; control messages
+// (prompts, notices) also go to stderr.
 //
 // Assembly happens here and only here: the config is read once, the
 // provider, tools, and storage are built, and the agent is constructed
@@ -12,7 +12,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -320,14 +319,13 @@ func (c *cliApp) send(text string) error {
 	return nil
 }
 
-// printRecord prints one committed record as a JSONL line.
+// printRecord renders one committed record. A user input opens a new run:
+// the blank line keeps runs visually separated.
 func (c *cliApp) printRecord(record storage.Record) {
-	line, err := json.Marshal(record)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "sai: encode record: %v\n", err)
-		return
+	if record.Type == storage.TypeUserInput {
+		c.printer.line("")
 	}
-	c.printer.line(string(line))
+	c.printer.line(formatRecord(record))
 }
 
 // closeSession stops the watcher and closes the session.
