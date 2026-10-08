@@ -535,10 +535,17 @@ func (c *cliApp) bind(session *agent.Session) error {
 	fmt.Fprintf(os.Stderr, "sai: session %s\n", session.ID())
 	// History shows only the tail: the full log stays in the file; a
 	// resumed session needs the recent context, not a wall of scroll-back.
+	// The omitted records count as processed — waitForRecords compares
+	// against the session's full committed count, and every omitted record
+	// would otherwise be waited for until the timeout.
 	initial := sub.Initial()
 	if len(initial) > resumeTailRecords {
+		omitted := len(initial) - resumeTailRecords
 		c.printer.line(fmt.Sprintf("[… showing last %d of %d records]", resumeTailRecords, len(initial)))
 		initial = initial[len(initial)-resumeTailRecords:]
+		c.printedMu.Lock()
+		c.printed += omitted
+		c.printedMu.Unlock()
 	}
 	for _, record := range initial {
 		c.printRecord(record)
