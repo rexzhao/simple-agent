@@ -17,16 +17,17 @@ build() {
     echo "built dist/$output_name"
 }
 
-# The Windows build product is dist/sai.exe itself: never a symlink or a
-# convenience copy, either of which can go stale after a rebuild.
+# The Windows build product is dist/sai-windows-amd64.exe; dist/sai.exe is
+# a symbolic link to it, refreshed on every build. (On a Git Bash host
+# without native symlink support the link degrades to a refreshed copy.)
 mkdir -p "$DIST_DIR"
 
-build windows amd64 sai.exe
+build windows amd64 sai-windows-amd64.exe
 build linux amd64 sai-linux-amd64
 build darwin arm64 sai-darwin-arm64
 
-# On a Unix host, link the matching build to dist/sai for convenience; the
-# link is refreshed on every build, and rm -f clears a stale plain file.
+# On the host platform, link the matching build to dist/sai for convenience;
+# the link is refreshed every build, and rm -f clears a stale plain file.
 case "$(uname -s)" in
     Linux*)
         if [ -f "$DIST_DIR/sai-linux-amd64" ]; then
@@ -40,6 +41,21 @@ case "$(uname -s)" in
             rm -f "$DIST_DIR/sai"
             ln -s sai-darwin-arm64 "$DIST_DIR/sai"
             echo "linked dist/sai -> sai-darwin-arm64"
+        fi
+        ;;
+    MINGW*|MSYS*|CYGWIN*)
+        if [ -f "$DIST_DIR/sai-windows-amd64.exe" ]; then
+            rm -f "$DIST_DIR/sai.exe"
+            if MSYS=winsymlinks:nativestrict ln -s sai-windows-amd64.exe "$DIST_DIR/sai.exe" 2>/dev/null; then
+                echo "linked dist/sai.exe -> sai-windows-amd64.exe (symbolic)"
+            elif ln "$DIST_DIR/sai-windows-amd64.exe" "$DIST_DIR/sai.exe" 2>/dev/null; then
+                # No symlink privilege on this host: a hard link shares the
+                # same file data, needs no elevation, and costs no extra disk.
+                echo "linked dist/sai.exe -> sai-windows-amd64.exe (hard link)"
+            else
+                cp -f "$DIST_DIR/sai-windows-amd64.exe" "$DIST_DIR/sai.exe"
+                echo "copied dist/sai.exe <- sai-windows-amd64.exe"
+            fi
         fi
         ;;
 esac

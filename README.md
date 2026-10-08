@@ -123,7 +123,7 @@ sh scripts/build.sh
 
 The build cross-compiles:
 
-- `dist/sai.exe`
+- `dist/sai-windows-amd64.exe` (with `dist/sai.exe` linked to it)
 - `dist/sai-linux-amd64`
 - `dist/sai-darwin-arm64`
 

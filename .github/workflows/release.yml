@@ -41,7 +41,7 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           for artifact in \
-            dist/sai.exe \
+            dist/sai-windows-amd64.exe \
             dist/sai-linux-amd64 \
             dist/sai-darwin-arm64
           do
@@ -52,7 +52,7 @@ jobs:
         working-directory: dist
         run: |
           sha256sum \
-            sai.exe \
+            sai-windows-amd64.exe \
             sai-linux-amd64 \
             sai-darwin-arm64 > SHA256SUMS
           sha256sum --check SHA256SUMS
@@ -63,7 +63,7 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           artifacts=(
-            dist/sai.exe
+            dist/sai-windows-amd64.exe
             dist/sai-linux-amd64
             dist/sai-darwin-arm64
             dist/SHA256SUMS

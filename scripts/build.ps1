@@ -9,10 +9,34 @@ $Dist = Join-Path $Root "dist"
 $Ldflags = "-s -w -X main.version=$Version"
 
 $Targets = @(
-    @{ GOOS = "windows"; GOARCH = "amd64"; Name = "sai.exe" },
+    @{ GOOS = "windows"; GOARCH = "amd64"; Name = "sai-windows-amd64.exe" },
     @{ GOOS = "linux"; GOARCH = "amd64"; Name = "sai-linux-amd64" },
     @{ GOOS = "darwin"; GOARCH = "arm64"; Name = "sai-darwin-arm64" }
 )
+
+# dist/sai.exe links to the Windows build, refreshed on every build. A
+# symbolic link needs Developer Mode or elevation; a hard link needs neither
+# (same volume, same file data, no extra disk); a copy is the last resort.
+function Ensure-WindowsConvenienceLink {
+    $Target = "sai-windows-amd64.exe"
+    $Link = Join-Path $Dist "sai.exe"
+    if (-not (Test-Path -LiteralPath (Join-Path $Dist $Target) -PathType Leaf)) {
+        return
+    }
+    Remove-Item -LiteralPath $Link -Force -ErrorAction SilentlyContinue
+    try {
+        New-Item -ItemType SymbolicLink -Path $Link -Target $Target | Out-Null
+        Write-Host "linked dist/sai.exe -> $Target (symbolic)"
+        return
+    } catch {}
+    try {
+        New-Item -ItemType HardLink -Path $Link -Target (Join-Path $Dist $Target) | Out-Null
+        Write-Host "linked dist/sai.exe -> $Target (hard link)"
+        return
+    } catch {}
+    Copy-Item -LiteralPath (Join-Path $Dist $Target) -Destination $Link -Force
+    Write-Host "copied dist/sai.exe <- $Target"
+}
 
 $OldCGOEnabled = $env:CGO_ENABLED
 $OldGOOS = $env:GOOS
@@ -35,3 +59,5 @@ try {
     $env:GOARCH = $OldGOARCH
     Pop-Location
 }
+
+Ensure-WindowsConvenienceLink
