@@ -165,6 +165,15 @@ func TestToolRoundTripCommitsRecords(t *testing.T) {
 	if len(second) != 3 {
 		t.Fatalf("second request messages = %d, want user+assistant+tool", len(second))
 	}
+	// The in-run history carries explicit roles — the streaming snapshot is
+	// an assistant message, not a zero-value one (a real provider rejects
+	// empty roles with HTTP 400).
+	wantRoles := []model.MessageRole{model.MessageRoleUser, model.MessageRoleAssistant, model.MessageRoleTool}
+	for i, want := range wantRoles {
+		if second[i].Role != want {
+			t.Fatalf("second request messages[%d].Role = %q, want %q", i, second[i].Role, want)
+		}
+	}
 	if second[2].Role != model.MessageRoleTool || second[2].ToolCallID != "call-1" {
 		t.Fatalf("tool message not replayed: %+v", second[2])
 	}

@@ -306,9 +306,14 @@ func (s *Session) appendLocked(record storage.Record) (storage.Record, error) {
 }
 
 // beginAssistant opens the streaming slot for a message being generated.
+// The message is an assistant message from birth: the run loop appends the
+// streaming snapshot to the request history verbatim.
 func (s *Session) beginAssistant(itemID string) {
 	s.mu.Lock()
-	s.state.Streaming = &storage.StreamingItem{ItemID: itemID}
+	s.state.Streaming = &storage.StreamingItem{
+		ItemID:  itemID,
+		Message: model.Message{Role: model.MessageRoleAssistant},
+	}
 	s.mu.Unlock()
 }
 
