@@ -2,7 +2,7 @@
 
 `sai` is a local agent application packaged as a single Go executable with a
 command-line interface. Type a message, the agent answers; it can read,
-search, and edit files and run shell commands in your project.
+and edit files in your project — all through its single tool: a Bash shell.
 
 While a run streams, a dot spinner shows progress; when the run settles, the
 session's appended JSONL records print to stdout, one line each. Control
@@ -35,10 +35,9 @@ Options:
 
 ```text
 --server-root dir   configuration namespace root (default: user config dir/sai)
---cwd dir           working directory for tools (default: process cwd)
+--cwd dir           shell working directory (default: process cwd)
 --provider name     override default_provider
 --model name        override default_model (model profile name)
---full-access       let file tools read and write outside the cwd
 --version           print version
 ```
 
@@ -73,17 +72,6 @@ provider_dir: providers
 
 agent:
   max_turns: 8
-
-tools:
-  enabled:
-    - list_files
-    - read_file
-    - glob_files
-    - grep_files
-    - write_file
-    - edit_file
-    - apply_patch
-    - shell
 ```
 
 Provider profile:
@@ -148,6 +136,6 @@ internal/sessionlog  append-only JSONL session store + fold
 internal/chatapp     minimal orchestration (provider, tools, runs)
 internal/agent       transport-neutral agent loop
 internal/model       provider adapters (OpenAI Chat/Responses, Anthropic)
-internal/tools       file and shell tools
+internal/tools       the shell tool (Bash on every platform, incl. Windows via Git Bash)
 internal/config      root + provider configuration
 ```

@@ -11,7 +11,6 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/model"
-	projectcontext "github.com/rexzhao/simple-agent/internal/context"
 	"github.com/rexzhao/simple-agent/internal/sessionlog"
 )
 
@@ -195,17 +194,37 @@ func eventMessage(event model.ErrorEvent) string {
 	return event.Err.Error()
 }
 
-// renderPrompt expands the config prompt template with the run values.
+// renderPrompt expands the config prompt template's {{cwd}}, {{config_dir}},
+// and {{time.now}} placeholders.
 func renderPrompt(template, cwd, configDir string) (string, error) {
-	rendered, err := projectcontext.RenderPromptTemplate(template, projectcontext.PromptRenderValues{
-		CWD:       cwd,
-		ConfigDir: configDir,
-		Now:       time.Now().UTC(),
-	})
-	if err != nil {
-		return "", fmt.Errorf("render prompt.system_prompt: %w", err)
+	replacements := map[string]string{
+		"cwd":        cwd,
+		"config_dir": configDir,
+		"time.now":   time.Now().UTC().Format(time.RFC3339),
 	}
-	return rendered, nil
+	var rendered strings.Builder
+	offset := 0
+	for {
+		start := strings.Index(template[offset:], "{{")
+		if start < 0 {
+			rendered.WriteString(template[offset:])
+			return rendered.String(), nil
+		}
+		start += offset
+		rendered.WriteString(template[offset:start])
+		end := strings.Index(template[start+2:], "}}")
+		if end < 0 {
+			return "", fmt.Errorf("prompt placeholder starting at byte %d is missing closing }}", start)
+		}
+		end += start + 2
+		name := strings.TrimSpace(template[start+2 : end])
+		replacement, ok := replacements[name]
+		if !ok {
+			return "", fmt.Errorf("unknown prompt placeholder %q; supported placeholders: config_dir, cwd, time.now", name)
+		}
+		rendered.WriteString(replacement)
+		offset = end + 2
+	}
 }
 
 func newID(prefix string) string {

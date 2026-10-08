@@ -128,8 +128,8 @@ func TestToolRoundTripPersistsContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	scripted := &scriptedProvider{responses: [][]model.Event{
-		// Iteration 1: assistant asks for a tool call.
-		toolCallResponse(model.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"sai.yaml"}`}),
+		// Iteration 1: assistant asks for a shell command.
+		toolCallResponse(model.ToolCall{ID: "call-1", Name: "shell", Arguments: `{"command":"echo config-ok"}`}),
 		// Iteration 2: final text.
 		textResponse("the config is fine"),
 	}}
@@ -277,42 +277,6 @@ func waitForSettle(t *testing.T, session *Session) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("run did not settle in time")
-}
-
-func TestUnknownEnabledToolsAreSkipped(t *testing.T) {
-	root := t.TempDir()
-	writeTestConfig(t, root)
-	// Enable builtins plus retired-stack tools that chatapp never registers.
-	rootYAML := "default_provider: fake\ndefault_model: test-model\nprovider_dir: providers\ntools:\n  enabled: [read_file, session_models, session_start]\n"
-	if err := os.WriteFile(filepath.Join(root, "sai.yaml"), []byte(rootYAML), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	app, err := New(Options{ServerRoot: root, CWD: root})
-	if err != nil {
-		t.Fatalf("New failed on config with unknown tools: %v", err)
-	}
-	if len(app.toolSchemas) != 1 || app.toolSchemas[0].Name != "read_file" {
-		t.Fatalf("tool schemas = %+v, want only read_file", app.toolSchemas)
-	}
-	if app.ToolNotice() == "" || !strings.Contains(app.ToolNotice(), "session_models") {
-		t.Fatalf("tool notice = %q", app.ToolNotice())
-	}
-}
-
-func TestAllUnknownToolsFallBackToBuiltins(t *testing.T) {
-	root := t.TempDir()
-	writeTestConfig(t, root)
-	rootYAML := "default_provider: fake\ndefault_model: test-model\nprovider_dir: providers\ntools:\n  enabled: [session_models]\n"
-	if err := os.WriteFile(filepath.Join(root, "sai.yaml"), []byte(rootYAML), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	app, err := New(Options{ServerRoot: root, CWD: root})
-	if err != nil {
-		t.Fatalf("New failed on config with only unknown tools: %v", err)
-	}
-	if len(app.toolSchemas) == 0 {
-		t.Fatal("fallback to builtins did not happen")
-	}
 }
 
 func TestSanitizeContextPatchesDanglingToolCalls(t *testing.T) {

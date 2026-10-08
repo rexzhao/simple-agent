@@ -5,11 +5,9 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -31,109 +29,12 @@ type ToolExecutor interface {
 	Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error)
 }
 
-// ActivePromptCheckpoint identifies a safe point in the agent turn where queued
-// active prompts may be drained. It is passed to ActivePromptDrain so the
-// callback can distinguish why it is being polled.
-type ActivePromptCheckpoint int
-
-const (
-	// ActivePromptCheckpointBeforeProvider is the checkpoint before the first
-	// provider request of the turn.
-	ActivePromptCheckpointBeforeProvider ActivePromptCheckpoint = iota
-	// ActivePromptCheckpointAfterToolBatch is the checkpoint after a complete
-	// assistant tool-call batch with every tool result durably published.
-	ActivePromptCheckpointAfterToolBatch
-	// ActivePromptCheckpointBeforeTerminal is the checkpoint after a no-tool
-	// assistant response, before terminal return.
-	ActivePromptCheckpointBeforeTerminal
-)
-
-// ActivePromptDrain is an optional callback polled at safe checkpoints during an
-// active agent turn. It receives the checkpoint being polled and returns queued
-// user messages to append to the active turn history within the same TurnID.
-// The agent loop never invokes it during a provider request or a tool call, and
-// never between assistant tool calls and their tool results. A nil callback
-// preserves the existing turn behavior.
-type ActivePromptDrain func(ActivePromptCheckpoint) []model.Message
-
-// AutoCompact is an optional safe-checkpoint callback invoked after a complete
-// tool batch and any queued user input have been durably published, immediately
-// before the next provider request. It may return replacement model history.
-type AutoCompact func(context.Context, []model.Message) ([]model.Message, error)
-
-// ToolCancellationRegistry tracks in-flight tool calls so they can be
-// individually cancelled without aborting the entire agent turn. The agent
-// loop registers each tool call before execution and unregisters it after.
-// A nil registry is a no-op.
-type ToolCancellationRegistry struct {
-	mu   sync.Mutex
-	stop map[string]context.CancelFunc
-}
-
-// NewToolCancellationRegistry returns an empty registry.
-func NewToolCancellationRegistry() *ToolCancellationRegistry {
-	return &ToolCancellationRegistry{stop: make(map[string]context.CancelFunc)}
-}
-
-// Register associates toolCallID with cancel. It returns a wrapped context
-// derived from parent that is cancelled when Cancel is called for the same ID
-// or when parent is cancelled. The returned cleanup function unregisters the
-// entry and must be called when the tool call finishes.
-func (r *ToolCancellationRegistry) Register(parent context.Context, toolCallID string) (context.Context, func()) {
-	if r == nil {
-		return parent, func() {}
-	}
-	ctx, cancel := context.WithCancel(parent)
-	r.mu.Lock()
-	r.stop[toolCallID] = cancel
-	r.mu.Unlock()
-	return ctx, func() {
-		cancel()
-		r.mu.Lock()
-		delete(r.stop, toolCallID)
-		r.mu.Unlock()
-	}
-}
-
-// Cancel cancels the in-flight tool call identified by toolCallID. It returns
-// true if a tool call was found and cancelled.
-func (r *ToolCancellationRegistry) Cancel(toolCallID string) bool {
-	if r == nil {
-		return false
-	}
-	r.mu.Lock()
-	cancel, ok := r.stop[toolCallID]
-	if ok {
-		// Cancellation is a one-shot control action. The gateway cache makes a
-		// duplicate request_id idempotent; a different request must not report
-		// an already-cancelled call as still active while the tool is unwinding.
-		delete(r.stop, toolCallID)
-	}
-	r.mu.Unlock()
-	if ok {
-		cancel()
-	}
-	return ok
-}
-
 type Options struct {
-	Provider          model.Provider
-	ToolExecutor      ToolExecutor
-	MaxTurns          int
-	TurnID            string
-	Publisher         eventbus.Publisher
-	ActivePromptDrain ActivePromptDrain
-	AutoCompact       AutoCompact
-	ToolCancel        *ToolCancellationRegistry
-	// AssistantCheckpoint controls cumulative visible assistant checkpoints.
-	// A nil policy uses DefaultAssistantCheckpointPolicy. Checkpoints are only
-	// enabled when Publisher also implements eventbus.AssistantCheckpointPublisher.
-	AssistantCheckpoint *AssistantCheckpointPolicy
-	// NextTurnID enables the execution layer to give each provider request its
-	// own durable Turn. When nil, the standalone agent API retains its
-	// historical single-turn behavior.
-	NextTurnID    func(iteration int) string
-	TurnIDChanged func(turnID string)
+	Provider     model.Provider
+	ToolExecutor ToolExecutor
+	MaxTurns     int
+	TurnID       string
+	Publisher    eventbus.Publisher
 }
 
 // AssistantCheckpointPolicy bounds write amplification while preserving an
@@ -197,43 +98,12 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 	enabledTools := enabledToolNames(request.Tools)
 
 	for iteration := 1; iteration <= maxTurns; iteration++ {
-		if iteration > 1 && options.NextTurnID != nil && options.Publisher != nil {
-			if !publishDurable(events, options.Publisher, eventbus.TurnCompleted{TurnID: turnID}, "persist turn completion") {
-				return
-			}
-			next := strings.TrimSpace(options.NextTurnID(iteration))
-			if next == "" {
-				events <- model.ErrorEvent{Err: fmt.Errorf("next agent turn id is blank")}
-				return
-			}
-			turnID = next
-			if !publishDurable(events, options.Publisher, eventbus.TurnStarted{TurnID: turnID}, "persist turn start") {
-				return
-			}
-			if options.TurnIDChanged != nil {
-				options.TurnIDChanged(turnID)
-			}
-		}
-		// Checkpoint: drain queued active prompts before the first provider
-		// request so appended user input is part of the initial turn history.
-		if iteration == 1 {
-			var ok bool
-			messages, _, ok = drainActivePrompts(events, options.Publisher, options.ActivePromptDrain, ActivePromptCheckpointBeforeProvider, turnID, messages)
-			if !ok {
-				return
-			}
-		}
-
 		request.Messages = messages
 		events <- model.AgentIterationStartedEvent{Iteration: iteration}
 
 		assistantItemID := newAssistantItemID()
 		events <- model.AssistantMessageStartedEvent{ItemID: assistantItemID, AgentIteration: iteration}
-		var checkpoint assistantOutputCheckpoint
-		if publisher, ok := options.Publisher.(eventbus.AssistantCheckpointPublisher); ok {
-			checkpoint = newAssistantOutputCheckpoint(publisher, turnID, iteration, assistantItemID, options.AssistantCheckpoint)
-		}
-		assistantContent, reasoningContent, toolCalls, responseState, messageRevision, stopped := streamModelTurn(ctx, options.Provider, request, events, assistantItemID, iteration, checkpoint)
+		assistantContent, reasoningContent, toolCalls, responseState, messageRevision, stopped := streamModelTurn(ctx, options.Provider, request, events, assistantItemID, iteration)
 		if stopped {
 			return
 		}
@@ -260,31 +130,12 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		events <- model.AssistantMessageCompletedEvent{ItemID: assistantItemID, AgentIteration: iteration, Revision: messageRevision + 1, Message: assistantMessage}
 		messages = append(messages, assistantMessage)
 		if len(toolCalls) == 0 {
-			// Checkpoint: after a no-tool assistant response, drain queued active
-			// prompts before terminal return. Queued input extends the active
-			// turn when turns remain; at the limit it is still published (never
-			// silently dropped) and the run stops with a max_turns error.
-			var appended int
-			var ok bool
-			messages, appended, ok = drainActivePrompts(events, options.Publisher, options.ActivePromptDrain, ActivePromptCheckpointBeforeTerminal, turnID, messages)
-			if !ok {
-				return
-			}
-			if appended > 0 {
-				if iteration == maxTurns {
-					events <- model.ErrorEvent{
-						Err: fmt.Errorf("agent reached max_turns %d with queued input after final response", maxTurns),
-					}
-					return
-				}
-				continue
-			}
 			sendResult(results, messages)
 			return
 		}
 
 		for _, toolCall := range toolCalls {
-			result := executeToolCall(ctx, options.ToolExecutor, enabledTools, toolCall, options.ToolCancel, events)
+			result := executeToolCall(ctx, options.ToolExecutor, enabledTools, toolCall, events)
 			if !publishDurable(events, options.Publisher, eventbus.ToolResultReady{TurnID: turnID, AgentIteration: iteration, Result: result}, "persist tool result") {
 				return
 			}
@@ -297,29 +148,11 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			})
 		}
 
-		// Checkpoint: after a complete assistant tool-call batch with every tool
-		// result durably published, drain queued active prompts before the next
-		// provider request. Drained user input is never inserted between
-		// assistant tool calls and their tool results.
-		var ok bool
-		messages, _, ok = drainActivePrompts(events, options.Publisher, options.ActivePromptDrain, ActivePromptCheckpointAfterToolBatch, turnID, messages)
-		if !ok {
-			return
-		}
-
 		if iteration == maxTurns {
 			events <- model.ErrorEvent{
 				Err: fmt.Errorf("agent reached max_turns %d before the model returned a final response", maxTurns),
 			}
 			return
-		}
-		if options.AutoCompact != nil {
-			compacted, err := options.AutoCompact(ctx, copyMessages(messages))
-			if err != nil {
-				events <- model.ErrorEvent{Err: err, Message: "auto compact"}
-				return
-			}
-			messages = compacted
 		}
 	}
 }
@@ -333,32 +166,6 @@ func publishDurable(out chan<- model.Event, publisher eventbus.Publisher, event 
 		return false
 	}
 	return true
-}
-
-// drainActivePrompts polls the active prompt drain callback at a safe
-// checkpoint. For every returned message it requires role user, durably
-// publishes a separate eventbus.TurnInputReady with the shared turnID, and only
-// then appends it to messages. It returns the updated messages slice, the
-// number of messages appended, and ok=false if the run must stop because a
-// drained message had a non-user role or a durable publish failed. A nil drain
-// is a no-op.
-func drainActivePrompts(out chan<- model.Event, publisher eventbus.Publisher, drain ActivePromptDrain, checkpoint ActivePromptCheckpoint, turnID string, messages []model.Message) ([]model.Message, int, bool) {
-	if drain == nil {
-		return messages, 0, true
-	}
-	appended := 0
-	for _, msg := range drain(checkpoint) {
-		if msg.Role != model.MessageRoleUser {
-			out <- model.ErrorEvent{Err: fmt.Errorf("drained prompt must have role user, got %q", msg.Role), Message: "persist turn input"}
-			return messages, appended, false
-		}
-		if !publishDurable(out, publisher, eventbus.TurnInputReady{TurnID: turnID, Message: msg}, "persist turn input") {
-			return messages, appended, false
-		}
-		messages = append(messages, msg)
-		appended++
-	}
-	return messages, appended, true
 }
 
 func sendResult(results chan<- TurnResult, messages []model.Message) {
@@ -399,43 +206,7 @@ func newAssistantItemID() string {
 	return fmt.Sprintf("assistant-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&assistantFallbackID, 1))
 }
 
-type assistantOutputCheckpoint func(content func() string, length int, hasNonWhitespace bool, force bool) (committedLength int, committed bool, err error)
-
-func newAssistantOutputCheckpoint(publisher eventbus.AssistantCheckpointPublisher, turnID string, iteration int, itemID string, policy *AssistantCheckpointPolicy) assistantOutputCheckpoint {
-	if publisher == nil {
-		return nil
-	}
-	config := DefaultAssistantCheckpointPolicy
-	if policy != nil {
-		config = *policy
-	}
-	lastLength := 0
-	lastCheckpointAt := time.Time{}
-	return func(content func() string, length int, hasNonWhitespace bool, force bool) (int, bool, error) {
-		if !hasNonWhitespace {
-			return lastLength, false, nil
-		}
-		if length == lastLength && lastLength > 0 {
-			return lastLength, false, nil
-		}
-		if !force && lastLength > 0 {
-			newRunes := length - lastLength
-			intervalElapsed := config.MinInterval <= 0 || time.Since(lastCheckpointAt) >= config.MinInterval
-			charsReached := config.MinNewRunes > 0 && newRunes >= config.MinNewRunes
-			if !charsReached && !intervalElapsed {
-				return lastLength, false, nil
-			}
-		}
-		if err := publisher.PublishAssistantCheckpoint(turnID, iteration, itemID, content()); err != nil {
-			return lastLength, false, err
-		}
-		lastLength = length
-		lastCheckpointAt = time.Now()
-		return lastLength, true, nil
-	}
-}
-
-func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event, assistantItemID string, agentIteration int, checkpoint assistantOutputCheckpoint) (string, string, []model.ToolCall, *model.ResponseState, uint64, bool) {
+func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event, assistantItemID string, agentIteration int) (string, string, []model.ToolCall, *model.ResponseState, uint64, bool) {
 	var assistantContent strings.Builder
 	var assistantRunes int
 	var assistantHasNonWhitespace bool
@@ -483,19 +254,7 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 	}
 	const maxAttempts = 5
 	var idleRetried bool
-	flushAssistant := func() error {
-		if checkpoint == nil || assistantContent.Len() == 0 {
-			return nil
-		}
-		_, _, err := checkpoint(assistantContent.String, assistantRunes, assistantHasNonWhitespace, true)
-		return err
-	}
 	failAfterPartialOutput := func(err error, message string) (string, string, []model.ToolCall, *model.ResponseState, uint64, bool) {
-		if flushErr := flushAssistant(); flushErr != nil {
-			publishMessageFailure()
-			out <- model.ErrorEvent{Err: flushErr, Message: "persist assistant output"}
-			return assistantContent.String(), reasoningContent.String(), nil, nil, messageRevision, true
-		}
 		publishMessageFailure()
 		out <- model.ErrorEvent{Err: err, Message: message}
 		return assistantContent.String(), reasoningContent.String(), nil, nil, messageRevision, true
@@ -532,16 +291,7 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 				assistantContent.WriteString(event.Text)
 				assistantRunes += utf8.RuneCountInString(event.Text)
 				assistantHasNonWhitespace = assistantHasNonWhitespace || strings.TrimSpace(event.Text) != ""
-				checkpointed := false
-				if checkpoint != nil {
-					_, checkpointed, err = checkpoint(assistantContent.String, assistantRunes, assistantHasNonWhitespace, false)
-					if err != nil {
-						publishMessageFailure()
-						out <- model.ErrorEvent{Err: err, Message: "persist assistant output"}
-						return assistantContent.String(), reasoningContent.String(), nil, nil, messageRevision, true
-					}
-				}
-				publishMessageUpdate(checkpointed)
+				publishMessageUpdate(false)
 			case model.ReasoningDeltaEvent:
 				madeProgress = true
 				reasoningContent.WriteString(event.Text)
@@ -588,11 +338,6 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 		if err := ctx.Err(); err != nil {
 			return failAfterPartialOutput(err, "stream model")
 		}
-		if err := flushAssistant(); err != nil {
-			publishMessageFailure()
-			out <- model.ErrorEvent{Err: err, Message: "persist assistant output"}
-			return assistantContent.String(), reasoningContent.String(), nil, nil, messageRevision, true
-		}
 		return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, messageRevision, false
 	}
 	panic("unreachable")
@@ -631,7 +376,7 @@ func copyProviderItems(items []model.ProviderItem) []model.ProviderItem {
 	return copied
 }
 
-func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, cancel *ToolCancellationRegistry, out chan<- model.Event) model.ToolResult {
+func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, out chan<- model.Event) model.ToolResult {
 	arguments, err := parseToolArguments(toolCall.Arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "invalid tool arguments: %v", err)
@@ -644,18 +389,8 @@ func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools ma
 	}
 
 	out <- model.ToolStartedEvent{ToolCall: toolCall}
-	toolCtx, cleanup := cancel.Register(ctx, toolCall.ID)
-	defer cleanup()
-	result, err := executor.Execute(toolCtx, toolCall.Name, arguments)
+	result, err := executor.Execute(ctx, toolCall.Name, arguments)
 	if err != nil {
-		if errors.Is(err, context.Canceled) && toolCtx.Err() == context.Canceled && ctx.Err() == nil {
-			return model.ToolResult{
-				ToolCallID: toolCall.ID,
-				Name:       toolCall.Name,
-				Content:    "[tool execution cancelled by user]",
-				IsError:    true,
-			}
-		}
 		return toolErrorResult(toolCall, "%v", err)
 	}
 	if result.ToolCallID == "" {

@@ -29,8 +29,6 @@ type Options struct {
 	// a model profile name within the provider.
 	Provider string
 	Model    string
-	// FullAccess lets file tools read and write outside the CWD.
-	FullAccess bool
 }
 
 // App is one running application instance bound to a server root.
@@ -45,18 +43,10 @@ type App struct {
 	cwd            string
 	project        string
 	systemPrompt   string
-	fullAccess     bool
-	toolRegistry   *tools.Registry
-	toolSchemas    []model.Tool
-	defaultEnabled []string
-	// toolNotice reports config entries which were skipped (unknown tools).
-	toolNotice string
-	store      *sessionlog.Store
+	toolRegistry *tools.Registry
+	toolSchemas  []model.Tool
+	store *sessionlog.Store
 }
-
-// ToolNotice returns a human-readable note about skipped configuration
-// entries, or the empty string when nothing was skipped.
-func (a *App) ToolNotice() string { return a.toolNotice }
 
 // New loads the server-root configuration and prepares the provider, tools,
 // and session store. The config file must already exist with a usable default
@@ -98,11 +88,6 @@ func New(options Options) (*App, error) {
 		maxTurns = 8
 	}
 
-	enabled := cfg.Tools.Enabled
-	if len(enabled) == 0 {
-		enabled = defaultTools
-	}
-
 	store, err := sessionlog.OpenStore(filepath.Join(options.ServerRoot, "data"))
 	if err != nil {
 		return nil, err
@@ -118,10 +103,8 @@ func New(options Options) (*App, error) {
 		maxTurns:       maxTurns,
 		cwd:            cwd,
 		project:        sessionlog.ProjectID(cwd),
-		fullAccess:     options.FullAccess,
-		toolRegistry:   tools.NewRegistry(),
-		defaultEnabled: enabled,
-		store:          store,
+		toolRegistry: tools.NewRegistry(),
+		store:        store,
 	}
 	if err := app.buildTools(); err != nil {
 		return nil, err
@@ -164,30 +147,10 @@ func (a *App) Project() string { return a.project }
 func (a *App) Config() *config.Config { return a.cfg }
 
 func (a *App) buildTools() error {
-	if err := tools.RegisterBuiltins(a.toolRegistry, a.cwd, a.fullAccess); err != nil {
+	if err := tools.RegisterShell(a.toolRegistry, a.cwd); err != nil {
 		return fmt.Errorf("register tools: %w", err)
 	}
-	// The configured toolset may name tools from surfaces this app does not
-	// provide (the retired Web stack's agent-session orchestration, MCP
-	// servers). Intersect instead of failing: unknown names are skipped, and
-	// an empty intersection falls back to every registered builtin so the
-	// agent never runs toolless by accident.
-	enabled := make([]string, 0, len(a.defaultEnabled))
-	var unknown []string
-	for _, name := range a.defaultEnabled {
-		if _, ok := a.toolRegistry.Lookup(name); ok {
-			enabled = append(enabled, name)
-		} else {
-			unknown = append(unknown, name)
-		}
-	}
-	if len(enabled) == 0 {
-		enabled = a.toolRegistry.Names()
-	}
-	if len(unknown) > 0 {
-		a.toolNotice = fmt.Sprintf("ignored unregistered tools: %s", strings.Join(unknown, ", "))
-	}
-	schemas, err := a.toolRegistry.EnabledSchemas(enabled)
+	schemas, err := a.toolRegistry.EnabledSchemas([]string{tools.BuiltinShell})
 	if err != nil {
 		return fmt.Errorf("resolve enabled tools: %w", err)
 	}
@@ -227,13 +190,8 @@ func resolveCWD(value string) (string, error) {
 	return abs, nil
 }
 
-var defaultTools = []string{
-	"list_files", "read_file", "glob_files", "grep_files",
-	"write_file", "edit_file", "apply_patch", "shell",
-}
-
 const builtInInstructions = `You are a capable software agent working in the user's project directory.
 
-- Prefer reading files and searching before making changes; verify your edits.
-- Use the shell tool for builds, tests, and git operations.
+- Your only tool is the shell: a Bash environment whose working directory is the project. Read, search, and edit files, run builds, tests, and git through shell commands.
+- Inspect before you change: read the relevant code first, verify your edits afterwards.
 - Keep answers concise; show file paths when you change them.`

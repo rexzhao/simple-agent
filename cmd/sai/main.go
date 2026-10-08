@@ -38,7 +38,6 @@ func main() {
 		cwd         = flag.String("cwd", "", "working directory for tools (default: process cwd)")
 		provider    = flag.String("provider", "", "override default_provider")
 		model       = flag.String("model", "", "override default_model (model profile name)")
-		fullAccess  = flag.Bool("full-access", false, "let file tools read and write outside the cwd")
 	)
 	flag.Parse()
 
@@ -60,7 +59,6 @@ func main() {
 		CWD:        *cwd,
 		Provider:   *provider,
 		Model:      *model,
-		FullAccess: *fullAccess,
 	})
 	if err != nil {
 		log.Fatalf("sai: %v", err)
@@ -68,10 +66,7 @@ func main() {
 	// The root can be discovered from the environment or the working
 	// directory; say which one won so silent discovery never becomes silent
 	// configuration drift.
-	fmt.Fprintf(os.Stderr, "sai: server root %s\n", *serverRoot)
-	if notice := app.ToolNotice(); notice != "" {
-		fmt.Fprintf(os.Stderr, "sai: %s\n", notice)
-	}
+	fmt.Fprintf(os.Stderr, "sai: server root %s, project %s (%s)\n", *serverRoot, app.Project(), *cwd)
 
 	cli := &cliApp{app: app, printer: &spinnerPrinter{}}
 	// An optional positional argument resumes a stored session directly.

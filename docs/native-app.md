@@ -67,6 +67,14 @@ durable 共享同一身份，不存在映射层。
   因此 `turn.started`/`turn.completed` 实际不会出现在日志里（事件表中
   保留它们是为了词汇完整性）。
 
+## 工具面
+
+agent 只有一个工具：shell。全平台统一 Bash 语法（Windows 用 Git Bash 或
+其他 bash.exe，绝不回退 PowerShell/cmd.exe），命令的工作目录是会话 cwd。
+读文件、搜索、编辑、构建、git 全部通过 shell 命令完成——工具面最小，能力
+不缩水。旧的文件工具（read_file/edit_file/apply_patch 等）与 skills、MCP、
+compaction、logging、pricing 配置已随最小化删除。
+
 ## 使用（命令行）
 
 ```sh

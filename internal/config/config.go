@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,7 +13,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"gopkg.in/yaml.v3"
 )
 
@@ -23,16 +21,8 @@ type Config struct {
 	DefaultProvider string                     `json:"default_provider" yaml:"default_provider"`
 	DefaultModel    string                     `json:"default_model" yaml:"default_model"`
 	ProviderDir     string                     `json:"provider_dir" yaml:"provider_dir"`
-	AuthDir         string                     `json:"auth_dir" yaml:"auth_dir"`
-	SkillDirs       []string                   `json:"skill_dirs" yaml:"skill_dirs"`
 	Agent           AgentConfig                `json:"agent" yaml:"agent"`
 	Prompt          PromptConfig               `json:"prompt" yaml:"prompt"`
-	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
-	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
-	Debug           DebugConfig                `json:"debug" yaml:"debug"`
-	Compaction      CompactionConfig           `json:"compaction" yaml:"compaction"`
-	MCPDir          string                     `json:"mcp_dir,omitempty" yaml:"mcp_dir,omitempty"`
-	MCPServers      map[string]MCPServerConfig `json:"mcp_servers,omitempty" yaml:"-"`
 	Providers       map[string]ProviderConfig  `json:"providers" yaml:"providers"`
 }
 
@@ -46,40 +36,11 @@ const (
 )
 
 type AgentConfig struct {
-	InstructionFiles []string `json:"instruction_files" yaml:"instruction_files"`
-	MaxTurns         int      `json:"max_turns" yaml:"max_turns"`
-	Stream           bool     `json:"stream" yaml:"stream"`
-	ShowReasoning    bool     `json:"show_reasoning" yaml:"show_reasoning"`
+	MaxTurns int `json:"max_turns" yaml:"max_turns"`
 }
 
 type PromptConfig struct {
 	SystemPrompt string `json:"system_prompt,omitempty" yaml:"system_prompt,omitempty"`
-}
-
-type ToolsConfig struct {
-	Enabled []string `json:"enabled" yaml:"enabled"`
-}
-
-type LoggingConfig struct {
-	Path  string `json:"path" yaml:"path"`
-	Level string `json:"level" yaml:"level"`
-	// RequestBodies is retained as the default for newly created sessions and
-	// as a fallback for sessions written before debug settings became scoped to
-	// a conversation. The Web UI can override it per session.
-	RequestBodies bool `json:"request_bodies,omitempty" yaml:"request_bodies,omitempty"`
-}
-
-type DebugConfig struct {
-	WebEvalEnabled bool `json:"web_eval_enabled" yaml:"web_eval_enabled"`
-}
-
-type CompactionConfig struct {
-	Enabled          bool   `json:"enabled" yaml:"enabled"`
-	ThresholdPercent int    `json:"threshold_percent" yaml:"threshold_percent"`
-	Reserved         int    `json:"reserved,omitempty" yaml:"reserved,omitempty"`
-	MaxRequestBytes  int    `json:"max_request_bytes,omitempty" yaml:"max_request_bytes,omitempty"`
-	SummaryProvider  string `json:"summary_provider" yaml:"summary_provider"`
-	SummaryModel     string `json:"summary_model" yaml:"summary_model"`
 }
 
 type ProviderConfig struct {
@@ -126,17 +87,10 @@ type ModelProfile struct {
 	ID              string          `json:"id" yaml:"id"`
 	Type            string          `json:"type,omitempty" yaml:"type,omitempty"`
 	Compatibility   string          `json:"compatibility,omitempty" yaml:"compatibility,omitempty"`
-	Input           []string        `json:"input,omitempty" yaml:"input,omitempty"`
 	DeveloperRole   string          `json:"developer_role,omitempty" yaml:"developer_role,omitempty"`
-	ContextWindow   int             `json:"context_window,omitempty" yaml:"context_window,omitempty"`
-	InputLimit      int             `json:"input_limit,omitempty" yaml:"input_limit,omitempty"`
 	OutputLimit     int             `json:"output_limit,omitempty" yaml:"output_limit,omitempty"`
 	Parameters      map[string]any  `json:"parameters,omitempty" yaml:"parameters,omitempty"`
 	ReasoningConfig ReasoningConfig `json:"reasoning_config,omitempty" yaml:"reasoning_config,omitempty"`
-	// Pricing is expressed in USD (or Currency) per one million tokens.  It is
-	// optional so existing provider files remain valid and models without a
-	// price configured simply do not show a cost in the UI.
-	Pricing *ModelPricing `json:"pricing,omitempty" yaml:"pricing,omitempty"`
 }
 
 // ModelPricing contains the billing buckets supported by the usage pipeline.
@@ -146,91 +100,8 @@ type ModelProfile struct {
 // Prices are per 1,000,000 tokens. This is the unit used by most hosted model
 // providers and avoids losing precision for the small per-token values users
 // normally enter.
-type ModelPricing struct {
-	InputCacheHit  float64 `json:"input_cache_hit" yaml:"input_cache_hit"`
-	InputCacheMiss float64 `json:"input_cache_miss" yaml:"input_cache_miss"`
-	CacheWrite     float64 `json:"cache_write,omitempty" yaml:"cache_write,omitempty"`
-	Output         float64 `json:"output" yaml:"output"`
-	Currency       string  `json:"currency,omitempty" yaml:"currency,omitempty"`
-	// LongContext contains the alternate prices used when a request's input
-	// token count exceeds LongContextThreshold. The top-level prices are the
-	// short-context prices for backwards compatibility with existing configs.
-	LongContextThreshold int               `json:"long_context_threshold,omitempty" yaml:"long_context_threshold,omitempty"`
-	LongContext          *ModelPricingTier `json:"long_context,omitempty" yaml:"long_context,omitempty"`
-}
-
 // ModelPricingTier is a complete price table for one context-length tier.
 // Prices are currency units per one million tokens.
-type ModelPricingTier struct {
-	InputCacheHit  float64 `json:"input_cache_hit" yaml:"input_cache_hit"`
-	InputCacheMiss float64 `json:"input_cache_miss" yaml:"input_cache_miss"`
-	CacheWrite     float64 `json:"cache_write,omitempty" yaml:"cache_write,omitempty"`
-	Output         float64 `json:"output" yaml:"output"`
-}
-
-func (p ModelPricing) Validate() error {
-	for name, value := range map[string]float64{
-		"input_cache_hit":  p.InputCacheHit,
-		"input_cache_miss": p.InputCacheMiss,
-		"cache_write":      p.CacheWrite,
-		"output":           p.Output,
-	} {
-		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-			return fmt.Errorf("pricing %s must be a finite non-negative number", name)
-		}
-	}
-	if p.LongContextThreshold < 0 {
-		return fmt.Errorf("pricing long_context_threshold must be non-negative")
-	}
-	if p.LongContext != nil {
-		if p.LongContextThreshold <= 0 {
-			return fmt.Errorf("pricing long_context_threshold must be positive when long_context is configured")
-		}
-		if err := p.LongContext.Validate(); err != nil {
-			return fmt.Errorf("pricing long_context: %w", err)
-		}
-	}
-	if currency := strings.ToUpper(strings.TrimSpace(p.Currency)); currency != "" {
-		if len(currency) != 3 || strings.IndexFunc(currency, func(r rune) bool { return r < 'A' || r > 'Z' }) >= 0 {
-			return fmt.Errorf("pricing currency must be a 3-letter code")
-		}
-	}
-	return nil
-}
-
-func (p ModelPricingTier) Validate() error {
-	for name, value := range map[string]float64{
-		"input_cache_hit":  p.InputCacheHit,
-		"input_cache_miss": p.InputCacheMiss,
-		"cache_write":      p.CacheWrite,
-		"output":           p.Output,
-	} {
-		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-			return fmt.Errorf("pricing %s must be a finite non-negative number", name)
-		}
-	}
-	return nil
-}
-
-// PricingTierForInput returns the price tier for a provider request. Input
-// tokens are the disjoint usage buckets combined: uncached input, cache hits,
-// and cache writes.
-func (p ModelPricing) PricingTierForInput(inputTokens int) ModelPricingTier {
-	tier := ModelPricingTier{
-		InputCacheHit:  p.InputCacheHit,
-		InputCacheMiss: p.InputCacheMiss,
-		CacheWrite:     p.CacheWrite,
-		Output:         p.Output,
-	}
-	if tier.CacheWrite == 0 {
-		tier.CacheWrite = tier.InputCacheMiss
-	}
-	if p.LongContext != nil && p.LongContextThreshold > 0 && inputTokens > p.LongContextThreshold {
-		return *p.LongContext
-	}
-	return tier
-}
-
 type ReasoningConfig struct {
 	// Type selects the reasoning control shape. An empty value or "effort"
 	// means string-level effort mapping (the historical behavior). "budget_tokens"
@@ -248,21 +119,16 @@ type ModelInfo struct {
 }
 
 type ResolvedModel struct {
-	ProviderName        string
-	Provider            ProviderConfig
-	Profile             string
-	ModelID             string
-	Type                string
-	Compatibility       string
-	Input               []string
-	DeveloperRole       string
-	Parameters          map[string]any
-	ContextWindow       int
-	ContextWindowSource string
-	InputLimit          int
-	OutputLimit         int
-	ReasoningConfig     ReasoningConfig
-	Pricing             *ModelPricing
+	ProviderName   string
+	Provider       ProviderConfig
+	Profile        string
+	ModelID        string
+	Type           string
+	Compatibility  string
+	DeveloperRole  string
+	Parameters     map[string]any
+	OutputLimit    int
+	ReasoningConfig ReasoningConfig
 }
 
 func (p ProviderConfig) MarshalJSON() ([]byte, error) {
@@ -308,12 +174,6 @@ func Load(configPath string) (*Config, error) {
 		return nil, err
 	}
 	cfg.Providers = providers
-
-	mcpServers, err := LoadMCPServerConfigs(cfg.MCPDir)
-	if err != nil {
-		return nil, err
-	}
-	cfg.MCPServers = mcpServers
 	return cfg, nil
 }
 
@@ -343,14 +203,6 @@ func LoadBase(configPath string) (*Config, error) {
 
 	cfg.ConfigPath = absConfigPath
 	cfg.ProviderDir = resolvePath(configDir, cfg.ProviderDir)
-	cfg.AuthDir = resolvePath(configDir, cfg.AuthDir)
-	if cfg.Logging.Path != "" {
-		cfg.Logging.Path = resolvePath(configDir, cfg.Logging.Path)
-	}
-	if cfg.MCPDir != "" {
-		cfg.MCPDir = resolvePath(configDir, cfg.MCPDir)
-	}
-
 	return &cfg, nil
 }
 
@@ -387,7 +239,7 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 	if err != nil {
 		return ResolvedModel{}, err
 	}
-	window := contextwindow.ResolveWindow(profile.ContextWindow)
+
 
 	resolvedProvider := copyProvider(provider)
 	if modelType != ProviderTypeOpenAICodex {
@@ -399,21 +251,16 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 	}
 
 	return ResolvedModel{
-		ProviderName:        providerName,
-		Provider:            resolvedProvider,
-		Profile:             modelName,
-		ModelID:             profile.ID,
-		Type:                modelType,
-		Compatibility:       profile.Compatibility,
-		Input:               append([]string(nil), profile.Input...),
-		DeveloperRole:       profile.DeveloperRole,
-		Parameters:          copyParameters(profile.Parameters),
-		ContextWindow:       window.Tokens,
-		ContextWindowSource: string(window.Source),
-		InputLimit:          profile.InputLimit,
-		OutputLimit:         profile.OutputLimit,
-		ReasoningConfig:     copyReasoningConfig(profile.ReasoningConfig),
-		Pricing:             copyModelPricing(profile.Pricing),
+		ProviderName:    providerName,
+		Provider:        resolvedProvider,
+		Profile:         modelName,
+		ModelID:         profile.ID,
+		Type:            modelType,
+		Compatibility:   profile.Compatibility,
+		DeveloperRole:   profile.DeveloperRole,
+		Parameters:      copyParameters(profile.Parameters),
+		OutputLimit:     profile.OutputLimit,
+		ReasoningConfig: copyReasoningConfig(profile.ReasoningConfig),
 	}, nil
 }
 
@@ -497,10 +344,8 @@ func copyModels(models map[string]ModelProfile) map[string]ModelProfile {
 
 	copied := make(map[string]ModelProfile, len(models))
 	for name, profile := range models {
-		profile.Input = append([]string(nil), profile.Input...)
 		profile.Parameters = copyParameters(profile.Parameters)
 		profile.ReasoningConfig = copyReasoningConfig(profile.ReasoningConfig)
-		profile.Pricing = copyModelPricing(profile.Pricing)
 		copied[name] = profile
 	}
 	return copied
@@ -523,22 +368,6 @@ func copyReasoningConfig(reasoning ReasoningConfig) ReasoningConfig {
 	return reasoning
 }
 
-func copyModelPricing(pricing *ModelPricing) *ModelPricing {
-	if pricing == nil {
-		return nil
-	}
-	copied := *pricing
-	copied.Currency = strings.ToUpper(strings.TrimSpace(copied.Currency))
-	if copied.Currency == "" {
-		copied.Currency = "USD"
-	}
-	if pricing.LongContext != nil {
-		longContext := *pricing.LongContext
-		copied.LongContext = &longContext
-	}
-	return &copied
-}
-
 func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 	var fields map[string]any
 	if err := value.Decode(&fields); err != nil {
@@ -556,31 +385,16 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 	delete(fields, "id")
 	var structured struct {
 		ReasoningConfig ReasoningConfig `yaml:"reasoning_config"`
-		Pricing         *ModelPricing   `yaml:"pricing"`
 	}
 	if err := value.Decode(&structured); err != nil {
 		return err
 	}
 	m.ReasoningConfig = structured.ReasoningConfig
 	delete(fields, "reasoning_config")
-	if structured.Pricing != nil {
-		if err := structured.Pricing.Validate(); err != nil {
-			return fmt.Errorf("model profile pricing: %w", err)
-		}
-		if strings.TrimSpace(structured.Pricing.Currency) == "" {
-			structured.Pricing.Currency = "USD"
-		}
-		m.Pricing = structured.Pricing
-	}
-	delete(fields, "pricing")
-
-	if rawInput, ok := fields["input"]; ok {
-		input, err := parseModelInput(rawInput)
-		if err != nil {
-			return err
-		}
-		m.Input = input
-		delete(fields, "input")
+	// Legacy web-stack model keys are accepted and ignored; deleting them
+	// here keeps them out of the unknown-fields-to-parameters passthrough.
+	for _, legacy := range []string{"pricing", "input", "context_window", "input_limit"} {
+		delete(fields, legacy)
 	}
 	if rawDeveloperRole, ok := fields["developer_role"]; ok {
 		developerRole, err := NormalizeDeveloperRole(rawDeveloperRole)
@@ -589,22 +403,6 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 		}
 		m.DeveloperRole = developerRole
 		delete(fields, "developer_role")
-	}
-	if rawContextWindow, ok := fields["context_window"]; ok {
-		contextWindow, err := parseContextWindow(rawContextWindow)
-		if err != nil {
-			return err
-		}
-		m.ContextWindow = contextWindow
-		delete(fields, "context_window")
-	}
-	if rawInputLimit, ok := fields["input_limit"]; ok {
-		inputLimit, err := parseModelTokenLimit("input_limit", rawInputLimit)
-		if err != nil {
-			return err
-		}
-		m.InputLimit = inputLimit
-		delete(fields, "input_limit")
 	}
 	if rawOutputLimit, ok := fields["output_limit"]; ok {
 		outputLimit, err := parseModelTokenLimit("output_limit", rawOutputLimit)
@@ -655,58 +453,6 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-func parseContextWindow(value any) (int, error) {
-	return parseModelTokenLimit("context_window", value)
-}
-
-func parseModelInput(value any) ([]string, error) {
-	values, ok := value.([]any)
-	if !ok || len(values) == 0 {
-		return nil, fmt.Errorf("model profile input must be a non-empty list")
-	}
-	input := make([]string, 0, len(values))
-	for _, raw := range values {
-		modality, ok := raw.(string)
-		if !ok {
-			return nil, fmt.Errorf("model profile input values must be strings")
-		}
-		input = append(input, modality)
-	}
-	return NormalizeModelInput(input)
-}
-
-func NormalizeModelInput(input []string) ([]string, error) {
-	if len(input) == 0 {
-		return nil, fmt.Errorf("model profile input must be a non-empty list")
-	}
-	normalized := make([]string, 0, len(input))
-	seen := make(map[string]struct{}, len(input))
-	for _, raw := range input {
-		modality := strings.ToLower(strings.TrimSpace(raw))
-		switch modality {
-		case "text", "image":
-		default:
-			return nil, fmt.Errorf("model profile input contains unsupported modality %q", modality)
-		}
-		if _, duplicate := seen[modality]; duplicate {
-			return nil, fmt.Errorf("model profile input contains duplicate modality %q", modality)
-		}
-		seen[modality] = struct{}{}
-		normalized = append(normalized, modality)
-	}
-	return normalized, nil
-}
-
-func ModelSupportsInput(input []string, modality string) bool {
-	modality = strings.ToLower(strings.TrimSpace(modality))
-	for _, configured := range input {
-		if strings.EqualFold(strings.TrimSpace(configured), modality) {
-			return true
-		}
-	}
-	return false
-}
-
 func NormalizeDeveloperRole(value any) (string, error) {
 	if value == nil {
 		return "", nil
@@ -753,53 +499,22 @@ func parseModelTokenLimit(name string, value any) (int, error) {
 }
 
 func validateConfig(cfg Config) error {
-	if cfg.Compaction.ThresholdPercent <= 0 {
-		return fmt.Errorf("compaction.threshold_percent must be positive")
-	}
-	if cfg.Compaction.Reserved < 0 {
-		return fmt.Errorf("compaction.reserved must not be negative")
-	}
-	if cfg.Compaction.MaxRequestBytes < 0 {
-		return fmt.Errorf("compaction.max_request_bytes must not be negative")
-	}
 	return nil
 }
 
 func defaultConfig() Config {
 	return Config{
 		ProviderDir: "providers",
-		AuthDir:     "auth",
-		SkillDirs: []string{
-			"$USER/.agents/skills",
-			"$REPO/.agents/skills",
-			"$CWD/.agents/skills",
-		},
 		Agent: AgentConfig{
-			InstructionFiles: []string{"$CWD/AGENTS.md"},
-			MaxTurns:         defaultAgentMaxTurns,
-			Stream:           true,
+			MaxTurns: defaultAgentMaxTurns,
 		},
-		Tools: ToolsConfig{
-			Enabled: []string{},
-		},
-		Compaction: CompactionConfig{
-			ThresholdPercent: 80,
-			MaxRequestBytes:  700 * 1024,
-		},
-		MCPDir:     "mcp",
-		Providers:  map[string]ProviderConfig{},
-		MCPServers: map[string]MCPServerConfig{},
+		Providers: map[string]ProviderConfig{},
 	}
 }
-
 const defaultAgentMaxTurns = 8
 
 func LoadProviderConfigs(providerDir string) (map[string]ProviderConfig, error) {
 	return loadProviders(providerDir)
-}
-
-func LoadMCPServerConfigs(mcpDir string) (map[string]MCPServerConfig, error) {
-	return loadMCPServers(mcpDir)
 }
 
 func loadProviders(providerDir string) (map[string]ProviderConfig, error) {
@@ -864,11 +579,6 @@ func validateProvider(path string, provider ProviderConfig) error {
 		if profile.ID == "" {
 			return fmt.Errorf("provider file %q model %q is missing id", path, profileName)
 		}
-		if profile.Pricing != nil {
-			if err := profile.Pricing.Validate(); err != nil {
-				return fmt.Errorf("provider file %q model %q: %w", path, profileName, err)
-			}
-		}
 		if profile.Type != "" && !isKnownProviderType(profile.Type) {
 			return fmt.Errorf("provider file %q model %q has unknown model type %q; supported provider types: %s", path, profileName, profile.Type, formatSupportedProviderTypes())
 		}
@@ -919,9 +629,6 @@ func normalizeProvider(provider ProviderConfig, providerFileDir string) Provider
 		profile.Type = strings.TrimSpace(profile.Type)
 		profile.Compatibility = strings.ToLower(strings.TrimSpace(profile.Compatibility))
 		profile.ReasoningConfig = normalizeReasoningConfig(profile.ReasoningConfig)
-		if profile.Pricing != nil {
-			profile.Pricing = copyModelPricing(profile.Pricing)
-		}
 		provider.Models[profileName] = profile
 	}
 	return provider
