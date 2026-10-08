@@ -62,7 +62,7 @@ func (l *Log) recover() error {
 	}
 	reader := bufio.NewReader(l.file)
 	var offset int64
-	var validLines int
+	var lastItemID, lastType string
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
@@ -83,7 +83,7 @@ func (l *Log) recover() error {
 				// invalid line is the fail-safe choice.
 				break
 			}
-			validLines++
+			lastItemID, lastType = record.ItemID, record.Type
 			offset += int64(len(line))
 		}
 		if err != nil {
@@ -102,8 +102,13 @@ func (l *Log) recover() error {
 			return fmt.Errorf("truncate torn session log tail: %w", err)
 		}
 		if info.Size()-offset > maxTornTailBytes {
-			fmt.Fprintf(os.Stderr, "jsonl: %s: discarded %d bytes after %d valid records; mid-file corruption, not a torn tail\n",
-				l.path, info.Size()-offset, validLines)
+			if lastItemID != "" {
+				fmt.Fprintf(os.Stderr, "jsonl: %s: discarded %d bytes after item %s (type %s); mid-file corruption, not a torn tail\n",
+					l.path, info.Size()-offset, lastItemID, lastType)
+			} else {
+				fmt.Fprintf(os.Stderr, "jsonl: %s: discarded %d bytes before the first valid record; mid-file corruption, not a torn tail\n",
+					l.path, info.Size()-offset)
+			}
 		}
 	}
 	// Truncation does not move the file offset, and the reading pass left it
@@ -193,14 +198,16 @@ func readRecords(path string) ([]storage.Record, error) {
 	}
 	defer file.Close()
 	var records []storage.Record
+	lineNumber := 0
 	reader := bufio.NewReaderSize(file, 64*1024)
 	for {
 		line, err := reader.ReadBytes('\n')
+		lineNumber++
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) > 0 {
 			var record storage.Record
 			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr != nil || record.Validate() != nil {
-				return nil, fmt.Errorf("session log %s has an invalid line", path)
+				return nil, fmt.Errorf("session log %s has an invalid line at line %d", path, lineNumber)
 			}
 			records = append(records, record)
 		}

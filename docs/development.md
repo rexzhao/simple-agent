@@ -21,7 +21,7 @@ cmd/sai              startup: read config once → agent.New → REPL
 internal/agent       state layer + agent loop (merges the old chatapp):
                      session owns State, commit is the only write path
 internal/storage     record schema + Fold() + Store/Session interfaces
-  jsonl/             file layout, ProjectID, seq, torn-tail recovery
+  jsonl/             file layout, ProjectID, torn-tail recovery
   memory/            in-memory map for tests and ephemeral sessions
 internal/model       provider adapters: openai_chat, openai_responses,
                      anthropic_messages, httpstream
