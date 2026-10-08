@@ -31,6 +31,8 @@ provider_dir: providers
 
 agent:
   max_iterations: 8        # iteration budget per run (default 8)
+  auto_compact: true       # compact the context automatically when the
+                           # request approaches the model's budget (default true)
 
 prompt:
   system_prompt: |         # appended after the built-in instructions
@@ -53,6 +55,8 @@ models:
   deepseek-v4.1-flash:
     id: deepseek-v4.1-flash
     type: openai-chat
+    context_window: 1000000  # total input+output capacity; drives the
+                              # automatic compaction budget (default 32000)
     output_limit: 384000   # optional, injected as the output token cap
     reasoning_config:
       parameter: reasoning_effort
@@ -88,11 +92,20 @@ nested `reasoning.effort` where the provider expects the top-level
 answers without thinking and no error is reported. Check the provider's API
 reference for the exact field before configuring.
 
+### Automatic compaction
+
+When `agent.auto_compact` is on (the default), the request is checked
+against a budget derived from `context_window` before each turn and after
+each tool batch: at the soft limit the session is summarized into a
+`context.compacted` record once enough new turns arrived since the last
+compaction; at the hard limit it compacts immediately and fails the turn
+if even the summary does not fit. The conversation before a compaction is
+replaced by the summary.
+
 ### Legacy keys
 
-`pricing`, `input`, `context_window`, and `input_limit` in a model profile
-are accepted and ignored (web-stack leftovers); they are not sent to the
-provider.
+`pricing`, `input`, and `input_limit` in a model profile are accepted and
+ignored (web-stack leftovers); they are not sent to the provider.
 
 ## Codex authentication
 

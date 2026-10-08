@@ -407,9 +407,9 @@ func (s *Session) settle() {
 	s.mu.Unlock()
 }
 
-// Compact summarizes the folded context and replaces it with the summary.
-// The compaction item's identity is minted before the model call; the
-// context.compacted record lands only on success — a failed or
+// Compact summarizes the folded context and replaces it with the
+// summary. The compaction item's identity is minted before the model
+// call; the context.compacted record lands only on success — a failed or
 // interrupted compaction leaves the context untouched. Exclusive with
 // Send: the run slot is held for the duration of the summary call.
 func (s *Session) Compact() error {
@@ -422,9 +422,6 @@ func (s *Session) Compact() error {
 		s.mu.Unlock()
 		return fmt.Errorf("nothing to compact")
 	}
-	itemID := storage.NewContextCompactedID()
-	s.state.Compacting = &storage.CompactingItem{ItemID: itemID, StartedAt: time.Now()}
-	request := s.agent.buildCompactionRequest(s.state.Context)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	s.running = true
@@ -436,16 +433,128 @@ func (s *Session) Compact() error {
 	defer s.settle()
 	defer cancel()
 
+	_, err := s.compactContext(ctx, storage.NewContextCompactedID(), pressureNone, 0)
+	return err
+}
+
+// compactContext generates and commits a context summary, replacing the
+// folded context. Callers already hold the single-flight run slot and
+// have minted the item id; the Compacting transient slot is held for
+// the duration. Under soft pressure the compaction is dropped without
+// committing when the summary would not reclaim enough of the budget —
+// churn, not relief.
+func (s *Session) compactContext(ctx context.Context, itemID string, pressure compactionPressure, beforeTokens int) (bool, error) {
+	s.mu.Lock()
+	if len(s.state.Context) == 0 {
+		s.mu.Unlock()
+		return false, fmt.Errorf("nothing to compact")
+	}
+	s.state.Compacting = &storage.CompactingItem{ItemID: itemID, StartedAt: time.Now()}
+	request := s.agent.buildCompactionRequest(s.state.Context)
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.state.Compacting = nil
+		s.mu.Unlock()
+	}()
+
 	summary, err := s.agent.summarizeContext(ctx, request)
 	if err != nil {
-		return fmt.Errorf("compact: %w", err)
+		return false, err
 	}
 	if strings.TrimSpace(summary) == "" {
-		return fmt.Errorf("compact: summary was empty")
+		return false, fmt.Errorf("compact: summary was empty")
 	}
-	return s.commit(storage.Record{
+	if pressure == pressureSoft {
+		after := estimateRequestTokens(s.agent.buildRequest([]model.Message{{Role: model.MessageRoleUser, Content: summary}}))
+		if !compactionReclaimsEnough(beforeTokens, after) {
+			return false, nil
+		}
+	}
+	if err := s.commit(storage.Record{
 		ItemID: itemID, Type: storage.TypeContextCompacted, Content: summary,
-	}, func(state *storage.State) { state.Compacting = nil })
+	}, nil); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// maybeAutoCompact checks the request against the compaction budget and
+// compacts when the guards allow. It returns the request to continue
+// with and whether a compaction happened; the rebuilt request is
+// assembled from the compacted context.
+func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, events chan model.Event) (model.Request, bool, error) {
+	if !s.agent.autoCompact {
+		return request, false, nil
+	}
+	pressure := s.agent.contextPressure(request)
+	if pressure == pressureNone {
+		return request, false, nil
+	}
+	// A summary summarizes answers; without one in the context there is
+	// nothing to gain and the summary would just echo the pending input.
+	if !s.hasCompactableAnswer() {
+		return request, false, nil
+	}
+	// Soft pressure waits for new turns since the last compaction
+	// instead of re-compacting in a loop; hard pressure never waits.
+	if pressure == pressureSoft && !s.softCooldownElapsed() {
+		return request, false, nil
+	}
+
+	itemID := storage.NewContextCompactedID()
+	sendEvent(ctx, events, model.CompactionStartedEvent{ItemID: itemID})
+	compacted, err := s.compactContext(ctx, itemID, pressure, estimateRequestTokens(request))
+	if err != nil {
+		return request, false, err
+	}
+	if !compacted {
+		return request, false, nil
+	}
+	sendEvent(ctx, events, model.CompactionCompletedEvent{ItemID: itemID})
+
+	s.mu.RLock()
+	context := append([]model.Message(nil), s.state.Context...)
+	s.mu.RUnlock()
+	compactedRequest := s.agent.buildRequest(context)
+	// Hard pressure must actually relieve the budget: a summary that
+	// still exceeds the safe limit cannot be sent.
+	if pressure == pressureHard && s.agent.contextPressure(compactedRequest) == pressureHard {
+		return request, false, fmt.Errorf(
+			"automatic compaction could not reclaim enough context: the summary still exceeds the safe input limit (estimated %d tokens)",
+			estimateRequestTokens(compactedRequest))
+	}
+	return compactedRequest, true, nil
+}
+
+// hasCompactableAnswer reports whether the folded context contains at
+// least one assistant answer worth summarizing.
+func (s *Session) hasCompactableAnswer() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, message := range s.state.Context {
+		if message.Role == model.MessageRoleAssistant {
+			return true
+		}
+	}
+	return false
+}
+
+// softCooldownElapsed reports whether at least two user inputs were
+// committed since the last compaction.
+func (s *Session) softCooldownElapsed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	inputs := 0
+	for i := len(s.records) - 1; i >= 0; i-- {
+		switch s.records[i].Type {
+		case storage.TypeContextCompacted:
+			return inputs >= 2
+		case storage.TypeUserInput:
+			inputs++
+		}
+	}
+	return true
 }
 
 // run drives one agent run: iterate (request the model, execute the tool
@@ -471,8 +580,19 @@ func (s *Session) run(ctx context.Context, runID string, request model.Request, 
 	}()
 
 	maxIterations := s.agent.maxIterations
-	messages := append([]model.Message(nil), request.Messages...)
 	enabledTools := enabledToolNames(request.Tools)
+
+	// Pre-turn pressure: the pending input is already in the context; a
+	// compaction absorbs it into the summary and the request is rebuilt.
+	if compactedRequest, compacted, err := s.maybeAutoCompact(ctx, request, events); err != nil {
+		failure = err.Error()
+		sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "auto compact"})
+		return
+	} else if compacted {
+		request = compactedRequest
+	}
+
+	messages := append([]model.Message(nil), request.Messages...)
 
 	for iteration := 1; iteration <= maxIterations; iteration++ {
 		request.Messages = messages
@@ -527,6 +647,18 @@ func (s *Session) run(ctx context.Context, runID string, request model.Request, 
 			failure = fmt.Sprintf("agent reached max iterations %d before the model returned a final response", maxIterations)
 			sendEvent(ctx, events, model.ErrorEvent{Err: errors.New(failure)})
 			return
+		}
+
+		// Mid-turn pressure: this iteration's messages grew the context;
+		// compact before the next request.
+		request.Messages = messages
+		if compactedRequest, compacted, err := s.maybeAutoCompact(ctx, request, events); err != nil {
+			failure = err.Error()
+			sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "auto compact"})
+			return
+		} else if compacted {
+			request = compactedRequest
+			messages = append([]model.Message(nil), request.Messages...)
 		}
 	}
 }

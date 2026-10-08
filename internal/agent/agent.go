@@ -37,6 +37,12 @@ type Options struct {
 	MaxIterations int
 	ProjectID     string // jsonl directory grouping
 	CWD           string
+	// ContextWindow is the model's context window in tokens; 0 means a
+	// conservative default. With AutoCompact it bounds the request budget.
+	ContextWindow int
+	// AutoCompact compacts the context automatically when the request
+	// approaches the budget (see budget.go).
+	AutoCompact bool
 }
 
 // Agent is one configured application instance: provider, tools, prompts,
@@ -55,6 +61,8 @@ type Agent struct {
 	maxIterations int
 	projectID     string
 	cwd           string
+	budget        contextBudget
+	autoCompact   bool
 }
 
 // New validates and assembles an agent.
@@ -87,6 +95,8 @@ func New(options Options) (*Agent, error) {
 		maxIterations: maxIterations,
 		projectID:     options.ProjectID,
 		cwd:           options.CWD,
+		budget:        resolveContextBudget(options.ContextWindow, options.MaxTokens),
+		autoCompact:   options.AutoCompact,
 	}, nil
 }
 
@@ -227,11 +237,31 @@ func (a *Agent) buildCompactionRequest(context []model.Message) model.Request {
 	}
 }
 
-// summarizeContext runs one model call and collects its text output.
+// summarizeContext runs the compaction summary call, retrying transient
+// provider failures with the same backoff as a normal turn: an automatic
+// compaction must not die to one hiccup while the context is already
+// large.
 func (a *Agent) summarizeContext(ctx context.Context, request model.Request) (string, error) {
+	const maxAttempts = 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		summary, retryable, err := a.summarizeOnce(ctx, request)
+		if err == nil {
+			return summary, nil
+		}
+		if ctx.Err() != nil || !retryable || attempt == maxAttempts {
+			return "", err
+		}
+		if err := waitForProviderRetry(ctx, providerRetryBackoff(attempt)); err != nil {
+			return "", err
+		}
+	}
+	panic("unreachable")
+}
+
+func (a *Agent) summarizeOnce(ctx context.Context, request model.Request) (string, bool, error) {
 	stream, err := a.provider.Stream(ctx, request)
 	if err != nil {
-		return "", err
+		return "", model.IsRetryableProviderError(err), err
 	}
 	var content strings.Builder
 	for event := range stream {
@@ -239,13 +269,25 @@ func (a *Agent) summarizeContext(ctx context.Context, request model.Request) (st
 		case model.TextDeltaEvent:
 			content.WriteString(event.Text)
 		case model.ErrorEvent:
-			return "", event.Err
+			return "", model.IsRetryableProviderError(event.Err), event.Err
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", false, err
 	}
-	return content.String(), nil
+	return content.String(), false, nil
+}
+
+// contextPressure grades a request against the compaction budget.
+func (a *Agent) contextPressure(request model.Request) compactionPressure {
+	estimated := estimateRequestTokens(request)
+	if a.budget.HardInputLimit > 0 && estimated >= a.budget.HardInputLimit {
+		return pressureHard
+	}
+	if a.budget.SoftInputLimit > 0 && estimated >= a.budget.SoftInputLimit {
+		return pressureSoft
+	}
+	return pressureNone
 }
 
 // enabledToolNames indexes the request's tool schemas for the enabled-tool

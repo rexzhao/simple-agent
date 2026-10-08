@@ -186,6 +186,8 @@ func assemble(serverRoot, providerName, modelName string) (*agent.Agent, string,
 		MaxIterations: cfg.Agent.MaxIterations,
 		ProjectID:     project,
 		CWD:           cwd,
+		ContextWindow: resolved.ContextWindow,
+		AutoCompact:   cfg.Agent.AutoCompact,
 	})
 	if err != nil {
 		return nil, "", err

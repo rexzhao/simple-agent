@@ -119,6 +119,8 @@ const (
 	EventTypeToolCallDone              EventType = "tool_call_done"
 	EventTypeToolStarted               EventType = "tool_started"
 	EventTypeToolResult                EventType = "tool_result"
+	EventTypeCompactionStarted        EventType = "compaction_started"
+	EventTypeCompactionCompleted      EventType = "compaction_completed"
 	EventTypeUsage                     EventType = "usage"
 	EventTypeResponseState             EventType = "response_state"
 	EventTypeProviderRetry             EventType = "provider_retry"
@@ -240,6 +242,26 @@ type ToolResultEvent struct {
 
 func (ToolResultEvent) Type() EventType {
 	return EventTypeToolResult
+}
+
+// CompactionStartedEvent opens an in-run context compaction. ItemID is
+// the identity of the context.compacted record which will land on
+// success; a skipped or failed compaction never completes it.
+type CompactionStartedEvent struct {
+	ItemID string
+}
+
+func (CompactionStartedEvent) Type() EventType {
+	return EventTypeCompactionStarted
+}
+
+// CompactionCompletedEvent closes a successful in-run compaction.
+type CompactionCompletedEvent struct {
+	ItemID string
+}
+
+func (CompactionCompletedEvent) Type() EventType {
+	return EventTypeCompactionCompleted
 }
 
 type Usage struct {

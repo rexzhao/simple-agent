@@ -37,6 +37,9 @@ const (
 
 type AgentConfig struct {
 	MaxIterations int `json:"max_iterations" yaml:"max_iterations"`
+	// AutoCompact enables automatic context compaction when the request
+	// approaches the model's context budget (default true).
+	AutoCompact bool `json:"auto_compact" yaml:"auto_compact"`
 }
 
 type PromptConfig struct {
@@ -90,6 +93,7 @@ type ModelProfile struct {
 	OutputLimit     int             `json:"output_limit,omitempty" yaml:"output_limit,omitempty"`
 	Parameters      map[string]any  `json:"parameters,omitempty" yaml:"parameters,omitempty"`
 	ReasoningConfig ReasoningConfig `json:"reasoning_config,omitempty" yaml:"reasoning_config,omitempty"`
+	ContextWindow   int             `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 }
 
 // ModelPricing contains the billing buckets supported by the usage pipeline.
@@ -127,6 +131,7 @@ type ResolvedModel struct {
 	DeveloperRole   string
 	Parameters      map[string]any
 	OutputLimit     int
+	ContextWindow   int
 	ReasoningConfig ReasoningConfig
 }
 
@@ -253,6 +258,7 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 		DeveloperRole:   profile.DeveloperRole,
 		Parameters:      copyParameters(profile.Parameters),
 		OutputLimit:     profile.OutputLimit,
+		ContextWindow:   profile.ContextWindow,
 		ReasoningConfig: copyReasoningConfig(profile.ReasoningConfig),
 	}, nil
 }
@@ -386,7 +392,7 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 	delete(fields, "reasoning_config")
 	// Legacy web-stack model keys are accepted and ignored; deleting them
 	// here keeps them out of the unknown-fields-to-parameters passthrough.
-	for _, legacy := range []string{"pricing", "input", "context_window", "input_limit"} {
+	for _, legacy := range []string{"pricing", "input", "input_limit"} {
 		delete(fields, legacy)
 	}
 	if rawDeveloperRole, ok := fields["developer_role"]; ok {
@@ -404,6 +410,14 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 		}
 		m.OutputLimit = outputLimit
 		delete(fields, "output_limit")
+	}
+	if rawContextWindow, ok := fields["context_window"]; ok {
+		contextWindow, err := parseModelTokenLimit("context_window", rawContextWindow)
+		if err != nil {
+			return err
+		}
+		m.ContextWindow = contextWindow
+		delete(fields, "context_window")
 	}
 
 	if rawType, ok := fields["type"]; ok {
@@ -496,6 +510,7 @@ func defaultConfig() Config {
 		ProviderDir: "providers",
 		Agent: AgentConfig{
 			MaxIterations: defaultAgentMaxIterations,
+			AutoCompact:  true,
 		},
 		Providers: map[string]ProviderConfig{},
 	}

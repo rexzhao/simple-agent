@@ -230,6 +230,28 @@ ItemID upsert、按 RunID 分组。CLI 现在直接消费同一事件流，零�
 
 - ~~**/clear 只重置 context window，不新开 session**~~——需求已取消：
   /clear 保持现状（新开 session），上下文重置由 /compact 承担。
-- **自动压缩**：当前无自动压缩（旧 web 栈的 execution 层实现随重构删除），
-  上下文无限增长直到 provider 拒绝。将来若加，复用 `context.compacted`
-  记录——手动与自动产出完全相同的记录，Fold 无需区分。
+
+## 13. 上下文压缩（手动 + 自动）
+
+手动 `/compact` 与自动压缩共享同一条路径：`compactContext`（mint 身份 →
+Compacting 槽 → 带重试的摘要调用 → 软压回收检查 → commit），产出完全
+相同的 `context.compacted` 记录，Fold 无需区分来源。
+
+**预算推导**（budget.go，移植自旧栈）：`context_window − 输出预留
+（output_limit 或 clamp(窗口/8, 4K–20K)）= 容量`；硬线 = 容量 −
+安全边（2%，clamp 512–8K）；软线 = 硬线 − headroom（20%，clamp
+2K–32K）。token 估算：ASCII/4 + 非 ASCII×1 + 消息头 8 + 请求头 16。
+
+**触发点**：新轮次前（待处理输入已在 Context 内）与每个工具批次后。
+
+**守卫**：Context 无 assistant 回答不压；软压冷却——上次压缩后需 ≥2 条
+user.input；软压回收检查——摘要后估算缩减不足 max(2K, 前/20) 则丢弃
+不落盘；硬压压缩后仍超硬线 → run.failed（与旧版差异：记录先落盘再判
+定，下次 Send 会再压缩——窗口容不下任何摘要时本就无解）。
+
+**与旧版的差异**：待处理输入被吸收进摘要（旧版保留原文；新架构下
+user.input 先落盘、compacted 后到，Fold 语义只能是整体替换）；无 usage
+锚定（纯估算）；无 MaxRequestBytes；摘要调用带与普通回合相同的重试。
+
+**transient 事件**：CompactionStartedEvent/CompletedEvent（带 ItemID）
+随 run 事件流发布；手动 Compact 无事件流（CLI spinner 覆盖）。
