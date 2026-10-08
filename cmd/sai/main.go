@@ -38,6 +38,10 @@ var spinnerFrames = []string{".", "..", "...", ""}
 
 const spinnerInterval = 250 * time.Millisecond
 
+// resumeTailRecords bounds how much history a resumed session prints; the
+// full log stays in the file.
+const resumeTailRecords = 20
+
 func main() {
 	var (
 		showVersion = flag.Bool("version", false, "print version and exit")
@@ -264,6 +268,35 @@ type cliApp struct {
 	liveMu    sync.Mutex
 	liveShown map[string]struct{}
 	parked    []storage.Record
+
+	// printedMu guards printed: how many records the watcher (and the
+	// synchronous history print) has processed. waitForRecords blocks
+	// until it catches up with the session's committed count.
+	printedMu sync.Mutex
+	printed   int
+}
+
+// countPrinted records one processed record.
+func (c *cliApp) countPrinted() {
+	c.printedMu.Lock()
+	c.printed++
+	c.printedMu.Unlock()
+}
+
+// waitForRecords blocks until the record printer has processed every
+// committed record, so the next prompt never appears before pending
+// output. A bounded timeout keeps a stuck printer from wedging the REPL.
+func (c *cliApp) waitForRecords() {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.printedMu.Lock()
+		printed := c.printed
+		c.printedMu.Unlock()
+		if printed >= c.session.RecordCount() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // dispatch handles one input line. It returns true when the REPL should
@@ -278,8 +311,15 @@ func (c *cliApp) dispatch(text string) bool {
 			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		}
 	case text == "/stop":
-		c.session.Stop()
 		fmt.Fprintln(os.Stderr, "sai: stopping run")
+		c.session.Stop()
+		// Wait for the run to settle and its records to print, so the
+		// prompt never interleaves the settling output.
+		deadline := time.Now().Add(5 * time.Second)
+		for c.session.Running() && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		c.waitForRecords()
 	case text == "/compact":
 		if err := c.compact(); err != nil {
 			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
@@ -343,6 +383,9 @@ func (c *cliApp) send(text string) error {
 	// (its start event not yet processed when the record arrived) prints
 	// here unless it was live-rendered after all.
 	c.reconcileParked()
+	// The next prompt must not appear before the watcher printed the
+	// run's records.
+	c.waitForRecords()
 	return nil
 }
 
@@ -376,6 +419,7 @@ func (c *cliApp) reconcileParked() {
 	c.parked = nil
 	c.liveMu.Unlock()
 	for _, record := range parked {
+		// Parked records were already counted when they were parked.
 		if !c.liveShownHas(record.ItemID) {
 			c.printer.line(formatRecord(record))
 		}
@@ -392,6 +436,9 @@ func (c *cliApp) compact() error {
 		select {
 		case err := <-done:
 			c.printer.clear()
+			// The compaction record prints through the watcher; do not let
+			// the next prompt overtake it.
+			c.waitForRecords()
 			return err
 		case <-time.After(spinnerInterval):
 			c.printer.frame(spinnerFrames[frame%len(spinnerFrames)])
@@ -479,14 +526,23 @@ func (c *cliApp) bind(session *agent.Session) error {
 			select {
 			case record := <-sub.Records():
 				c.printRecord(record)
+				c.countPrinted()
 			case <-sub.Done():
 				return
 			}
 		}
 	}()
 	fmt.Fprintf(os.Stderr, "sai: session %s\n", session.ID())
-	for _, record := range sub.Initial() {
+	// History shows only the tail: the full log stays in the file; a
+	// resumed session needs the recent context, not a wall of scroll-back.
+	initial := sub.Initial()
+	if len(initial) > resumeTailRecords {
+		c.printer.line(fmt.Sprintf("[… showing last %d of %d records]", resumeTailRecords, len(initial)))
+		initial = initial[len(initial)-resumeTailRecords:]
+	}
+	for _, record := range initial {
 		c.printRecord(record)
+		c.countPrinted()
 	}
 	return nil
 }

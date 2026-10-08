@@ -81,6 +81,15 @@ func (s *Session) Persisted() bool {
 	return len(s.records) > 0
 }
 
+// RecordCount returns how many records the session has committed. The
+// CLI waits until its record printer has caught up with this count before
+// drawing the next prompt, so output never lands behind the prompt.
+func (s *Session) RecordCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.records)
+}
+
 // Snapshot returns a deep copy of the state, including the transient
 // streaming and running slots.
 func (s *Session) Snapshot() storage.State {

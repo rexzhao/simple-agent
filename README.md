@@ -50,7 +50,8 @@ An optional positional argument resumes a stored session. Slash commands:
 - `/clear` — start a new session (empty sessions are never written to disk)
 - `/compact` — summarize the context and continue from the summary; the
   conversation before the compaction is replaced by it
-- `/resume <id>` — reopen a stored session
+- `/resume <id>` — reopen a stored session (history prints as the last
+  20 records; the full log stays in the file)
 - `/stop` — stop the active run (Ctrl+C does the same)
 - `/quit` — exit (a second Ctrl+C when idle also exits)
 
