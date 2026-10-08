@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/storage"
@@ -240,8 +241,8 @@ func (a *Agent) buildCompactionRequest(context []model.Message) model.Request {
 // summarizeContext runs the compaction summary call, retrying transient
 // provider failures with the same backoff as a normal turn: an automatic
 // compaction must not die to one hiccup while the context is already
-// large.
-func (a *Agent) summarizeContext(ctx context.Context, request model.Request) (string, error) {
+// large. onRetry (optional) is notified before each backoff wait.
+func (a *Agent) summarizeContext(ctx context.Context, request model.Request, onRetry func(err error, attempt int, delay time.Duration)) (string, error) {
 	const maxAttempts = 5
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		summary, retryable, err := a.summarizeOnce(ctx, request)
@@ -251,7 +252,11 @@ func (a *Agent) summarizeContext(ctx context.Context, request model.Request) (st
 		if ctx.Err() != nil || !retryable || attempt == maxAttempts {
 			return "", err
 		}
-		if err := waitForProviderRetry(ctx, providerRetryBackoff(attempt)); err != nil {
+		delay := providerRetryBackoff(attempt)
+		if onRetry != nil {
+			onRetry(err, attempt, delay)
+		}
+		if err := waitForProviderRetry(ctx, delay); err != nil {
 			return "", err
 		}
 	}

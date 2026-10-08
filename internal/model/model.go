@@ -121,6 +121,7 @@ const (
 	EventTypeToolResult                EventType = "tool_result"
 	EventTypeCompactionStarted        EventType = "compaction_started"
 	EventTypeCompactionCompleted      EventType = "compaction_completed"
+	EventTypeContextPressure          EventType = "context_pressure"
 	EventTypeUsage                     EventType = "usage"
 	EventTypeResponseState             EventType = "response_state"
 	EventTypeProviderRetry             EventType = "provider_retry"
@@ -262,6 +263,19 @@ type CompactionCompletedEvent struct {
 
 func (CompactionCompletedEvent) Type() EventType {
 	return EventTypeCompactionCompleted
+}
+
+// ContextPressureEvent reports that the request exceeded the hard input
+// budget but no compaction was possible (nothing to summarize). There
+// is no local preflight — the estimate is heuristic — so the request is
+// sent anyway and the provider decides.
+type ContextPressureEvent struct {
+	EstimatedTokens int
+	HardInputLimit  int
+}
+
+func (ContextPressureEvent) Type() EventType {
+	return EventTypeContextPressure
 }
 
 type Usage struct {

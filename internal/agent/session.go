@@ -433,17 +433,18 @@ func (s *Session) Compact() error {
 	defer s.settle()
 	defer cancel()
 
-	_, err := s.compactContext(ctx, storage.NewContextCompactedID(), pressureNone, 0)
+	_, err := s.compactContext(ctx, storage.NewContextCompactedID(), pressureNone, 0, nil)
 	return err
 }
 
 // compactContext generates and commits a context summary, replacing the
 // folded context. Callers already hold the single-flight run slot and
 // have minted the item id; the Compacting transient slot is held for
-// the duration. Under soft pressure the compaction is dropped without
-// committing when the summary would not reclaim enough of the budget —
-// churn, not relief.
-func (s *Session) compactContext(ctx context.Context, itemID string, pressure compactionPressure, beforeTokens int) (bool, error) {
+// the duration. events (optional) receives the summary retry notices.
+// Under soft pressure the compaction is dropped without committing when
+// the summary would not reclaim enough of the budget — churn, not
+// relief.
+func (s *Session) compactContext(ctx context.Context, itemID string, pressure compactionPressure, beforeTokens int, events chan model.Event) (bool, error) {
 	s.mu.Lock()
 	if len(s.state.Context) == 0 {
 		s.mu.Unlock()
@@ -458,9 +459,13 @@ func (s *Session) compactContext(ctx context.Context, itemID string, pressure co
 		s.mu.Unlock()
 	}()
 
-	summary, err := s.agent.summarizeContext(ctx, request)
+	summary, err := s.agent.summarizeContext(ctx, request, func(retryErr error, attempt int, delay time.Duration) {
+		sendEvent(ctx, events, model.ProviderRetryEvent{
+			Attempt: attempt + 1, MaxAttempts: 5, Delay: delay, Reason: model.RetryReason(retryErr),
+		})
+	})
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("compact: %w", err)
 	}
 	if strings.TrimSpace(summary) == "" {
 		return false, fmt.Errorf("compact: summary was empty")
@@ -494,6 +499,14 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 	// A summary summarizes answers; without one in the context there is
 	// nothing to gain and the summary would just echo the pending input.
 	if !s.hasCompactableAnswer() {
+		// Hard pressure with nothing to summarize is worth a notice:
+		// there is no local preflight (the estimate is heuristic), so the
+		// request is sent and the provider decides.
+		if pressure == pressureHard {
+			sendEvent(ctx, events, model.ContextPressureEvent{
+				EstimatedTokens: estimateRequestTokens(request), HardInputLimit: s.agent.budget.HardInputLimit,
+			})
+		}
 		return request, false, nil
 	}
 	// Soft pressure waits for new turns since the last compaction
@@ -504,7 +517,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 
 	itemID := storage.NewContextCompactedID()
 	sendEvent(ctx, events, model.CompactionStartedEvent{ItemID: itemID})
-	compacted, err := s.compactContext(ctx, itemID, pressure, estimateRequestTokens(request))
+	compacted, err := s.compactContext(ctx, itemID, pressure, estimateRequestTokens(request), events)
 	if err != nil {
 		return request, false, err
 	}
@@ -658,6 +671,11 @@ func (s *Session) run(ctx context.Context, runID string, request model.Request, 
 			return
 		} else if compacted {
 			request = compactedRequest
+			// The rebuilt history comes from the folded context: anything a
+			// record carries that Fold does not fold (ResponseState today)
+			// is intentionally dropped here — a future record type with
+			// unfoldable fields must not rely on surviving a mid-turn
+			// compaction.
 			messages = append([]model.Message(nil), request.Messages...)
 		}
 	}
@@ -776,6 +794,9 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 // goroutine on a full channel (the durable story of an interruption is
 // the unanswered user input).
 func sendEvent(ctx context.Context, out chan<- model.Event, event model.Event) {
+	if out == nil {
+		return
+	}
 	select {
 	case out <- event:
 	case <-ctx.Done():

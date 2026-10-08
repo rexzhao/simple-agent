@@ -58,9 +58,17 @@ func TestResolveContextBudget(t *testing.T) {
 		t.Fatalf("fallback budget degenerate: %+v", fallback)
 	}
 
-	// A window smaller than the output reserve has no usable capacity.
-	if degenerate := resolveContextBudget(1_000, 2_000); degenerate.HardInputLimit != 0 {
-		t.Fatalf("degenerate budget = %+v, want zero limits", degenerate)
+	// Degenerate configurations must still produce a budget: a tiny
+	// window without an output limit caps the reserve at a quarter of
+	// the window, and an output limit larger than the window falls back
+	// the same way — a zero budget would silently disable compaction.
+	tiny := resolveContextBudget(2_000, 0)
+	if tiny.HardInputLimit <= 0 || tiny.SoftInputLimit <= 0 {
+		t.Fatalf("tiny-window budget degenerate: %+v", tiny)
+	}
+	oversized := resolveContextBudget(1_000, 2_000)
+	if oversized.HardInputLimit <= 0 || oversized.SoftInputLimit <= 0 {
+		t.Fatalf("oversized-output budget degenerate: %+v", oversized)
 	}
 }
 
@@ -304,3 +312,69 @@ func TestSummarizeContextRetriesTransientFailures(t *testing.T) {
 	}
 }
 
+
+func TestAutoCompactTriggersMidTurnAfterToolBatch(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{
+		// Iteration 1: an assistant message with a tool call.
+		{model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "c1", Name: "echo", Arguments: `{}`}}},
+		// The mid-turn compaction summary.
+		{model.TextDeltaEvent{Text: "mid-turn summary"}},
+		// Iteration 2: the final answer.
+		{model.TextDeltaEvent{Text: "final answer"}},
+	}}
+	executor := &fakeToolExecutor{result: model.ToolResult{Content: strings.Repeat("果", 16_000)}}
+	_, session := autoCompactAgent(t, provider, executor, nil)
+
+	// The user input (~60k estimated tokens) plus the tool result (~16k)
+	// crosses the soft limit only after the tool batch: the pre-turn
+	// check sees ~60k and stays quiet.
+	if err := session.Send(strings.Repeat("工", 60_000)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	events := waitSettled(t, session)
+
+	compacted := compactedRecords(t, session)
+	if len(compacted) != 1 || compacted[0].Content != "mid-turn summary" {
+		t.Fatalf("mid-turn compactions = %+v, want one mid-turn summary", compacted)
+	}
+
+	// The compaction events rode the run's stream, after the tool result.
+	var pressureOrder []string
+	for _, event := range events {
+		switch event.(type) {
+		case model.ToolResultEvent:
+			pressureOrder = append(pressureOrder, "tool")
+		case model.CompactionCompletedEvent:
+			pressureOrder = append(pressureOrder, "compact")
+		case model.AssistantMessageCompletedEvent:
+			pressureOrder = append(pressureOrder, "assistant")
+		}
+	}
+	// assistant (iteration 1, with the tool call), tool (result),
+	// compact (mid-turn), assistant (final).
+	if len(pressureOrder) != 4 || pressureOrder[0] != "assistant" || pressureOrder[1] != "tool" ||
+		pressureOrder[2] != "compact" || pressureOrder[3] != "assistant" {
+		t.Fatalf("event order = %v, want assistant → tool → compact → assistant", pressureOrder)
+	}
+
+	// The iteration-2 request continues from the summary alone: the
+	// absorbed assistant+tool exchange is gone.
+	if len(provider.requests) != 3 {
+		t.Fatalf("provider requests = %d, want 3", len(provider.requests))
+	}
+	continuation := provider.requests[2].Messages
+	if len(continuation) != 1 || continuation[0].Role != model.MessageRoleUser || continuation[0].Content != "mid-turn summary" {
+		t.Fatalf("iteration-2 request = %+v, want the summary as the sole message", continuation)
+	}
+}
+
+func TestEstimateRequestTokensCountsToolSchema(t *testing.T) {
+	without := estimateRequestTokens(model.Request{Messages: []model.Message{{Role: model.MessageRoleUser, Content: "hi"}}})
+	with := estimateRequestTokens(model.Request{
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "hi"}},
+		Tools:    []model.Tool{{Name: "shell", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}},
+	})
+	if with <= without+8 { // name + description + schema text
+		t.Fatalf("input schema not counted: %d vs %d", with, without)
+	}
+}

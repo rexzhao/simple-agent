@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"math"
 	"unicode/utf8"
 
@@ -22,7 +23,7 @@ const (
 	contextSafetyPercent = 2
 	contextSafetyMin     = 512
 	contextSafetyMax     = 8 * 1024
-	softHeadroomPercent  = 20 // soft limit sits 20% of capacity below hard
+	softHeadroomPercent  = 20 // soft limit sits 20% of the hard limit below it
 	softHeadroomMin      = 2 * 1024
 	softHeadroomMax      = 32 * 1024
 	reservedOutputMin    = 4 * 1024
@@ -41,6 +42,9 @@ func estimateRequestTokens(request model.Request) int {
 	}
 	for _, tool := range request.Tools {
 		total += estimateTextTokens(tool.Name) + estimateTextTokens(tool.Description)
+		if encoded, err := json.Marshal(tool.InputSchema); err == nil {
+			total += estimateTextTokens(string(encoded))
+		}
 	}
 	if total < 1 {
 		return 1
@@ -99,11 +103,17 @@ func resolveContextBudget(contextWindow, maxOutputTokens int) contextBudget {
 	}
 	reservedOutput := maxOutputTokens
 	if reservedOutput <= 0 {
-		reservedOutput = clampInt(contextWindow/8, reservedOutputMin, reservedOutputMax)
+		// A tiny window must not be eaten entirely by the minimum
+		// reserve: cap it at a quarter of the window so a budget always
+		// exists (a degenerate budget would silently disable
+		// auto-compaction).
+		reservedOutput = minInt(clampInt(contextWindow/8, reservedOutputMin, reservedOutputMax), contextWindow/4)
 	}
 	capacity := contextWindow - reservedOutput
 	if capacity <= 0 {
-		return contextBudget{}
+		// A configured output limit larger than the window would leave
+		// nothing; fall back to a quarter of the window.
+		capacity = contextWindow - contextWindow/4
 	}
 	safety := clampInt((capacity*contextSafetyPercent+99)/100, contextSafetyMin, contextSafetyMax)
 	hard := capacity - safety
@@ -140,6 +150,13 @@ func clampInt(value, minimum, maximum int) int {
 
 func maxInt(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

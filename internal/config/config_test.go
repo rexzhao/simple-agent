@@ -866,3 +866,29 @@ func TestProviderNameDefaultsFromFileName(t *testing.T) {
 		t.Fatalf("providers = %v, want explicit name preserved", providers)
 	}
 }
+
+func TestAgentAutoCompactDefaultsOn(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	// Absent agent block: the default survives the unmarshal.
+	cfg, err := Load(rootConfigPath(dir))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Agent.AutoCompact {
+		t.Fatal("auto_compact default is not on")
+	}
+
+	// An explicit opt-out must stick.
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
+agent:
+  auto_compact: false
+`)
+	cfg, err = Load(rootConfigPath(dir))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.AutoCompact {
+		t.Fatal("auto_compact: false did not stick")
+	}
+}

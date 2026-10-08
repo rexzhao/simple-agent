@@ -238,13 +238,17 @@ Compacting 槽 → 带重试的摘要调用 → 软压回收检查 → commit）
 相同的 `context.compacted` 记录，Fold 无需区分来源。
 
 **预算推导**（budget.go，移植自旧栈）：`context_window − 输出预留
-（output_limit 或 clamp(窗口/8, 4K–20K)）= 容量`；硬线 = 容量 −
-安全边（2%，clamp 512–8K）；软线 = 硬线 − headroom（20%，clamp
-2K–32K）。token 估算：ASCII/4 + 非 ASCII×1 + 消息头 8 + 请求头 16。
+（output_limit 或 clamp(窗口/8, 4K–20K)，且不超过窗口/4）= 容量`；硬线 =
+容量 − 安全边（2%，clamp 512–8K）；软线 = 硬线 − headroom（硬线的 20%，
+clamp 2K–32K）。退化配置（微小窗口、输出预留 ≥ 窗口）回退到窗口的 3/4
+作容量，预算永不为零——零预算会静默关闭自动压缩。token 估算：
+ASCII/4 + 非 ASCII×1 + 消息头 8 + 请求头 16 + 工具 schema（名字/描述/
+InputSchema 的 JSON）。
 
 **触发点**：新轮次前（待处理输入已在 Context 内）与每个工具批次后。
 
-**守卫**：Context 无 assistant 回答不压；软压冷却——上次压缩后需 ≥2 条
+**守卫**：Context 无 assistant 回答不压（硬压时发 ContextPressureEvent
+告知用户超预算但无摘要可压、请求照发）；软压冷却——上次压缩后需 ≥2 条
 user.input；软压回收检查——摘要后估算缩减不足 max(2K, 前/20) 则丢弃
 不落盘；硬压压缩后仍超硬线 → run.failed（与旧版差异：记录先落盘再判
 定，下次 Send 会再压缩——窗口容不下任何摘要时本就无解）。
