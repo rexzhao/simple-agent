@@ -11,7 +11,7 @@ type Session interface {
 	// before the first record is persisted.
 	ID() string
 	// Append stores one record and returns the stored form (the
-	// implementation may fill ordering fields such as seq and time).
+	// implementation may fill fields such as time).
 	Append(record Record) (Record, error)
 	// Records returns every stored record in order. A session which has
 	// not been materialized yet has no records.

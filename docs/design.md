@@ -23,7 +23,7 @@ internal/
     storage.go      接口：Store{Create, Open} + Session{Append, Records, ID, Close}
     record.go       Record 类型（schema，两实现共享）
     fold.go         Fold() 纯函数 + State + Summarize
-    jsonl/          文件实现：目录布局、ProjectID、seq、torn-tail 恢复
+    jsonl/          文件实现：目录布局、ProjectID、torn-tail 恢复
     memory/         内存实现：map + slice（测试与临时会话）
   model/            不变：Provider 接口 + openai_chat / openai_responses / anthropic_messages
   tools/            shell 工具
@@ -48,7 +48,7 @@ agent.Session（状态层：owns State + Fold 推进 + 通知）     ①
 storage.Session（jsonl / memory，纯记录存储）              ②
 ```
 
-- **② storage 是笨存储**：只认记录。jsonl 管目录布局、seq 分配、torn-tail
+- **② storage 是笨存储**：只认记录。jsonl 管目录布局、torn-tail
   恢复；memory 是 map + slice。两者都不维护状态、不发通知。
 - **① 状态层垄断写路径**：`commit` 是唯一写入口（落盘 → fold → 清
   transient，同一锁段）。Open 时全量重放记录重建状态。
@@ -76,10 +76,11 @@ run.failed        {ItemID, RunID, Error}
 | `RunID` | 轮次分组 + grep（无状态消费者） |
 | `ToolCallID` / `ToolCalls[].ID` | wire：provider 回放配对 |
 | `Iter` | 诊断数据（可从 run 内 assistant message 计数派生，留着） |
-| `Seq` | jsonl 私有：行序校验、torn-tail 恢复。"私有"指 agent 逻辑不消费、
-  UI 不以其为键；它仍出现在落盘行与 CLI 输出中（Record 即落盘格式） |
 
-旧 schema 的 `turn` 字段删除。
+旧 schema 的 `turn`、`seq` 字段删除。**行序由文件顺序保证**（单写者 +
+append-only），torn-tail 恢复只依据行完整性与 JSON 合法性，**不做内容级
+的行序校验**——外部工具插入/重排合法 JSON 行属于威胁模型之外。旧的带
+seq 日志仍可读（Unmarshal 忽略未知字段）。
 
 ## 5. 身份体系
 
@@ -88,7 +89,9 @@ run.failed        {ItemID, RunID, Error}
 | ItemID（每条记录） | 见下表 | UI upsert 唯一键；出生先于落盘 |
 | RunID | Send 时 | 轮次分组；每条 run 内记录都带，`grep '"run":"run-…"'` 直查 |
 | ToolCallID | provider 给（空缺时 agent mint 顶上） | wire 配对；UI 的派生 join 键 |
-| Seq | jsonl Append 时 | 存储内部：agent 逻辑不消费、UI 不以其为键；仍随落盘行与 CLI 输出出现 |
+
+（seq 已删除：它是行号的冗余编码，唯一的消费者——按 seq 寻址的 tail——
+已不存在。）
 
 ItemID mint 时机（全部满足“身份先于落盘”）：
 
@@ -199,7 +202,7 @@ session    会话：一个 log.jsonl
 | internal/eventbus durable 词汇表 + sessionlog.Publisher | agent 直接 commit |
 | Store.List / Summary | 无（将来 WebUI 需要时加回，Summarize 纯函数保留） |
 | storage 级 RecordsAfter / Subscribe | 通知上移到 agent.Session 的 commit 通知（携带记录本身） |
-| State.LastSeq | 无，seq 私有化 |
+| State.LastSeq | 无，行序即文件序 |
 | TurnID / turn 字段 / MaxTurns 命名 | RunID / MaxIterations |
 | agent 的 config 依赖 | 参数全部构造期注入 |
 | chatapp.Session.Close 的 5s 忙等 | 显式同步（cancel → 等 pump goroutine 退出） |

@@ -46,15 +46,12 @@ func (s *Store) Open(id string) (storage.Session, error) {
 // records is the shared, append-only record list behind every handle.
 type records struct {
 	mu      sync.Mutex
-	seq     int64
 	entries []storage.Record
 }
 
 func (r *records) append(record storage.Record) (storage.Record, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.seq++
-	record.Seq = r.seq
 	if record.Time == "" {
 		record.Time = storage.NewTime()
 	}

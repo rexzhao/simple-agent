@@ -12,17 +12,16 @@ import (
 	"github.com/rexzhao/simple-agent/internal/storage"
 )
 
-// Log is the append-only JSONL file of one session. It owns the file, the
-// sequence counter, and the durability policy. Append is safe for
-// concurrent use; readers go through Records.
+// Log is the append-only JSONL file of one session. It owns the file and
+// the durability policy. Append is safe for concurrent use; readers go
+// through Records.
 type Log struct {
 	path string
 
-	mu      sync.Mutex
-	file    *os.File
-	writer  *bufio.Writer
-	lastSeq int64
-	closed  bool
+	mu     sync.Mutex
+	file   *os.File
+	writer *bufio.Writer
+	closed bool
 }
 
 // OpenLog opens (creating if needed) the log at path, recovers a torn tail
@@ -43,23 +42,27 @@ func OpenLog(path string) (*Log, error) {
 	return log, nil
 }
 
-// recover scans the file line by line and truncates a torn tail: a final line
-// without its newline, or one that is not valid JSON for a valid record. The
-// last valid record's seq becomes the sequence base.
+// recover scans the file line by line and truncates a torn tail: a final
+// line without its newline, or one that is not valid JSON for a valid
+// record.
 //
-// The write path guarantees a torn line can only be the last one: appends are
-// strictly ordered by the log mutex, every append flushes its complete line,
-// and an fsync of a durable record also solidifies every earlier write. A
-// mid-file invalid line therefore indicates external corruption or a manual
-// edit; recovery still truncates from there (fail-safe over fail-stop), and
-// reports how much was discarded.
+// The write path guarantees a torn line can only be the last one: appends
+// are strictly ordered by the log mutex, every append flushes its complete
+// line, and an fsync of a durable record also solidifies every earlier
+// write. A mid-file invalid line therefore indicates external corruption
+// or a manual edit; recovery still truncates from there (fail-safe over
+// fail-stop), and reports how much was discarded.
+//
+// Line order is the record order: a single writer appends under the mutex,
+// so no content-level ordering check is performed (external tools
+// inserting or reordering valid lines are outside the threat model).
 func (l *Log) recover() error {
 	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek session log: %w", err)
 	}
 	reader := bufio.NewReader(l.file)
 	var offset int64
-	var lastSeq int64
+	var validLines int
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
@@ -73,17 +76,14 @@ func (l *Log) recover() error {
 				continue
 			}
 			var record storage.Record
-			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr != nil || record.Validate() != nil || record.Seq < 1 {
+			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr != nil || record.Validate() != nil {
 				// An invalid complete line is treated like a torn tail: under
 				// the write-path invariant it can only be external corruption
 				// (see the comment on recover), and truncating from the first
 				// invalid line is the fail-safe choice.
 				break
 			}
-			if record.Seq <= lastSeq {
-				return fmt.Errorf("session log %s: seq %d does not advance past %d", l.path, record.Seq, lastSeq)
-			}
-			lastSeq = record.Seq
+			validLines++
 			offset += int64(len(line))
 		}
 		if err != nil {
@@ -102,8 +102,8 @@ func (l *Log) recover() error {
 			return fmt.Errorf("truncate torn session log tail: %w", err)
 		}
 		if info.Size()-offset > maxTornTailBytes {
-			fmt.Fprintf(os.Stderr, "jsonl: %s: discarded %d bytes after seq %d; mid-file corruption, not a torn tail\n",
-				l.path, info.Size()-offset, lastSeq)
+			fmt.Fprintf(os.Stderr, "jsonl: %s: discarded %d bytes after %d valid records; mid-file corruption, not a torn tail\n",
+				l.path, info.Size()-offset, validLines)
 		}
 	}
 	// Truncation does not move the file offset, and the reading pass left it
@@ -113,11 +113,10 @@ func (l *Log) recover() error {
 	if _, err := l.file.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("seek session log after recovery: %w", err)
 	}
-	l.lastSeq = lastSeq
 	return nil
 }
 
-// Append assigns seq and time, writes the record as one line, and fsyncs when
+// Append fills the record's time, writes it as one line, and fsyncs when
 // the record class requires durability. It returns the stored record.
 func (l *Log) Append(record storage.Record) (storage.Record, error) {
 	l.mu.Lock()
@@ -125,7 +124,6 @@ func (l *Log) Append(record storage.Record) (storage.Record, error) {
 	if l.closed {
 		return storage.Record{}, fmt.Errorf("session log is closed")
 	}
-	record.Seq = l.lastSeq + 1
 	if record.Time == "" {
 		record.Time = storage.NewTime()
 	}
@@ -151,7 +149,6 @@ func (l *Log) Append(record storage.Record) (storage.Record, error) {
 			return storage.Record{}, fmt.Errorf("sync record: %w", err)
 		}
 	}
-	l.lastSeq = record.Seq
 	return record, nil
 }
 
@@ -196,20 +193,15 @@ func readRecords(path string) ([]storage.Record, error) {
 	}
 	defer file.Close()
 	var records []storage.Record
-	var lastSeq int64
 	reader := bufio.NewReaderSize(file, 64*1024)
 	for {
 		line, err := reader.ReadBytes('\n')
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) > 0 {
 			var record storage.Record
-			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr != nil || record.Validate() != nil || record.Seq < 1 {
-				return nil, fmt.Errorf("session log %s has an invalid line after seq %d", path, lastSeq)
+			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr != nil || record.Validate() != nil {
+				return nil, fmt.Errorf("session log %s has an invalid line", path)
 			}
-			if record.Seq <= lastSeq {
-				return nil, fmt.Errorf("session log %s: seq %d does not advance past %d", path, record.Seq, lastSeq)
-			}
-			lastSeq = record.Seq
 			records = append(records, record)
 		}
 		if err != nil {

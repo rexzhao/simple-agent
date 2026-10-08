@@ -63,9 +63,6 @@ func TestFirstAppendOpensLogInOrder(t *testing.T) {
 	if records[0].Type != storage.TypeSessionCreated || records[0].Provider != "p" || records[0].CWD != "/w" {
 		t.Fatalf("session.created = %+v", records[0])
 	}
-	if records[0].Seq >= records[1].Seq {
-		t.Fatalf("seq does not advance: %d then %d", records[0].Seq, records[1].Seq)
-	}
 	if records[1].Type != storage.TypeUserInput || records[1].ItemID != "u1" {
 		t.Fatalf("user.input = %+v", records[1])
 	}
@@ -135,7 +132,7 @@ func TestTornTailRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open log: %v", err)
 	}
-	if _, err := file.WriteString(`{"seq":3,"item":"torn`); err != nil {
+	if _, err := file.WriteString(`{"item":"torn`); err != nil {
 		t.Fatalf("write torn tail: %v", err)
 	}
 	file.Close()
@@ -151,13 +148,9 @@ func TestTornTailRecovery(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("records = %d, want torn tail discarded", len(records))
 	}
-	// The next append continues the sequence.
-	stored, err := reopened.Append(storage.Record{ItemID: "u2", Type: storage.TypeUserInput, Content: "two"})
-	if err != nil {
+	// The next append extends the recovered log.
+	if _, err := reopened.Append(storage.Record{ItemID: "u2", Type: storage.TypeUserInput, Content: "two"}); err != nil {
 		t.Fatalf("Append after recovery: %v", err)
-	}
-	if stored.Seq != records[len(records)-1].Seq+1 {
-		t.Fatalf("seq after recovery = %d, want %d", stored.Seq, records[len(records)-1].Seq+1)
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

@@ -30,9 +30,6 @@ const MaxRecordBytes = 8 * 1024 * 1024
 
 // Record is one append-only log line and one item.
 type Record struct {
-	// Seq is the jsonl implementation's internal line ordering. The agent
-	// and the UI never read it.
-	Seq int64 `json:"seq"`
 	// ItemID is the record's identity, minted by the agent before the
 	// record exists anywhere.
 	ItemID string `json:"item,omitempty"`

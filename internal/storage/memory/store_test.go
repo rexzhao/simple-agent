@@ -22,7 +22,7 @@ func TestCreateAppendOpenRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Records: %v", err)
 	}
-	if len(records) != 1 || records[0].Content != "hi" || records[0].Seq != 1 {
+	if len(records) != 1 || records[0].Content != "hi" {
 		t.Fatalf("records = %+v, want one stored user input", records)
 	}
 
