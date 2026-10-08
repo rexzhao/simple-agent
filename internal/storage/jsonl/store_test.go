@@ -175,3 +175,82 @@ func TestProjectIDDeterministicAndPathSafe(t *testing.T) {
 		t.Fatalf("ProjectID %q is not path-safe", first)
 	}
 }
+
+func TestReadRecordsNamesInvalidLineNumber(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	content := "{\"item\":\"u1\",\"t\":\"user.input\",\"ts\":\"2026-01-02T03:04:05Z\"}\n" +
+		"\n" +
+		"{not json"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	if _, err := readRecords(path); err == nil || !strings.Contains(err.Error(), "invalid line at line 3") {
+		t.Fatalf("readRecords error = %v, want invalid line at line 3 (blank lines counted)", err)
+	}
+}
+
+func TestRecoverDiscardWarningNamesLastValidItem(t *testing.T) {
+	original := maxTornTailBytes
+	maxTornTailBytes = 16
+	t.Cleanup(func() { maxTornTailBytes = original })
+
+	store := newTestStore(t)
+	session, err := store.Create(ProjectID(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := session.Append(storage.Record{ItemID: "u1", Type: storage.TypeUserInput, Content: "kept"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	id := session.ID()
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A garbage tail far over the (shrunken) torn-tail bound: recovering it
+	// must report mid-file corruption and locate the boundary by the last
+	// valid item.
+	path := filepath.Join(session.(*Session).Dir(), logFileName)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	if _, err := file.WriteString("{" + strings.Repeat("x", 200) + "}\n"); err != nil {
+		t.Fatalf("write garbage tail: %v", err)
+	}
+	file.Close()
+
+	var reopened storage.Session
+	stderr := captureStderr(t, func() {
+		reopened, err = store.Open(id)
+	})
+	if err != nil {
+		t.Fatalf("Open after garbage tail: %v", err)
+	}
+	if !strings.Contains(stderr, "after item u1 (type user.input)") {
+		t.Fatalf("discard warning = %q, want it to name the last valid item", stderr)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// captureStderr runs fn with os.Stderr redirected to a temp file and
+// returns what was written.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	tmp, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatalf("create stderr capture: %v", err)
+	}
+	original := os.Stderr
+	os.Stderr = tmp
+	defer func() { os.Stderr = original }()
+	fn()
+	tmp.Close()
+	data, err := os.ReadFile(tmp.Name())
+	if err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	return string(data)
+}
