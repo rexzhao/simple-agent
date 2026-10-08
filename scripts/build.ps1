@@ -6,26 +6,24 @@ $ErrorActionPreference = "Stop"
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Dist = Join-Path $Root "dist"
-$Web = Join-Path $Root "web"
-$Ldflags = "-s -w -X github.com/rexzhao/simple-agent/internal/webapp.Version=$Version"
+$Ldflags = "-s -w -X main.version=$Version"
 
 $Targets = @(
-    @{ GOOS = "windows"; GOARCH = "amd64"; Name = "sai-windows-amd64.exe" },
-    @{ GOOS = "linux"; GOARCH = "amd64"; Name = "sai-linux-amd64" },
-    @{ GOOS = "darwin"; GOARCH = "arm64"; Name = "sai-darwin-arm64" }
+    @{ GOOS = "windows"; GOARCH = "amd64"; Name = "sai-native-windows-amd64.exe" },
+    @{ GOOS = "linux"; GOARCH = "amd64"; Name = "sai-native-linux-amd64" },
+    @{ GOOS = "darwin"; GOARCH = "arm64"; Name = "sai-native-darwin-arm64" }
 )
 
 function Ensure-WindowsConvenienceLink {
-    $Target = Join-Path $Dist "sai-windows-amd64.exe"
-    $Link = Join-Path $Dist "sai.exe"
+    $Target = Join-Path $Dist "sai-native-windows-amd64.exe"
+    $Link = Join-Path $Dist "sai-native.exe"
     if (-not (Test-Path -LiteralPath $Target -PathType Leaf)) {
         return
     }
-    if ($null -ne (Get-Item -LiteralPath $Link -Force -ErrorAction SilentlyContinue)) {
-        return
-    }
-    New-Item -ItemType SymbolicLink -Path $Link -Target "sai-windows-amd64.exe" | Out-Null
-    Write-Host "linked dist/sai.exe -> sai-windows-amd64.exe"
+    # A symlink needs Developer Mode; a refreshed copy is always correct and
+    # can never go stale after a rebuild.
+    Copy-Item -LiteralPath $Target -Destination $Link -Force
+    Write-Host "copied dist/sai-native.exe <- sai-native-windows-amd64.exe"
 }
 
 $OldCGOEnabled = $env:CGO_ENABLED
@@ -36,42 +34,18 @@ New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
 Push-Location $Root
 try {
-    Push-Location $Web
-    try {
-        npm ci
-        npm run build
-    } finally {
-        Pop-Location
-    }
-
     foreach ($Target in $Targets) {
         $env:CGO_ENABLED = "0"
         $env:GOOS = $Target.GOOS
         $env:GOARCH = $Target.GOARCH
-
-        $Output = Join-Path $Dist $Target.Name
-        go build -trimpath -ldflags $Ldflags -o $Output ./cmd/sai
+        go build -trimpath -ldflags $Ldflags -o (Join-Path $Dist $Target.Name) ./cmd/sai-native
         Write-Host "built dist/$($Target.Name)"
     }
-    Ensure-WindowsConvenienceLink
 } finally {
+    $env:CGO_ENABLED = $OldCGOEnabled
+    $env:GOOS = $OldGOOS
+    $env:GOARCH = $OldGOARCH
     Pop-Location
-
-    if ($null -eq $OldCGOEnabled) {
-        Remove-Item Env:\CGO_ENABLED -ErrorAction SilentlyContinue
-    } else {
-        $env:CGO_ENABLED = $OldCGOEnabled
-    }
-
-    if ($null -eq $OldGOOS) {
-        Remove-Item Env:\GOOS -ErrorAction SilentlyContinue
-    } else {
-        $env:GOOS = $OldGOOS
-    }
-
-    if ($null -eq $OldGOARCH) {
-        Remove-Item Env:\GOARCH -ErrorAction SilentlyContinue
-    } else {
-        $env:GOARCH = $OldGOARCH
-    }
 }
+
+Ensure-WindowsConvenienceLink

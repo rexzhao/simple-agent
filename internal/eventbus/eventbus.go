@@ -5,15 +5,12 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 const (
-	KindTurnStarted         = "turn.started"
-	KindCompactionRequested = "compaction.requested"
-	KindTurnInputReady      = "turn.input_ready"
+	KindTurnStarted    = "turn.started"
+	KindTurnInputReady = "turn.input_ready"
 	KindAssistantReady      = "assistant.ready"
 	KindAssistantCheckpoint = "assistant.text_checkpoint"
 	KindToolResultReady     = "tool_result.ready"
@@ -257,16 +254,6 @@ type TurnStarted struct {
 
 func (TurnStarted) Kind() string  { return KindTurnStarted }
 func (TurnStarted) durableEvent() {}
-
-type CompactionRequested struct {
-	TurnID     string
-	Summary    sessions.SessionItem
-	Checkpoint sessions.CompactionCheckpoint
-	Context    *contextwindow.Metadata
-}
-
-func (CompactionRequested) Kind() string  { return KindCompactionRequested }
-func (CompactionRequested) durableEvent() {}
 
 type TurnInputReady struct {
 	TurnID  string

@@ -20,41 +20,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
-
-      - name: Install frontend dependencies
-        working-directory: web
-        run: npm ci
-
-      - name: Check and test frontend
-        working-directory: web
-        run: |
-          npm run check
-          npm test
-
-      - name: Install Chromium
-        working-directory: web
-        run: npx playwright install --with-deps chromium
-
-      - name: Run browser tests
-        working-directory: web
-        run: npm run test:e2e
-
-      - name: Build embedded frontend
-        working-directory: web
-        run: npm run build
-
-      - name: Verify embedded frontend is current
-        run: git diff --exit-code -- internal/webapp/assets
 
       - name: Validate backend
         run: |
@@ -71,11 +40,10 @@ jobs:
         env:
           VERSION: ${{ github.ref_name }}
         run: |
-          test "$(./dist/sai-linux-amd64 --version)" = "$VERSION"
           for artifact in \
-            dist/sai-windows-amd64.exe \
-            dist/sai-linux-amd64 \
-            dist/sai-darwin-arm64
+            dist/sai-native-windows-amd64.exe \
+            dist/sai-native-linux-amd64 \
+            dist/sai-native-darwin-arm64
           do
             strings "$artifact" | grep -Fx -- "$VERSION"
           done
@@ -84,9 +52,9 @@ jobs:
         working-directory: dist
         run: |
           sha256sum \
-            sai-windows-amd64.exe \
-            sai-linux-amd64 \
-            sai-darwin-arm64 > SHA256SUMS
+            sai-native-windows-amd64.exe \
+            sai-native-linux-amd64 \
+            sai-native-darwin-arm64 > SHA256SUMS
           sha256sum --check SHA256SUMS
 
       - name: Publish GitHub release
@@ -95,9 +63,9 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           artifacts=(
-            dist/sai-windows-amd64.exe
-            dist/sai-linux-amd64
-            dist/sai-darwin-arm64
+            dist/sai-native-windows-amd64.exe
+            dist/sai-native-linux-amd64
+            dist/sai-native-darwin-arm64
             dist/SHA256SUMS
           )
           if gh release view "$VERSION" >/dev/null 2>&1; then

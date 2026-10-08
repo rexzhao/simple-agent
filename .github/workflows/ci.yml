@@ -8,42 +8,6 @@ permissions:
   contents: read
 
 jobs:
-  frontend:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: npm ci
-      - run: npm run check
-      - run: npm test
-      - run: npm run build
-      - name: Verify embedded frontend is current
-        working-directory: .
-        run: git diff --exit-code -- internal/webapp/assets
-
-  browser:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: npm ci
-      - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e
-
   backend:
     runs-on: ubuntu-latest
     steps:
@@ -56,8 +20,6 @@ jobs:
       - run: go vet ./...
       - name: Race test core packages
         run: go test -race ./internal/...
-      - name: Verify fresh-checkout embed
-        run: go build ./cmd/sai
       - run: git diff --check
 
   build:
@@ -72,4 +34,4 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go build ./cmd/sai
+      - run: go build ./cmd/sai-native

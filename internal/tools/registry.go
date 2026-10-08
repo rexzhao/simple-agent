@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -54,6 +55,16 @@ func (r *Registry) Register(definition model.Tool, executor Executor) error {
 func (r *Registry) Lookup(name string) (Entry, bool) {
 	entry, ok := r.entries[name]
 	return entry, ok
+}
+
+// Names returns every registered tool name, sorted.
+func (r *Registry) Names() []string {
+	names := make([]string, 0, len(r.entries))
+	for name := range r.entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (r *Registry) EnabledSchemas(enabled []string) ([]model.Tool, error) {

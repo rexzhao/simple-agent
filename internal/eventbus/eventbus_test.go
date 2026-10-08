@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 func TestBusPublishDurableInvokesHandlerAndFansOut(t *testing.T) {
@@ -243,7 +242,6 @@ func TestEventKinds(t *testing.T) {
 		want  string
 	}{
 		{"turn started", TurnStarted{TurnID: "turn"}, KindTurnStarted},
-		{"compaction requested", CompactionRequested{TurnID: "turn", Summary: sessions.SessionItem{ID: "summary"}, Checkpoint: sessions.CompactionCheckpoint{ID: "checkpoint"}}, KindCompactionRequested},
 		{"turn input ready", TurnInputReady{TurnID: "turn", Message: model.Message{Role: model.MessageRoleUser, Content: "hi"}}, KindTurnInputReady},
 		{"assistant ready", AssistantReady{TurnID: "turn", Message: model.Message{Role: model.MessageRoleAssistant, Content: "hello"}}, KindAssistantReady},
 		{"tool result ready", ToolResultReady{TurnID: "turn", Result: model.ToolResult{ToolCallID: "call", Content: "ok"}}, KindToolResultReady},
