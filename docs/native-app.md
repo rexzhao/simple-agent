@@ -35,15 +35,19 @@ cmd/sai-native（mygo 原生窗口）
 
 | 类型 | 载荷 | 说明 |
 |---|---|---|
-| `session.created` | provider/model/cwd | 会话元数据 |
-| `user.input` | run/content | 一次用户输入，开启一个 run |
-| `run.started` / `run.settled` | run/status/error | run 生命周期 |
-| `turn.started` / `turn.completed` / `turn.interrupted` | turn | provider 请求边界 |
-| `turn.input` | turn/content | run 进行中被排队的输入 |
-| `assistant.checkpoint` | item/content | 流式输出快照，**累积**而非增量；不进 Context |
-| `assistant.ready` | item/content/reasoning/tool_calls | 终态助手消息；checkpoint 在 fold 中原位定稿 |
+| `session.created` | provider/model/cwd | 会话元数据，每会话仅一行 |
+| `user.input` | run/content | 一次用户输入，同时定义其 run 的开始 |
+| `assistant.message` | item/content/reasoning/tool_calls | 终态助手消息（旧名 `assistant.ready` 读时兼容） |
 | `tool.result` | tool_call_id/content | 工具结果，独立于工具调用，靠 ID 关联 |
-| `compaction.created` | — | 预留（当前无发布方；compaction 重设计后将定义载荷） |
+| `run.failed` | error | 仅失败时记录；完成 = 无失败记录，中断 = 输入无回答 |
+| `compaction.created` | — | 预留（当前无发布方） |
+
+run 生命周期不再有记录：`user.input` 即 run 开始，无失败即完成，中断
+留下无回答的输入。turn 边界与流式 checkpoint 不落盘——日志是对话，不是
+事件轨迹。中断在工具调用中间的 run 由 chatapp 在下次请求前修补上下文
+（合成的 `[tool execution interrupted]` 结果按调用顺序补齐，见
+`sanitizeContext`）。
+
 
 `item` ID 由 agent 在流式开始时生成并在落盘时沿用——transient 与
 durable 共享同一身份，不存在映射层。
@@ -77,10 +81,10 @@ go run ./cmd/sai [session-id]
 --full-access       文件工具允许读写 cwd 之外
 ```
 
-交互：`sai> ` 提示符读入一行输入；运行期间 stderr 显示 `.` `..` `...`
-循环光标；运行结束后该 run 追加的全部 JSONL 记录一次性打印到 stdout。
-控制信息（提示符、通知、会话列表）只走 stderr，stdout 是纯记录流，
-可以直接重定向留存。
+交互：`sai> ` 提示符读入一行输入；记录一经落盘立即打印到 stdout（ watcher
+实时尾随）；**仅当模型正在流式输出时** stderr 显示 `.` `..` `...` ``
+（含空帧）循环光标，打印记录前先清掉光标行。等待首 token、工具执行期
+间不转。控制信息只走 stderr，stdout 是纯记录流，可直接重定向留存。
 
 命令：
 

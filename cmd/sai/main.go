@@ -1,8 +1,8 @@
-// Command sai is the command-line chat interface for the agent. It reads
-// input line by line; while a run streams it shows a dot spinner, and when
-// the run settles it prints the JSONL records the run appended, one line
-// each, to stdout. Control messages (prompts, notices, session lists) go to
-// stderr, so stdout is a pure session-record stream.
+// Command sai is the command-line chat interface for the agent. Records are
+// printed to stdout as soon as they are appended to the session log, one
+// JSONL line each. While the model streams, a dot spinner cycles on stderr;
+// control messages (prompts, notices, session lists) also go to stderr, so
+// stdout stays a pure session-record stream.
 package main
 
 import (
@@ -15,17 +15,26 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/chatapp"
+	"github.com/rexzhao/simple-agent/internal/model"
 )
 
 var version = "dev"
 
+// spinnerFrames cycles ".", "..", "...", and an empty frame: the empty frame
+// makes the animation blink rather than crawl.
+var spinnerFrames = []string{".", "..", "...", ""}
+
+const spinnerInterval = 250 * time.Millisecond
+
 func main() {
 	var (
 		showVersion = flag.Bool("version", false, "print version and exit")
-		serverRoot  = flag.String("server-root", "", "configuration namespace root (default: $SAI_SERVER_ROOT, else ./.sai/sai.yaml if present, else user config dir/sai)")
+		serverRoot  = flag.String("server-root", "", "configuration namespace root (default: $SAI_SERVER_ROOT, else ./.<app>/sai.yaml if present, else user config dir/<app>)")
 		cwd         = flag.String("cwd", "", "working directory for tools (default: process cwd)")
 		provider    = flag.String("provider", "", "override default_provider")
 		model       = flag.String("model", "", "override default_model (model profile name)")
@@ -64,7 +73,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "sai: %s\n", notice)
 	}
 
-	cli := &cliApp{app: app}
+	cli := &cliApp{app: app, printer: &spinnerPrinter{}}
 	// An optional positional argument resumes a stored session directly.
 	if flag.NArg() > 0 {
 		if err := cli.resume(flag.Arg(0)); err != nil {
@@ -106,13 +115,54 @@ func main() {
 	}
 }
 
-// cliApp holds the active session and the sequence of its last printed
-// record. Everything runs on the main thread; the SIGINT handler only calls
-// session.Stop.
+// spinnerPrinter interleaves the stderr spinner with stdout record lines:
+// a record line always erases the spinner first, so the two never mix on a
+// combined terminal.
+type spinnerPrinter struct {
+	mu    sync.Mutex
+	shown bool
+}
+
+// frame draws one spinner frame on stderr.
+func (p *spinnerPrinter) frame(frame string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "\r%s", frame)
+	p.shown = frame != ""
+}
+
+// clear erases the spinner, if drawn.
+func (p *spinnerPrinter) clear() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.shown {
+		fmt.Fprint(os.Stderr, "\r  \r")
+		p.shown = false
+	}
+}
+
+// line prints one record line to stdout, clearing the spinner first.
+func (p *spinnerPrinter) line(line string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.shown {
+		fmt.Fprint(os.Stderr, "\r  \r")
+		p.shown = false
+	}
+	fmt.Println(line)
+}
+
+// cliApp holds the active session. Record printing and the last printed
+// sequence are shared between the main thread and the per-session watcher
+// goroutine.
 type cliApp struct {
 	app     *chatapp.App
 	session *chatapp.Session
+	printer *spinnerPrinter
+
+	mu      sync.Mutex
 	lastSeq int64
+	unwatch func()
 }
 
 // dispatch handles one input line. It returns true when the REPL should
@@ -120,7 +170,7 @@ type cliApp struct {
 func (c *cliApp) dispatch(text string) bool {
 	switch {
 	case text == "/quit" || text == "/exit":
-		c.session.Close()
+		c.closeSession()
 		return true
 	case text == "/clear":
 		if err := c.freshSession(); err != nil {
@@ -145,34 +195,57 @@ func (c *cliApp) dispatch(text string) bool {
 	return false
 }
 
-// send runs one agent turn: spinner while streaming, then the run's JSONL
-// records printed to stdout.
+// send runs one agent turn: records print as they are appended, and the
+// spinner shows only while the model is streaming.
 func (c *cliApp) send(text string) error {
 	if err := c.session.Send(text); err != nil {
 		return err
 	}
-	c.spinWhileRunning()
-	c.printNewRecords()
+
+	// Drain the run's transient events to know when the model streams. The
+	// assistant message window (started → completed/failed) is exactly the
+	// streaming window; waiting for the first token and running tools are
+	// silent by design.
+	streaming := &atomic.Bool{}
+	events := c.session.Events()
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for event := range events {
+			switch event.(type) {
+			case model.AssistantMessageStartedEvent:
+				streaming.Store(true)
+			case model.AssistantMessageCompletedEvent, model.AssistantMessageFailedEvent:
+				streaming.Store(false)
+			}
+		}
+	}()
+
+	frame := 0
+	for c.session.Running() {
+		time.Sleep(spinnerInterval)
+		if streaming.Load() {
+			c.printer.frame(spinnerFrames[frame%len(spinnerFrames)])
+			frame++
+		} else {
+			c.printer.clear()
+		}
+	}
+	c.printer.clear()
+	<-drained
+	// The watcher prints on append notifications; make sure the final
+	// records are flushed even if their notification raced the run ending.
+	c.tail()
 	return nil
 }
 
-// spinWhileRunning shows the cycling dot spinner on stderr until the active
-// run settles, then erases it.
-func (c *cliApp) spinWhileRunning() {
-	frames := []string{".", "..", "..."}
-	index := 0
-	for c.session.Running() {
-		fmt.Fprintf(os.Stderr, "\r%s", frames[index%len(frames)])
-		index++
-		time.Sleep(300 * time.Millisecond)
-	}
-	fmt.Fprint(os.Stderr, "\r  \r")
-}
-
-// printNewRecords writes every record appended since the last print, one
-// JSONL line each, in sequence order.
-func (c *cliApp) printNewRecords() {
-	records, err := c.session.RecordsAfter(c.lastSeq)
+// tail prints every record appended since the last print, one JSONL line
+// each, in sequence order.
+func (c *cliApp) tail() {
+	c.mu.Lock()
+	lastSeq := c.lastSeq
+	c.mu.Unlock()
+	records, err := c.session.RecordsAfter(lastSeq)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		return
@@ -183,9 +256,42 @@ func (c *cliApp) printNewRecords() {
 			fmt.Fprintf(os.Stderr, "sai: encode record: %v\n", err)
 			continue
 		}
-		fmt.Println(string(line))
+		c.printer.line(string(line))
+		c.mu.Lock()
 		c.lastSeq = record.Seq
+		c.mu.Unlock()
 	}
+}
+
+// watch prints records as they are appended, until the session is switched
+// away or closed.
+func (c *cliApp) watch() {
+	session := c.session
+	notify, unsubscribe := session.Subscribe()
+	c.unwatch = unsubscribe
+	go func() {
+		for range notify {
+			if c.currentSession() != session {
+				return
+			}
+			c.tail()
+		}
+	}()
+}
+
+func (c *cliApp) currentSession() *chatapp.Session {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.session
+}
+
+// closeSession stops the watcher and closes the session.
+func (c *cliApp) closeSession() {
+	if c.unwatch != nil {
+		c.unwatch()
+		c.unwatch = nil
+	}
+	c.session.Close()
 }
 
 // freshSession switches to a new empty session.
@@ -194,7 +300,10 @@ func (c *cliApp) freshSession() error {
 	if err != nil {
 		return err
 	}
-	c.bind(session, false)
+	if err := c.bind(session, false); err != nil {
+		session.Close()
+		return err
+	}
 	return nil
 }
 
@@ -204,7 +313,10 @@ func (c *cliApp) resume(id string) error {
 	if err != nil {
 		return err
 	}
-	c.bind(session, true)
+	if err := c.bind(session, true); err != nil {
+		session.Close()
+		return err
+	}
 	return nil
 }
 
@@ -233,20 +345,22 @@ func (c *cliApp) resumeCommand(arg string) {
 
 // bind switches to session. When printHistory is set, every stored record is
 // printed to stdout first so a resumed session continues the JSONL stream.
-func (c *cliApp) bind(session *chatapp.Session, printHistory bool) {
+func (c *cliApp) bind(session *chatapp.Session, printHistory bool) error {
 	if c.session != nil {
 		if c.session.Running() {
-			session.Close()
-			fmt.Fprintln(os.Stderr, "sai: the current session is still running; /stop it first")
-			return
+			return fmt.Errorf("the current session is still running; /stop it first")
 		}
-		c.session.Close()
+		c.closeSession()
 	}
+	c.mu.Lock()
 	c.session = session
 	c.lastSeq = 0
+	c.mu.Unlock()
+	c.watch()
 	if printHistory {
-		c.printNewRecords()
+		c.tail()
 	}
+	return nil
 }
 
 func displayTitle(title string) string {

@@ -1,7 +1,6 @@
 package sessionlog
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
@@ -24,20 +23,17 @@ const (
 
 // Item is one display row in the folded session state.
 type Item struct {
-	ID    string `json:"id"`
-	Kind  string `json:"kind"`
+	ID     string `json:"id"`
+	Kind   string `json:"kind"`
 	TurnID string `json:"turn_id,omitempty"`
-	RunID string `json:"run_id,omitempty"`
+	RunID  string `json:"run_id,omitempty"`
 
 	// Content is the user text, assistant text, or tool output.
 	Content string `json:"content,omitempty"`
 	// Reasoning is assistant reasoning text.
 	Reasoning string `json:"reasoning,omitempty"`
-	// Streaming marks an assistant item still being checkpointed; the
-	// assistant.ready record finalizes it.
-	Streaming bool `json:"streaming,omitempty"`
 
-	// ToolCalls are the calls of a finalized assistant item.
+	// ToolCalls are the calls of an assistant message.
 	ToolCalls []model.ToolCall `json:"tool_calls,omitempty"`
 
 	// Tool result fields.
@@ -62,26 +58,21 @@ type State struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 
-	// Items is the display order: user inputs, assistant messages (final or
-	// streaming), and tool results interleaved exactly as they were appended.
+	// Items is the display order: user inputs, assistant messages, and tool
+	// results interleaved exactly as they were appended.
 	Items []Item
 
 	// Context is the model-facing history: the user, assistant and tool
-	// messages the next request needs, in request order. Streaming
-	// checkpoints never enter the context.
+	// messages the next request needs, in request order. A run which was
+	// interrupted mid-tool can leave assistant tool calls without results;
+	// the consumer (chatapp) patches those before sending.
 	Context []model.Message
-
-	// Runs maps run ID to settle status; a run which started but has not
-	// settled reports RunStatusRunning.
-	Runs map[string]string
-	// ActiveRun is the run of the last user input.
-	ActiveRun string
 
 	LastSeq int64
 }
 
 func newState(sessionID string) *State {
-	return &State{SessionID: sessionID, Runs: make(map[string]string)}
+	return &State{SessionID: sessionID}
 }
 
 // fold advances the state with one record. It is a total function: it never
@@ -109,66 +100,13 @@ func fold(state *State, record Record) {
 		if state.Title == "" {
 			state.Title = summarizeTitle(record.Content)
 		}
-	case TypeTurnInput:
-		state.Items = append(state.Items, Item{
-			ID: fmt.Sprintf("%s-%d", record.TurnID, record.Seq), Kind: ItemKindUser, TurnID: record.TurnID,
-			Content: record.Content, Seq: record.Seq,
-		})
-		state.Context = append(state.Context, model.Message{Role: model.MessageRoleUser, Content: record.Content})
-	case TypeRunStarted:
-		state.Runs[record.RunID] = RunStatusRunning
-		state.ActiveRun = record.RunID
-	case TypeRunSettled:
-		state.Runs[record.RunID] = record.Status
-		if state.ActiveRun == record.RunID {
-			state.ActiveRun = ""
-		}
-		// A settled run cannot stream any more: finalize its display-only
-		// checkpoint items so a resumed session does not show a live caret
-		// over output that will never grow. Finalized content still never
-		// enters the model context.
-		for index := range state.Items {
-			if state.Items[index].RunID == record.RunID && state.Items[index].Streaming {
-				state.Items[index].Streaming = false
-			}
-		}
-		if record.Error != "" {
-			state.Items = append(state.Items, Item{
-				ID: record.RunID + "-error", Kind: ItemKindError, RunID: record.RunID,
-				Content: record.Error, Seq: record.Seq,
-			})
-		}
-	case TypeTurnStarted, TypeTurnCompleted, TypeTurnInterrupted:
-		// Turn boundaries are durable facts but carry no display or context
-		// payload in the minimal fold.
-	case TypeAssistantCheckpoint:
-		// Cumulative content: the checkpoint replaces whatever the item
-		// showed so far, so a delayed writer can never reorder a prefix.
-		if index := findItem(state.Items, record.ItemID); index >= 0 {
-			// A checkpoint for an already-finalized item is out of order
-			// (only reachable from a hand-crafted log); never regress a
-			// terminal record back to a streaming state.
-			if !state.Items[index].Streaming {
-				break
-			}
-			item := &state.Items[index]
-			item.Content = record.Content
-			item.Streaming = true
-			item.Seq = record.Seq
-			break
-		}
-		state.Items = append(state.Items, Item{
-			ID: record.ItemID, Kind: ItemKindAssistant, TurnID: record.TurnID, RunID: record.RunID,
-			Content: record.Content, Streaming: true, Seq: record.Seq,
-		})
-	case TypeAssistantReady:
+	case TypeAssistantMessage, TypeAssistantReady:
 		calls := modelToolCalls(record.ToolCalls)
 		if index := findItem(state.Items, record.ItemID); index >= 0 {
 			item := &state.Items[index]
 			item.Content = record.Content
 			item.Reasoning = record.Reasoning
 			item.ToolCalls = calls
-			item.Streaming = false
 			item.Seq = record.Seq
 		} else {
 			state.Items = append(state.Items, Item{
@@ -198,6 +136,15 @@ func fold(state *State, record Record) {
 			Content:    record.Content,
 			ToolCallID: record.ToolCallID,
 			IsError:    record.IsError,
+		})
+	case TypeRunFailed:
+		// A failed run leaves its error visible in the conversation; a
+		// committed or interrupted run needs no record: committed is the
+		// absence of failure, and an interruption simply leaves the user
+		// input unanswered.
+		state.Items = append(state.Items, Item{
+			ID: record.RunID + "-error", Kind: ItemKindError, RunID: record.RunID,
+			Content: record.Error, Seq: record.Seq,
 		})
 	case TypeCompactionCreated:
 		// Reserved for the compaction fold; the minimal fold keeps the full

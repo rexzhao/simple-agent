@@ -28,12 +28,8 @@ func TestAppendAndReopenFold(t *testing.T) {
 	}
 
 	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "run-1", Content: "hello world this is a long first message"})
-	appendRecord(t, session, Record{Type: TypeRunStarted, RunID: "run-1"})
-	appendRecord(t, session, Record{Type: TypeTurnStarted, RunID: "run-1", TurnID: "turn-1"})
-	appendRecord(t, session, Record{Type: TypeAssistantCheckpoint, RunID: "run-1", TurnID: "turn-1", ItemID: "assistant-1", Content: "partial"})
-	appendRecord(t, session, Record{Type: TypeAssistantReady, RunID: "run-1", TurnID: "turn-1", ItemID: "assistant-1", Content: "final answer", Reasoning: "thinking", ToolCalls: []WireToolCall{{ID: "call-1", Name: "read_file", Arguments: `{"path":"a.txt"}`}}})
+	appendRecord(t, session, Record{Type: TypeAssistantMessage, RunID: "run-1", TurnID: "turn-1", ItemID: "assistant-1", Content: "final answer", Reasoning: "thinking", ToolCalls: []WireToolCall{{ID: "call-1", Name: "read_file", Arguments: `{"path":"a.txt"}`}}})
 	appendRecord(t, session, Record{Type: TypeToolResult, RunID: "run-1", TurnID: "turn-1", ToolCallID: "call-1", ToolName: "read_file", Content: "file body"})
-	appendRecord(t, session, Record{Type: TypeRunSettled, RunID: "run-1", Status: RunStatusCommitted})
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -51,13 +47,6 @@ func TestAppendAndReopenFold(t *testing.T) {
 	if state.Title != "hello world this is a long first message" {
 		t.Fatalf("title = %q", state.Title)
 	}
-	if state.ActiveRun != "" {
-		t.Fatalf("active run = %q, want empty after settle", state.ActiveRun)
-	}
-	if state.Runs["run-1"] != RunStatusCommitted {
-		t.Fatalf("run status = %q", state.Runs["run-1"])
-	}
-
 	kinds := make([]string, 0, len(state.Items))
 	for _, item := range state.Items {
 		kinds = append(kinds, item.Kind)
@@ -66,10 +55,8 @@ func TestAppendAndReopenFold(t *testing.T) {
 	if strings.Join(kinds, ",") != strings.Join(want, ",") {
 		t.Fatalf("item kinds = %v, want %v", kinds, want)
 	}
-	// The checkpoint created the item and assistant.ready finalized it in
-	// place: still one assistant item, not two.
-	if state.Items[1].Content != "final answer" || state.Items[1].Streaming || state.Items[1].Reasoning != "thinking" {
-		t.Fatalf("assistant item not finalized: %+v", state.Items[1])
+	if state.Items[1].Content != "final answer" || state.Items[1].Reasoning != "thinking" {
+		t.Fatalf("assistant item = %+v", state.Items[1])
 	}
 	if len(state.Items[1].ToolCalls) != 1 || state.Items[1].ToolCalls[0].Name != "read_file" {
 		t.Fatalf("tool calls not folded: %+v", state.Items[1].ToolCalls)
@@ -78,8 +65,7 @@ func TestAppendAndReopenFold(t *testing.T) {
 		t.Fatalf("tool item not folded: %+v", state.Items[2])
 	}
 
-	// The model context must mirror the wire order and exclude the
-	// checkpoint-only content.
+	// The model context must mirror the wire order.
 	roles := make([]string, 0, len(state.Context))
 	for _, message := range state.Context {
 		roles = append(roles, string(message.Role))
@@ -101,7 +87,7 @@ func TestTornTailRecovery(t *testing.T) {
 	}
 	log := session
 	for i := 0; i < 3; i++ {
-		if _, err := log.Append(Record{Type: TypeTurnStarted, TurnID: "t"}); err != nil {
+		if _, err := log.Append(Record{Type: TypeUserInput, RunID: "r", Content: "x"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -155,21 +141,21 @@ func TestInvalidCompleteLineIsTornTail(t *testing.T) {
 	}
 }
 
-func TestRunSettleErrorCreatesErrorItem(t *testing.T) {
+func TestRunFailedCreatesErrorItem(t *testing.T) {
 	root := t.TempDir()
 	store, _ := OpenStore(root)
 	session, _ := store.Create("p", "m", "")
 	defer session.Close()
 	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "run-9", Content: "hi"})
-	appendRecord(t, session, Record{Type: TypeRunStarted, RunID: "run-9"})
-	appendRecord(t, session, Record{Type: TypeRunSettled, RunID: "run-9", Status: RunStatusFailed, Error: "provider exploded"})
+	appendRecord(t, session, Record{Type: TypeRunFailed, RunID: "run-9", Error: "provider exploded"})
 	state := session.Snapshot()
 	last := state.Items[len(state.Items)-1]
 	if last.Kind != ItemKindError || last.Content != "provider exploded" {
 		t.Fatalf("error item = %+v", last)
 	}
-	if state.Runs["run-9"] != RunStatusFailed {
-		t.Fatalf("run status = %q", state.Runs["run-9"])
+	// A failure is context-free: only the unanswered user message.
+	if len(state.Context) != 1 {
+		t.Fatalf("context = %d messages, want 1", len(state.Context))
 	}
 }
 
@@ -187,7 +173,7 @@ func TestSubscribeNotifiesOnAppend(t *testing.T) {
 		t.Fatal("no notification after append")
 	}
 	// A second append while the channel is full coalesces instead of blocking.
-	appendRecord(t, session, Record{Type: TypeRunStarted, RunID: "r"})
+	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "r2", Content: "again"})
 	select {
 	case <-ch:
 	default:
@@ -232,26 +218,21 @@ func TestListSessionsNewestFirst(t *testing.T) {
 	}
 }
 
-func TestCheckpointThenReopenKeepsStreamingDisplay(t *testing.T) {
-	// A crash between a checkpoint and assistant.ready leaves a streaming
-	// item on disk; reopening must show it rather than lose the partial
-	// output.
+func TestLegacyAssistantReadyStillFolds(t *testing.T) {
+	// Logs written before the assistant.ready → assistant.message rename
+	// must still fold their assistant messages.
 	root := t.TempDir()
 	store, _ := OpenStore(root)
 	session, _ := store.Create("p", "m", "")
+	defer session.Close()
 	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "r", Content: "q"})
-	appendRecord(t, session, Record{Type: TypeAssistantCheckpoint, RunID: "r", ItemID: "a-1", Content: "partial output"})
-	session.Close()
-
-	reopened, _ := store.Open(session.ID())
-	defer reopened.Close()
-	state := reopened.Snapshot()
-	if len(state.Items) != 2 || !state.Items[1].Streaming || state.Items[1].Content != "partial output" {
-		t.Fatalf("streaming item not recovered: %+v", state.Items)
+	appendRecord(t, session, Record{Type: TypeAssistantReady, RunID: "r", ItemID: "a-1", Content: "old spelling"})
+	state := session.Snapshot()
+	if len(state.Items) != 2 || state.Items[1].Content != "old spelling" {
+		t.Fatalf("legacy assistant item = %+v", state.Items)
 	}
-	// Streaming content never enters the model context.
-	if len(state.Context) != 1 {
-		t.Fatalf("context = %d messages, want 1", len(state.Context))
+	if len(state.Context) != 2 || state.Context[1].Content != "old spelling" {
+		t.Fatalf("legacy context = %+v", state.Context)
 	}
 }
 
@@ -384,25 +365,24 @@ func TestRecordsAfter(t *testing.T) {
 		t.Fatalf("lazy RecordsAfter = %v, %v", records, err)
 	}
 	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "r", Content: "one"})
-	appendRecord(t, session, Record{Type: TypeRunStarted, RunID: "r"})
-	appendRecord(t, session, Record{Type: TypeRunSettled, RunID: "r", Status: RunStatusCommitted})
+	appendRecord(t, session, Record{Type: TypeRunFailed, RunID: "r", Error: "boom"})
 
 	// seq 1 is the materialized session.created.
 	all, err := session.RecordsAfter(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 4 || all[0].Type != TypeSessionCreated {
+	if len(all) != 3 || all[0].Type != TypeSessionCreated {
 		t.Fatalf("RecordsAfter(0) = %d records, first %s", len(all), all[0].Type)
 	}
 	tail, err := session.RecordsAfter(2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tail) != 2 || tail[0].Seq != 3 || tail[1].Seq != 4 {
+	if len(tail) != 1 || tail[0].Seq != 3 {
 		t.Fatalf("RecordsAfter(2) = %+v", tail)
 	}
-	none, err := session.RecordsAfter(4)
+	none, err := session.RecordsAfter(3)
 	if err != nil || len(none) != 0 {
 		t.Fatalf("RecordsAfter(4) = %v, %v", none, err)
 	}

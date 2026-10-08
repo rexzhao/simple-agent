@@ -8,12 +8,15 @@ import (
 )
 
 // Publisher adapts the agent loop's durable event vocabulary onto JSONL
-// records. It implements eventbus.Publisher and
-// eventbus.AssistantCheckpointPublisher, so it can be handed to agent.Stream
-// directly and the log becomes the single durable sink.
+// records. It implements eventbus.Publisher, so it can be handed to
+// agent.Stream directly and the log becomes the single durable sink.
 //
-// The current run ID is stamped onto every record so the fold can group a
-// session turn with the user input that started it.
+// Only events which carry conversation content are recorded: assistant
+// messages and tool results. Turn boundaries and streaming checkpoints are
+// deliberately not persisted — the log is a conversation, not an event trace.
+//
+// The current run ID is stamped onto every record so the fold can group an
+// assistant message with the user input that prompted it.
 type Publisher struct {
 	session *Session
 }
@@ -33,30 +36,12 @@ func (p *Publisher) Publish(event eventbus.Event) error {
 	}
 	runID := p.session.currentRun()
 	switch event := event.(type) {
-	case eventbus.TurnStarted:
-		_, err := p.session.Append(Record{Type: TypeTurnStarted, RunID: runID, TurnID: event.TurnID})
-		return err
-	case eventbus.TurnCompleted:
-		_, err := p.session.Append(Record{Type: TypeTurnCompleted, RunID: runID, TurnID: event.TurnID})
-		return err
-	case eventbus.TurnInterrupted:
-		_, err := p.session.Append(Record{Type: TypeTurnInterrupted, RunID: runID, TurnID: event.TurnID})
-		return err
-	case eventbus.TurnInputReady:
-		_, err := p.session.Append(Record{Type: TypeTurnInput, RunID: runID, TurnID: event.TurnID, Content: event.Message.Content})
-		return err
 	case eventbus.AssistantReady:
 		_, err := p.session.Append(Record{
-			Type: TypeAssistantReady, RunID: runID, TurnID: event.TurnID, ItemID: event.ItemID,
+			Type: TypeAssistantMessage, RunID: runID, TurnID: event.TurnID, ItemID: event.ItemID,
 			Iteration: event.AgentIteration, Role: string(model.MessageRoleAssistant),
 			Content: event.Message.Content, Reasoning: event.Message.ReasoningContent,
 			ToolCalls: wireToolCalls(event.Message.ToolCalls),
-		})
-		return err
-	case eventbus.AssistantTextCheckpoint:
-		_, err := p.session.Append(Record{
-			Type: TypeAssistantCheckpoint, RunID: runID, TurnID: event.TurnID, ItemID: event.ItemID,
-			Iteration: event.AgentIteration, Content: event.Content,
 		})
 		return err
 	case eventbus.ToolResultReady:
@@ -66,17 +51,10 @@ func (p *Publisher) Publish(event eventbus.Event) error {
 			Content: event.Result.Content, IsError: event.Result.IsError,
 		})
 		return err
-	case eventbus.ModelEvent:
-		// Transient by contract; never durable.
-		return nil
 	default:
+		// TurnStarted, TurnCompleted, TurnInterrupted, TurnInputReady,
+		// AssistantTextCheckpoint and transient events carry no
+		// conversation content; they are not recorded.
 		return nil
 	}
-}
-
-// PublishAssistantCheckpoint implements eventbus.AssistantCheckpointPublisher.
-func (p *Publisher) PublishAssistantCheckpoint(turnID string, agentIteration int, itemID, content string) error {
-	return p.Publish(eventbus.AssistantTextCheckpoint{
-		TurnID: turnID, AgentIteration: agentIteration, ItemID: itemID, Content: content,
-	})
 }

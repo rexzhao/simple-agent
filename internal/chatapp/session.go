@@ -91,11 +91,6 @@ func (s *Session) Send(text string) error {
 		cancel()
 		return err
 	}
-	if _, err := s.log.Append(sessionlog.Record{Type: sessionlog.TypeRunStarted, RunID: runID}); err != nil {
-		s.mu.Unlock()
-		cancel()
-		return err
-	}
 	request := s.app.request(s.log.Snapshot().Context)
 	s.running = true
 	s.cancel = cancel
@@ -136,8 +131,10 @@ func (s *Session) Close() error {
 	return s.log.Close()
 }
 
-// pump forwards agent events to the UI channel and settles the run when the
-// agent loop finishes.
+// pump forwards agent events to the UI channel and records the failure when
+// the agent loop finishes with an error. A committed or interrupted run
+// writes nothing: committed is the absence of failure, and an interruption
+// simply leaves the user input unanswered.
 func (s *Session) pump(ctx context.Context, runID string, request model.Request, events chan model.Event) {
 	stream, err := agent.Stream(ctx, request, agent.Options{
 		Provider:     s.app.provider,
@@ -146,18 +143,13 @@ func (s *Session) pump(ctx context.Context, runID string, request model.Request,
 		TurnID:       newID("turn"),
 		Publisher:    s.pub,
 	})
-	var settleStatus string
-	var settleError string
+	var failure string
 	if err != nil {
-		settleStatus = sessionlog.RunStatusFailed
-		settleError = err.Error()
+		failure = err.Error()
 	} else {
-		settleStatus = sessionlog.RunStatusCommitted
 		for event := range stream {
-			switch event := event.(type) {
-			case model.ErrorEvent:
-				settleStatus = sessionlog.RunStatusFailed
-				settleError = eventMessage(event)
+			if failureEvent, ok := event.(model.ErrorEvent); ok && ctx.Err() == nil {
+				failure = eventMessage(failureEvent)
 			}
 			select {
 			case events <- event:
@@ -167,13 +159,11 @@ func (s *Session) pump(ctx context.Context, runID string, request model.Request,
 				// under backpressure is safe.
 			}
 		}
-		if ctx.Err() != nil {
-			settleStatus = sessionlog.RunStatusInterrupted
-			settleError = ""
-		}
 	}
 	close(events)
-	_, _ = s.log.Append(sessionlog.Record{Type: sessionlog.TypeRunSettled, RunID: runID, Status: settleStatus, Error: settleError})
+	if failure != "" {
+		_, _ = s.log.Append(sessionlog.Record{Type: sessionlog.TypeRunFailed, RunID: runID, Error: failure})
+	}
 	s.mu.Lock()
 	s.running = false
 	s.cancel = nil
@@ -187,7 +177,7 @@ func (a *App) request(context []model.Message) model.Request {
 	if a.systemPrompt != "" {
 		messages = append(messages, model.Message{Role: model.MessageRoleSystem, Content: a.systemPrompt})
 	}
-	messages = append(messages, context...)
+	messages = append(messages, sanitizeContext(context)...)
 	return model.Request{
 		Model:         a.resolved.ModelID,
 		Messages:      messages,
@@ -224,4 +214,49 @@ func newID(prefix string) string {
 		return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 	}
 	return prefix + "-" + hex.EncodeToString(raw[:])
+}
+
+// sanitizeContext patches a folded history so it always satisfies the
+// provider contract: every assistant tool call is followed by its tool
+// result. A run interrupted or crashed mid-tool leaves such gaps; the
+// missing results are synthesized as interrupted errors in call order.
+func sanitizeContext(context []model.Message) []model.Message {
+	result := make([]model.Message, 0, len(context))
+	var pending []model.ToolCall
+	// flush appends placeholder results for every unresolved tool call,
+	// in call order, so the next message follows a complete exchange.
+	flush := func() {
+		for _, call := range pending {
+			result = append(result, model.Message{
+				Role:       model.MessageRoleTool,
+				ToolCallID: call.ID,
+				Content:    "[tool execution interrupted]",
+				IsError:    true,
+			})
+		}
+		pending = nil
+	}
+	for _, message := range context {
+		switch {
+		case message.Role == model.MessageRoleAssistant && len(message.ToolCalls) > 0:
+			flush()
+			pending = append(pending, message.ToolCalls...)
+			result = append(result, message)
+		case message.Role == model.MessageRoleTool:
+			for i, call := range pending {
+				if call.ID == message.ToolCallID {
+					pending = append(pending[:i], pending[i+1:]...)
+				break
+				}
+			}
+			result = append(result, message)
+		default:
+			// A user message (or a no-tool assistant message) cannot follow
+			// unresolved tool calls: patch the gap first.
+			flush()
+			result = append(result, message)
+		}
+	}
+	flush()
+	return result
 }

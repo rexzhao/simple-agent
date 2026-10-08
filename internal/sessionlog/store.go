@@ -66,10 +66,9 @@ func (s *Store) Create(provider, model, cwd string) (*Session, error) {
 func (s *Store) SessionDir(id string) string { return filepath.Join(s.root, id) }
 
 // Open loads an existing session, recovering its folded state from the log.
-// Any run left in the running state by a crash is healed with an appended
-// run.settled(interrupted) record, so a resumed session never reports a
-// phantom active run. Healing is an append: it preserves the append-only
-// invariant and is idempotent per run.
+// A run which was interrupted by a crash needs no repair record: its user
+// input simply stays unanswered, and chatapp patches any dangling tool calls
+// before the next request.
 func (s *Store) Open(id string) (*Session, error) {
 	if !ValidSessionID(id) {
 		return nil, fmt.Errorf("invalid session id %q", id)
@@ -94,15 +93,6 @@ func (s *Store) Open(id string) (*Session, error) {
 	session := &Session{id: id, log: log, state: newState(id)}
 	for _, record := range records {
 		fold(session.state, record)
-	}
-	for runID, status := range session.state.Runs {
-		if status != RunStatusRunning {
-			continue
-		}
-		if _, err := session.Append(Record{Type: TypeRunSettled, RunID: runID, Status: RunStatusInterrupted}); err != nil {
-			log.Close()
-			return nil, fmt.Errorf("heal interrupted run %q: %w", runID, err)
-		}
 	}
 	return session, nil
 }
@@ -332,11 +322,6 @@ func copyState(state *State) State {
 	for i := range copied.Context {
 		copied.Context[i].ToolCalls = append([]model.ToolCall(nil), state.Context[i].ToolCalls...)
 	}
-	runs := make(map[string]string, len(state.Runs))
-	for id, status := range state.Runs {
-		runs[id] = status
-	}
-	copied.Runs = runs
 	return copied
 }
 

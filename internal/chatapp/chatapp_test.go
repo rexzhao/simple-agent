@@ -105,20 +105,10 @@ func TestSendRunSettlesAndPersists(t *testing.T) {
 	waitForSettle(t, session)
 
 	state := session.Snapshot()
-	if state.Runs[state.ActiveRun] == sessionlog.RunStatusRunning {
-		t.Fatal("run still marked running")
-	}
-	var statuses []string
-	for _, status := range state.Runs {
-		statuses = append(statuses, status)
-	}
-	if len(statuses) != 1 || statuses[0] != sessionlog.RunStatusCommitted {
-		t.Fatalf("run statuses = %v", statuses)
-	}
 	if len(state.Items) != 2 {
 		t.Fatalf("items = %d, want 2 (user + assistant)", len(state.Items))
 	}
-	if state.Items[1].Content != "hello there" || state.Items[1].Streaming {
+	if state.Items[1].Content != "hello there" {
 		t.Fatalf("assistant item = %+v", state.Items[1])
 	}
 	if len(state.Context) != 2 {
@@ -243,10 +233,13 @@ func TestStopInterruptsRun(t *testing.T) {
 	waitForSettle(t, session)
 
 	state := session.Snapshot()
-	for _, status := range state.Runs {
-		if status != sessionlog.RunStatusInterrupted {
-			t.Fatalf("run status = %q, want interrupted", status)
-		}
+	// An interrupted run needs no record: the user input simply stays
+	// unanswered, and no failure item appears.
+	if len(state.Items) != 1 || state.Items[0].Kind != sessionlog.ItemKindUser {
+		t.Fatalf("interrupted items = %+v", state.Items)
+	}
+	if len(state.Context) != 1 {
+		t.Fatalf("interrupted context = %d messages, want 1", len(state.Context))
 	}
 	session.Close()
 }
@@ -319,5 +312,88 @@ func TestAllUnknownToolsFallBackToBuiltins(t *testing.T) {
 	}
 	if len(app.toolSchemas) == 0 {
 		t.Fatal("fallback to builtins did not happen")
+	}
+}
+
+func TestSanitizeContextPatchesDanglingToolCalls(t *testing.T) {
+	// A run crashed mid-tool leaves an assistant tool call without its
+	// result, followed by the next user input.
+	input := []model.Message{
+		{Role: model.MessageRoleUser, Content: "q1"},
+		{Role: model.MessageRoleAssistant, Content: "checking", ToolCalls: []model.ToolCall{
+			{ID: "call-1", Name: "read_file", Arguments: "{}"},
+			{ID: "call-2", Name: "shell", Arguments: "{}"},
+		}},
+		{Role: model.MessageRoleUser, Content: "q2"},
+	}
+	patched := sanitizeContext(input)
+	roles := make([]string, 0, len(patched))
+	for _, message := range patched {
+		roles = append(roles, string(message.Role))
+	}
+	// Synthesized results land between the tool call and the next user
+	// message, in call order.
+	want := "user,assistant,tool,tool,user"
+	if strings.Join(roles, ",") != want {
+		t.Fatalf("patched roles = %v, want %v", roles, strings.Split(want, ","))
+	}
+	if patched[2].ToolCallID != "call-1" || patched[3].ToolCallID != "call-2" {
+		t.Fatalf("patched order = %q, %q", patched[2].ToolCallID, patched[3].ToolCallID)
+	}
+	if !patched[2].IsError || patched[2].Content != "[tool execution interrupted]" {
+		t.Fatalf("patched result = %+v", patched[2])
+	}
+}
+
+func TestSanitizeContextTrailingDanglingCalls(t *testing.T) {
+	// A crash can also leave the dangling calls at the very end of the log.
+	input := []model.Message{
+		{Role: model.MessageRoleUser, Content: "q1"},
+		{Role: model.MessageRoleAssistant, ToolCalls: []model.ToolCall{{ID: "call-1", Name: "shell", Arguments: "{}"}}},
+	}
+	patched := sanitizeContext(input)
+	if len(patched) != 3 || patched[2].Role != model.MessageRoleTool || patched[2].ToolCallID != "call-1" {
+		t.Fatalf("patched = %+v", patched)
+	}
+}
+
+func TestSanitizeContextKeepsCompleteExchanges(t *testing.T) {
+	input := []model.Message{
+		{Role: model.MessageRoleUser, Content: "q1"},
+		{Role: model.MessageRoleAssistant, ToolCalls: []model.ToolCall{{ID: "call-1", Name: "shell", Arguments: "{}"}}},
+		{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "ok"},
+		{Role: model.MessageRoleAssistant, Content: "done"},
+	}
+	patched := sanitizeContext(input)
+	if len(patched) != len(input) {
+		t.Fatalf("patched = %d messages, want %d (nothing to fix)", len(patched), len(input))
+	}
+}
+
+func TestFailedRunRecordsFailure(t *testing.T) {
+	root := t.TempDir()
+	writeTestConfig(t, root)
+	app, _ := New(Options{ServerRoot: root, CWD: root})
+	scripted := &scriptedProvider{}
+	scripted.stream = func(ctx context.Context) (<-chan model.Event, error) {
+		return nil, errors.New("connection refused")
+	}
+	app.provider = scripted
+
+	session, _ := app.NewSession()
+	defer session.Close()
+	if err := session.Send("hello"); err != nil {
+		t.Fatal(err)
+	}
+	waitForSettle(t, session)
+
+	state := session.Snapshot()
+	last := state.Items[len(state.Items)-1]
+	if last.Kind != sessionlog.ItemKindError || last.Content == "" {
+		t.Fatalf("failure item = %+v", last)
+	}
+	// The failure stays out of the model context.
+	if len(state.Context) != 1 {
+		t.Fatalf("context = %d messages, want 1", len(state.Context))
 	}
 }

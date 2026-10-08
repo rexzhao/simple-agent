@@ -1,11 +1,3 @@
-// Package sessionlog is the append-only JSONL session store. Every durable
-// fact about a session is one line in <session-dir>/log.jsonl; nothing is ever
-// updated or deleted. Session state is a fold of the log, rebuilt on open and
-// maintained incrementally as records are appended.
-//
-// The wire vocabulary deliberately mirrors the durable event vocabulary of the
-// agent loop (see internal/eventbus), so the JSONL publisher is a thin adapter
-// and the log can be replayed into model context without a translation layer.
 package sessionlog
 
 import (
@@ -17,27 +9,22 @@ import (
 
 // Record types. The set is closed: fold ignores unknown types so a newer
 // writer never corrupts an older reader.
+//
+// The vocabulary is a conversation log: session metadata, user inputs,
+// assistant messages, tool results, and failures. Run lifecycle needs no
+// records of its own — a user input starts its run, the absence of a failure
+// means it completed, and an interruption simply leaves the input
+// unanswered.
 const (
-	TypeSessionCreated      = "session.created"
-	TypeUserInput           = "user.input"
-	TypeRunStarted          = "run.started"
-	TypeRunSettled          = "run.settled"
-	TypeTurnStarted         = "turn.started"
-	TypeTurnCompleted       = "turn.completed"
-	TypeTurnInterrupted     = "turn.interrupted"
-	TypeTurnInput           = "turn.input"
-	TypeAssistantCheckpoint = "assistant.checkpoint"
-	TypeAssistantReady      = "assistant.ready"
-	TypeToolResult          = "tool.result"
-	TypeCompactionCreated   = "compaction.created"
-)
-
-// Run settle statuses.
-const (
-	RunStatusRunning     = "running"
-	RunStatusCommitted   = "committed"
-	RunStatusFailed      = "failed"
-	RunStatusInterrupted = "interrupted"
+	TypeSessionCreated   = "session.created"
+	TypeUserInput        = "user.input"
+	TypeAssistantMessage = "assistant.message"
+	// TypeAssistantReady is the pre-rename spelling of TypeAssistantMessage,
+	// accepted on read so logs written before the rename still fold.
+	TypeAssistantReady    = "assistant.ready"
+	TypeToolResult        = "tool.result"
+	TypeRunFailed         = "run.failed"
+	TypeCompactionCreated = "compaction.created"
 )
 
 // maxRecordBytes bounds a single JSONL line. Tool output larger than this is
@@ -52,9 +39,9 @@ type Record struct {
 	Type string `json:"t"`
 	Time string `json:"ts"`
 
-	// Identity scopes. RunID groups one user input into its settled run;
-	// TurnID groups one provider request; ItemID is the stable identity of
-	// one assistant message across checkpoints and its final record.
+	// Identity scopes. RunID groups one user input with its assistant
+	// messages and tool results; ItemID is the stable identity of one
+	// assistant message.
 	RunID     string `json:"run,omitempty"`
 	TurnID    string `json:"turn,omitempty"`
 	ItemID    string `json:"item,omitempty"`
@@ -76,9 +63,8 @@ type Record struct {
 	ToolName   string `json:"tool_name,omitempty"`
 	IsError    bool   `json:"is_error,omitempty"`
 
-	// Run settle payload.
-	Status string `json:"status,omitempty"`
-	Error  string `json:"error,omitempty"`
+	// Failure payload (run.failed).
+	Error string `json:"error,omitempty"`
 }
 
 // WireToolCall is the JSON form of model.ToolCall. The provider ID is not
@@ -111,14 +97,13 @@ func modelToolCalls(calls []WireToolCall) []model.ToolCall {
 	return result
 }
 
-// durable reports whether the record must survive a power failure. Streaming
-// checkpoints are excluded: a run in flight may lose its partial display
-// output, the settled records restore the authoritative content.
+// durable reports whether the record must survive a power failure. Failures
+// are durable so the reason a run died survives a crash; everything else in
+// the vocabulary is already terminal content.
 func (r Record) durable() bool {
 	switch r.Type {
-	case TypeSessionCreated, TypeUserInput, TypeRunStarted, TypeRunSettled,
-		TypeTurnStarted, TypeTurnCompleted, TypeTurnInterrupted, TypeTurnInput,
-		TypeAssistantReady, TypeToolResult, TypeCompactionCreated:
+	case TypeSessionCreated, TypeUserInput, TypeAssistantMessage,
+		TypeAssistantReady, TypeToolResult, TypeRunFailed, TypeCompactionCreated:
 		return true
 	default:
 		return false
