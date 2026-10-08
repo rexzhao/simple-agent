@@ -18,6 +18,7 @@ const (
 	itemKindRunFailed      = "f"
 	itemKindToolCall       = "c" // minted wire tool-call id fallback
 	itemKindRun            = "r" // run grouping id ("run-" prefixed)
+	itemKindCompaction     = "x" // context.compacted
 )
 
 // NewSessionID returns a fresh session identity.
@@ -37,6 +38,10 @@ func NewToolResultID() string { return NewItemID(itemKindToolResult) }
 
 // NewRunFailedID returns the item id of a run.failed record.
 func NewRunFailedID() string { return NewItemID(itemKindRunFailed) }
+
+// NewContextCompactedID returns the item id of a context.compacted
+// record, minted before the compaction model call begins.
+func NewContextCompactedID() string { return NewItemID(itemKindCompaction) }
 
 // NewToolCallID returns a minted wire tool-call id, used when a provider
 // issues none. Providers validate the pairing between assistant tool calls

@@ -119,3 +119,22 @@ func TestItemIDsAreUniqueAndPrefixed(t *testing.T) {
 		t.Fatalf("item id collisions: %d unique of 100", len(seen))
 	}
 }
+
+func TestFoldContextCompactedReplacesContext(t *testing.T) {
+	state := foldRecords(t, []Record{
+		{ItemID: "u1", Type: TypeUserInput, Content: "q1"},
+		{ItemID: "a1", Type: TypeAssistantMessage, Content: "a1"},
+		{ItemID: "u2", Type: TypeUserInput, Content: "q2"},
+		{ItemID: "x1", Type: TypeContextCompacted, Content: "summary of the work"},
+		{ItemID: "u3", Type: TypeUserInput, Content: "continue"},
+	})
+	if len(state.Context) != 2 {
+		t.Fatalf("Context length = %d, want summary + later input", len(state.Context))
+	}
+	if state.Context[0].Role != model.MessageRoleUser || state.Context[0].Content != "summary of the work" {
+		t.Fatalf("summary message = %+v", state.Context[0])
+	}
+	if state.Context[1].Content != "continue" {
+		t.Fatalf("post-compaction input lost: %+v", state.Context[1])
+	}
+}

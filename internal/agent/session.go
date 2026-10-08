@@ -385,16 +385,58 @@ func (s *Session) commitToolResult(resultItemID, runID string, iteration int, re
 
 // settle clears the run slot and the transient region. It is the last
 // state change before the run's done channel closes: whatever the exit
-// path, a settled session never shows a streaming message or a running
-// tool in its Snapshot (the partial content lived only in the failure
-// events).
+// path, a settled session never shows a streaming message, a running
+// tool, or an in-flight compaction in its Snapshot (the partial content
+// lived only in the failure events).
 func (s *Session) settle() {
 	s.mu.Lock()
 	s.running = false
 	s.cancel = nil
 	s.state.Streaming = nil
 	s.state.Running = nil
+	s.state.Compacting = nil
 	s.mu.Unlock()
+}
+
+// Compact summarizes the folded context and replaces it with the summary.
+// The compaction item's identity is minted before the model call; the
+// context.compacted record lands only on success — a failed or
+// interrupted compaction leaves the context untouched. Exclusive with
+// Send: the run slot is held for the duration of the summary call.
+func (s *Session) Compact() error {
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return fmt.Errorf("a run is already active; stop it first")
+	}
+	if len(s.state.Context) == 0 {
+		s.mu.Unlock()
+		return fmt.Errorf("nothing to compact")
+	}
+	itemID := storage.NewContextCompactedID()
+	s.state.Compacting = &storage.CompactingItem{ItemID: itemID, StartedAt: time.Now()}
+	request := s.agent.buildCompactionRequest(s.state.Context)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.running = true
+	s.cancel = cancel
+	s.done = done
+	s.mu.Unlock()
+
+	defer close(done)
+	defer s.settle()
+	defer cancel()
+
+	summary, err := s.agent.summarizeContext(ctx, request)
+	if err != nil {
+		return fmt.Errorf("compact: %w", err)
+	}
+	if strings.TrimSpace(summary) == "" {
+		return fmt.Errorf("compact: summary was empty")
+	}
+	return s.commit(storage.Record{
+		ItemID: itemID, Type: storage.TypeContextCompacted, Content: summary,
+	}, func(state *storage.State) { state.Compacting = nil })
 }
 
 // run drives one agent run: iterate (request the model, execute the tool

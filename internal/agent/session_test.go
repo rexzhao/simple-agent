@@ -595,3 +595,123 @@ func TestUnsubscribeDuringCommitNotifyDoesNotPanic(t *testing.T) {
 		t.Fatalf("commit after Stop: %v", err)
 	}
 }
+
+func TestCompactReplacesContextAndPersists(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "first answer"}},
+		{model.TextDeltaEvent{Text: "the summary"}},
+		{model.TextDeltaEvent{Text: "the answer"}},
+	}}
+	_, session := newTestAgent(t, provider, nil)
+	if err := session.Send("first question"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitSettled(t, session)
+	if err := session.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	// The compacted context is exactly one summary message.
+	snapshot := session.Snapshot()
+	if len(snapshot.Context) != 1 || snapshot.Context[0].Content != "the summary" {
+		t.Fatalf("context after compact = %+v", snapshot.Context)
+	}
+	if snapshot.Compacting != nil {
+		t.Fatal("compacting slot not cleared")
+	}
+
+	// The record landed, between the input and nothing else pending.
+	sub := session.Subscribe()
+	records := sub.Initial()
+	sub.Stop()
+	found := false
+	for _, record := range records {
+		if record.Type == storage.TypeContextCompacted {
+			found = true
+			if record.Content != "the summary" || record.ItemID == "" {
+				t.Fatalf("compaction record = %+v", record)
+			}
+			if record.RunID != "" {
+				t.Fatalf("compaction is not a run: %+v", record)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no context.compacted record in %v", recordTypes(records))
+	}
+
+	// The summary call carried the compaction prompt and no tools.
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider requests = %d, want 2", len(provider.requests))
+	}
+	summaryRequest := provider.requests[1]
+	if summaryRequest.Tools != nil {
+		t.Fatalf("compaction request offered tools: %+v", summaryRequest.Tools)
+	}
+	if summaryRequest.Messages[0].Role != model.MessageRoleSystem ||
+		!strings.Contains(summaryRequest.Messages[0].Content, "Summarize the conversation") {
+		t.Fatalf("compaction prompt missing: %+v", summaryRequest.Messages[0])
+	}
+
+	// A later Send continues from the summary.
+	if err := session.Send("next"); err != nil {
+		t.Fatalf("Send after compact: %v", err)
+	}
+	waitSettled(t, session)
+	continuation := provider.requests[2].Messages
+	if len(continuation) != 2 ||
+		continuation[0].Role != model.MessageRoleUser || continuation[0].Content != "the summary" ||
+		continuation[1].Content != "next" {
+		t.Fatalf("continuation request = %+v, want summary + next input", continuation)
+	}
+}
+
+func TestCompactFailureLeavesContextUntouched(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "first answer"}},
+		{model.ErrorEvent{Err: errors.New("summary provider down")}},
+	}}
+	_, session := newTestAgent(t, provider, nil)
+	if err := session.Send("question"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitSettled(t, session)
+
+	err := session.Compact()
+	if err == nil || !strings.Contains(err.Error(), "summary provider down") {
+		t.Fatalf("Compact error = %v, want the provider failure", err)
+	}
+	sub := session.Subscribe()
+	records := sub.Initial()
+	sub.Stop()
+	for _, record := range records {
+		if record.Type == storage.TypeContextCompacted {
+			t.Fatalf("failed compaction left a record: %+v", record)
+		}
+	}
+	snapshot := session.Snapshot()
+	if len(snapshot.Context) != 2 || snapshot.Compacting != nil {
+		t.Fatalf("context changed by failed compaction: %+v", snapshot)
+	}
+}
+
+func TestCompactGuards(t *testing.T) {
+	provider := &gatedProvider{gate: make(chan struct{})}
+	_, session := newTestAgent(t, provider, nil)
+
+	// Empty context: nothing to compact.
+	if err := session.Compact(); err == nil || !strings.Contains(err.Error(), "nothing to compact") {
+		t.Fatalf("empty compact = %v, want rejection", err)
+	}
+
+	// While a run is active: rejected.
+	if err := session.Send("hi"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if err := session.Compact(); err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("compact while running = %v, want rejection", err)
+	}
+	session.Stop()
+	close(provider.gate)
+	waitSettled(t, session)
+}

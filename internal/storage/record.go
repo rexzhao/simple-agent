@@ -21,6 +21,7 @@ const (
 	TypeAssistantMessage = "assistant.message"
 	TypeToolResult       = "tool.result"
 	TypeRunFailed        = "run.failed"
+	TypeContextCompacted = "context.compacted"
 )
 
 // MaxRecordBytes bounds a single JSONL line. Tool output larger than this is
@@ -101,7 +102,7 @@ func ModelToolCalls(calls []WireToolCall) []model.ToolCall {
 func (r Record) Durable() bool {
 	switch r.Type {
 	case TypeSessionCreated, TypeUserInput, TypeAssistantMessage,
-		TypeToolResult, TypeRunFailed:
+		TypeToolResult, TypeRunFailed, TypeContextCompacted:
 		return true
 	default:
 		return false

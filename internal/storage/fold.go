@@ -34,8 +34,9 @@ type State struct {
 	Context []model.Message
 
 	// Transient region.
-	Streaming *StreamingItem
-	Running   *RunningTool
+	Streaming  *StreamingItem
+	Running    *RunningTool
+	Compacting *CompactingItem
 }
 
 // StreamingItem is the assistant message currently being generated. It is
@@ -51,6 +52,14 @@ type StreamingItem struct {
 type RunningTool struct {
 	ItemID    string
 	ToolCall  model.ToolCall
+	StartedAt time.Time
+}
+
+// CompactingItem is the context compaction currently in flight. ItemID is
+// the identity of the context.compacted record which will land on success;
+// a failed or interrupted compaction leaves nothing behind.
+type CompactingItem struct {
+	ItemID    string
 	StartedAt time.Time
 }
 
@@ -99,6 +108,12 @@ func Fold(state *State, record Record) {
 		// A failed run leaves its error out of the context: committed is
 		// the absence of failure, and an interruption simply leaves the
 		// user input unanswered.
+	case TypeContextCompacted:
+		// The compacted history is replaced by the summary: subsequent
+		// requests see exactly one user message carrying it. Everything
+		// before the compaction point — including any dangling tool
+		// exchanges — is gone.
+		state.Context = []model.Message{{Role: model.MessageRoleUser, Content: record.Content}}
 	default:
 		// Unknown record type: ignore for forward compatibility.
 	}
@@ -119,6 +134,10 @@ func CopyState(state *State) State {
 	if state.Running != nil {
 		running := *state.Running
 		copied.Running = &running
+	}
+	if state.Compacting != nil {
+		compacting := *state.Compacting
+		copied.Compacting = &compacting
 	}
 	return copied
 }

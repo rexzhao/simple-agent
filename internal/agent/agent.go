@@ -200,6 +200,54 @@ func sanitizeContext(context []model.Message) []model.Message {
 	return result
 }
 
+// compactionPrompt instructs the summary model call of /compact.
+const compactionPrompt = `Summarize the conversation so far so that work can continue with this summary as the only context. Preserve:
+
+- The user's goal and any constraints
+- Decisions made and their reasons
+- Files read or changed, and what was learned or done to them
+- Commands run and their outcomes
+- The current state and the next steps
+
+Write the summary as a compact briefing addressed to the assistant that continues the work. Omit pleasantries.`
+
+// buildCompactionRequest assembles the summary request: the compaction
+// prompt instead of the normal system prompt, the sanitized history as
+// payload, and no tools — a summary must not call tools.
+func (a *Agent) buildCompactionRequest(context []model.Message) model.Request {
+	messages := make([]model.Message, 0, len(context)+1)
+	messages = append(messages, model.Message{Role: model.MessageRoleSystem, Content: compactionPrompt})
+	messages = append(messages, sanitizeContext(context)...)
+	return model.Request{
+		Model:         a.modelID,
+		Messages:      messages,
+		Parameters:    a.parameters,
+		DeveloperRole: a.developerRole,
+		MaxTokens:     a.outputLimit,
+	}
+}
+
+// summarizeContext runs one model call and collects its text output.
+func (a *Agent) summarizeContext(ctx context.Context, request model.Request) (string, error) {
+	stream, err := a.provider.Stream(ctx, request)
+	if err != nil {
+		return "", err
+	}
+	var content strings.Builder
+	for event := range stream {
+		switch event := event.(type) {
+		case model.TextDeltaEvent:
+			content.WriteString(event.Text)
+		case model.ErrorEvent:
+			return "", event.Err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return content.String(), nil
+}
+
 // enabledToolNames indexes the request's tool schemas for the enabled-tool
 // check during execution.
 func enabledToolNames(toolSchemas []model.Tool) map[string]struct{} {

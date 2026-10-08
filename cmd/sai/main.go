@@ -280,8 +280,12 @@ func (c *cliApp) dispatch(text string) bool {
 	case text == "/stop":
 		c.session.Stop()
 		fmt.Fprintln(os.Stderr, "sai: stopping run")
+	case text == "/compact":
+		if err := c.compact(); err != nil {
+			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
+		}
 	case text == "/help":
-		fmt.Fprintln(os.Stderr, "sai: /clear new session · /resume <id> reopen a stored session · /stop stop the run · /quit exit")
+		fmt.Fprintln(os.Stderr, "sai: /clear new session · /compact summarize the context · /resume <id> reopen a session · /stop stop the run · /quit exit")
 	case strings.HasPrefix(text, "/resume"):
 		c.resumeCommand(strings.TrimSpace(strings.TrimPrefix(text, "/resume")))
 	default:
@@ -374,6 +378,24 @@ func (c *cliApp) reconcileParked() {
 	for _, record := range parked {
 		if !c.liveShownHas(record.ItemID) {
 			c.printer.line(formatRecord(record))
+		}
+	}
+}
+
+// compact summarizes the session context. The spinner runs while the
+// summary generates; the committed record prints through the watcher.
+func (c *cliApp) compact() error {
+	done := make(chan error, 1)
+	go func() { done <- c.session.Compact() }()
+	frame := 0
+	for {
+		select {
+		case err := <-done:
+			c.printer.clear()
+			return err
+		case <-time.After(spinnerInterval):
+			c.printer.frame(spinnerFrames[frame%len(spinnerFrames)])
+			frame++
 		}
 	}
 }

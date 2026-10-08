@@ -66,6 +66,7 @@ user.input        {ItemID, RunID, Content}
 assistant.message {ItemID, RunID, Content, Reasoning, ToolCalls[{ID, Name, Arguments}], Iter}
 tool.result       {ItemID, RunID, ToolCallID, Name, Content, IsError, Iter}
 run.failed        {ItemID, RunID, Error}
+context.compacted {ItemID, Content}                  // 摘要替换全量历史，无 RunID（会话级）
 ```
 
 字段归属（自足的事实 + wire 回放必需的数据，仅此而已）：
@@ -102,6 +103,7 @@ ItemID mint 时机（全部满足“身份先于落盘”）：
 | assistant.message | 迭代开始 |
 | tool.result | **ToolStarted 时**（执行开始，结果身份先于结果存在） |
 | run.failed | settle 时 |
+| context.compacted | Compact 开始时（记录仅成功时落盘，失败/中断不留痕） |
 
 session.created 的落盘由状态层完成（NewSession 备好记录，commitLocked
 随第一条真实记录提交），store 只分配会话 ID 和目录——这保证**每条记录
@@ -122,8 +124,9 @@ type State struct {
     Context []model.Message    // 下次请求的历史（wire 世界）
 
     // transient 区：只由 delta/生命周期事件推进，重启即失
-    Streaming *StreamingItem   // 生成中的 assistant message（含半成品 tool calls）
-    Running   *RunningTool     // 执行中的 tool
+    Streaming  *StreamingItem  // 生成中的 assistant message（含半成品 tool calls）
+    Running    *RunningTool    // 执行中的 tool
+    Compacting *CompactingItem // 进行中的上下文压缩（成功时落 context.compacted）
 }
 
 type RunningTool struct {
@@ -225,9 +228,8 @@ ItemID upsert、按 RunID 分组。CLI 现在直接消费同一事件流，零�
 
 ## 12. 已记录的未来需求（未设计）
 
-- **/clear 只重置 context window，不新开 session**：/clear 应仅清空模型
-  请求的上下文，session id 不变，同一日志继续追加。存储侧如何表达（例如
-  引入 compaction 类记录，由 Fold 在该点截断 Context，UI 是否同时清屏）
-  到实现时再定。旧 sessionlog 曾为此预留 `compaction.created` 类型；新
-  schema 有意不预留——Fold 忽略未知类型，将来新增记录类型不会破坏现有
-  读者（降级为保持全量历史，安全）。
+- ~~**/clear 只重置 context window，不新开 session**~~——需求已取消：
+  /clear 保持现状（新开 session），上下文重置由 /compact 承担。
+- **自动压缩**：当前无自动压缩（旧 web 栈的 execution 层实现随重构删除），
+  上下文无限增长直到 provider 拒绝。将来若加，复用 `context.compacted`
+  记录——手动与自动产出完全相同的记录，Fold 无需区分。

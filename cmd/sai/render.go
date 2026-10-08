@@ -67,6 +67,8 @@ func recordHeader(record storage.Record) string {
 		label = "tool"
 	case storage.TypeRunFailed:
 		label = "error"
+	case storage.TypeContextCompacted:
+		label = "compact"
 	default:
 		label = record.Type
 	}
@@ -132,6 +134,8 @@ func recordBody(record storage.Record) string {
 		return truncateResultBody(record.Content)
 	case storage.TypeRunFailed:
 		return record.Error
+	case storage.TypeContextCompacted:
+		return record.Content
 	default:
 		return ""
 	}
