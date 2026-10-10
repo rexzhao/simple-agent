@@ -117,7 +117,7 @@ func recordBody(record storage.Record) string {
 	case storage.TypeAssistantMessage:
 		var parts []string
 		if record.Reasoning != "" {
-			parts = append(parts, prefixLines(renderReasoning(record.Reasoning), "· "))
+			parts = append(parts, gray(prefixLines(renderReasoning(record.Reasoning), "· ")))
 		}
 		if record.Content != "" {
 			parts = append(parts, record.Content)

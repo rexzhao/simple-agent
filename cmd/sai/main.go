@@ -90,6 +90,9 @@ func main() {
 	}
 
 	// Ctrl+C stops the active run; a second Ctrl+C when idle exits.
+	// Color is for terminals only; pipes and files must stay plain.
+	colorEnabled = stdoutIsTerminal() && enableVirtualTerminal()
+
 	interrupts := make(chan os.Signal, 1)
 	signal.Notify(interrupts, os.Interrupt)
 	go func() {

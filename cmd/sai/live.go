@@ -143,7 +143,14 @@ func (w *liveWriter) writeChunk(chunk string, reasoning bool) {
 	}
 	w.lastKind = kind
 	w.sawOutput.Store(true)
-	builder.WriteString(formatLiveChunk(chunk, reasoning, &w.lineStart))
+	formatted := formatLiveChunk(chunk, reasoning, &w.lineStart)
+	if reasoning {
+		// Each reasoning chunk carries its own color and reset: the
+		// gray never survives into the answer, the spinner, or a
+		// following write.
+		formatted = gray(formatted)
+	}
+	builder.WriteString(formatted)
 	w.printer.write(builder.String())
 }
 
