@@ -771,3 +771,32 @@ func TestCompactSegmentsAcrossReopenWithJSONL(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+// MaterializeHeader: the header lands through the same write path as a
+// commit (fold + records cache + storage), a second call is a no-op,
+// and the pending slot is cleared.
+func TestMaterializeHeader(t *testing.T) {
+	_, session := newTestAgent(t, &fakeProvider{}, nil)
+
+	if got := len(sessionRecords(t, session)); got != 0 {
+		t.Fatalf("fresh session has %d records", got)
+	}
+	if err := session.MaterializeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	records := sessionRecords(t, session)
+	if len(records) != 1 || records[0].Type != storage.TypeSessionCreated {
+		t.Fatalf("records = %+v, want only the header", records)
+	}
+	if snapshot := session.Snapshot(); snapshot.Title != "" || len(snapshot.Context) != 0 {
+		t.Fatalf("header must fold into no context: %+v", snapshot)
+	}
+
+	// Second call: no-op (the pending slot is cleared).
+	if err := session.MaterializeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(sessionRecords(t, session)); got != 1 {
+		t.Fatalf("after second materialize: %d records, want 1", got)
+	}
+}

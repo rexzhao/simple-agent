@@ -5,7 +5,10 @@
 // only writer and the only folder.
 package storage
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // SessionInfo describes one stored session for listing (the serve-mode
 // project/session browser). Title is best-effort: the first user input of
@@ -65,3 +68,8 @@ type Store interface {
 	// real corruption errors.
 	ListSessions(projectID string) ([]SessionInfo, error)
 }
+
+// ErrSessionNotFound is the typed sentinel for opening a session that
+// does not exist (or lives outside the requested project). Callers
+// classify with errors.Is — never by parsing the message.
+var ErrSessionNotFound = errors.New("session not found")

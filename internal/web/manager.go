@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +44,7 @@ type Manager struct {
 
 	sweeperStop chan struct{}
 	sweeperDone chan struct{}
+	closeOnce   sync.Once
 }
 
 // sessionEntry is one open session. refs counts in-flight requests;
@@ -64,7 +63,7 @@ var (
 	// SessionIdleEvict is how long a session survives with no request,
 	// no subscriber, and no run before the sweeper closes it (releasing
 	// the OS lock for a CLI process). A var: tests shrink it.
-	SessionIdleEvict = 30 * time.Second // a var: tests shrink it
+	SessionIdleEvict = 30 * time.Second
 	// sweeperInterval is the eviction scan period; it also refreshes
 	// idleSince for running sessions, so measured idle time can exceed
 	// the true idle by at most one interval (the safe direction —
@@ -120,24 +119,30 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 }
 
 // Close stops the sweeper, every hub, and every session, and releases
-// the root lock.
+// the root lock. Idempotent: the serve shutdown has two entry points
+// (the interrupt goroutine and the console loop's end/EOF) that can
+// race, plus error paths. It ignores refs — in-flight requests are
+// closed along with their sessions; that is the exit semantics, not
+// the steady-state ones.
 func (m *Manager) Close() {
-	close(m.sweeperStop)
-	<-m.sweeperDone
+	m.closeOnce.Do(func() {
+		close(m.sweeperStop)
+		<-m.sweeperDone
 
-	m.mu.Lock()
-	entries := make([]*sessionEntry, 0, len(m.sessions))
-	for id, entry := range m.sessions {
-		entries = append(entries, entry)
-		delete(m.sessions, id)
-		m.closing[id] = struct{}{}
-	}
-	m.mu.Unlock()
-	for _, entry := range entries {
-		entry.hub.Stop()
-		_ = entry.session.Close()
-	}
-	m.rootLock.Release()
+		m.mu.Lock()
+		entries := make([]*sessionEntry, 0, len(m.sessions))
+		for id, entry := range m.sessions {
+			entries = append(entries, entry)
+			delete(m.sessions, id)
+			m.closing[id] = struct{}{}
+		}
+		m.mu.Unlock()
+		for _, entry := range entries {
+			entry.hub.Stop()
+			_ = entry.session.Close()
+		}
+		m.rootLock.Release()
+	})
 }
 
 // StopRuns stops every active run across all open sessions (the serve
@@ -186,8 +191,12 @@ func (m *Manager) Preopen(sessionID string) error {
 // Session opens a session lazily and returns the manager's object for
 // it — through the same registration gate and error triage as the
 // routes. The caller drives THAT object (sends on it notify its hub,
-// snapshots reflect it); the entry stays subject to the idle
-// eviction rules. Preopen is the hold-forever form.
+// snapshots reflect it). CAVEAT: the refs go back to zero here, so the
+// entry stays subject to idle eviction — a caller holding the object
+// across eviction drives a closed session (errors surface on use).
+// Current callers are tests; a long-lived host (a future /tail tap)
+// should take the release func instead — split the signature when that
+// consumer exists. Preopen is the hold-forever form.
 func (m *Manager) Session(id string) (*agent.Session, error) {
 	entry, release, status, err := m.open(id)
 	if err != nil {
@@ -236,13 +245,19 @@ func (m *Manager) open(id string) (*sessionEntry, func(), int, error) {
 	// Find the owning registered project — a lock-free probe, so the
 	// agent assembly (which may fail) happens BEFORE the session lock:
 	// a failed assembly must not leave a zombie locked entry.
+	// The same id under two REGISTERED projects means hand-copied
+	// directories: refuse instead of silently picking the first
+	// (design §4).
 	var ownerPath, ownerID string
 	for _, entry := range m.entriesLocked() {
 		projectID := jsonl.ProjectID(entry.Path)
-		if m.store.HasSession(projectID, id) {
-			ownerPath, ownerID = entry.Path, projectID
-			break
+		if !m.store.HasSession(projectID, id) {
+			continue
 		}
+		if ownerID != "" {
+			return nil, nil, http.StatusConflict, fmt.Errorf("multiple registered projects hold session %s", id)
+		}
+		ownerPath, ownerID = entry.Path, projectID
 	}
 	if ownerID == "" {
 		return nil, nil, http.StatusNotFound, fmt.Errorf("unknown session")
@@ -267,7 +282,7 @@ func (m *Manager) open(id string) (*sessionEntry, func(), int, error) {
 			// retryable from this serve — the page must not loop.
 			return nil, nil, http.StatusConflict, &apiError{code: "session_locked", cause: err}
 		}
-		if isNotFound(err) {
+		if errors.Is(err, storage.ErrSessionNotFound) {
 			return nil, nil, http.StatusNotFound, fmt.Errorf("unknown session")
 		}
 		// Segment corruption, permissions: real errors, surfaced.
@@ -338,32 +353,40 @@ func (m *Manager) sweepLoop() {
 	}
 }
 
+type evictJob struct {
+	id    string
+	entry *sessionEntry
+}
+
 func (m *Manager) sweep() {
 	now := time.Now()
 	m.mu.Lock()
-	var evict []*sessionEntry
-	var ids []string
+	var evict []evictJob
 	for id, entry := range m.sessions {
 		if entry.refs > 0 || entry.hub.Subscribers() > 0 || entry.session.Running() {
 			// Known active: restart the clock. For a running session
 			// this refresh is the run-end transition (up to one
 			// interval late — the safe direction, eviction delayed).
+			// A COMPACTING session is covered here too: Compact
+			// occupies the run slot for the whole summary — if that
+			// ever changes, the sweeper must learn the Compacting
+			// transient explicitly (Close mid-summary would lose the
+			// failure notice with the hub).
 			entry.idleSince = now
 			continue
 		}
 		if now.Sub(entry.idleSince) >= SessionIdleEvict {
 			delete(m.sessions, id)
 			m.closing[id] = struct{}{}
-			evict = append(evict, entry)
-			ids = append(ids, id)
+			evict = append(evict, evictJob{id: id, entry: entry})
 		}
 	}
 	m.mu.Unlock()
-	for i, entry := range evict {
-		entry.hub.Stop()
-		_ = entry.session.Close()
+	for _, job := range evict {
+		job.entry.hub.Stop()
+		_ = job.entry.session.Close()
 		m.mu.Lock()
-		delete(m.closing, ids[i])
+		delete(m.closing, job.id)
 		m.mu.Unlock()
 	}
 }
@@ -420,27 +443,31 @@ func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 
 	body := projectsBody{RegistryOK: regErr == nil}
 	body.Projects = make([]projectsProjectWire, len(entries))
+	// Identity goes in BEFORE the listings: a failed listing then
+	// leaves a project with no sessions rather than an empty shell
+	// with no id (which the page could neither render nor debug).
+	for i, entry := range entries {
+		body.Projects[i] = projectsProjectWire{ID: jsonl.ProjectID(entry.Path), Path: entry.Path}
+	}
 	var wg sync.WaitGroup
 	for i, entry := range entries {
 		wg.Add(1)
-		go func(i int, path, projectID string) {
+		go func(i int, projectID string) {
 			defer wg.Done()
 			infos, err := m.store.ListSessions(projectID)
 			if err != nil {
 				log.Printf("sai: serve: list %s: %v", projectID, err)
 				return
 			}
-			wire := projectsProjectWire{ID: projectID, Path: path}
 			for _, info := range infos {
-				wire.Sessions = append(wire.Sessions, projectsSessionWire{
+				body.Projects[i].Sessions = append(body.Projects[i].Sessions, projectsSessionWire{
 					ID:      info.ID,
 					Title:   info.Title,
 					Created: info.Created,
 					Active:  openIDs[info.ID],
 				})
 			}
-			body.Projects[i] = wire
-		}(i, entry.Path, jsonl.ProjectID(entry.Path))
+		}(i, jsonl.ProjectID(entry.Path))
 	}
 	wg.Wait()
 
@@ -455,16 +482,6 @@ func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(encoded)
-}
-
-// isNotFound matches the store's not-found failures. The lock sentinel
-// is checked first (it is a cousin of not-found in wording only).
-func isNotFound(err error) bool {
-	var held *jsonl.LockHeldError
-	if errors.As(err, &held) {
-		return false
-	}
-	return errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "not found")
 }
 
 // apiError carries the stable code for the JSON error body.

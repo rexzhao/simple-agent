@@ -43,7 +43,7 @@ func (s *Store) Open(id string) (storage.Session, error) {
 	defer s.mu.Unlock()
 	log, ok := s.sessions[id]
 	if !ok {
-		return nil, fmt.Errorf("open session %q: not found", id)
+		return nil, fmt.Errorf("open session %q: %w", id, storage.ErrSessionNotFound)
 	}
 	return &Session{id: id, log: log}, nil
 }
@@ -122,11 +122,11 @@ func (s *Store) OpenIn(projectID, sessionID string) (storage.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.projectOf[sessionID] != projectID {
-		return nil, fmt.Errorf("open session %q: not found", sessionID)
+		return nil, fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
 	}
 	log, ok := s.sessions[sessionID]
 	if !ok {
-		return nil, fmt.Errorf("open session %q: not found", sessionID)
+		return nil, fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
 	}
 	return &Session{id: sessionID, log: log}, nil
 }

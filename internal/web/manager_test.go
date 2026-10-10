@@ -180,7 +180,10 @@ func TestSweeperEvictsIdleSession(t *testing.T) {
 
 	id := createJSONLSession(t, provider, store, projectDir)
 
-	// Open it through a request; then let it go idle.
+	// Open it through a request; then let it go idle. Unlinking from
+	// the map precedes teardown by design — wait for the CLOSING SET
+	// to clear instead: that is the point where the lock is released
+	// (waiting for the unlink alone races the closing window).
 	resp, err := http.Get(base.URL + "/api/s/" + id + "/state") //nolint:noctx // test
 	if err != nil {
 		t.Fatal(err)
@@ -192,8 +195,9 @@ func TestSweeperEvictsIdleSession(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool {
 		manager.mu.Lock()
 		defer manager.mu.Unlock()
+		_, busy := manager.closing[id]
 		_, open := manager.sessions[id]
-		return !open
+		return !busy && !open
 	})
 
 	// The lock is really released: another session open (a second agent
@@ -266,12 +270,13 @@ func TestSweeperNeverEvictsActiveSession(t *testing.T) {
 	release()
 	provider.release() // let the gated run settle: Running blocks eviction
 
-	// Now idle: eviction reclaims it.
+	// Now idle: eviction reclaims it (same closing-set condition).
 	waitFor(t, 2*time.Second, func() bool {
 		manager.mu.Lock()
 		defer manager.mu.Unlock()
+		_, busy := manager.closing[id]
 		_, open := manager.sessions[id]
-		return !open
+		return !busy && !open
 	})
 }
 
@@ -477,4 +482,83 @@ func fetchProjects(t *testing.T, base string) projectsBody {
 		t.Fatal(err)
 	}
 	return body
+}
+
+// Close is idempotent: the serve shutdown has two entry points (the
+// interrupt goroutine and the console loop) that can race.
+func TestManagerCloseIdempotent(t *testing.T) {
+	provider := &steerFlowProvider{gate: make(chan struct{})}
+	t.Cleanup(provider.release)
+	manager, _, base, projectDir := newJSONLTestServer(t, provider)
+	store := jsonlStoreOf(t, manager)
+	id := createJSONLSession(t, provider, store, projectDir)
+	resp, err := http.Get(base.URL + "/api/s/" + id + "/state") //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	manager.Close()
+	manager.Close() // must not panic (close of closed channel)
+}
+
+// The same session id under two REGISTERED projects (hand-copied
+// directories) is refused, not silently resolved to the first.
+func TestDuplicateSessionAcrossProjectsIs409(t *testing.T) {
+	provider := &steerFlowProvider{gate: make(chan struct{})}
+	t.Cleanup(provider.release)
+	manager, _, base, projectDir := newJSONLTestServer(t, provider)
+	store := jsonlStoreOf(t, manager)
+	id := createJSONLSession(t, provider, store, projectDir)
+
+	// Copy the session directory into a second registered project.
+	secondDir := t.TempDir()
+	registry := &projects.Registry{Projects: []projects.Entry{
+		{Path: projectDir, Added: time.Now().UTC()},
+		{Path: secondDir, Added: time.Now().UTC()},
+	}}
+	if err := registry.Save(projects.FilePath(manager.root)); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyTree(t, filepath.Join(store.Root(), jsonl.ProjectID(projectDir), id),
+		filepath.Join(store.Root(), jsonl.ProjectID(secondDir), id)); err != nil {
+		t.Fatal(err)
+	}
+	manager.projectsMu.Lock()
+	manager.projectsCache, manager.projectsCached = nil, time.Time{}
+	manager.projectsMu.Unlock()
+
+	resp, err := http.Get(base.URL + "/api/s/" + id + "/state") //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate session: %d, want 409", resp.StatusCode)
+	}
+}
+
+// copyTree copies a session directory (files only).
+func copyTree(t *testing.T, src, dst string) error {
+	t.Helper()
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(src, entry.Name()))
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dst, entry.Name()), data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }

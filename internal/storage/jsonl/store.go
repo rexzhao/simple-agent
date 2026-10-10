@@ -256,7 +256,7 @@ func (s *Store) sessionDir(id string) (string, error) {
 		}
 	}
 	if hit == "" {
-		return "", fmt.Errorf("open session %q: not found", id)
+		return "", fmt.Errorf("open session %q: %w", id, storage.ErrSessionNotFound)
 	}
 	return hit, nil
 }
@@ -294,7 +294,7 @@ func (s *Store) OpenIn(projectID, sessionID string) (storage.Session, error) {
 	}
 	dir := filepath.Join(s.root, projectID, sessionID)
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-		return nil, fmt.Errorf("open session %q: not found", sessionID)
+		return nil, fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
 	}
 	return s.openDir(sessionID, dir)
 }

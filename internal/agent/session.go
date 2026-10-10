@@ -425,6 +425,13 @@ func (s *Session) commit(record storage.Record, clear func(*storage.State)) erro
 // disk before any run (the serve-mode session lifecycle) flush just
 // the header. It is a no-op for sessions that already committed
 // anything.
+//
+// INVARIANT: call it only BEFORE the session's first run and first
+// subscriber. The write and the fold are serialized against commit by
+// s.mu, but the subscriber delivery happens outside the lock — two
+// out-of-order deliveries would break the digest chain's ordering,
+// which is why the first-run-first-subscriber window is the only safe
+// one (and the only one any host needs).
 func (s *Session) MaterializeHeader() error {
 	s.mu.Lock()
 	if s.pendingCreated == nil {
