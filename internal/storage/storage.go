@@ -59,9 +59,10 @@ type Store interface {
 	// the lock; a failed assembly must not leave a zombie lock).
 	HasSession(projectID, sessionID string) bool
 	// Delete removes a stored session and its records, permanently.
-	// The session lock is taken first — a holder (a CLI mid-write, or
-	// this process) refuses the deletion instead of silently unlinking
-	// files under an active writer.
+	// The jsonl layer refuses an EXTERNAL lock holder (a CLI mid-write)
+	// instead of silently unlinking files under an active writer; a
+	// session held open by the CALLING process is the caller's business
+	// (the serve manager refuses its own open sessions before calling)
 	Delete(projectID, sessionID string) error
 	// ListSessions enumerates the stored sessions of one project,
 	// newest activity first (ID as the tiebreak). Sessions never

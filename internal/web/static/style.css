@@ -80,11 +80,16 @@ main:has(#rows:not(:empty)) #empty-view { display: none; }
 #sync.sync-unknown { color: var(--dim); }
 
 /* session delete affordance inside the sidebar link */
-.session-link { position: relative; padding-right: 1.5em; }
+.session-link { position: relative; }
 .session-link .delete {
-  position: absolute; right: .2em; top: .25em;
+  position: absolute; right: .2em; top: .3em;
   background: none; border: none; color: var(--dim); cursor: pointer;
   font-size: 12px; padding: 0 .2em; visibility: hidden;
 }
 .session-link:hover .delete, .session-link:focus-within .delete { visibility: visible; }
 .session-link .delete:hover { color: var(--fg); }
+
+/* the row is a div; the inner <a> carries the navigation */
+.session-link > a { display: block; color: inherit; text-decoration: none; }
+.session-link { padding: 0; }
+.session-link > a { padding: .3em .4em; }

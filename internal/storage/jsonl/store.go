@@ -731,10 +731,18 @@ func (s *Store) HasSession(projectID, sessionID string) bool {
 // Windows cannot remove a directory while a handle inside it is open,
 // so the deletion is staged: the CONTENT (log segments) dies while the
 // lock is held — the data is gone under exclusive control — then the
-// lock releases and the empty directory follows. An external process
-// racing into that gap at worst resurrects an empty session whose
-// directory then disappears under it; its next append fails loudly
-// (ENOENT), never silently.
+// lock releases and the empty directory follows.
+//
+// The release→removal gap is honest about its limits: the directory
+// still exists in it, so an external process racing in CAN open the
+// dying session (a fresh empty log), and what it appends there is
+// silently lost to the removal that follows. The window is the lock
+// release to the RemoveAll of an already-contentless directory
+// (microseconds), the lost data is only what that racer wrote inside
+// it, and after the removal the racer converges to not-found on its
+// next open. A tombstone checked by openDir could close even that —
+// at the price of a marker whose failed removal permanently wedges
+// the session — not worth it until a real workload hits the window.
 func (s *Store) Delete(projectID, sessionID string) error {
 	if !ValidProjectID(projectID) {
 		return fmt.Errorf("invalid project id %q", projectID)

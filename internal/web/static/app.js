@@ -588,10 +588,13 @@ function renderSidebar() {
     path.title = p.id;
     block.appendChild(path);
     for (const s of p.sessions || []) {
+      // The row is a div (a button inside an <a> is invalid HTML); the
+      // navigation target is the inner link wrapping title and meta.
+      const row = document.createElement("div");
+      row.className = "session-link";
       const link = document.createElement("a");
-      link.className = "session-link";
       link.href = "#/s/" + s.id;
-      if (s.id === state.session) link.classList.add("current");
+      if (s.id === state.session) row.classList.add("current");
       const title = document.createElement("span");
       title.className = "title";
       title.appendChild(textNode(s.title || s.id));
@@ -614,6 +617,7 @@ function renderSidebar() {
         meta.appendChild(badge);
       }
       link.append(title, meta);
+      row.appendChild(link);
       // The delete affordance: one confirmation, then DELETE. A session
       // this page is viewing must be left first — its own stream holds
       // the server-side refs (session_open); navigate away, wait for
@@ -627,39 +631,60 @@ function renderSidebar() {
         e.stopPropagation();
         if (!confirm("Delete this session and all its records?")) return;
         if (s.id === state.session) {
+          // Our own view holds the server-side refs: navigate away and
+          // let the hashchange task tear the stream down. The readyState
+          // wait below only waits out that task; the server releases
+          // refs when it notices the connection drop, so the real
+          // convergence is the session_open retry loop.
           const closing = es;
           location.hash = "";
-          // route() replaced the ES synchronously; the OLD one closes
-          // asynchronously — wait for it (bounded) before deleting.
           for (let i = 0; i < 40 && closing && closing.readyState !== 2; i++) {
             await new Promise(res => setTimeout(res, 50));
           }
         }
         const st = state;
         try {
-          const res = await fetch("/api/s/" + s.id, { method: "DELETE" });
-          if (st !== state) return;
+          // session_open (a view still holds it) and session_closing
+          // (the sweeper or a prior delete is tearing it down) both
+          // converge with a retry — bounded, and the error text names
+          // the ones that need a human action.
+          let res;
+          for (let attempt = 0; ; attempt++) {
+            res = await fetch("/api/s/" + s.id, { method: "DELETE" });
+            if (res.status !== 409 && res.status !== 503) break;
+            const data = await res.json().catch(() => ({}));
+            if (data.error !== "session_open" && data.error !== "session_closing") break;
+            if (data.error === "session_open" && attempt >= 5) {
+              if (st === state) showError("session is open in a view — close it first");
+              return;
+            }
+            await new Promise(r => setTimeout(r, 200));
+          }
           if (res.ok) {
             sessionCache.delete(s.id);
-            refreshProjects();
-          } else if (res.status === 409) {
-            const data = await res.json().catch(() => ({}));
-            if (st !== state) return;
-            showError(data.error === "session_open" ? "session is open in a view — close it first"
-              : data.error === "run_active" ? "stop the run first" : "session is locked by another process");
           } else if (res.status === 404) {
             sessionCache.delete(s.id);
-            refreshProjects();
           } else {
-            const text = await res.text();
+            const raw = await res.text().catch(() => "");
+            let code = "";
+            try { code = (JSON.parse(raw) || {}).error || ""; } catch (_) { /* plain-text body */ }
+            const text = ({
+              run_active: "stop the run first",
+              session_locked: "session is locked by another process",
+              session_open: "session is open in a view — close it first",
+            })[code] || raw || "delete failed";
             if (st === state) showError(text);
+            return;
           }
+          // A successful (or already-gone) deletion is a server-side
+          // fact: refresh regardless of which view is current now.
+          refreshProjects();
         } catch (_) {
           showError("delete failed");
         }
       };
-      link.appendChild(del);
-      block.appendChild(link);
+      row.appendChild(del);
+      block.appendChild(row);
     }
     host.appendChild(block);
   }

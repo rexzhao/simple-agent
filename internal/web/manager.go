@@ -561,7 +561,11 @@ func (m *Manager) DeleteSession(w http.ResponseWriter, r *http.Request) {
 	m.closing[id] = struct{}{}
 	m.mu.Unlock()
 
-	// Every path from here clears the closing claim.
+	// Every path from here clears the closing claim. INVARIANT: the
+	// teardown between claim and clear must stay fast — hub.Stop is a
+	// channel close and session.Close was made cheap by the Running
+	// pre-check — a blocking Close here would hold every concurrent
+	// open of this id at 503 for its whole duration.
 	clearClosing := func() {
 		m.mu.Lock()
 		delete(m.closing, id)
