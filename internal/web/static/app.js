@@ -92,6 +92,8 @@ function appendRecord(r) {
     const existing = state.byItem.get(r.item);
     existing._body.replaceChildren(recordBody(r));
     existing.classList.remove("streaming");
+    existing._reasoningEl = null;
+    existing._contentEl = null;
     return;
   }
   const row = rowFor(r, false);
@@ -208,8 +210,33 @@ function beginStreamingItem(itemID, snapshot) {
   }
   if (snapshot) {
     row._body.replaceChildren(recordBody({ reasoning: snapshot.reasoning, content: snapshot.content }));
+    row._reasoningEl = null;
+    row._contentEl = null;
   }
   return row;
+}
+
+// ensureStreamText returns the accumulating container for one kind of
+// streaming text on a row, creating it on first use. The reasoning
+// container stays before the content container, matching the committed
+// record's render order.
+function ensureStreamText(row, reasoning) {
+  if (reasoning) {
+    if (!row._reasoningEl) {
+      const div = document.createElement("div");
+      div.className = "reasoning";
+      if (row._contentEl) row._body.insertBefore(div, row._contentEl);
+      else row._body.appendChild(div);
+      row._reasoningEl = div;
+    }
+    return row._reasoningEl;
+  }
+  if (!row._contentEl) {
+    const div = document.createElement("div");
+    row._body.appendChild(div);
+    row._contentEl = div;
+  }
+  return row._contentEl;
 }
 
 function beginToolItem(itemID, name, args) {
@@ -223,6 +250,8 @@ function beginToolItem(itemID, name, args) {
   }
   if (name) {
     row._body.replaceChildren(recordBody({ tool_calls: [{ name, arguments: args }] }));
+    row._reasoningEl = null;
+    row._contentEl = null;
   }
   return row;
 }
@@ -238,10 +267,10 @@ function handleEvent(frame) {
       if (!state.streaming) break;
       const row = state.byItem.get(state.streaming.item);
       if (!row) break;
-      const line = document.createElement("div");
-      if (frame.t === "reasoning_delta") line.className = "reasoning";
-      line.appendChild(textNode(frame.text));
-      row._body.appendChild(line);
+      // Deltas accumulate into one container per kind — a div per delta
+      // would put every fragment on its own line.
+      const container = ensureStreamText(row, frame.t === "reasoning_delta");
+      container.appendChild(textNode(frame.text));
       scrollToBottom();
       break;
     }
