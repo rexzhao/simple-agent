@@ -75,3 +75,6 @@ button:disabled { opacity: .4; cursor: default; }
 .session-link .badge.running { border-color: var(--fg); color: var(--fg); }
 #empty-view { color: var(--dim); padding: 2em; text-align: center; }
 main:has(#rows:not(:empty)) #empty-view { display: none; }
+
+/* pre-first-snapshot sync state */
+#sync.sync-unknown { color: var(--dim); }

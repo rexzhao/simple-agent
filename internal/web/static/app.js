@@ -83,6 +83,9 @@ function recordBody(r) {
   }
   if (r.content) {
     const div = document.createElement("div");
+    // The class is addressable state: steer-row editing finds the
+    // current text through it (querySelector(".content")).
+    div.className = "content";
     div.appendChild(textNode(r.content));
     body.appendChild(div);
   }
@@ -303,6 +306,7 @@ function ensureStreamText(row, reasoning) {
   }
   if (!row._contentEl) {
     const div = document.createElement("div");
+    div.className = "content";
     row._body.appendChild(div);
     row._contentEl = div;
   }
@@ -495,12 +499,22 @@ document.getElementById("composer").addEventListener("submit", async e => {
   const input = document.getElementById("input");
   const text = input.value.trim();
   if (!text) return;
-  const send = () => postJSON2(api("/send"), { text });
-  const steer = () => postJSON2(api("/steer"), { text });
-  let res = state.running ? await steer() : await send();
+  // The interaction guard: capture the target session and build every
+  // URL from the CAPTURED id — a switch mid-flight must not redirect
+  // the fallback POST (and this text) to the newly-viewed session.
+  // The 409 fallback itself is load-bearing: a cache-restored view
+  // holds running=false until the resume snapshot corrects it, so the
+  // first POST of a restored-running session races as the wrong kind.
+  const st = state;
+  const target = "/api/s/" + state.session;
+  const send = () => postJSON2(target + "/send", { text });
+  const steer = () => postJSON2(target + "/steer", { text });
+  let res = st.running ? await steer() : await send();
+  if (st !== state) return;
   if (res.status === 409) {
-    const fallback = state.running ? send : steer;
+    const fallback = st.running ? send : steer;
     res = await fallback();
+    if (st !== state) return;
   }
   if (res.ok) {
     input.value = "";
@@ -524,9 +538,12 @@ document.getElementById("stop").addEventListener("click", () => {
 
 document.getElementById("compact").addEventListener("click", async () => {
   if (!state.session) return;
+  const st = state;
   const res = await fetch(api("/compact"), { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  if (st !== state) return;
   if (res.status === 409) {
     const data = await res.json().catch(() => ({}));
+    if (st !== state) return;
     showError(data.error === "nothing_to_compact" ? "nothing to compact" : "busy");
   }
 });
@@ -538,6 +555,7 @@ document.getElementById("compact").addEventListener("click", async () => {
 // ever shown for the session this page is viewing, from its live
 // stream state.
 let projectsBody = { projects: [], registry_ok: true };
+let sidebarSignature = "";
 
 async function refreshProjects() {
   try {
@@ -550,6 +568,13 @@ async function refreshProjects() {
 }
 
 function renderSidebar() {
+  // Signature skip: the sidebar is a pure derivation of the projects
+  // payload and the current session's id/running — rebuilding an
+  // unchanged derivation would drop keyboard focus and hover every
+  // status transition and every 5s poll (the links are focusable).
+  const signature = JSON.stringify(projectsBody) + "|" + state.session + "|" + !!state.running;
+  if (signature === sidebarSignature) return;
+  sidebarSignature = signature;
   const host = document.getElementById("projects");
   host.replaceChildren();
   for (const p of projectsBody.projects || []) {
@@ -594,7 +619,8 @@ function renderSidebar() {
 }
 
 function renderSidebarCurrent() {
-  // Cheap refresh of just the current/running markers.
+  // Re-derive: the signature skip inside renderSidebar makes this a
+  // no-op unless the current/running markers actually changed.
   renderSidebar();
 }
 
@@ -636,7 +662,7 @@ function showList() {
   updateStatus();
 }
 
-async function openSession(id) {
+async function openSession(id, retries = 0) {
   if (state.session === id && es) return; // already viewing
   teardownSession();
   state = freshState();
@@ -679,23 +705,40 @@ async function openSession(id) {
   if (st !== state) return;
   if (res.status === 404) {
     sessionCache.delete(id);
+    // Detach before the hash change routes to the list: the list's
+    // teardown would otherwise re-cache this session as a ghost
+    // (empty records + genesis head) right after the delete.
+    st.session = "";
     showError("session not found");
-    location.hash = "";
+    if (location.hash) {
+      location.hash = "";
+    } else {
+      route();
+    }
     return;
   }
   if (res.status === 409) {
     const data = await res.json().catch(() => ({}));
+    if (st !== state) return;
     showError(data.error === "session_locked" ? "session is locked by another process" : "conflict");
     return;
   }
   if (res.status === 503) {
-    // Our own eviction teardown: retry shortly.
+    // Our own eviction teardown: retry shortly, bounded — a session
+    // stuck in closing must surface as an error, not an endless toast
+    // loop.
+    if (retries >= 4) {
+      showError("session is unavailable (closing did not finish)");
+      return;
+    }
     showError("session is closing, retrying…");
-    setTimeout(() => { if (st === state && state.session === id) openSession(id); }, 1000);
+    setTimeout(() => { if (st === state && state.session === id) openSession(id, retries + 1); }, 1000);
     return;
   }
   if (!res.ok) {
-    showError(await res.text());
+    const text = await res.text();
+    if (st !== state) return;
+    showError(text);
     return;
   }
   if (st !== state) return;
