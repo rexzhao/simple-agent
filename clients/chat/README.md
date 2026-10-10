@@ -43,8 +43,18 @@ preflights for loopback origins, so a direct connection works too.
   fallback (Rule A); `edit`/`remove` map to `PUT`/`DELETE /steer`;
   the unanchored steer-lane `move` ("run now") stops the live run and
   leaves the item queued for the next drain point.
-- `src/App.tsx` — the UI over assistant-ui primitives (no Tailwind, no
-  shadcn registry: hand CSS in the log page's palette).
+- `src/App.tsx` — sidebar (projects poll), status strip (chain
+  verification), and the official assistant-ui `Thread` — the
+  official-site look: Tailwind v4 + shadcn base components + the
+  r.assistant-ui.com registry components under `src/components/`
+  (markdown text, reasoning, tool fallback, Geist fonts).
+
+  The registry layout the components expect is reconstructed under
+  `src/components/assistant-ui/elements/` and `src/utils/` (the CLI
+  drops the files flat); `thread.aui.tsx` carries one local patch —
+  the queued-steer rows in the composer (upstream has no queue
+  rendering), and `tooltip-icon-button.tsx` uses the Base UI `delay`
+  prop name.
 
 Known v1 gaps, on purpose: `context.compacted` / `session.created`
 records have no chat rendering (the `/log` view is the record-level
@@ -54,5 +64,6 @@ protocol has no branching).
 
 ## Sizes
 
-The built bundle is ~580 KB (~177 KB gzipped) — React + assistant-ui.
-The Go binary serves it as static files; nothing is embedded.
+The built bundle is ~1.07 MB (fonts included; ~370 KB gzipped) —
+React + assistant-ui + Tailwind + Geist. The Go binary serves it as
+static files; nothing is embedded.

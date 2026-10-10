@@ -3,11 +3,9 @@ import { useSyncExternalStore } from "react";
 import {
   AssistantRuntimeProvider,
   useExternalStoreRuntime,
-  MessagePrimitive,
-  ComposerPrimitive,
-  ThreadPrimitive,
-  QueueItemPrimitive,
 } from "@assistant-ui/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { Thread } from "@/components/thread.aui";
 import { getProjects } from "./api";
 import { useSaiAdapter } from "./runtime";
 import { SessionStore } from "./store";
@@ -37,107 +35,6 @@ function useProjects(): ProjectsResponse | null {
   return projects;
 }
 
-// ---- part renderers ----
-
-function TextPartBody({ text }: { text: string }) {
-  return <div className="part-text">{text}</div>;
-}
-
-function ReasoningPart({ text }: { text: string }) {
-  return (
-    <details className="part-reasoning">
-      <summary>reasoning</summary>
-      <div>{text}</div>
-    </details>
-  );
-}
-
-function ToolCallPart({
-  toolName,
-  argsText,
-  result,
-  isError,
-}: {
-  toolName: string;
-  argsText?: string;
-  result?: unknown;
-  isError?: boolean;
-}) {
-  const args = argsText || "";
-  const resultText = typeof result === "string" ? result : "";
-  return (
-    <div className={"part-tool" + (isError ? " err" : "")}>
-      <div className="part-tool-head">
-        {toolName}
-        {resultText === "" ? " …" : ""}
-      </div>
-      {args && <pre className="part-tool-args">{args}</pre>}
-      {resultText && <pre className="part-tool-result">{resultText}</pre>}
-    </div>
-  );
-}
-
-function MyMessage() {
-  return (
-    <MessagePrimitive.Root className="message">
-      <MessagePrimitive.Parts
-        components={{
-          Text: TextPartBody,
-          Reasoning: ReasoningPart,
-          tools: { Fallback: ToolCallPart },
-        }}
-      />
-    </MessagePrimitive.Root>
-  );
-}
-
-// ---- the thread ----
-
-function MyThread({ notice, verified }: { notice: string; verified: boolean | null }) {
-  return (
-    <ThreadPrimitive.Root className="thread">
-      <div className="thread-status">
-        <span className={"chain" + (verified === false ? " bad" : "")}>
-          {verified === false ? "chain drift!" : verified ? "verified" : "…"}
-        </span>
-        {notice && <span className="notice">{notice}</span>}
-      </div>
-      <ThreadPrimitive.Viewport className="thread-viewport">
-        <ThreadPrimitive.Empty>
-          <div className="thread-empty">select a session from the list</div>
-        </ThreadPrimitive.Empty>
-        <ThreadPrimitive.Messages components={{ UserMessage: MyMessage, AssistantMessage: MyMessage }} />
-        <ThreadPrimitive.ViewportFooter className="thread-footer">
-          <ThreadPrimitive.LoadEarlier>load earlier messages</ThreadPrimitive.LoadEarlier>
-          <ThreadPrimitive.ScrollToBottom>↓</ThreadPrimitive.ScrollToBottom>
-        </ThreadPrimitive.ViewportFooter>
-      </ThreadPrimitive.Viewport>
-      <Composer />
-    </ThreadPrimitive.Root>
-  );
-}
-
-function Composer() {
-  return (
-    <ComposerPrimitive.Root className="composer">
-      <ComposerPrimitive.Queue>
-        {() => (
-          <div className="queue-item">
-            <QueueItemPrimitive.Text />
-            <span className="queue-controls">
-              <QueueItemPrimitive.Steer title="run now (stops the current run)">▲</QueueItemPrimitive.Steer>
-              <QueueItemPrimitive.Remove title="withdraw">×</QueueItemPrimitive.Remove>
-            </span>
-          </div>
-        )}
-      </ComposerPrimitive.Queue>
-      <ComposerPrimitive.Input placeholder="message…" autoFocus />
-      <ComposerPrimitive.Send>send</ComposerPrimitive.Send>
-      <ComposerPrimitive.Cancel>stop</ComposerPrimitive.Cancel>
-    </ComposerPrimitive.Root>
-  );
-}
-
 // ---- app ----
 
 export default function App() {
@@ -152,7 +49,10 @@ export default function App() {
       if (id !== sessionID) store.detach();
     }
     const store = stores.get(sessionID);
-    if (store) void store.open(sessionID);
+    // An empty session id (nothing selected) must never open a stream:
+    // /api/s//stream normalizes to /api/s/stream — a 404 that looks
+    // like a routing bug.
+    if (store && sessionID) void store.open(sessionID);
   }, [sessionID, stores]);
 
   useEffect(
@@ -193,30 +93,65 @@ export default function App() {
     return out;
   }, [projects]);
 
+  const verified = snap ? snap.verified : null;
+  const notice = snap ? snap.notice : "";
+
   return (
-    <AssistantRuntimeProvider runtime={runtime}>
-      <div id="layout">
-        <nav id="sidebar">
-          <div id="sidebar-head">
-            sessions <a className="log-link" href="/log" title="the record-level log view">/log</a>
-          </div>
-          <div id="sessions">
-            {sessions.length === 0 && <div className="empty">no sessions — create one from the CLI</div>}
-            {sessions.map(s => (
-              <button
-                key={s.id}
-                className={"session" + (s.id === sessionID ? " current" : "")}
-                onClick={() => setSessionID(s.id)}
-                title={s.project}
+    <TooltipProvider>
+      <AssistantRuntimeProvider runtime={runtime}>
+        <div className="bg-background text-foreground flex h-screen w-full overflow-hidden">
+          <nav className="bg-background border-border hidden w-64 shrink-0 flex-col border-r md:flex">
+            <div className="text-muted-foreground border-border flex items-baseline justify-between border-b px-4 py-3 text-xs tracking-wider uppercase">
+              sessions
+              <a
+                className="hover:text-foreground no-underline"
+                href="/log"
+                title="the record-level log view"
               >
-                <span className="session-title">{s.title}</span>
-                <span className="session-project">{s.project}</span>
-              </button>
-            ))}
+                /log
+              </a>
+            </div>
+            <div className="flex flex-col gap-0.5 overflow-y-auto p-2">
+              {sessions.length === 0 && (
+                <div className="text-muted-foreground px-3 py-4 text-sm">
+                  no sessions — create one from the CLI
+                </div>
+              )}
+              {sessions.map(s => (
+                <button
+                  key={s.id}
+                  className={
+                    "flex cursor-pointer flex-col gap-0.5 rounded-lg border-none px-3 py-2 text-left font-sans text-sm " +
+                    (s.id === sessionID
+                      ? "bg-accent text-accent-foreground"
+                      : "bg-transparent hover:bg-accent/50")
+                  }
+                  onClick={() => setSessionID(s.id)}
+                  title={s.project}
+                >
+                  <span className="truncate">{s.title}</span>
+                  <span className="text-muted-foreground truncate text-xs">{s.project}</span>
+                </button>
+              ))}
+            </div>
+          </nav>
+          <div className="relative flex min-w-0 flex-1 flex-col">
+            <div className="text-muted-foreground border-border flex min-h-7 items-baseline gap-4 border-b px-4 py-1 text-xs">
+              <span
+                className={
+                  verified === false ? "text-destructive font-semibold" : ""
+                }
+              >
+                {verified === false ? "chain drift!" : verified ? "verified" : "…"}
+              </span>
+              {notice && <span className="text-accent-foreground">{notice}</span>}
+            </div>
+            <div className="aui-root relative flex min-h-0 flex-1 flex-col items-center justify-start">
+              <Thread autoFocus />
+            </div>
           </div>
-        </nav>
-        <MyThread notice={snap?.notice || ""} verified={snap ? snap.verified : null} />
-      </div>
-    </AssistantRuntimeProvider>
+        </div>
+      </AssistantRuntimeProvider>
+    </TooltipProvider>
   );
 }

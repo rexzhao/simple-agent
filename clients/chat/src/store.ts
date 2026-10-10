@@ -70,7 +70,7 @@ export class SessionStore {
   // open attaches this store to a session: a fresh store connects with
   // a full snapshot; a cached one resumes from its held head.
   async open(id: string) {
-    if (this.closed || this.snap.session === id && this.es) return;
+    if (!id || this.closed || (this.snap.session === id && this.es)) return;
     if (this.snap.session !== id) {
       this.snap = { ...initialSnap, session: id, head: await chainGenesis(id), prefixAnchor: await chainGenesis(id) };
     }
@@ -78,6 +78,7 @@ export class SessionStore {
   }
 
   private connect() {
+    if (!this.snap.session) return;
     const from = this.snap.head && this.snap.records.length ? this.snap.head : "";
     const url = `/api/s/${this.snap.session}/stream` + (from ? `?from=${encodeURIComponent(from)}` : "");
     const es = new EventSource(url);

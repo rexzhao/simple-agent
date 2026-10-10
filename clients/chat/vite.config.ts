@@ -1,5 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import { fileURLToPath } from "node:url";
 
 // Base /chat/: the sai server mounts this build at /chat (Vite-absolute
 // asset URLs must live under the mount point). The dev server proxies
@@ -7,7 +9,12 @@ import react from "@vitejs/plugin-react";
 // CORS preflights for loopback origins.
 export default defineConfig({
   base: "/chat/",
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },
   server: {
     // The chain module is imported from the server's static tree.
     fs: { allow: ["../.."] },

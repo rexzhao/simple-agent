@@ -10,6 +10,26 @@ import { convertLive, convertRecords, toThreadMessageLike, type ChatMessage } fr
 import { SessionStore, type Snap } from "./store";
 import type { ProjectsResponse } from "./types";
 
+// Subscribing with no session selected: a stable no-op pair so
+// useSyncExternalStore never sees changing identities across renders.
+const noopSubscribe = () => () => {};
+const emptySnapshot: Snap = {
+  version: -1,
+  session: "",
+  records: [],
+  live: null,
+  steered: [],
+  running: false,
+  compacting: false,
+  more: false,
+  prefixAnchor: "",
+  head: "",
+  connected: false,
+  verified: null,
+  notice: "",
+};
+const emptySnap = () => emptySnapshot;
+
 function textOf(message: AppendMessage): string {
   if (typeof message.content === "string") return message.content;
   return message.content
@@ -47,13 +67,9 @@ export function useSaiAdapter(
   onSwitch: (id: string) => void,
   onDeleted: (id: string) => void,
 ): ExternalStoreAdapter<ChatMessage> {
-  let store = stores.get(sessionID);
-  if (!store) {
-    store = new SessionStore();
-    stores.set(sessionID, store);
-  }
-  const handle = useSyncExternalStore(store.subscribe, store.getSnapshot);
-  const snap = handle;
+  let store = stores.get(sessionID) ?? (sessionID ? (stores.set(sessionID, new SessionStore()), stores.get(sessionID)!) : undefined);
+  const handle = useSyncExternalStore(store ? store.subscribe : noopSubscribe, store ? store.getSnapshot : emptySnap);
+  const snap = handle ?? emptySnapshot;
 
   return useMemo<ExternalStoreAdapter<ChatMessage>>(() => {
     const messages = convertRecords(snap.records);
@@ -62,6 +78,7 @@ export function useSaiAdapter(
 
     const sessionID = snap.session;
     const running = snap.running || snap.compacting;
+    const activeStore = store;
 
     return {
       isRunning: running,
@@ -70,7 +87,7 @@ export function useSaiAdapter(
       convertMessage: toThreadMessageLike,
       hasEarlier: snap.more,
       onLoadEarlier: async () => {
-        await store.loadEarlier();
+        await activeStore?.loadEarlier();
       },
       onNew: async (message: AppendMessage) => {
         await sendOrSteer(sessionID, running, textOf(message));

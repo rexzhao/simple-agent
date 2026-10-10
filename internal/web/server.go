@@ -86,6 +86,8 @@ func New(manager *Manager, opts ...ServerOption) *Server {
 	_ = mime.AddExtensionType(".mjs", "text/javascript")
 	_ = mime.AddExtensionType(".css", "text/css")
 	_ = mime.AddExtensionType(".html", "text/html; charset=utf-8")
+	_ = mime.AddExtensionType(".woff", "font/woff")
+	_ = mime.AddExtensionType(".woff2", "font/woff2")
 	mux := http.NewServeMux()
 	// Top-level routing: / is the chat client (default landing), /log is
 	// the embedded zero-dependency log view, /api/... is the wire
