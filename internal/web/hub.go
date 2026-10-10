@@ -47,6 +47,8 @@ type Hub struct {
 	// events is the currently attached run event channel (nil between
 	// runs). attachMu is not needed: only the loop goroutine touches it.
 	events <-chan model.Event
+
+	stopOnce sync.Once
 }
 
 type client struct {
@@ -68,13 +70,11 @@ func NewHub(session *agent.Session) *Hub {
 	return h
 }
 
-// Stop terminates the hub loop.
+// Stop terminates the hub loop and releases its subscription: a
+// stopped hub must never sit as a dead subscriber whose full buffer
+// would block the committer on the next commit.
 func (h *Hub) Stop() {
-	select {
-	case <-h.done:
-	default:
-		close(h.done)
-	}
+	h.stopOnce.Do(func() { close(h.done) })
 }
 
 // Wake reattaches the run event channel. The POST /api/send handler
@@ -102,6 +102,9 @@ func (h *Hub) run() {
 	// h.done is closed by Stop only — a return here (session closed)
 	// must not race a second close.
 	sub := h.session.Subscribe()
+	// Whatever ends the loop, the subscription is released: a dead
+	// subscriber blocks the committer once its buffer fills.
+	defer sub.Stop()
 	// Seed the mirror and the chain from the atomic snapshot: no record
 	// can be missed or duplicated between Initial and the channel.
 	h.mu.Lock()
@@ -307,12 +310,18 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 		Digest:  h.chainHeadLocked(),
 	}
 	if snapshot.Streaming != nil {
-		streaming, _ := json.Marshal(snapshot.Streaming)
-		f.Streamin = streaming
+		f.Streaming = &StreamingWire{
+			Item:      snapshot.Streaming.ItemID,
+			Content:   snapshot.Streaming.Message.Content,
+			Reasoning: snapshot.Streaming.Message.ReasoningContent,
+		}
 	}
 	if snapshot.Running != nil {
-		tool, _ := json.Marshal(snapshot.Running)
-		f.Tool = tool
+		f.Tool = &ToolWire{
+			Item: snapshot.Running.ItemID,
+			Name: snapshot.Running.ToolCall.Name,
+			Args: snapshot.Running.ToolCall.Arguments,
+		}
 	}
 
 	c := &client{ch: make(chan []byte, clientBufferSize), done: make(chan struct{})}

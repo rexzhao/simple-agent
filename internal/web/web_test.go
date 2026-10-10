@@ -341,8 +341,13 @@ func TestMidstreamConnectSeesStreaming(t *testing.T) {
 	defer c.close()
 	snap := c.next(t, 2*time.Second)
 	streaming, ok := snap["streaming"].(map[string]any)
-	if !ok || (streaming["ItemID"] == "" && streaming["item_id"] == "") {
+	if !ok || streaming["item"] == "" {
 		t.Fatalf("snapshot carries no in-flight item: %v", snap["streaming"])
+	}
+	// The wire DTO carries the accumulated content, not the internal
+	// StreamingItem shape (that bug left the recovered row empty).
+	if streaming["content"] != "partial" {
+		t.Fatalf("in-flight content = %v, want partial", streaming["content"])
 	}
 	close(gated.gate)
 	// Let the run finish before cleanup tears the server down.

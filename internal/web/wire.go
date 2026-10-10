@@ -87,14 +87,14 @@ type Frame struct {
 	Kind string `json:"kind"`
 
 	// snapshot
-	Anchor   string          `json:"anchor,omitempty"` // digest before the first delivered record
-	Resumed  bool            `json:"resumed,omitempty"`
-	Total    int             `json:"total,omitempty"` // records held by the server
-	More     bool            `json:"more,omitempty"`  // history exists before the anchor
-	Records  json.RawMessage `json:"records,omitempty"`
-	Running  *bool           `json:"running,omitempty"`
-	Streamin json.RawMessage `json:"streaming,omitempty"` // in-flight assistant item
-	Tool     json.RawMessage `json:"tool,omitempty"`      // in-flight tool execution
+	Anchor    string          `json:"anchor,omitempty"` // digest before the first delivered record
+	Resumed   bool            `json:"resumed,omitempty"`
+	Total     int             `json:"total,omitempty"` // records held by the server
+	More      bool            `json:"more,omitempty"`  // history exists before the anchor
+	Records   json.RawMessage `json:"records,omitempty"`
+	Running   *bool           `json:"running,omitempty"`
+	Streaming *StreamingWire  `json:"streaming,omitempty"` // in-flight assistant item
+	Tool      *ToolWire       `json:"tool,omitempty"`      // in-flight tool execution
 
 	// record
 	Record json.RawMessage `json:"r,omitempty"`
@@ -119,6 +119,23 @@ type Frame struct {
 	Count      int    `json:"n,omitempty"`
 	Compacting *bool  `json:"compacting,omitempty"`
 	Notice     string `json:"notice,omitempty"`
+}
+
+// StreamingWire is the in-flight assistant item of a mid-stream
+// connection: enough to draw the row, nothing more. It is a DTO on
+// purpose — marshaling the internal StreamingItem leaks untagged field
+// names (and the whole Message shape) onto the wire.
+type StreamingWire struct {
+	Item      string `json:"item"`
+	Content   string `json:"content,omitempty"`
+	Reasoning string `json:"reasoning,omitempty"`
+}
+
+// ToolWire is the in-flight tool execution of a mid-stream connection.
+type ToolWire struct {
+	Item string `json:"item"`
+	Name string `json:"name,omitempty"`
+	Args string `json:"args,omitempty"`
 }
 
 func encodeFrame(f Frame) []byte {

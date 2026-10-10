@@ -4,57 +4,35 @@
 // holds and comparing it against the server's head in every status frame.
 "use strict";
 
-// ---------- digest chain (must match internal/web/wire.go byte for byte) ----------
-
-const chainVersion = "sai/v1/";
-
-async function sha256Hex(text) {
-  const data = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
-function chainInput(r) {
-  let s = "";
-  const field = v => { s += v.length + ":" + v; };
-  field(r.item || "");
-  field(r.t || "");
-  field(r.ts || "");
-  field(r.content || "");
-  field(r.reasoning || "");
-  field(r.is_error ? "1" : "0");
-  field(r.tool_call_id || "");
-  field(r.tool_name || "");
-  field(r.error || "");
-  s += (r.tool_calls || []).length + "#";
-  for (const call of r.tool_calls || []) {
-    field(call.name || "");
-    field(call.arguments || "");
-    field(call.id || "");
-  }
-  field(r.provider || "");
-  field(r.model || "");
-  field(r.cwd || "");
-  return s;
-}
+import { chainGenesis, chainStep } from "./chain.mjs";
 
 // ---------- state ----------
 
 const state = {
   session: "",
-  head: chainVersion, // digest after all folded records
+  head: "",           // digest after all folded records
+  prefixAnchor: "",   // digest BEFORE the first held record (history cursor)
   records: [],        // the page's record store
   byItem: new Map(),  // itemID -> row element (committed + in-flight)
-  anchorStart: 0,     // index of the first held record
   more: false,
   running: false,
-  streaming: null,    // {item, reasoning, text} for the in-flight row
+  streaming: null,    // {item} of the in-flight assistant message
   es: null,
   reconnectFrom: "",
 };
 
 const rowsEl = document.getElementById("rows");
 const logEl = document.getElementById("log");
+
+// Frame processing is serialized through one promise chain: the chain
+// folds are async (crypto.subtle), and two frames processed concurrently
+// would both fold from the same predecessor head. Scroll-back shares the
+// same chain so history prepends never interleave with live folds.
+let queue = Promise.resolve();
+function enqueue(job) {
+  queue = queue.then(job).catch(err => console.error("sai page:", err));
+  return queue;
+}
 
 // ---------- rendering (escaped, log-style, no chat bubbles) ----------
 
@@ -84,7 +62,7 @@ function recordBody(r) {
     div.appendChild(textNode(r.error));
     body.appendChild(div);
   }
-  if (!r.reasoning && !r.content && (!r.tool_calls || !r.tool_calls.length) && !r.error) {
+  if (!body.childNodes.length) {
     const div = document.createElement("div");
     div.style.color = "var(--dim)";
     div.appendChild(textNode("·"));
@@ -127,8 +105,13 @@ function appendRecord(r) {
 
 // ---------- chain + self-check ----------
 
-async function foldRecord(r) {
-  state.head = await sha256Hex(state.head + "\n" + chainInput(r));
+async function handleRecords(records) {
+  for (const r of records) {
+    state.records.push(r);
+    state.head = await chainStep(state.head, r);
+    appendRecord(r);
+  }
+  scrollToBottom();
 }
 
 function setSync(ok, serverHead) {
@@ -145,22 +128,22 @@ function setSync(ok, serverHead) {
   }
 }
 
-async function handleRecords(records) {
-  for (const r of records) {
-    state.records.push(r);
-    await foldRecord(r);
-    appendRecord(r);
-  }
-  scrollToBottom();
-}
-
 // ---------- SSE ----------
 
 function connect() {
   const url = state.reconnectFrom ? "/api/stream?from=" + encodeURIComponent(state.reconnectFrom) : "/api/stream";
   const es = new EventSource(url);
   state.es = es;
-  es.onmessage = e => dispatch(JSON.parse(e.data));
+  es.onmessage = e => {
+    let frame;
+    try {
+      frame = JSON.parse(e.data);
+    } catch (err) {
+      console.error("sai page: bad frame", err);
+      return;
+    }
+    enqueue(() => dispatch(frame));
+  };
   es.onerror = () => {
     // EventSource retries on its own; the in-memory digest lets the
     // retry resume with ?from= instead of replaying.
@@ -176,16 +159,19 @@ async function dispatch(frame) {
         state.records = [];
         state.byItem = new Map();
         rowsEl.replaceChildren();
-        state.head = await sha256Hex(chainVersion + sessionIdFromUrl());
+        state.head = await chainGenesis(state.session);
       }
       state.reconnectFrom = "";
       await handleRecords(frame.records || []);
+      // The prefix anchor is the digest BEFORE the first held record —
+      // the cursor for scroll-back, not the head.
+      state.prefixAnchor = frame.anchor;
       state.more = !!frame.more;
       document.getElementById("load-more").hidden = !state.more;
       state.running = !!frame.running;
-      if (frame.streaming) beginStreamingItem(frame.streaming.item_id || frame.streaming.ItemID, frame.streaming);
+      if (frame.streaming) beginStreamingItem(frame.streaming.item, frame.streaming);
+      if (frame.tool) beginToolItem(frame.tool.item, frame.tool.name, frame.tool.args);
       updateStatus();
-      // First live check after the snapshot.
       if (frame.d) setSync(state.head === frame.d, frame.d);
       break;
     case "record":
@@ -203,12 +189,8 @@ async function dispatch(frame) {
   }
 }
 
-function sessionIdFromUrl() {
-  return new URLSearchParams(location.search).get("session") || "local";
-}
-
 function updateStatus() {
-  document.getElementById("session").textContent = "session " + sessionIdFromUrl();
+  document.getElementById("session").textContent = "session " + state.session;
   document.getElementById("count").textContent = state.records.length + " records" + (state.more ? "+" : "");
   const run = document.getElementById("runstate");
   run.textContent = state.running ? "running" : "idle";
@@ -227,9 +209,9 @@ function showError(text) {
   setTimeout(() => el.classList.add("hidden"), 4000);
 }
 
-// ---------- in-flight item (deltas merged by identity) ----------
+// ---------- in-flight items (deltas merged by identity) ----------
 
-function beginStreamingItem(itemID, snapshotItem) {
+function beginStreamingItem(itemID, snapshot) {
   let row = state.byItem.get(itemID);
   if (!row) {
     const r = { t: "assistant.message", item: itemID, ts: "" };
@@ -238,9 +220,23 @@ function beginStreamingItem(itemID, snapshotItem) {
     state.byItem.set(itemID, row);
     scrollToBottom();
   }
-  if (snapshotItem) {
-    const msg = snapshotItem.Message || snapshotItem.message;
-    if (msg) row._body.replaceChildren(recordBody({ reasoning: msg.reasoning, content: msg.content }));
+  if (snapshot) {
+    row._body.replaceChildren(recordBody({ reasoning: snapshot.reasoning, content: snapshot.content }));
+  }
+  return row;
+}
+
+function beginToolItem(itemID, name, args) {
+  let row = state.byItem.get(itemID);
+  if (!row) {
+    const r = { t: "tool.result", item: itemID, ts: "" };
+    row = rowFor(r, true);
+    state.byItem.set(itemID, row);
+    rowsEl.appendChild(row);
+    scrollToBottom();
+  }
+  if (name) {
+    row._body.replaceChildren(recordBody({ tool_calls: [{ name, arguments: args }] }));
   }
   return row;
 }
@@ -256,24 +252,16 @@ function handleEvent(frame) {
       if (!state.streaming) break;
       const row = state.byItem.get(state.streaming.item);
       if (!row) break;
-      const cls = frame.t === "reasoning_delta" ? "reasoning" : "";
       const line = document.createElement("div");
-      if (cls) line.className = cls;
+      if (frame.t === "reasoning_delta") line.className = "reasoning";
       line.appendChild(textNode(frame.text));
       row._body.appendChild(line);
       scrollToBottom();
       break;
     }
-    case "tool_started": {
-      const row = state.byItem.get(frame.item);
-      if (!row) {
-        const r = { t: "tool.result", item: frame.item, ts: "" };
-        const toolRow = rowFor(r, true);
-        rowsEl.appendChild(toolRow);
-        state.byItem.set(frame.item, toolRow);
-      }
+    case "tool_started":
+      beginToolItem(frame.item, frame.name, frame.args);
       break;
-    }
     case "assistant_message_completed":
     case "assistant_message_failed":
       if (state.streaming && state.streaming.item === frame.item) state.streaming = null;
@@ -297,65 +285,49 @@ function scrollToBottom() {
 
 // ---------- scroll-back ----------
 
-document.getElementById("load-more").addEventListener("click", loadHistory);
+document.getElementById("load-more").addEventListener("click", () => enqueue(loadHistory));
 logEl.addEventListener("scroll", () => {
-  if (logEl.scrollTop < 60 && state.more) loadHistory();
+  if (logEl.scrollTop < 60 && state.more) enqueue(loadHistory);
 });
 
-let loading = false;
 async function loadHistory() {
-  if (loading || !state.more) return;
-  loading = true;
-  try {
-    const anchor = await anchorOfFirstHeld();
-    const res = await fetch("/api/history?before=" + encodeURIComponent(anchor) + "&limit=50");
-    if (res.status === 409) {
-      // Stale anchor (server restarted): resynchronize from scratch.
-      state.reconnectFrom = "";
-      state.es.close();
-      connect();
-      return;
-    }
-    const data = await res.json();
-    // Backward verification: fold(anchor, records) must equal our current
-    // first-held digest — both ends known, stronger than forward.
-    let h = data.anchor;
-    for (const r of data.records) {
-      h = await sha256Hex(h + "\n" + chainInput(r));
-    }
-    if (h !== anchor) {
-      setSync(false, "");
-      state.more = false;
-      document.getElementById("load-more").hidden = true;
-      return;
-    }
-    // Prepend in order, keeping scroll anchored.
-    const prevHeight = logEl.scrollHeight;
-    for (const r of data.records) {
-      state.records.unshift(r);
-      const row = rowFor(r, false);
-      row._body.appendChild(recordBody(r));
-      if (rowsEl.firstChild) rowsEl.insertBefore(row, rowsEl.firstChild);
-      else rowsEl.appendChild(row);
-      state.byItem.set(r.item, row);
-    }
-    state.more = !!data.more;
-    document.getElementById("load-more").hidden = !state.more;
-    logEl.scrollTop += logEl.scrollHeight - prevHeight;
-  } finally {
-    loading = false;
+  if (!state.more || !state.prefixAnchor) return;
+  const res = await fetch("/api/history?before=" + encodeURIComponent(state.prefixAnchor) + "&limit=50");
+  if (res.status === 409) {
+    // Stale anchor (server restarted): resynchronize from scratch.
+    state.reconnectFrom = "";
+    state.es.close();
+    connect();
+    return;
   }
-}
-
-async function anchorOfFirstHeld() {
-  if (!state.records.length) return await sha256Hex(chainVersion + sessionIdFromUrl());
-  return await digestAfterN(state.records.length); // head; first-held for window loads
-}
-
-async function digestAfterN(n) {
-  let h = await sha256Hex(chainVersion + sessionIdFromUrl());
-  for (let i = 0; i < n; i++) h = await sha256Hex(h + "\n" + chainInput(state.records[i]));
-  return h;
+  const data = await res.json();
+  // Backward verification: fold(anchor, records) must equal the prefix
+  // anchor of our first held record — both ends known, stronger than
+  // forward.
+  let h = data.anchor;
+  for (const r of data.records) {
+    h = await chainStep(h, r);
+  }
+  if (h !== state.prefixAnchor) {
+    setSync(false, "");
+    state.more = false;
+    document.getElementById("load-more").hidden = true;
+    return;
+  }
+  // Prepend in order, keeping scroll anchored.
+  const prevHeight = logEl.scrollHeight;
+  for (const r of data.records) {
+    state.records.unshift(r);
+    const row = rowFor(r, false);
+    row._body.appendChild(recordBody(r));
+    if (rowsEl.firstChild) rowsEl.insertBefore(row, rowsEl.firstChild);
+    else rowsEl.appendChild(row);
+    state.byItem.set(r.item, row);
+  }
+  state.prefixAnchor = data.anchor;
+  state.more = !!data.more;
+  document.getElementById("load-more").hidden = !state.more;
+  logEl.scrollTop += logEl.scrollHeight - prevHeight;
 }
 
 // ---------- composer ----------
@@ -393,7 +365,7 @@ document.getElementById("compact").addEventListener("click", async () => {
 
 // ---------- boot ----------
 
-// Refresh the status area from /api/state when the stream is down
+// Refresh the status area from /api/state while the stream is down
 // (covers the gap between connects).
 setInterval(async () => {
   if (state.es && state.es.readyState === 2) {
@@ -408,21 +380,20 @@ setInterval(async () => {
   }
 }, 2000);
 
-state.head = "init";
 (async () => {
-  // The genesis must come from the served session id, not the URL guess.
+  // The genesis needs the served session id.
   try {
     const res = await fetch("/api/state");
     if (res.ok) {
       const s = await res.json();
       state.session = s.session;
       history.replaceState(null, "", "?session=" + s.session);
-      state.head = await sha256Hex(chainVersion + s.session);
-    } else {
-      state.head = await sha256Hex(chainVersion + sessionIdFromUrl());
     }
-  } catch (_) {
-    state.head = await sha256Hex(chainVersion + sessionIdFromUrl());
+  } catch (_) { /* fall back to the URL guess below */ }
+  if (!state.session) {
+    state.session = new URLSearchParams(location.search).get("session") || "local";
   }
+  state.head = await chainGenesis(state.session);
+  state.prefixAnchor = state.head;
   connect();
 })();
