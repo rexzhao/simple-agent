@@ -220,7 +220,7 @@ const compactionPrompt = `Summarize the conversation so far so that work can con
 - Commands run and their outcomes
 - The current state and the next steps
 
-Write the summary as a compact briefing addressed to the assistant that continues the work. State established facts as facts, not as claims to verify. Omit pleasanities.`
+Write the summary as a compact briefing addressed to the assistant that continues the work. State established facts as facts, not as claims to verify. Omit pleasantries.`
 
 // buildCompactionRequest assembles the summary request: the compaction
 // prompt instead of the normal system prompt, the sanitized history as
@@ -322,5 +322,14 @@ func isBlank(message model.Message) bool {
 
 // summaryFrame wraps the committed summary so that, replayed as the sole
 // prior context, the continuing model treats it as its own memory of the
-// session instead of a user assertion to verify against the world.
-const summaryFrame = "以下是本会话先前对话的摘要，是你自己的工作记忆（既定事实，直接依据它继续，不要向用户求证或重新验证）：\n\n"
+// session instead of a user assertion to verify against the world. It is
+// English regardless of the conversation language: it is an instruction to
+// the model, like the system prompt.
+//
+// Known costs of embedding the frame in the record (design §13): it is
+// persisted verbatim (immutable wording), appears in CLI/UI rendering of
+// the compact block, and is re-fed to the summary model on a repeated
+// compaction as part of the prior summary. The alternative — a fold-time
+// marker with request-time wrapping — was rejected to keep the record
+// self-contained and the request layer ignorant of compaction.
+const summaryFrame = "The following is a summary of the earlier conversation in this session. It is your own working memory of established facts: rely on it directly and do not re-verify it with the user or the repository.\n\n"

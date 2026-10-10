@@ -5,7 +5,10 @@
 package jsonl
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -336,15 +339,17 @@ func (s *Session) appendCompactionLocked(record storage.Record) (storage.Record,
 		return storage.Record{}, err
 	}
 	// The new segment opens with a copy of the session header so it is
-	// self-contained (metadata and creation time survive alone).
+	// self-contained (metadata and creation time survive alone). Only the
+	// first record is read — the switch cost stays independent of the
+	// segment size.
 	if s.log != nil {
-		records, err := s.log.Records()
+		header, ok, err := firstRecord(filepath.Join(dir, logFileName))
 		if err != nil {
 			staging.Close()
 			return storage.Record{}, err
 		}
-		if len(records) > 0 && records[0].Type == storage.TypeSessionCreated {
-			if _, err := staging.Append(records[0]); err != nil {
+		if ok {
+			if _, err := staging.Append(header); err != nil {
 				staging.Close()
 				return storage.Record{}, fmt.Errorf("stage segment header: %w", err)
 			}
@@ -360,23 +365,55 @@ func (s *Session) appendCompactionLocked(record storage.Record) (storage.Record,
 	}
 
 	// The staging is durable: archive the active log and activate it.
+	// From here on the in-process log handle is closed; a failure in the
+	// remaining steps leaves the session unusable in this process by
+	// design. Do NOT lazily reopen here: in the window where the active
+	// log was archived but the staging not yet activated, the active path
+	// does not exist, and reopening would create an empty log.jsonl —
+	// appending to it would make the next Open discard the staged
+	// compaction seed. The on-disk state is convergent either way; the
+	// session continues after a reopen (-session).
 	if s.log != nil {
 		if err := s.log.Close(); err != nil {
-			return storage.Record{}, fmt.Errorf("close active segment: %w", err)
+			return storage.Record{}, fmt.Errorf("segment switch failed; reopen the session to continue: %w", err)
 		}
 		if err := os.Rename(activePath, nextArchiveName(dir)); err != nil {
-			return storage.Record{}, fmt.Errorf("archive active segment: %w", err)
+			return storage.Record{}, fmt.Errorf("segment switch failed; reopen the session to continue: %w", err)
 		}
 	}
 	if err := os.Rename(stagingPath, activePath); err != nil {
-		return storage.Record{}, fmt.Errorf("activate staged segment: %w", err)
+		return storage.Record{}, fmt.Errorf("segment switch failed; reopen the session to continue: %w", err)
 	}
 	log, err := OpenLog(activePath)
 	if err != nil {
-		return storage.Record{}, err
+		return storage.Record{}, fmt.Errorf("segment switch failed; reopen the session to continue: %w", err)
 	}
 	s.log = log
 	return stored, nil
+}
+
+// firstRecord reads the first valid record of a log file without reading
+// the rest.
+func firstRecord(path string) (storage.Record, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return storage.Record{}, false, nil
+		}
+		return storage.Record{}, false, fmt.Errorf("open session log: %w", err)
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, 64*1024)
+	line, err := reader.ReadBytes('\n')
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return storage.Record{}, false, nil
+	}
+	var record storage.Record
+	if err := json.Unmarshal(trimmed, &record); err != nil || record.Validate() != nil {
+		return storage.Record{}, false, fmt.Errorf("session log %s has an invalid header line", path)
+	}
+	return record, true, nil
 }
 
 // Records returns every stored record in order. A session which has not

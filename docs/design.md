@@ -270,5 +270,15 @@ user.input；软压回收检查——摘要后估算缩减不足 max(2K, 前/20)
 user.input 先落盘、compacted 后到，Fold 语义只能是整体替换）；无 usage
 锚定（纯估算）；无 MaxRequestBytes；摘要调用带与普通回合相同的重试。
 
+**摘要自描述框架**：`context.compacted` 的 Content 存的是框架前缀 + 摘要
+正文——重放为唯一先前上下文时，模型把它当自己的工作记忆而非待验证的
+用户断言。已知代价（有意接受）：框架随记录不可变（措辞不可演进）、
+出现在 CLI/UI 的 compact 块显示中、重复压缩时作为先前摘要的一部分再
+喂给摘要模型。替代方案（Fold 打标记 + 请求层包装）被否决：记录自包含
+优先于请求层零知识。框架用英文书写（对模型的指令，同 system prompt）。
+Title 由活跃段首条 user.input 决定（压缩后刷新；刚压缩完尚未有新输入
+时为空——将来做会话选择器时如需稳定标题，把标题源写进段头）。
+
 **transient 事件**：CompactionStartedEvent/CompletedEvent（带 ItemID）
-随 run 事件流发布；手动 Compact 无事件流（CLI spinner 覆盖）。
+随 run 事件流发布；手动 Compact 无事件流（CLI spinner 覆盖）。硬压下
+Completed 与 run.failed 并置是有意行为（摘要已落盘，见上）。

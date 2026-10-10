@@ -58,6 +58,12 @@ type Session struct {
 
 	mu      sync.RWMutex
 	state   *storage.State
+	// records is the in-process flat record stream. After a compaction
+	// it is deliberately LONGER than the on-disk active segment: the
+	// pre-compaction records stay here (cooldown scans and the CLI's
+	// flat printed counter need them) while jsonl archives them. A
+	// consumer subscribing mid-session sees the flat stream; a fresh
+	// Open sees only the active segment. Fold handles both.
 	records []storage.Record
 	// pendingCreated is the session.created record of a fresh session,
 	// committed ahead of the first real record. Nil on reopened sessions.
