@@ -106,3 +106,29 @@ func createSecondSession(t *testing.T, s *Server) string {
 	}
 	return created.ID()
 }
+
+// TestChatStoreMirror runs the chat client's SessionStore (the TS
+// mirror of the page reducer) and the page reducer itself against
+// identical synthetic frame sequences, asserting agreement on every
+// shared field — the mirror-consistency that would otherwise live in
+// CI's blind spot (the store is TypeScript; node >= 22.6 runs it via
+// type stripping). Serverless: the server contract is pinned by
+// TestPageReducerFixture. Skips without node.
+func TestChatStoreMirror(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; the chat store mirror check needs node >= 22.6")
+	}
+	script, err := filepath.Abs(filepath.Join("static", "store_check.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(node, script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("store_check.mjs: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "store_check: OK") {
+		t.Fatalf("store_check.mjs: unexpected output\n%s", out)
+	}
+}

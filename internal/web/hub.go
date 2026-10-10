@@ -328,8 +328,8 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 		f.Tool = &ToolWire{
 			Item:   snapshot.Running.ItemID,
 			CallID: snapshot.Running.ToolCall.ID,
-			Name: snapshot.Running.ToolCall.Name,
-			Args: snapshot.Running.ToolCall.Arguments,
+			Name:   snapshot.Running.ToolCall.Name,
+			Args:   snapshot.Running.ToolCall.Arguments,
 		}
 	}
 	for _, entry := range snapshot.Steered {

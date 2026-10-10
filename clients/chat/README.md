@@ -68,6 +68,7 @@ unreachable until a thread list is rendered).
 
 ## Sizes
 
-The built bundle is ~1.07 MB (fonts included; ~370 KB gzipped) —
-React + assistant-ui + Tailwind + Geist. The Go binary serves it as
+Measured after the official-style switch: JS 1,073,593 B (333,255 B
+gzipped), dist total 1,244,142 B including five Geist woff2 subsets —
+React + assistant-ui + Tailwind + fonts. The Go binary serves it as
 static files; nothing is embedded.
