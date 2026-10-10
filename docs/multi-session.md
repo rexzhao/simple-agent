@@ -236,7 +236,11 @@ POST /api/s/<id>/stop
   | （无码） | 404 | 否 | 未知会话 / 未注册项目 / 非法 id |
 
   §2.3 的 CLI↔serve 互操作里"409 锁冲突"即 `session_locked`；CSRF
-  守卫（guardAPI）全量适用，未过守卫的请求不进入上表
+  守卫（guardAPI）全量适用，未过守卫的请求不进入上表。**边界**：守卫
+  与请求解析层的若干失败（`bad json` 400、`content-type must be
+  application/json` 415、`missing item` 400 等）走 `http.Error`，
+  **body 是纯文本不是 JSON**——客户端不得假定错误响应总能 json
+  解析，解析失败时应显示原始 body 而非抛异常
 - 旧无前缀路由删除：仓内 `/api/...` 的唯一消费者是 `internal/web/static`
   与进程内工具，无外部客户端（已 grep 核实）；`docs/webui.md` §6 路由表
   加指针声明被本文取代
