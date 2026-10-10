@@ -630,14 +630,8 @@ function renderSidebar() {
         e.preventDefault();
         e.stopPropagation();
         if (!confirm("Delete this session and all its records?")) return;
-        // Re-entry guard: the retry loop spans seconds. Every exit
-        // re-enables the button; the identity guard lives HERE, inside
-        // done — one discipline for all exits.
+        // Re-entry guard: the retry loop spans seconds.
         del.disabled = true;
-        const done = text => {
-          del.disabled = false;
-          if (text !== undefined && st === state) showError(text);
-        };
         if (s.id === state.session) {
           // Our own view holds the server-side refs: navigate away and
           // let the hashchange task tear the stream down. The readyState
@@ -658,6 +652,13 @@ function renderSidebar() {
         // st !== state means the user switched away mid-delete — the
         // one case worth suppressing.
         const st = state;
+        // Defined after st: done closes over it, and defining it earlier
+        // would leave a TDZ trap for any future early exit inside the
+        // navigation block above.
+        const done = text => {
+          del.disabled = false;
+          if (text !== undefined && st === state) showError(text);
+        };
         try {
           // A response body is single-use: read it as TEXT once and
           // parse locally — the retry loop and the final branch share
