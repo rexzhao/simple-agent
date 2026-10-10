@@ -362,30 +362,39 @@ func (h *Hub) history(before string, limit int) (records []storage.Record, ancho
 
 // state is the /api/state summary.
 type state struct {
-	Session    string                 `json:"session"`
-	Running    bool                   `json:"running"`
-	Compacting bool                   `json:"compacting"`
-	Count      int                    `json:"count"`
-	Digest     string                 `json:"digest"`
-	Streaming  *storage.StreamingItem `json:"streaming,omitempty"`
-	Pressure   string                 `json:"pressure,omitempty"`
-	Retry      string                 `json:"retry,omitempty"`
-	Notice     string                 `json:"notice,omitempty"`
+	Session    string         `json:"session"`
+	Running    bool           `json:"running"`
+	Compacting bool           `json:"compacting"`
+	Count      int            `json:"count"`
+	Digest     string         `json:"digest"`
+	Streaming  *StreamingWire `json:"streaming,omitempty"`
+	Pressure   string         `json:"pressure,omitempty"`
+	Retry      string         `json:"retry,omitempty"`
+	Notice     string         `json:"notice,omitempty"`
 }
 
 func (h *Hub) state() state {
 	snapshot := h.session.Snapshot()
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return state{
+	s := state{
 		Session:    h.session.ID(),
 		Running:    h.session.Running(),
 		Compacting: snapshot.Compacting != nil,
 		Count:      len(h.records),
 		Digest:     h.chainHeadLocked(),
-		Streaming:  snapshot.Streaming,
 		Pressure:   h.lastPressure,
 		Retry:      h.lastRetry,
 		Notice:     h.lastNotice,
 	}
+	// The wire DTO, not the internal StreamingItem (untagged keys, the
+	// whole Message shape) — the same trap the snapshot frame fixed.
+	if snapshot.Streaming != nil {
+		s.Streaming = &StreamingWire{
+			Item:      snapshot.Streaming.ItemID,
+			Content:   snapshot.Streaming.Message.Content,
+			Reasoning: snapshot.Streaming.Message.ReasoningContent,
+		}
+	}
+	return s
 }

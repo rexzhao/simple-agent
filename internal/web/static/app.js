@@ -156,16 +156,24 @@ async function dispatch(frame) {
     case "snapshot":
       if (!frame.resumed) {
         // Rule A: a miss is a clean rebuild, never a chain continuation.
+        // The rebuild folds from the server-attested ANCHOR — the digest
+        // before the first windowed record — not from genesis: with a
+        // truncated window (more=true) folding from genesis produces a
+        // head that never matches the server. A running hash converges
+        // to the same head from any correct starting anchor.
         state.records = [];
         state.byItem = new Map();
         rowsEl.replaceChildren();
-        state.head = await chainGenesis(state.session);
+        state.head = frame.anchor;
       }
       state.reconnectFrom = "";
       await handleRecords(frame.records || []);
       // The prefix anchor is the digest BEFORE the first held record —
-      // the cursor for scroll-back, not the head.
-      state.prefixAnchor = frame.anchor;
+      // the cursor for scroll-back. Only a (re)issued window updates
+      // it: on a resume the server's anchor is our own head (the end
+      // of what we hold), not the beginning — adopting it would make
+      // the next scroll-back re-fetch and duplicate the newest window.
+      if (!frame.resumed) state.prefixAnchor = frame.anchor;
       state.more = !!frame.more;
       document.getElementById("load-more").hidden = !state.more;
       state.running = !!frame.running;

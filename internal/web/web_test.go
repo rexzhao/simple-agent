@@ -525,3 +525,57 @@ func recordsJSON(t *testing.T, maps []map[string]any) []storage.Record {
 	}
 	return out
 }
+
+// The truncated-window contract the page's self-check depends on:
+// folding the windowed records onto the snapshot's anchor must yield
+// the server's chain head. A page that folds from genesis instead of
+// the anchor drifts exactly when the window truncates (more=true) —
+// the bug the first real browser session caught.
+func TestWindowAnchorFoldsToHead(t *testing.T) {
+	turns := make([][]model.Event, 130)
+	for i := range turns {
+		turns[i] = []model.Event{model.TextDeltaEvent{Text: "answer"}}
+	}
+	session, _, base := newTestServer(t, turns)
+	for i := 0; i < 130; i++ {
+		if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "m"}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+		waitSettled(t, session)
+	}
+
+	res, err := http.DefaultClient.Get(base.URL + "/api/stream?window=100") //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	scanner := bufio.NewScanner(res.Body)
+	if !scanner.Scan() {
+		t.Fatal("no snapshot frame")
+	}
+	line := scanner.Text()
+	payload, ok := strings.CutPrefix(line, "data: ")
+	if !ok {
+		t.Fatalf("not a data line: %q", line)
+	}
+	var snap Frame
+	if err := json.Unmarshal([]byte(payload), &snap); err != nil {
+		t.Fatal(err)
+	}
+	var windowed []storage.Record
+	if err := json.Unmarshal(snap.Records, &windowed); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Total != 261 || len(windowed) != 100 || !snap.More {
+		t.Fatalf("window = total %d, %d records, more=%v", snap.Total, len(windowed), snap.More)
+	}
+
+	// The page's fold: start from the anchor, fold the window.
+	head := snap.Anchor
+	for _, r := range windowed {
+		head = chainStep(head, r)
+	}
+	if head != snap.Digest {
+		t.Fatalf("fold(anchor, window) = %s, want server head %s", head, snap.Digest)
+	}
+}
