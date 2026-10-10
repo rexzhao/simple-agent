@@ -45,6 +45,7 @@ Options:
 --session id        resume a stored session by id (exit if not found)
 --provider name     override default_provider
 --model name        override default_model (model profile name)
+--http addr         serve the web UI instead of the interactive REPL
 --version           print version
 ```
 
@@ -63,6 +64,20 @@ An optional positional argument resumes a stored session. Slash commands:
 The working directory is the process cwd: the shell tool runs where you
 started `sai`. The session id prints at startup, and again at exit when the
 session was persisted, so it can be resumed later with `--session`.
+
+### Web UI
+
+`sai -http 127.0.0.1:7420` serves the session as a **log view**: every
+persisted record in order plus the item currently streaming, a status
+area, and an input box. The page continuously verifies itself against
+the server (a digest chain over the record stream — the status area
+shows ✅ synced / ❌ drift), reconnects resume with zero retransmission,
+and scrolling up loads earlier records with the same verification. The
+serve console becomes a debug REPL that accepts commands only (free
+text goes to the page); a session is single-writer — a second process
+on the same session is refused while the first holds it.
+
+See `docs/webui.md` for the design.
 
 ## Server root and configuration
 
