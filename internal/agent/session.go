@@ -56,8 +56,8 @@ type Session struct {
 	agent   *Agent
 	storage storage.Session
 
-	mu      sync.RWMutex
-	state   *storage.State
+	mu    sync.RWMutex
+	state *storage.State
 	// records is the in-process flat record stream. After a compaction
 	// it is deliberately LONGER than the on-disk active segment: the
 	// pre-compaction records stay here (cooldown scans and the CLI's

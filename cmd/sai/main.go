@@ -259,10 +259,11 @@ func (p *spinnerPrinter) write(text string) {
 
 // cliApp holds the active session.
 type cliApp struct {
-	agent   *agent.Agent
-	session *agent.Session
-	printer *spinnerPrinter
-	unwatch func()
+	agent       *agent.Agent
+	session     *agent.Session
+	printer     *spinnerPrinter
+	unwatch     func()
+	watcherDone chan struct{} // closed when the record watcher goroutine exited
 
 	// liveMu guards liveShown and parked: assistant messages rendered
 	// live by the event drain (their committed records must not print
@@ -492,6 +493,15 @@ func (c *cliApp) closeSession() {
 		c.unwatch()
 		c.unwatch = nil
 	}
+	// Join the watcher goroutine before returning: after Stop it may
+	// still process buffered records, and those must not leak past the
+	// counter reset in bind (a late countPrinted would inflate the new
+	// session's printed; a late printRecord would render old-session
+	// records into the new one).
+	if c.watcherDone != nil {
+		<-c.watcherDone
+		c.watcherDone = nil
+	}
 	c.session.Close()
 }
 
@@ -548,7 +558,10 @@ func (c *cliApp) bind(session *agent.Session) error {
 	c.session = session
 	sub := session.Subscribe()
 	c.unwatch = sub.Stop
+	watcherDone := make(chan struct{})
+	c.watcherDone = watcherDone
 	go func() {
+		defer close(watcherDone)
 		for {
 			select {
 			case record := <-sub.Records():

@@ -340,15 +340,16 @@ func (s *Session) appendCompactionLocked(record storage.Record) (storage.Record,
 	}
 	// The new segment opens with a copy of the session header so it is
 	// self-contained (metadata and creation time survive alone). Only the
-	// first record is read — the switch cost stays independent of the
-	// segment size.
+	// first line is read (a hand-edited blank first line means no header
+	// copy, an accepted narrowing) — the switch cost stays independent
+	// of the segment size.
 	if s.log != nil {
 		header, ok, err := firstRecord(filepath.Join(dir, logFileName))
 		if err != nil {
 			staging.Close()
 			return storage.Record{}, err
 		}
-		if ok {
+		if ok && header.Type == storage.TypeSessionCreated {
 			if _, err := staging.Append(header); err != nil {
 				staging.Close()
 				return storage.Record{}, fmt.Errorf("stage segment header: %w", err)
@@ -392,8 +393,9 @@ func (s *Session) appendCompactionLocked(record storage.Record) (storage.Record,
 	return stored, nil
 }
 
-// firstRecord reads the first valid record of a log file without reading
-// the rest.
+// firstRecord reads the first line of a log file as a record, without
+// reading the rest. A blank or missing first line reports ok=false (no
+// header copy is staged); an invalid one is an error.
 func firstRecord(path string) (storage.Record, bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
