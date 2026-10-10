@@ -140,3 +140,53 @@ func TestListSessionsCompactedStart(t *testing.T) {
 		t.Fatalf("title = %q, want empty", infos[0].Title)
 	}
 }
+
+// The title is the FIRST user input, not the last; a headerless start
+// stays untitled.
+func TestListSessionsTitleSemantics(t *testing.T) {
+	store := OpenStore()
+	project := "ptest0000000000001"
+
+	first, err := store.Create(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []storage.Record{
+		{ItemID: "h1", Type: storage.TypeSessionCreated, Time: "2026-10-10T01:00:00Z"},
+		{ItemID: "u1", Type: storage.TypeUserInput, Time: "2026-10-10T01:00:01Z", Content: "FIRST INPUT"},
+		{ItemID: "u2", Type: storage.TypeUserInput, Time: "2026-10-10T01:01:00Z", Content: "SECOND INPUT"},
+		{ItemID: "u3", Type: storage.TypeUserInput, Time: "2026-10-10T01:02:00Z", Content: "THIRD INPUT"},
+	} {
+		if _, err := first.Append(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	headerless, err := store.Create(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []storage.Record{
+		{ItemID: "x1", Type: storage.TypeContextCompacted, Time: "2026-10-10T02:00:00Z"},
+		{ItemID: "u2", Type: storage.TypeUserInput, Time: "2026-10-10T02:00:10Z", Content: "MID INPUT"},
+	} {
+		if _, err := headerless.Append(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	infos, err := store.ListSessions(project)
+	if err != nil || len(infos) != 2 {
+		t.Fatalf("list: %v %d", err, len(infos))
+	}
+	byTitle := map[string]string{}
+	for _, info := range infos {
+		byTitle[info.ID] = info.Title
+	}
+	if byTitle[first.ID()] != "FIRST INPUT" {
+		t.Errorf("title = %q, want FIRST INPUT", byTitle[first.ID()])
+	}
+	if byTitle[headerless.ID()] != "" {
+		t.Errorf("headerless title = %q, want empty", byTitle[headerless.ID()])
+	}
+}

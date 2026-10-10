@@ -308,3 +308,158 @@ func copyDir(src, dst string) error {
 	}
 	return nil
 }
+
+// The title is the FIRST user input, not the last.
+func TestListSessionsTitleIsFirstInput(t *testing.T) {
+	store, _ := testStore(t)
+	project := ProjectID(t.TempDir())
+	session, err := store.Create(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, session,
+		headerRecord("2026-10-10T01:00:00Z"),
+		userInput("u1", "2026-10-10T01:00:01Z", "FIRST INPUT"),
+		storage.Record{ItemID: "a1", Type: storage.TypeAssistantMessage, Time: "2026-10-10T01:00:05Z", Content: "ok"},
+		userInput("u2", "2026-10-10T01:01:00Z", "SECOND INPUT"),
+		userInput("u3", "2026-10-10T01:02:00Z", "THIRD INPUT"))
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := store.ListSessions(project)
+	if err != nil || len(infos) != 1 {
+		t.Fatalf("list: %v %d", err, len(infos))
+	}
+	if infos[0].Title != "FIRST INPUT" {
+		t.Fatalf("title = %q, want the first input", infos[0].Title)
+	}
+}
+
+// A headerless start ([context.compacted, user.input], archives gone) has
+// no title — a mid-conversation input must not pose as the session start.
+func TestListSessionsHeaderlessStart(t *testing.T) {
+	store, _ := testStore(t)
+	project := ProjectID(t.TempDir())
+	dir := filepath.Join(store.Root(), project, "s00003894headerless01")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := `{"item":"x1","t":"context.compacted","ts":"2026-10-10T02:00:00Z","content":"SUMMARY"}
+{"item":"u2","t":"user.input","ts":"2026-10-10T02:00:10Z","content":"MID CONVERSATION INPUT"}
+`
+	if err := os.WriteFile(filepath.Join(dir, logFileName), []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := store.ListSessions(project)
+	if err != nil || len(infos) != 1 {
+		t.Fatalf("list: %v %d", err, len(infos))
+	}
+	if infos[0].Title != "" {
+		t.Fatalf("title = %q, want empty (headerless start)", infos[0].Title)
+	}
+}
+
+// A segment switch interrupted between the two renames (archive exists,
+// staging ready, active log not yet activated) must not make the session
+// vanish from the listing: the archive is a readable segment.
+func TestListSessionsMidSwitchCrashStillListed(t *testing.T) {
+	store, _ := testStore(t)
+	project := ProjectID(t.TempDir())
+	session, err := store.Create(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, session,
+		headerRecord("2026-10-10T01:00:00Z"),
+		userInput("u1", "2026-10-10T01:00:01Z", "before compaction"),
+		storage.Record{ItemID: "x1", Type: storage.TypeContextCompacted, Time: "2026-10-10T02:00:00Z", Content: "SUMMARY"})
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := session.(*Session).Dir()
+	// Simulate the crash: the active log is gone, the staged next segment
+	// sits beside the archive.
+	active := filepath.Join(dir, logFileName)
+	next := filepath.Join(dir, logSwitchStaging)
+	if err := os.Rename(active, next); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := store.ListSessions(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("sessions = %d, want 1 (archive is a segment)", len(infos))
+	}
+	if infos[0].Title != "before compaction" {
+		t.Fatalf("title = %q, want the archived original", infos[0].Title)
+	}
+}
+
+// Merely opening a session (lock/holder bookkeeping) must not change its
+// listed Modified — that field is content activity.
+func TestListSessionsOpenDoesNotBumpModified(t *testing.T) {
+	store, _ := testStore(t)
+	project := ProjectID(t.TempDir())
+	session, err := store.Create(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, session,
+		headerRecord("2026-10-10T01:00:00Z"),
+		userInput("u1", "2026-10-10T01:00:01Z", "hello"))
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.ListSessions(project)
+	if err != nil || len(before) != 1 {
+		t.Fatalf("list: %v %d", err, len(before))
+	}
+	// Open (rewrites holder) and close; the mtime of the content must
+	// not move. Force a visible gap so an equal-filesystem-timestamp
+	// flake cannot mask a regression.
+	time.Sleep(1100 * time.Millisecond)
+	opened, err := store.OpenIn(project, session.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.ListSessions(project)
+	if err != nil || len(after) != 1 {
+		t.Fatalf("list: %v %d", err, len(after))
+	}
+	if !after[0].Modified.Equal(before[0].Modified) {
+		t.Fatalf("Modified moved on open: %v -> %v", before[0].Modified, after[0].Modified)
+	}
+}
+
+// One unreadable session directory must not blank the whole project
+// listing (a listing is a view; opening is where corruption errors).
+func TestListSessionsSkipsUnreadableSession(t *testing.T) {
+	store, _ := testStore(t)
+	project := ProjectID(t.TempDir())
+	session, err := store.Create(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, session,
+		headerRecord("2026-10-10T01:00:00Z"),
+		userInput("u1", "2026-10-10T01:00:01Z", "good session"))
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A session dir whose "segment" is a directory: unreadable as a log.
+	bad := filepath.Join(store.Root(), project, "s00003894unreadable01")
+	if err := os.MkdirAll(filepath.Join(bad, logFileName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := store.ListSessions(project)
+	if err != nil {
+		t.Fatalf("listing failed on one bad dir: %v", err)
+	}
+	if len(infos) != 1 || infos[0].Title != "good session" {
+		t.Fatalf("infos = %+v, want only the good session", infos)
+	}
+}

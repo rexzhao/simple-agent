@@ -158,7 +158,14 @@ func describeSession(id string, records []storage.Record) (storage.SessionInfo, 
 	if len(records) == 0 {
 		return storage.SessionInfo{}, false
 	}
-	compacted := false
+	// Structured guard: a listing only trusts a title when the records
+	// genuinely start at the session header — records[0] must be the
+	// session.created (headerless starts stay untitled instead of
+	// posing a mid-conversation input as the start), and records[1]
+	// must not already be a compaction (the start is off-store).
+	compacted := records[0].Type != storage.TypeSessionCreated ||
+		(len(records) > 1 && records[1].Type == storage.TypeContextCompacted)
+loop:
 	for i, record := range records {
 		switch record.Type {
 		case storage.TypeSessionCreated:
@@ -167,16 +174,15 @@ func describeSession(id string, records []storage.Record) (storage.SessionInfo, 
 					info.Created = parsed
 				}
 			}
-		case storage.TypeContextCompacted:
-			if i == 1 {
-				compacted = true
-			}
 		case storage.TypeUserInput:
-			// The first input is the title — unless the records start
-			// as a compaction product (the session start is off-store
-			// and a mid-conversation input must not pose as one).
+			// The FIRST input is the title — unless the structured guard
+			// above marked the start as off-store or headerless (a
+			// mid-conversation input must not pose as the start). Later
+			// inputs are ordinary history: stop here, same as the jsonl
+			// reader's return-at-first-hit.
 			if !compacted {
 				info.Title = record.Content
+				break loop
 			}
 		}
 	}

@@ -302,7 +302,7 @@ func (s *Session) UpdateSteer(itemID, text string) error {
 				}
 			}
 			return nil
-			}
+		}
 	}
 	return ErrNotQueued
 }
@@ -788,8 +788,8 @@ func (s *Session) run(ctx context.Context, runID string, request model.Request, 
 		messages = append(messages, message)
 		if len(message.ToolCalls) == 0 {
 			// A queued steer extends the run (followup): consume and request
-		// again — within the iteration budget. At the budget edge the
-		// entries stay queued, delivered by a future run.
+			// again — within the iteration budget. At the budget edge the
+			// entries stay queued, delivered by a future run.
 			if iteration < maxIterations {
 				if n, err := s.drainSteered(&messages, runID); err != nil {
 					failure = err.Error()

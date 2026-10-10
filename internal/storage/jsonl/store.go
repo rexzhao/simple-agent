@@ -250,7 +250,7 @@ func (s *Store) sessionDir(id string) (string, error) {
 		dir := filepath.Join(s.root, project.Name(), id)
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
 			if hit != "" {
-				return "", fmt.Errorf("open session %q: multiple project directories hold this id", id)
+				return "", fmt.Errorf("open session %q: multiple project directories hold this id: %s, %s", id, hit, dir)
 			}
 			hit = dir
 		}
@@ -530,37 +530,48 @@ func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
 		dir := filepath.Join(s.root, projectID, entry.Name())
 		info, ok, err := listSession(dir)
 		if err != nil {
-			return nil, err
+			// A listing is a view: one unreadable session directory
+			// must not blank the whole project. The session errors
+			// loudly when opened — that is where corruption belongs.
+			continue
 		}
 		if ok {
 			infos = append(infos, info)
 		}
 	}
-	sort.Slice(infos, func(i, j int) bool { return infos[i].Modified.After(infos[j].Modified) })
+	sort.Slice(infos, func(i, j int) bool {
+		if !infos[i].Modified.Equal(infos[j].Modified) {
+			return infos[i].Modified.After(infos[j].Modified)
+		}
+		return infos[i].ID < infos[j].ID // stable tiebreak
+	})
 	return infos, nil
 }
 
 // listSession derives one session's listing info from its directory. The
-// second return is false for a session with no log (never materialized).
+// second return is false for a session with no segment at all (never
+// materialized, or a segment switch interrupted before the archive landed
+// — either way there is nothing to list). Modified is CONTENT activity:
+// the newest mtime among segment files only — the lock/holder bookkeeping
+// (rewritten on every open) must not make an opened-but-idle session look
+// recently active.
 func listSession(dir string) (storage.SessionInfo, bool, error) {
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return storage.SessionInfo{}, false, fmt.Errorf("read session dir: %w", err)
 	}
 	var modified time.Time
-	hasLog := false
+	hasSegment := false
 	for _, file := range files {
-		if file.IsDir() {
+		if file.IsDir() || !isSegmentName(file.Name()) {
 			continue
 		}
-		if file.Name() == logFileName {
-			hasLog = true
-		}
+		hasSegment = true
 		if info, err := file.Info(); err == nil && info.ModTime().After(modified) {
 			modified = info.ModTime()
 		}
 	}
-	if !hasLog {
+	if !hasSegment {
 		return storage.SessionInfo{}, false, nil
 	}
 	info, err := readSessionHead(dir)
@@ -572,9 +583,21 @@ func listSession(dir string) (storage.SessionInfo, bool, error) {
 	return info, true, nil
 }
 
-// headScanLimit bounds the Title search: the original first user input
-// follows the session header within a few lines; a session whose first
-// input sits deeper than this is pathological.
+// isSegmentName reports whether a file is a log segment (active, archive,
+// or staged next) — the only files whose mtimes count as content activity.
+func isSegmentName(name string) bool {
+	if name == logFileName || name == logSwitchStaging {
+		return true
+	}
+	return strings.HasPrefix(name, logArchivePrefix) && strings.HasSuffix(name, logArchiveSuffix)
+}
+
+// headScanLimit bounds the Title search. With the structural guard in
+// readSessionHead (header first, no immediate compaction), the first
+// user input follows the header within a couple of records; the limit
+// only bounds pathological files, so a small value is provably
+// sufficient and a large one costs nothing (the scan stops at the
+// first hit).
 const headScanLimit = 1000
 
 // readSessionHead reads Created and Title from the earliest segment — the
@@ -584,6 +607,13 @@ const headScanLimit = 1000
 // timestamp. A leading session.created+context.compacted pair means the
 // start is off-disk (archives were cleaned): the title stays empty rather
 // than lying with a mid-conversation input.
+//
+// The guard is structural, not positional: a title is only trusted when
+// the records genuinely start at the session header — records[0] must be
+// the session.created (a headerless start stays untitled) and records[1]
+// must not already be a compaction. With the guard, the scan terminates
+// at the first user input and the head limit only bounds pathological
+// files — a handful of records is provably sufficient.
 func readSessionHead(dir string) (storage.SessionInfo, error) {
 	var info storage.SessionInfo
 	earliest := filepath.Join(dir, logFileName)
@@ -594,25 +624,17 @@ func readSessionHead(dir string) (storage.SessionInfo, error) {
 	if err != nil {
 		return info, err
 	}
-	compacted := false
-	for i, record := range records {
-		switch record.Type {
-		case storage.TypeSessionCreated:
-			if i == 0 {
-				info.Created = parseRecordTime(record.Time)
-			}
-		case storage.TypeContextCompacted:
-			// Only a compacted second line (right after the header)
-			// marks an off-disk start; later compactions are ordinary
-			// history.
-			if i == 1 {
-				compacted = true
-			}
-		case storage.TypeUserInput:
-			if !compacted {
-				info.Title = record.Content
-			}
-			return info, nil
+	if len(records) == 0 || records[0].Type != storage.TypeSessionCreated {
+		return info, nil
+	}
+	info.Created = parseRecordTime(records[0].Time)
+	if len(records) > 1 && records[1].Type == storage.TypeContextCompacted {
+		return info, nil
+	}
+	for _, record := range records[1:] {
+		if record.Type == storage.TypeUserInput {
+			info.Title = record.Content
+			break
 		}
 	}
 	return info, nil

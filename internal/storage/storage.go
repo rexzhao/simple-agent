@@ -9,8 +9,13 @@ import "time"
 
 // SessionInfo describes one stored session for listing (the serve-mode
 // project/session browser). Title is best-effort: the first user input of
-// the earliest segment, empty when the session start is no longer on disk
-// (a leading session.created+context.compacted pair).
+// the earliest segment — trusted only when the records structurally start
+// at the session header; empty when the session start is no longer on
+// disk (a leading session.created+context.compacted pair, or a headerless
+// start). Modified is CONTENT activity — the jsonl layout takes the
+// newest segment-file mtime (lock bookkeeping excluded), memory takes the
+// last record's timestamp; both answer "when did this conversation last
+// move", not "when was it last touched by a process".
 type SessionInfo struct {
 	ID       string
 	Title    string
@@ -46,7 +51,12 @@ type Store interface {
 	// projects) and the id→dir resolution cannot cross it.
 	OpenIn(projectID, sessionID string) (Session, error)
 	// ListSessions enumerates the stored sessions of one project,
-	// newest activity first. Sessions never materialized (no first
-	// record) are not listed: they hold nothing.
+	// newest activity first (ID as the tiebreak). Sessions never
+	// materialized (no first record) are not listed: they hold nothing.
+	// The listing is a VIEW: it tolerates concurrent appends (a writer
+	// mid-line into a tail) by skipping unparseable lines, and a session
+	// directory whose segment cannot be read at all is skipped rather
+	// than failing the whole project — opening that session is where
+	// real corruption errors.
 	ListSessions(projectID string) ([]SessionInfo, error)
 }
