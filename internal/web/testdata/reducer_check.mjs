@@ -3,7 +3,7 @@
 // window, resume-after-disconnect, scroll-back after resume — asserting
 // the {head, prefixAnchor, more, records.length} evolution. Run by
 // TestPageReducerFixture via `node reducer_check.mjs <base-url>`.
-import { initialState, initChain, applySnapshot, applyRecord, applyStatus, applyHistory } from "./reducer.mjs";
+import { initialState, initChain, applySnapshot, applyRecord, applyStatus, applyHistory } from "../static/reducer.mjs";
 
 const base = process.argv[2];
 if (!base) {

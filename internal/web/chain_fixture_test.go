@@ -55,7 +55,7 @@ func TestJSChainFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	script, err := filepath.Abs(filepath.Join("static", "chain_check.mjs"))
+	script, err := filepath.Abs(filepath.Join("testdata", "chain_check.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}

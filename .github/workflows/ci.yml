@@ -16,6 +16,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # The JS fixture checks (chain/reducer/store mirrors) skip
+      # without node; without this step the entire value of those
+      # checks — drift cannot land silently — is absent from CI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - run: go test ./...
       - run: go vet ./...
       - name: Gofmt gate

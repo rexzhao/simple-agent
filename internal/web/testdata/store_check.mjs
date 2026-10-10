@@ -10,9 +10,9 @@
 // Run by TestChatStoreMirror via `node store_check.mjs`. Serverless:
 // the frames are synthetic; the server contract itself is pinned by
 // reducer_check.mjs against a live serve.
-import { initialState, initChain, applySnapshot, applyRecord } from "./reducer.mjs";
+import { initialState, initChain, applySnapshot, applyRecord } from "../static/reducer.mjs";
 import { SessionStore } from "../../../clients/chat/src/store.ts";
-import { chainStep } from "./chain.mjs";
+import { chainStep } from "../static/chain.mjs";
 
 const failures = [];
 function assert(cond, what) {

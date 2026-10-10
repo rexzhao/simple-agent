@@ -38,7 +38,7 @@ func TestPageReducerFixture(t *testing.T) {
 	// scenario (scenario 4 in the fixture).
 	second := createSecondSession(t, server)
 
-	script, err := filepath.Abs(filepath.Join("static", "reducer_check.mjs"))
+	script, err := filepath.Abs(filepath.Join("testdata", "reducer_check.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestChatStoreMirror(t *testing.T) {
 	if err != nil {
 		t.Skip("node not available; the chat store mirror check needs node >= 22.6")
 	}
-	script, err := filepath.Abs(filepath.Join("static", "store_check.mjs"))
+	script, err := filepath.Abs(filepath.Join("testdata", "store_check.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}

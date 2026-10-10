@@ -3,7 +3,7 @@
 // module's chain encoding and folding match byte for byte. Run by
 // TestJSChainFixture via `node chain_check.mjs`; the chain code itself
 // lives in chain.mjs — the exact module the page imports.
-import { chainGenesis, chainStep, chainInput } from "./chain.mjs";
+import { chainGenesis, chainStep, chainInput } from "../static/chain.mjs";
 
 const crypto = globalThis.crypto;
 if (!crypto || !crypto.subtle) {
