@@ -630,11 +630,9 @@ function renderSidebar() {
         e.preventDefault();
         e.stopPropagation();
         if (!confirm("Delete this session and all its records?")) return;
-        // Re-entry guard: the retry loop spans seconds. The identity is
-        // captured at click time; every exit re-enables the button and
-        // shows its text only if this view is still current — ONE guard
-        // discipline, inside done itself.
-        const st = state;
+        // Re-entry guard: the retry loop spans seconds. Every exit
+        // re-enables the button; the identity guard lives HERE, inside
+        // done — one discipline for all exits.
         del.disabled = true;
         const done = text => {
           del.disabled = false;
@@ -652,6 +650,14 @@ function renderSidebar() {
             await new Promise(res => setTimeout(res, 50));
           }
         }
+        // The identity is captured AFTER the self-navigation above: for
+        // the delete-own-view flow the state object has already been
+        // replaced by the list view, and capturing earlier would swallow
+        // every failure toast of this exact flow (a destructive
+        // operation failing silently is the worst outcome). From here,
+        // st !== state means the user switched away mid-delete — the
+        // one case worth suppressing.
+        const st = state;
         try {
           // A response body is single-use: read it as TEXT once and
           // parse locally — the retry loop and the final branch share
