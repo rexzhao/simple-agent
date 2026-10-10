@@ -519,7 +519,9 @@ document.getElementById("composer").addEventListener("submit", async e => {
   if (res.ok) {
     input.value = "";
   } else {
-    showError(await res.text());
+    const text = await res.text();
+    if (st !== state) return;
+    showError(text);
   }
 });
 
@@ -710,11 +712,8 @@ async function openSession(id, retries = 0) {
     // (empty records + genesis head) right after the delete.
     st.session = "";
     showError("session not found");
-    if (location.hash) {
-      location.hash = "";
-    } else {
-      route();
-    }
+    if (location.hash) location.hash = "";
+    route();
     return;
   }
   if (res.status === 409) {
