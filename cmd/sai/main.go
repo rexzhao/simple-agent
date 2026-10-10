@@ -103,7 +103,7 @@ func main() {
 		}
 	}()
 
-	fmt.Fprintln(os.Stderr, "sai: /clear /resume <id> /stop /help /quit")
+	fmt.Fprintln(os.Stderr, "sai: /clear /compact /resume <id> /stop /help /quit")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for {
@@ -370,6 +370,13 @@ func (c *cliApp) send(text string) error {
 					pressure.EstimatedTokens, pressure.HardInputLimit)
 				continue
 			}
+			// Retry notices land on stderr for the same reason — a silent
+			// retry between streaming chunks looks like a hang.
+			if retry, ok := event.(model.ProviderRetryEvent); ok {
+				fmt.Fprintf(os.Stderr, "sai: retrying model request (attempt %d/%d, %s)\n",
+					retry.Attempt, retry.MaxAttempts, retry.Reason)
+				continue
+			}
 			live.handle(event)
 		}
 		live.settle()
@@ -527,6 +534,17 @@ func (c *cliApp) bind(session *agent.Session) error {
 		}
 		c.closeSession()
 	}
+	// Reset the cross-session bookkeeping: printed counts toward the new
+	// session's records (a stale counter would make waitForRecords a
+	// permanent no-op), and the live-render markers of the old session
+	// are meaningless here.
+	c.liveMu.Lock()
+	c.liveShown = nil
+	c.parked = nil
+	c.liveMu.Unlock()
+	c.printedMu.Lock()
+	c.printed = 0
+	c.printedMu.Unlock()
 	c.session = session
 	sub := session.Subscribe()
 	c.unwatch = sub.Stop

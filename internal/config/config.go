@@ -96,15 +96,6 @@ type ModelProfile struct {
 	ContextWindow   int             `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 }
 
-// ModelPricing contains the billing buckets supported by the usage pipeline.
-// InputTokens is the uncached input bucket; cache-write tokens can either use
-// their own price or fall back to the cache-miss rate for legacy configs.
-//
-// Prices are per 1,000,000 tokens. This is the unit used by most hosted model
-// providers and avoids losing precision for the small per-token values users
-// normally enter.
-// ModelPricingTier is a complete price table for one context-length tier.
-// Prices are currency units per one million tokens.
 type ReasoningConfig struct {
 	// Type selects the reasoning control shape. An empty value or "effort"
 	// means string-level effort mapping (the historical behavior). "budget_tokens"

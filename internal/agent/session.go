@@ -526,6 +526,10 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 		return request, false, nil
 	}
 	sendEvent(ctx, events, model.CompactionCompletedEvent{ItemID: itemID})
+	// Note: under hard pressure the run may still fail right after this
+	// event — the summary was committed (it is a real, smaller context)
+	// but the rebuilt request still exceeds the safe limit. Completed +
+	// run.failed coexisting is intentional; see design §13.
 
 	s.mu.RLock()
 	context := append([]model.Message(nil), s.state.Context...)
