@@ -5,6 +5,19 @@
 // only writer and the only folder.
 package storage
 
+import "time"
+
+// SessionInfo describes one stored session for listing (the serve-mode
+// project/session browser). Title is best-effort: the first user input of
+// the earliest segment, empty when the session start is no longer on disk
+// (a leading session.created+context.compacted pair).
+type SessionInfo struct {
+	ID       string
+	Title    string
+	Created  time.Time
+	Modified time.Time
+}
+
 // Session is one stored session: an append-only sequence of records.
 type Session interface {
 	// ID returns the session identity, minted at Create and available
@@ -27,4 +40,13 @@ type Store interface {
 	// in-memory implementations ignore it.
 	Create(projectID string) (Session, error)
 	Open(id string) (Session, error)
+	// OpenIn opens a session scoped to one project: the jsonl layout
+	// resolves the id inside <root>/<projectID>/ only — the serve-mode
+	// registration gate is structural (no scan across unregistered
+	// projects) and the id→dir resolution cannot cross it.
+	OpenIn(projectID, sessionID string) (Session, error)
+	// ListSessions enumerates the stored sessions of one project,
+	// newest activity first. Sessions never materialized (no first
+	// record) are not listed: they hold nothing.
+	ListSessions(projectID string) ([]SessionInfo, error)
 }

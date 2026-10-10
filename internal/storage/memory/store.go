@@ -6,7 +6,9 @@ package memory
 
 import (
 	"fmt"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/storage"
 )
@@ -15,20 +17,23 @@ import (
 type Store struct {
 	mu       sync.Mutex
 	sessions map[string]*records
+	// projectOf mirrors the jsonl layout: which project each session
+	// belongs to. OpenIn's gate and ListSessions' scoping depend on it.
+	projectOf map[string]string
 }
 
 // OpenStore returns an empty in-memory store.
 func OpenStore() *Store {
-	return &Store{sessions: make(map[string]*records)}
+	return &Store{sessions: make(map[string]*records), projectOf: make(map[string]string)}
 }
 
-// Create returns a new session. The project id is ignored: memory sessions
-// have no directory layout.
+// Create returns a new session inside the project.
 func (s *Store) Create(projectID string) (storage.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session := &Session{id: storage.NewSessionID(), log: &records{}}
 	s.sessions[session.id] = session.log
+	s.projectOf[session.id] = projectID
 	return session, nil
 }
 
@@ -108,4 +113,85 @@ func (s *Session) Close() error {
 	defer s.mu.Unlock()
 	s.closed = true
 	return nil
+}
+
+// OpenIn opens a session scoped to one project: a session living under a
+// different project is not found, mirroring the jsonl registration gate.
+func (s *Store) OpenIn(projectID, sessionID string) (storage.Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.projectOf[sessionID] != projectID {
+		return nil, fmt.Errorf("open session %q: not found", sessionID)
+	}
+	log, ok := s.sessions[sessionID]
+	if !ok {
+		return nil, fmt.Errorf("open session %q: not found", sessionID)
+	}
+	return &Session{id: sessionID, log: log}, nil
+}
+
+// ListSessions enumerates a project's sessions, newest activity first.
+// Sessions with no records hold nothing and stay unlisted.
+func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var infos []storage.SessionInfo
+	for id, log := range s.sessions {
+		if s.projectOf[id] != projectID {
+			continue
+		}
+		info, ok := describeSession(id, log.snapshot())
+		if ok {
+			infos = append(infos, info)
+		}
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Modified.After(infos[j].Modified) })
+	return infos, nil
+}
+
+// describeSession derives listing info from a record slice: Created is the
+// session.created timestamp, Modified the last record's, Title the first
+// user input unless the records start as a compaction product (the session
+// start is off-store).
+func describeSession(id string, records []storage.Record) (storage.SessionInfo, bool) {
+	var info storage.SessionInfo
+	if len(records) == 0 {
+		return storage.SessionInfo{}, false
+	}
+	compacted := false
+	for i, record := range records {
+		switch record.Type {
+		case storage.TypeSessionCreated:
+			if i == 0 {
+				if parsed, err := time.Parse(time.RFC3339Nano, record.Time); err == nil {
+					info.Created = parsed
+				}
+			}
+		case storage.TypeContextCompacted:
+			if i == 1 {
+				compacted = true
+			}
+		case storage.TypeUserInput:
+			// The first input is the title — unless the records start
+			// as a compaction product (the session start is off-store
+			// and a mid-conversation input must not pose as one).
+			if !compacted {
+				info.Title = record.Content
+			}
+		}
+	}
+	info.ID = id
+	info.Modified = parseLastTime(records)
+	return info, true
+}
+
+func parseLastTime(records []storage.Record) time.Time {
+	if len(records) == 0 {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, records[len(records)-1].Time)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }

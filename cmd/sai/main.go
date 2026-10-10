@@ -65,8 +65,14 @@ func main() {
 		}
 		*serverRoot = root
 	}
+	// The registry subcommands run before any agent assembly; they see
+	// the same resolved root the session-bearing modes use.
+	resolvedServerRoot = *serverRoot
+	if flag.NArg() > 0 && flag.Arg(0) == "project" {
+		os.Exit(projectCommand(flag.Args()[1:]))
+	}
 
-	ag, project, err := assemble(*serverRoot, *provider, *modelName)
+	ag, project, err := assembleCurrentDir(*serverRoot, *provider, *modelName)
 	if err != nil {
 		log.Fatalf("sai: %v", err)
 	}
@@ -137,70 +143,108 @@ func main() {
 // assemble performs the one-time startup assembly: load the config,
 // resolve the model, build the provider, tools, and storage, and construct
 // the agent with everything injected.
-func assemble(serverRoot, providerName, modelName string) (*agent.Agent, string, error) {
+// agentFactory assembles one agent per project: everything project-
+// independent (config, provider, store) is resolved once; everything
+// else (tool executor, system prompt, project id) is bound to the
+// project's cwd at assembly time. serve mode instantiates lazily per
+// registered project; the CLI instantiates once for the process cwd.
+type agentFactory struct {
+	store         *jsonl.Store
+	cfg           *config.Config
+	provider      model.Provider
+	providerName  string
+	modelID       string
+	parameters    map[string]any
+	developerRole model.MessageRole
+	outputLimit   int
+	contextWindow int
+}
+
+// assembleFactory resolves the project-independent half of the assembly.
+func assembleFactory(serverRoot, providerName, modelName string) (*agentFactory, error) {
 	configPath := filepath.Join(serverRoot, "sai.yaml")
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		return nil, "", fmt.Errorf("load %s: %w", configPath, err)
+		return nil, fmt.Errorf("load %s: %w", configPath, err)
 	}
 	resolved, err := cfg.ResolveModel(providerName, modelName)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	provider, err := newProvider(resolved)
 	if err != nil {
-		return nil, "", err
-	}
-
-	cwd, err := filepath.Abs(".")
-	if err != nil {
-		return nil, "", fmt.Errorf("resolve working directory: %w", err)
+		return nil, err
 	}
 	parameters, err := config.ApplyReasoningLevel(resolved.Parameters, resolved.ReasoningConfig, "")
 	if err != nil {
-		return nil, "", fmt.Errorf("apply reasoning level: %w", err)
+		return nil, fmt.Errorf("apply reasoning level: %w", err)
 	}
 	developerRole := model.MessageRoleDeveloper
 	if strings.TrimSpace(resolved.DeveloperRole) != "" {
 		developerRole = model.MessageRole(resolved.DeveloperRole)
 	}
-
 	store, err := jsonl.OpenStore(filepath.Join(serverRoot, "data"))
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	project := jsonl.ProjectID(cwd)
+	return &agentFactory{
+		store:         store,
+		cfg:           cfg,
+		provider:      provider,
+		providerName:  resolved.ProviderName,
+		modelID:       resolved.ModelID,
+		parameters:    parameters,
+		developerRole: developerRole,
+		outputLimit:   resolved.OutputLimit,
+		contextWindow: resolved.ContextWindow,
+	}, nil
+}
 
-	shell, executor, err := tools.Shell(cwd)
+// Agent assembles the agent for one project directory.
+func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
+	shell, executor, err := tools.Shell(projectCwd)
 	if err != nil {
 		return nil, "", fmt.Errorf("register tools: %w", err)
 	}
-	systemPrompt, err := buildSystemPrompt(cfg, cwd)
+	systemPrompt, err := buildSystemPrompt(f.cfg, projectCwd)
 	if err != nil {
 		return nil, "", err
 	}
-
+	project := jsonl.ProjectID(projectCwd)
 	ag, err := agent.New(agent.Options{
-		Provider:      provider,
-		ProviderName:  resolved.ProviderName,
-		ModelID:       resolved.ModelID,
-		Storage:       store,
+		Provider:      f.provider,
+		ProviderName:  f.providerName,
+		ModelID:       f.modelID,
+		Storage:       f.store,
 		Tools:         []model.Tool{shell},
 		ToolExecutor:  namedExecutor{exec: executor},
 		SystemPrompt:  systemPrompt,
-		DeveloperRole: developerRole,
-		Parameters:    parameters,
-		MaxTokens:     resolved.OutputLimit,
-		MaxIterations: cfg.Agent.MaxIterations,
+		DeveloperRole: f.developerRole,
+		Parameters:    f.parameters,
+		MaxTokens:     f.outputLimit,
+		MaxIterations: f.cfg.Agent.MaxIterations,
 		ProjectID:     project,
-		CWD:           cwd,
-		ContextWindow: resolved.ContextWindow,
-		AutoCompact:   cfg.Agent.AutoCompact,
+		CWD:           projectCwd,
+		ContextWindow: f.contextWindow,
+		AutoCompact:   f.cfg.Agent.AutoCompact,
 	})
 	if err != nil {
 		return nil, "", err
 	}
 	return ag, project, nil
+}
+
+// assembleCurrentDir is the CLI path: one agent for the process cwd.
+func assembleCurrentDir(serverRoot, providerName, modelName string) (*agent.Agent, string, error) {
+	cwd, err := filepath.Abs(".")
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve working directory: %w", err)
+	}
+	factory, err := assembleFactory(serverRoot, providerName, modelName)
+	if err != nil {
+		return nil, "", err
+	}
+	return factory.Agent(cwd)
 }
 
 // namedExecutor adapts the single-tool executor to the agent loop's
@@ -647,3 +691,7 @@ func appName() string {
 	}
 	return name
 }
+
+// resolvedServerRoot is the server root after flag/env/default resolution,
+// shared with the project registry subcommands.
+var resolvedServerRoot string

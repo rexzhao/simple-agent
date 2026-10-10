@@ -10,12 +10,15 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/storage"
 )
@@ -129,41 +132,6 @@ func (s *Store) Create(projectID string) (storage.Session, error) {
 	}, nil
 }
 
-// Open loads an existing session. The session ID is globally unique, so the
-// project directory it lives in is found by scanning the data root. A run
-// which was interrupted by a crash needs no repair record: its user input
-// simply stays unanswered, and the agent patches any dangling tool calls
-// before the next request.
-//
-// A session's records live in segments: log.jsonl is the active segment,
-// log-NNNN.jsonl files are immutable archives of the history before each
-// compaction. An interrupted segment switch is recovered here.
-func (s *Store) Open(id string) (storage.Session, error) {
-	if !ValidSessionID(id) {
-		return nil, fmt.Errorf("invalid session id %q", id)
-	}
-	dir, err := s.sessionDir(id)
-	if err != nil {
-		return nil, err
-	}
-	// The lock precedes recovery and the log open: both touch files a
-	// concurrent writer could be mid-switch on.
-	lock, err := lockSession(dir)
-	if err != nil {
-		return nil, err
-	}
-	if err := recoverSegments(dir); err != nil {
-		lock.Release()
-		return nil, err
-	}
-	log, err := OpenLog(filepath.Join(dir, logFileName))
-	if err != nil {
-		lock.Release()
-		return nil, err
-	}
-	return &Session{id: id, project: filepath.Base(filepath.Dir(dir)), store: s, log: log, lock: lock}, nil
-}
-
 // recoverSegments completes or discards an interrupted compaction switch.
 // The switch stages the next segment in log.jsonl.next (fully written and
 // synced), archives the active log, then activates the staged file; every
@@ -265,22 +233,91 @@ func nextArchiveName(dir string) string {
 }
 
 // sessionDir locates the directory of a session ID by scanning the project
-// directories of the data root.
+// directories of the data root. Session IDs are globally unique, so more
+// than one hit means directories were copied around by hand — refuse
+// instead of silently picking the first (the serve layer surfaces this as
+// 409).
 func (s *Store) sessionDir(id string) (string, error) {
 	projects, err := os.ReadDir(s.root)
 	if err != nil {
 		return "", fmt.Errorf("read data root: %w", err)
 	}
+	var hit string
 	for _, project := range projects {
 		if !project.IsDir() || !ValidProjectID(project.Name()) {
 			continue
 		}
 		dir := filepath.Join(s.root, project.Name(), id)
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			return dir, nil
+			if hit != "" {
+				return "", fmt.Errorf("open session %q: multiple project directories hold this id", id)
+			}
+			hit = dir
 		}
 	}
-	return "", fmt.Errorf("open session %q: not found", id)
+	if hit == "" {
+		return "", fmt.Errorf("open session %q: not found", id)
+	}
+	return hit, nil
+}
+
+// Open loads an existing session. The session ID is globally unique, so the
+// project directory it lives in is found by scanning the data root. A run
+// which was interrupted by a crash needs no repair record: its user input
+// simply stays unanswered, and the agent patches any dangling tool calls
+// before the next request.
+//
+// A session's records live in segments: log.jsonl is the active segment,
+// log-NNNN.jsonl files are immutable archives of the history before each
+// compaction. An interrupted segment switch is recovered here.
+func (s *Store) Open(id string) (storage.Session, error) {
+	if !ValidSessionID(id) {
+		return nil, fmt.Errorf("invalid session id %q", id)
+	}
+	dir, err := s.sessionDir(id)
+	if err != nil {
+		return nil, err
+	}
+	return s.openDir(id, dir)
+}
+
+// OpenIn loads a session scoped to one project: the id resolves inside
+// <root>/<projectID>/ only. The serve-mode registration gate is structural
+// — an unregistered project's sessions cannot be opened even though the
+// store can see their directories.
+func (s *Store) OpenIn(projectID, sessionID string) (storage.Session, error) {
+	if !ValidProjectID(projectID) {
+		return nil, fmt.Errorf("invalid project id %q", projectID)
+	}
+	if !ValidSessionID(sessionID) {
+		return nil, fmt.Errorf("invalid session id %q", sessionID)
+	}
+	dir := filepath.Join(s.root, projectID, sessionID)
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("open session %q: not found", sessionID)
+	}
+	return s.openDir(sessionID, dir)
+}
+
+// openDir takes the session lock, recovers an interrupted segment switch,
+// and opens the active log — the shared sequence behind Open and OpenIn.
+func (s *Store) openDir(id, dir string) (storage.Session, error) {
+	// The lock precedes recovery and the log open: both touch files a
+	// concurrent writer could be mid-switch on.
+	lock, err := lockSession(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := recoverSegments(dir); err != nil {
+		lock.Release()
+		return nil, err
+	}
+	log, err := OpenLog(filepath.Join(dir, logFileName))
+	if err != nil {
+		lock.Release()
+		return nil, err
+	}
+	return &Session{id: id, project: filepath.Base(filepath.Dir(dir)), store: s, log: log, lock: lock}, nil
 }
 
 // Session is one open session's log. It holds no conversation state and no
@@ -467,4 +504,188 @@ func (s *Session) Close() error {
 	}
 	lock.Release()
 	return err
+}
+
+// ListSessions enumerates the materialized sessions of one project, newest
+// activity first. Reading is listing-grade best effort: unparseable lines
+// are skipped (a CLI may hold the lock and be mid-append into the tail
+// right now), and sessions without a log file hold nothing and stay
+// unlisted.
+func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
+	if !ValidProjectID(projectID) {
+		return nil, fmt.Errorf("invalid project id %q", projectID)
+	}
+	entries, err := os.ReadDir(filepath.Join(s.root, projectID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read project dir: %w", err)
+	}
+	var infos []storage.SessionInfo
+	for _, entry := range entries {
+		if !entry.IsDir() || !ValidSessionID(entry.Name()) {
+			continue
+		}
+		dir := filepath.Join(s.root, projectID, entry.Name())
+		info, ok, err := listSession(dir)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			infos = append(infos, info)
+		}
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Modified.After(infos[j].Modified) })
+	return infos, nil
+}
+
+// listSession derives one session's listing info from its directory. The
+// second return is false for a session with no log (never materialized).
+func listSession(dir string) (storage.SessionInfo, bool, error) {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return storage.SessionInfo{}, false, fmt.Errorf("read session dir: %w", err)
+	}
+	var modified time.Time
+	hasLog := false
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		if file.Name() == logFileName {
+			hasLog = true
+		}
+		if info, err := file.Info(); err == nil && info.ModTime().After(modified) {
+			modified = info.ModTime()
+		}
+	}
+	if !hasLog {
+		return storage.SessionInfo{}, false, nil
+	}
+	info, err := readSessionHead(dir)
+	if err != nil {
+		return storage.SessionInfo{}, false, err
+	}
+	info.ID = filepath.Base(dir)
+	info.Modified = modified
+	return info, true, nil
+}
+
+// headScanLimit bounds the Title search: the original first user input
+// follows the session header within a few lines; a session whose first
+// input sits deeper than this is pathological.
+const headScanLimit = 1000
+
+// readSessionHead reads Created and Title from the earliest segment — the
+// lowest-numbered archive, else the active log. Archives are immutable, so
+// the session start (header + first user input) survives compaction there;
+// the active segment opens with a header copy that keeps the original
+// timestamp. A leading session.created+context.compacted pair means the
+// start is off-disk (archives were cleaned): the title stays empty rather
+// than lying with a mid-conversation input.
+func readSessionHead(dir string) (storage.SessionInfo, error) {
+	var info storage.SessionInfo
+	earliest := filepath.Join(dir, logFileName)
+	if best, ok := earliestArchive(dir); ok {
+		earliest = best
+	}
+	records, err := scanHead(earliest, headScanLimit)
+	if err != nil {
+		return info, err
+	}
+	compacted := false
+	for i, record := range records {
+		switch record.Type {
+		case storage.TypeSessionCreated:
+			if i == 0 {
+				info.Created = parseRecordTime(record.Time)
+			}
+		case storage.TypeContextCompacted:
+			// Only a compacted second line (right after the header)
+			// marks an off-disk start; later compactions are ordinary
+			// history.
+			if i == 1 {
+				compacted = true
+			}
+		case storage.TypeUserInput:
+			if !compacted {
+				info.Title = record.Content
+			}
+			return info, nil
+		}
+	}
+	return info, nil
+}
+
+// earliestArchive returns the lowest-numbered archived segment.
+func earliestArchive(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	best, bestNumber := "", -1
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, logArchivePrefix) || !strings.HasSuffix(name, logArchiveSuffix) {
+			continue
+		}
+		number, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, logArchivePrefix), logArchiveSuffix))
+		if err != nil || number < 0 {
+			continue
+		}
+		if bestNumber < 0 || number < bestNumber {
+			best, bestNumber = name, number
+		}
+	}
+	if bestNumber < 0 {
+		return "", false
+	}
+	return filepath.Join(dir, best), true
+}
+
+// scanHead reads up to limit records from a segment, skipping unparseable
+// lines — a concurrent writer may be mid-append into the tail (the session
+// lock is not taken for a listing). Skipping is safe: the listing is a
+// view, the session itself errors loudly when opened.
+func scanHead(path string, limit int) ([]storage.Record, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open segment: %w", err)
+	}
+	defer file.Close()
+	var records []storage.Record
+	reader := bufio.NewReaderSize(file, 64*1024)
+	for len(records) < limit {
+		line, err := reader.ReadBytes('\n')
+		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
+			var record storage.Record
+			if decodeErr := json.Unmarshal(trimmed, &record); decodeErr == nil && record.Validate() == nil {
+				records = append(records, record)
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("read segment: %w", err)
+		}
+	}
+	return records, nil
+}
+
+// parseRecordTime is lenient by design: a listing must not fail on an
+// odd timestamp, it just loses precision.
+func parseRecordTime(value string) time.Time {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }
