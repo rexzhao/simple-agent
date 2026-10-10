@@ -256,3 +256,222 @@ func captureStderr(t *testing.T, fn func()) string {
 	}
 	return string(data)
 }
+
+func appendRecord(t *testing.T, session storage.Session, record storage.Record) storage.Record {
+	t.Helper()
+	stored, err := session.Append(record)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	return stored
+}
+
+func TestCompactionSwitchesSegments(t *testing.T) {
+	store := newTestStore(t)
+	session, err := store.Create(ProjectID(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	appendRecord(t, session, storage.Record{ItemID: "h1", Type: storage.TypeSessionCreated, Provider: "p", CWD: "/w"})
+	appendRecord(t, session, storage.Record{ItemID: "u1", Type: storage.TypeUserInput, Content: "old turn"})
+	appendRecord(t, session, storage.Record{ItemID: "a1", Type: storage.TypeAssistantMessage, Content: "old answer"})
+	compacted := appendRecord(t, session, storage.Record{ItemID: "x1", Type: storage.TypeContextCompacted, Content: "summary"})
+	appendRecord(t, session, storage.Record{ItemID: "u2", Type: storage.TypeUserInput, Content: "post turn"})
+
+	dir := session.(*Session).Dir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	if len(names) != 2 || !contains(names, logFileName) || !contains(names, "log-0000.jsonl") {
+		t.Fatalf("segment files = %v, want log.jsonl + log-0000.jsonl", names)
+	}
+
+	// The active segment is self-contained: header copy + compaction +
+	// post-compaction records — never the archived history.
+	records, err := session.Records()
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	wantTypes := []string{storage.TypeSessionCreated, storage.TypeContextCompacted, storage.TypeUserInput}
+	if len(records) != len(wantTypes) {
+		t.Fatalf("active records = %v, want %v", recordTypes(records), wantTypes)
+	}
+	for i, want := range wantTypes {
+		if records[i].Type != want {
+			t.Fatalf("active[%d] = %s, want %s", i, records[i].Type, want)
+		}
+	}
+	// The header copy preserves the original metadata and identity.
+	if records[0].ItemID != "h1" || records[0].Provider != "p" {
+		t.Fatalf("segment header = %+v, want a verbatim copy of the original", records[0])
+	}
+	if records[1].ItemID != compacted.ItemID {
+		t.Fatalf("compaction item id lost: %q vs %q", records[1].ItemID, compacted.ItemID)
+	}
+
+	// The archive holds the pre-compaction history verbatim.
+	archive, err := readRecords(filepath.Join(dir, "log-0000.jsonl"))
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	if len(archive) != 3 || archive[0].ItemID != "h1" || archive[2].Content != "old answer" {
+		t.Fatalf("archive = %v", recordTypes(archive))
+	}
+
+	// A second compaction archives again, numbered in order.
+	appendRecord(t, session, storage.Record{ItemID: "a2", Type: storage.TypeAssistantMessage, Content: "post answer"})
+	appendRecord(t, session, storage.Record{ItemID: "x2", Type: storage.TypeContextCompacted, Content: "summary two"})
+	entries, _ = os.ReadDir(dir)
+	if len(entries) != 3 {
+		t.Fatalf("segment files after second switch = %d, want 3", len(entries))
+	}
+	records, err = session.Records()
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	// The second compaction absorbed the post-compaction turns: the new
+	// active segment is again just header + compaction.
+	if len(records) != 2 || records[1].Content != "summary two" {
+		t.Fatalf("active after second switch = %v, want header + second summary", recordTypes(records))
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestResumeReadsActiveSegmentOnly(t *testing.T) {
+	store := newTestStore(t)
+	session, err := store.Create(ProjectID(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	appendRecord(t, session, storage.Record{ItemID: "h1", Type: storage.TypeSessionCreated, Provider: "p"})
+	appendRecord(t, session, storage.Record{ItemID: "u1", Type: storage.TypeUserInput, Content: "old"})
+	appendRecord(t, session, storage.Record{ItemID: "x1", Type: storage.TypeContextCompacted, Content: "summary"})
+	id := session.ID()
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := store.Open(id)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	records, err := reopened.Records()
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if len(records) != 2 || records[0].Type != storage.TypeSessionCreated || records[1].Content != "summary" {
+		t.Fatalf("resumed records = %v, want header + compaction only", recordTypes(records))
+	}
+	// Appending continues in the active segment.
+	appendRecord(t, reopened, storage.Record{ItemID: "u2", Type: storage.TypeUserInput, Content: "next"})
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestSegmentSwitchRecoveryWindows(t *testing.T) {
+	writeFixture := func(t *testing.T) (store *Store, session storage.Session, dir string) {
+		store = newTestStore(t)
+		session, err := store.Create(ProjectID(t.TempDir()))
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		appendRecord(t, session, storage.Record{ItemID: "h1", Type: storage.TypeSessionCreated})
+		appendRecord(t, session, storage.Record{ItemID: "u1", Type: storage.TypeUserInput, Content: "old"})
+		dir = session.(*Session).Dir()
+		return store, session, dir
+	}
+
+	// Window 1: staging exists, active exists — the staged compaction is
+	// discarded, the context stays pre-compaction.
+	store, session, dir := writeFixture(t)
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, logSwitchStaging), []byte("{\"item\":\"x1\",\"t\":\"context.compacted\"}\n"), 0o644); err != nil {
+		t.Fatalf("write staging: %v", err)
+	}
+	reopened, err := store.Open(session.ID())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, logSwitchStaging)); !os.IsNotExist(err) {
+		t.Fatal("stale staging survived recovery")
+	}
+	records, _ := reopened.Records()
+	if len(records) != 2 || records[1].Content != "old" {
+		t.Fatalf("window-1 records = %v, want the untouched pre-compaction history", recordTypes(records))
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Window 2: staging exists, active missing — the switch completes.
+	store, session, dir = writeFixture(t)
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	staged := "{\"item\":\"h1\",\"t\":\"session.created\"}\n{\"item\":\"x1\",\"t\":\"context.compacted\",\"content\":\"summary\"}\n"
+	if err := os.WriteFile(filepath.Join(dir, logSwitchStaging), []byte(staged), 0o644); err != nil {
+		t.Fatalf("write staging: %v", err)
+	}
+	if err := os.Rename(filepath.Join(dir, logFileName), filepath.Join(dir, "log-0000.jsonl")); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	reopened, err = store.Open(session.ID())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	records, _ = reopened.Records()
+	if len(records) != 2 || records[1].Content != "summary" {
+		t.Fatalf("window-2 records = %v, want the adopted staged segment", recordTypes(records))
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Window 3: no active, no staging, archives exist — the newest
+	// archive rolls back into place.
+	store, session, dir = writeFixture(t)
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := os.Rename(filepath.Join(dir, logFileName), filepath.Join(dir, "log-0000.jsonl")); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	reopened, err = store.Open(session.ID())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	records, _ = reopened.Records()
+	if len(records) != 2 || records[1].Content != "old" {
+		t.Fatalf("window-3 records = %v, want the rolled-back archive", recordTypes(records))
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func recordTypes(records []storage.Record) []string {
+	types := make([]string, len(records))
+	for i, record := range records {
+		types[i] = record.Type
+	}
+	return types
+}

@@ -143,7 +143,7 @@ func TestAutoCompactTriggersOnSoftPressureBeforeTurn(t *testing.T) {
 	if len(compacted) != 1 {
 		t.Fatalf("auto compactions = %d, want 1", len(compacted))
 	}
-	if compacted[0].Content != "summary of everything" {
+	if !strings.HasSuffix(compacted[0].Content, "summary of everything") {
 		t.Fatalf("summary = %q", compacted[0].Content)
 	}
 
@@ -166,12 +166,12 @@ func TestAutoCompactTriggersOnSoftPressureBeforeTurn(t *testing.T) {
 		t.Fatalf("provider requests = %d, want 3", len(provider.requests))
 	}
 	continuation := provider.requests[2].Messages
-	if len(continuation) != 1 || continuation[0].Role != model.MessageRoleUser || continuation[0].Content != "summary of everything" {
+	if len(continuation) != 1 || continuation[0].Role != model.MessageRoleUser || !strings.HasSuffix(continuation[0].Content, "summary of everything") {
 		t.Fatalf("continuation = %+v, want the summary as the sole message", continuation)
 	}
 	// The final answer sits after the summary in the folded context.
 	snapshot := session.Snapshot()
-	if len(snapshot.Context) != 2 || snapshot.Context[1].Content != "answer after compaction" {
+	if len(snapshot.Context) != 2 || !strings.Contains(snapshot.Context[1].Content, "answer after compaction") {
 		t.Fatalf("context after run = %+v", snapshot.Context)
 	}
 }
@@ -340,7 +340,7 @@ func TestAutoCompactTriggersMidTurnAfterToolBatch(t *testing.T) {
 	events := waitSettled(t, session)
 
 	compacted := compactedRecords(t, session)
-	if len(compacted) != 1 || compacted[0].Content != "mid-turn summary" {
+	if len(compacted) != 1 || !strings.HasSuffix(compacted[0].Content, "mid-turn summary") {
 		t.Fatalf("mid-turn compactions = %+v, want one mid-turn summary", compacted)
 	}
 
@@ -369,7 +369,7 @@ func TestAutoCompactTriggersMidTurnAfterToolBatch(t *testing.T) {
 		t.Fatalf("provider requests = %d, want 3", len(provider.requests))
 	}
 	continuation := provider.requests[2].Messages
-	if len(continuation) != 1 || continuation[0].Role != model.MessageRoleUser || continuation[0].Content != "mid-turn summary" {
+	if len(continuation) != 1 || continuation[0].Role != model.MessageRoleUser || !strings.HasSuffix(continuation[0].Content, "mid-turn summary") {
 		t.Fatalf("iteration-2 request = %+v, want the summary as the sole message", continuation)
 	}
 }

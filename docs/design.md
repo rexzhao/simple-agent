@@ -48,8 +48,10 @@ agent.Session（状态层：owns State + Fold 推进 + 通知）     ①
 storage.Session（jsonl / memory，纯记录存储）              ②
 ```
 
-- **② storage 是笨存储**：只认记录。jsonl 管目录布局、torn-tail
-  恢复；memory 是 map + slice。两者都不维护状态、不发通知。
+- **② storage 是笨存储**：只认记录。jsonl 管目录布局、段切换、
+  torn-tail 恢复；memory 是 map + slice。两者都不维护状态、不发通知。
+  jsonl 的会话目录是分段的：`log.jsonl` 为活跃段，`log-NNNN.jsonl` 为
+  每次压缩前的不可变归档；storage 接口不变，段管理是 jsonl 内部实现。
 - **① 状态层垄断写路径**：`commit` 是唯一写入口（落盘 → fold → 清
   transient，同一锁段）。Open 时全量重放记录重建状态。
 - **eventbus 的 durable 词汇表和 sessionlog.Publisher 死亡**：agent 直接
@@ -236,6 +238,17 @@ ItemID upsert、按 RunID 分组。CLI 现在直接消费同一事件流，零�
 手动 `/compact` 与自动压缩共享同一条路径：`compactContext`（mint 身份 →
 Compacting 槽 → 带重试的摘要调用 → 软压回收检查 → commit），产出完全
 相同的 `context.compacted` 记录，Fold 无需区分来源。
+
+**段切换**：每次压缩 commit 时，jsonl 把当前 `log.jsonl` 归档为
+`log-NNNN.jsonl`，新开 `log.jsonl`，首条为原 `session.created` 的逐字
+副本（段头，保会话元数据与创建时间自包含），随后是
+`context.compacted`。因此：**resume 只读活跃段，成本 ∝ 有效上下文而
+非会话 lifetime**；压缩点之前的历史永不被重放，只供归档审计
+（`grep ... log*.jsonl`）。Title 由活跃段首条 user.input 决定（压缩后
+刷新）。切换是两段式改名：先在 staging 文件完整写入并 fsync 新段，
+再归档旧段、激活新段——所有中断窗口都收敛到"压缩丢失、上下文原样"
+或"完全生效"，无新崩溃语义。旧单文件会话即单段会话，首次压缩才
+产生归档，向后兼容。
 
 **预算推导**（budget.go，移植自旧栈）：`context_window − 输出预留
 （output_limit 或 clamp(窗口/8, 4K–20K)，且不超过窗口/4）= 容量`；硬线 =

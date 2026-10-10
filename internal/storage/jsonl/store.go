@@ -10,13 +10,19 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/rexzhao/simple-agent/internal/storage"
 )
 
-const logFileName = "log.jsonl"
+const (
+	logFileName      = "log.jsonl"
+	logSwitchStaging = "log.jsonl.next"
+	logArchivePrefix = "log-"
+	logArchiveSuffix = ".jsonl"
+)
 
 // Store manages sessions under a data root.
 type Store struct {
@@ -125,6 +131,10 @@ func (s *Store) Create(projectID string) (storage.Session, error) {
 // which was interrupted by a crash needs no repair record: its user input
 // simply stays unanswered, and the agent patches any dangling tool calls
 // before the next request.
+//
+// A session's records live in segments: log.jsonl is the active segment,
+// log-NNNN.jsonl files are immutable archives of the history before each
+// compaction. An interrupted segment switch is recovered here.
 func (s *Store) Open(id string) (storage.Session, error) {
 	if !ValidSessionID(id) {
 		return nil, fmt.Errorf("invalid session id %q", id)
@@ -133,11 +143,114 @@ func (s *Store) Open(id string) (storage.Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := recoverSegments(dir); err != nil {
+		return nil, err
+	}
 	log, err := OpenLog(filepath.Join(dir, logFileName))
 	if err != nil {
 		return nil, err
 	}
 	return &Session{id: id, project: filepath.Base(filepath.Dir(dir)), store: s, log: log}, nil
+}
+
+// recoverSegments completes or discards an interrupted compaction switch.
+// The switch stages the next segment in log.jsonl.next (fully written and
+// synced), archives the active log, then activates the staged file; every
+// interruption point converges to "the compaction never took effect" or
+// "it fully did":
+//
+//   - staging exists, active exists: interrupted before the archive —
+//     discard the staging (the compaction is lost, the context untouched);
+//   - staging exists, active missing: interrupted between the renames —
+//     complete the switch by activating the staging;
+//   - active missing, no staging: a switch never staged (or the active
+//     file was removed externally) — roll the newest archive back into
+//     place, which is the pre-compaction history.
+func recoverSegments(dir string) error {
+	staging := filepath.Join(dir, logSwitchStaging)
+	active := filepath.Join(dir, logFileName)
+	stagingExists, err := fileExists(staging)
+	if err != nil {
+		return err
+	}
+	if stagingExists {
+		activeExists, err := fileExists(active)
+		if err != nil {
+			return err
+		}
+		if activeExists {
+			if err := os.Remove(staging); err != nil {
+				return fmt.Errorf("discard interrupted segment staging: %w", err)
+			}
+		} else if err := os.Rename(staging, active); err != nil {
+			return fmt.Errorf("complete interrupted segment switch: %w", err)
+		}
+		return nil
+	}
+	activeExists, err := fileExists(active)
+	if err != nil {
+		return err
+	}
+	if !activeExists {
+		if newest, ok := newestArchive(dir); ok {
+			if err := os.Rename(newest, active); err != nil {
+				return fmt.Errorf("roll back newest archive: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func fileExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// newestArchive returns the highest-numbered archived segment.
+func newestArchive(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	best, bestNumber := "", -1
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, logArchivePrefix) || !strings.HasSuffix(name, logArchiveSuffix) {
+			continue
+		}
+		number, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, logArchivePrefix), logArchiveSuffix))
+		if err != nil || number < 0 {
+			continue
+		}
+		if number > bestNumber {
+			best, bestNumber = name, number
+		}
+	}
+	if bestNumber < 0 {
+		return "", false
+	}
+	return filepath.Join(dir, best), true
+}
+
+// nextArchiveName returns the archive path for the next switch.
+func nextArchiveName(dir string) string {
+	number := 0
+	if newest, ok := newestArchive(dir); ok {
+		name := filepath.Base(newest)
+		if parsed, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, logArchivePrefix), logArchiveSuffix)); err == nil {
+			number = parsed + 1
+		}
+	}
+	return filepath.Join(dir, fmt.Sprintf("%s%04d%s", logArchivePrefix, number, logArchiveSuffix))
 }
 
 // sessionDir locates the directory of a session ID by scanning the project
@@ -180,7 +293,12 @@ func (s *Session) Dir() string {
 	return filepath.Join(s.store.root, s.project, s.id)
 }
 
-// Append stores one record, opening the log on the first call.
+// Append stores one record, opening the log on the first call. A
+// context.compacted record switches the segment: the current log is
+// archived immutably and a new active log opens with a copy of the
+// session header (the session.created record) followed by the
+// compaction record — so the active segment always folds into the
+// current context on its own.
 func (s *Session) Append(record storage.Record) (storage.Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -191,7 +309,74 @@ func (s *Session) Append(record storage.Record) (storage.Record, error) {
 		}
 		s.log = log
 	}
+	if record.Type == storage.TypeContextCompacted {
+		return s.appendCompactionLocked(record)
+	}
 	return s.log.Append(record)
+}
+
+// appendCompactionLocked performs the segment switch for one
+// context.compacted record. The switch is staged first: the next segment
+// (header + compaction record) is fully written and synced into
+// log.jsonl.next; only then is the active log archived and the staging
+// activated. Every interruption converges to "the compaction never took
+// effect" (see recoverSegments). Callers hold s.mu.
+func (s *Session) appendCompactionLocked(record storage.Record) (storage.Record, error) {
+	dir := filepath.Join(s.store.root, s.project, s.id)
+	stagingPath := filepath.Join(dir, logSwitchStaging)
+	activePath := filepath.Join(dir, logFileName)
+
+	// A stale staging from an interrupted switch must not leak into the
+	// new one.
+	if err := os.Remove(stagingPath); err != nil && !os.IsNotExist(err) {
+		return storage.Record{}, fmt.Errorf("clear stale segment staging: %w", err)
+	}
+	staging, err := OpenLog(stagingPath)
+	if err != nil {
+		return storage.Record{}, err
+	}
+	// The new segment opens with a copy of the session header so it is
+	// self-contained (metadata and creation time survive alone).
+	if s.log != nil {
+		records, err := s.log.Records()
+		if err != nil {
+			staging.Close()
+			return storage.Record{}, err
+		}
+		if len(records) > 0 && records[0].Type == storage.TypeSessionCreated {
+			if _, err := staging.Append(records[0]); err != nil {
+				staging.Close()
+				return storage.Record{}, fmt.Errorf("stage segment header: %w", err)
+			}
+		}
+	}
+	stored, err := staging.Append(record)
+	if err != nil {
+		staging.Close()
+		return storage.Record{}, fmt.Errorf("stage compaction record: %w", err)
+	}
+	if err := staging.Close(); err != nil {
+		return storage.Record{}, fmt.Errorf("sync staged segment: %w", err)
+	}
+
+	// The staging is durable: archive the active log and activate it.
+	if s.log != nil {
+		if err := s.log.Close(); err != nil {
+			return storage.Record{}, fmt.Errorf("close active segment: %w", err)
+		}
+		if err := os.Rename(activePath, nextArchiveName(dir)); err != nil {
+			return storage.Record{}, fmt.Errorf("archive active segment: %w", err)
+		}
+	}
+	if err := os.Rename(stagingPath, activePath); err != nil {
+		return storage.Record{}, fmt.Errorf("activate staged segment: %w", err)
+	}
+	log, err := OpenLog(activePath)
+	if err != nil {
+		return storage.Record{}, err
+	}
+	s.log = log
+	return stored, nil
 }
 
 // Records returns every stored record in order. A session which has not

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/internal/storage/memory"
 )
 
@@ -613,7 +615,7 @@ func TestCompactReplacesContextAndPersists(t *testing.T) {
 
 	// The compacted context is exactly one summary message.
 	snapshot := session.Snapshot()
-	if len(snapshot.Context) != 1 || snapshot.Context[0].Content != "the summary" {
+	if len(snapshot.Context) != 1 || !strings.HasSuffix(snapshot.Context[0].Content, "the summary") {
 		t.Fatalf("context after compact = %+v", snapshot.Context)
 	}
 	if snapshot.Compacting != nil {
@@ -628,7 +630,7 @@ func TestCompactReplacesContextAndPersists(t *testing.T) {
 	for _, record := range records {
 		if record.Type == storage.TypeContextCompacted {
 			found = true
-			if record.Content != "the summary" || record.ItemID == "" {
+			if !strings.HasSuffix(record.Content, "the summary") || record.ItemID == "" {
 				t.Fatalf("compaction record = %+v", record)
 			}
 			if record.RunID != "" {
@@ -660,7 +662,7 @@ func TestCompactReplacesContextAndPersists(t *testing.T) {
 	waitSettled(t, session)
 	continuation := provider.requests[2].Messages
 	if len(continuation) != 2 ||
-		continuation[0].Role != model.MessageRoleUser || continuation[0].Content != "the summary" ||
+		continuation[0].Role != model.MessageRoleUser || !strings.HasSuffix(continuation[0].Content, "the summary") ||
 		continuation[1].Content != "next" {
 		t.Fatalf("continuation request = %+v, want summary + next input", continuation)
 	}
@@ -714,4 +716,58 @@ func TestCompactGuards(t *testing.T) {
 	session.Stop()
 	close(provider.gate)
 	waitSettled(t, session)
+}
+
+func TestCompactSegmentsAcrossReopenWithJSONL(t *testing.T) {
+	store, err := jsonl.OpenStore(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "the answer"}},
+		{model.TextDeltaEvent{Text: "the summary"}},
+	}}
+	ag, err := New(Options{
+		Provider:     provider,
+		ProviderName: "test",
+		ModelID:      "model-test",
+		Storage:      store,
+		ProjectID:    jsonl.ProjectID(t.TempDir()),
+		CWD:          "/w",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	session, err := ag.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := session.Send("question"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitSettled(t, session)
+	if err := session.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	id := session.ID()
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The reopened session folds only the active segment: metadata and
+	// the summary, never the archived pre-compaction history.
+	resumed, err := ag.OpenSession(id)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	snapshot := resumed.Snapshot()
+	if len(snapshot.Context) != 1 || !strings.HasSuffix(snapshot.Context[0].Content, "the summary") {
+		t.Fatalf("resumed context = %+v, want the summary alone", snapshot.Context)
+	}
+	if snapshot.Provider != "test" || snapshot.CWD == "" {
+		t.Fatalf("session metadata lost across segments: %+v", snapshot)
+	}
+	if err := resumed.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 }

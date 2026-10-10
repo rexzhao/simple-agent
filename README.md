@@ -22,7 +22,10 @@ Every durable fact about a session is one line in an append-only JSONL log:
 
 A project is the working directory the session runs in, identified by a
 deterministic hash of its path, so sessions group by workspace with no
-registration step.
+registration step. Sessions are segmented: `log.jsonl` is the active
+segment — the records of the current context — and each compaction
+archives the prior history as an immutable `log-NNNN.jsonl`, so reopening
+a session reads only what the context still needs.
 
 There is no update and no delete. Session state is a fold of the log,
 rebuilt on open and advanced incrementally as records are appended. See

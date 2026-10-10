@@ -220,7 +220,7 @@ const compactionPrompt = `Summarize the conversation so far so that work can con
 - Commands run and their outcomes
 - The current state and the next steps
 
-Write the summary as a compact briefing addressed to the assistant that continues the work. Omit pleasantries.`
+Write the summary as a compact briefing addressed to the assistant that continues the work. State established facts as facts, not as claims to verify. Omit pleasanities.`
 
 // buildCompactionRequest assembles the summary request: the compaction
 // prompt instead of the normal system prompt, the sanitized history as
@@ -319,3 +319,8 @@ func eventMessage(event model.ErrorEvent) string {
 func isBlank(message model.Message) bool {
 	return len(message.ToolCalls) == 0 && strings.TrimSpace(message.Content) == ""
 }
+
+// summaryFrame wraps the committed summary so that, replayed as the sole
+// prior context, the continuing model treats it as its own memory of the
+// session instead of a user assertion to verify against the world.
+const summaryFrame = "以下是本会话先前对话的摘要，是你自己的工作记忆（既定事实，直接依据它继续，不要向用户求证或重新验证）：\n\n"

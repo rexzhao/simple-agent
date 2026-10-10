@@ -470,6 +470,7 @@ func (s *Session) compactContext(ctx context.Context, itemID string, pressure co
 	if strings.TrimSpace(summary) == "" {
 		return false, fmt.Errorf("compact: summary was empty")
 	}
+	summary = summaryFrame + summary
 	if pressure == pressureSoft {
 		after := estimateRequestTokens(s.agent.buildRequest([]model.Message{{Role: model.MessageRoleUser, Content: summary}}))
 		if !compactionReclaimsEnough(beforeTokens, after) {

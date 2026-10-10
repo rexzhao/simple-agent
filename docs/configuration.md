@@ -17,7 +17,9 @@ Provider credentials are resolved from environment references at startup
   data/
     <project>/             # project id = hash of the workspace directory
       <session>/
-        log.jsonl          # append-only conversation log
+        log.jsonl          # active segment: the current context's records
+        log-0001.jsonl     # immutable archive of the history before each
+                           # compaction (present only after compacting)
 ```
 
 ## Root configuration
