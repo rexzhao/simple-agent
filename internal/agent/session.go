@@ -194,6 +194,11 @@ var (
 	ErrRunActive = errors.New("a run is already active; stop it first")
 	// ErrNothingToCompact is returned by Compact when the context is empty.
 	ErrNothingToCompact = errors.New("nothing to compact")
+	// ErrNoRun is returned by Steer when no run is active to inject into.
+	ErrNoRun = errors.New("no active run to steer")
+	// ErrNotQueued is returned by UpdateSteer/WithdrawSteer for an unknown
+	// or already-consumed steer entry.
+	ErrNotQueued = errors.New("no such queued steer message")
 )
 
 func (s *Session) Send(text string) error {
@@ -239,6 +244,110 @@ func (s *Session) Send(text string) error {
 	}
 	go s.run(ctx, runID, request, events, done)
 	return nil
+}
+
+// Steer queues a user input for mid-run injection: the run consumes it
+// before its next model request (or extends with a followup turn at its
+// final response). The returned ItemID is the identity the eventual
+// user.input record carries — minted here, before persistence, so
+// observers can address the queued message from the start.
+//
+// A steer can never be a session's first user input: it requires an
+// active run, which a Send must have started — so the Fold's
+// first-input-becomes-Title rule is unaffected.
+func (s *Session) Steer(text string) (string, error) {
+	text = strings.TrimRight(text, "\r\n")
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("input is empty")
+	}
+	s.mu.Lock()
+	if !s.running {
+		s.mu.Unlock()
+		return "", ErrNoRun
+	}
+	itemID := storage.NewUserInputID()
+	s.state.Steered = append(s.state.Steered, storage.SteeredItem{ItemID: itemID, Text: text})
+	// The events channel closes only after settle (defer order), and
+	// settle needs this lock — with running still true the send cannot
+	// race a close. A full buffer drops the notice: best-effort, like
+	// every transient event; the queue itself is in Snapshot.
+	events := s.events
+	s.mu.Unlock()
+	if events != nil {
+		select {
+		case events <- model.SteerQueuedEvent{ItemID: itemID, Text: text}:
+		default:
+		}
+	}
+	return itemID, nil
+}
+
+// UpdateSteer edits the text of a still-queued steer message.
+func (s *Session) UpdateSteer(itemID, text string) error {
+	text = strings.TrimRight(text, "\r\n")
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("input is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.Steered {
+		if s.state.Steered[i].ItemID == itemID {
+			s.state.Steered[i].Text = text
+			if s.running && s.events != nil {
+				select {
+				case s.events <- model.SteerUpdatedEvent{ItemID: itemID, Text: text}:
+				default:
+				}
+			}
+			return nil
+			}
+	}
+	return ErrNotQueued
+}
+
+// WithdrawSteer removes a still-queued steer message before consumption.
+func (s *Session) WithdrawSteer(itemID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.Steered {
+		if s.state.Steered[i].ItemID == itemID {
+			s.state.Steered = append(s.state.Steered[:i], s.state.Steered[i+1:]...)
+			if s.running && s.events != nil {
+				select {
+				case s.events <- model.SteerWithdrawnEvent{ItemID: itemID}:
+				default:
+				}
+			}
+			return nil
+		}
+	}
+	return ErrNotQueued
+}
+
+// drainSteered consumes the steer queue into the run's message list,
+// committing each entry as a user.input record carrying its original
+// ItemID. Callers are the run loop, at iteration boundaries. Returns
+// how many entries were consumed.
+func (s *Session) drainSteered(messages *[]model.Message, runID string) (int, error) {
+	s.mu.Lock()
+	if len(s.state.Steered) == 0 {
+		s.mu.Unlock()
+		return 0, nil
+	}
+	queued := s.state.Steered
+	s.state.Steered = nil
+	s.mu.Unlock()
+
+	for _, entry := range queued {
+		if err := s.commit(storage.Record{
+			ItemID: entry.ItemID, Type: storage.TypeUserInput,
+			RunID: runID, Content: entry.Text,
+		}, nil); err != nil {
+			return 0, fmt.Errorf("persist steered input: %w", err)
+		}
+		*messages = append(*messages, model.Message{Role: model.MessageRoleUser, Content: entry.Text})
+	}
+	return len(queued), nil
 }
 
 // Stop cancels the active run. The run settles it as interrupted: no
@@ -628,6 +737,14 @@ func (s *Session) run(ctx context.Context, runID string, request model.Request, 
 	messages := append([]model.Message(nil), request.Messages...)
 
 	for iteration := 1; iteration <= maxIterations; iteration++ {
+		// Iteration-top drain: steers queued before this request (leftovers
+		// of a previous run land after this run's triggering input — they
+		// were typed earlier but deliver at the next opportunity).
+		if _, err := s.drainSteered(&messages, runID); err != nil {
+			failure = err.Error()
+			sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "drain steered input"})
+			return
+		}
 		request.Messages = messages
 		sendEvent(ctx, events, model.AgentIterationStartedEvent{Iteration: iteration})
 
@@ -655,6 +772,18 @@ func (s *Session) run(ctx context.Context, runID string, request model.Request, 
 		sendEvent(ctx, events, model.AssistantMessageCompletedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
 		messages = append(messages, message)
 		if len(message.ToolCalls) == 0 {
+			// A queued steer extends the run (followup): consume and request
+		// again — within the iteration budget. At the budget edge the
+		// entries stay queued, delivered by a future run.
+			if iteration < maxIterations {
+				if n, err := s.drainSteered(&messages, runID); err != nil {
+					failure = err.Error()
+					sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "drain steered input"})
+					return
+				} else if n > 0 {
+					continue
+				}
+			}
 			return
 		}
 

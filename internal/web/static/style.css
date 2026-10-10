@@ -50,3 +50,12 @@ button {
 button:disabled { opacity: .4; cursor: default; }
 #error { color: var(--err); padding-top: .4em; min-height: 1.2em; }
 .hidden { display: none; }
+
+/* queued steer rows: pending user inputs addressable before they land */
+.row.steer-queued .type::after { content: " ⏳"; }
+.steer-controls { grid-column: 1 / -1; display: flex; gap: .5em; padding: .1em 0; }
+.steer-controls button {
+  background: none; border: 1px solid var(--line); color: var(--dim);
+  border-radius: 3px; padding: .05em .6em; font-size: 11px; cursor: pointer;
+}
+.steer-controls button:hover { color: var(--fg); }

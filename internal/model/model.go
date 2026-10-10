@@ -126,6 +126,9 @@ const (
 	EventTypeResponseState             EventType = "response_state"
 	EventTypeProviderRetry             EventType = "provider_retry"
 	EventTypeError                     EventType = "error"
+	EventTypeSteerQueued               EventType = "steer_queued"
+	EventTypeSteerUpdated              EventType = "steer_updated"
+	EventTypeSteerWithdrawn            EventType = "steer_withdrawn"
 )
 
 type Event interface {
@@ -339,6 +342,31 @@ type ErrorEvent struct {
 	Err     error
 	Message string
 }
+
+// SteerQueuedEvent announces a user input queued for mid-run injection.
+// The ItemID is the identity the eventual user.input record will carry.
+type SteerQueuedEvent struct {
+	ItemID string
+	Text   string
+}
+
+func (SteerQueuedEvent) Type() EventType { return EventTypeSteerQueued }
+
+// SteerUpdatedEvent announces an edit to a still-queued steer message.
+type SteerUpdatedEvent struct {
+	ItemID string
+	Text   string
+}
+
+func (SteerUpdatedEvent) Type() EventType { return EventTypeSteerUpdated }
+
+// SteerWithdrawnEvent announces a queued steer message was withdrawn
+// before consumption.
+type SteerWithdrawnEvent struct {
+	ItemID string
+}
+
+func (SteerWithdrawnEvent) Type() EventType { return EventTypeSteerWithdrawn }
 
 func (ErrorEvent) Type() EventType {
 	return EventTypeError

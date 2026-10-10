@@ -88,10 +88,12 @@ function rowFor(r, streaming) {
 function appendRecord(r) {
   if (state.byItem.has(r.item)) {
     // The ItemID merge: a committed record replaces the streamed view of
-    // the same item.
+    // the same item — including a queued steer row becoming the real
+    // user input.
     const existing = state.byItem.get(r.item);
     existing._body.replaceChildren(recordBody(r));
-    existing.classList.remove("streaming");
+    existing.classList.remove("streaming", "steer-queued");
+    existing.querySelectorAll(".steer-controls").forEach(el => el.remove());
     existing._reasoningEl = null;
     existing._contentEl = null;
     return;
@@ -155,6 +157,7 @@ async function dispatch(frame) {
       document.getElementById("load-more").hidden = !state.more;
       if (frame.streaming) beginStreamingItem(frame.streaming.item, frame.streaming);
       if (frame.tool) beginToolItem(frame.tool.item, frame.tool.name, frame.tool.args);
+      for (const entry of frame.steered || []) beginSteerRow(entry.item, entry.text);
       updateStatus();
       if (frame.d) setSync(state.head === frame.d, frame.d);
       break;
@@ -182,7 +185,11 @@ function updateStatus() {
   const run = document.getElementById("runstate");
   run.textContent = state.running ? "running" : "idle";
   run.className = state.running ? "running" : "idle";
-  document.getElementById("send").disabled = state.running;
+  // Steer keeps the composer usable while running.
+  const send = document.getElementById("send");
+  send.textContent = state.running ? "steer" : "send";
+  send.disabled = false;
+  document.getElementById("input").placeholder = state.running ? "steer a message…" : "message…";
 }
 
 function showNotice(text) {
@@ -255,8 +262,79 @@ function beginToolItem(itemID, name, args) {
   return row;
 }
 
+// ---------- queued steer messages (addressable by identity) ----------
+
+// A queued steer row merges into the real user.input row when the
+// record lands — same ItemID, same merge rule as in-flight items.
+function beginSteerRow(itemID, text) {
+  let row = state.byItem.get(itemID);
+  if (!row) {
+    const r = { t: "user.input", item: itemID, ts: "", content: text };
+    row = rowFor(r, true);
+    row.classList.add("steer-queued");
+    row._body.appendChild(recordBody({ content: text }));
+    appendSteerControls(row, itemID);
+    rowsEl.appendChild(row);
+    state.byItem.set(itemID, row);
+    scrollToBottom();
+  }
+  return row;
+}
+
+function appendSteerControls(row, itemID) {
+  const controls = document.createElement("span");
+  controls.className = "steer-controls";
+  const edit = document.createElement("button");
+  edit.textContent = "edit";
+  edit.onclick = () => editSteer(itemID, row);
+  const drop = document.createElement("button");
+  drop.textContent = "withdraw";
+  drop.onclick = () => withdrawSteer(itemID);
+  controls.append(edit, drop);
+  row.appendChild(controls);
+}
+
+function editSteer(itemID, row) {
+  const current = row._body.querySelector(".content")?.textContent || "";
+  const next = prompt("Edit steer message", current);
+  if (next === null || !next.trim()) return;
+  fetch("/api/steer", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ item: itemID, text: next }),
+  }).then(res => {
+    if (!res.ok) showError("steer edit failed");
+  });
+}
+
+function withdrawSteer(itemID) {
+  fetch("/api/steer?item=" + encodeURIComponent(itemID), { method: "DELETE" })
+    .then(res => {
+      if (!res.ok) showError("steer withdraw failed");
+    });
+}
+
 function handleEvent(frame) {
   switch (frame.t) {
+    case "steer_queued":
+      beginSteerRow(frame.item, frame.text);
+      break;
+    case "steer_updated": {
+      const row = state.byItem.get(frame.item);
+      if (row && row.classList.contains("steer-queued")) {
+        row._body.replaceChildren(recordBody({ content: frame.text }));
+        appendSteerControls(row, frame.item);
+      }
+      break;
+    }
+    case "steer_withdrawn": {
+      const row = state.byItem.get(frame.item);
+      if (row && row.classList.contains("steer-queued")) {
+        row.remove();
+        state.byItem.delete(frame.item);
+      }
+      break;
+    }
     case "assistant_message_started":
       state.streaming = { item: frame.item };
       beginStreamingItem(frame.item);
@@ -340,24 +418,35 @@ async function loadHistory() {
 
 // ---------- composer ----------
 
+// While a run is active the composer steers (queued for the next model
+// request); each direction races the run state, so both 409s fall back
+// to the other endpoint.
 document.getElementById("composer").addEventListener("submit", async e => {
   e.preventDefault();
   const input = document.getElementById("input");
   const text = input.value.trim();
   if (!text) return;
-  const res = await fetch("/api/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
-  });
+  const send = () => postJSON2("/api/send", { text });
+  const steer = () => postJSON2("/api/steer", { text });
+  let res = state.running ? await steer() : await send();
+  if (res.status === 409) {
+    const fallback = state.running ? send : steer;
+    res = await fallback();
+  }
   if (res.ok) {
     input.value = "";
-  } else if (res.status === 409) {
-    showError("a run is already active");
   } else {
     showError(await res.text());
   }
 });
+
+async function postJSON2(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
 
 document.getElementById("stop").addEventListener("click", () => {
   fetch("/api/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });

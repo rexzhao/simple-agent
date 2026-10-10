@@ -323,6 +323,9 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 			Args: snapshot.Running.ToolCall.Arguments,
 		}
 	}
+	for _, entry := range snapshot.Steered {
+		f.Steered = append(f.Steered, SteeredWire{Item: entry.ItemID, Text: entry.Text})
+	}
 
 	c := &client{ch: make(chan []byte, clientBufferSize), done: make(chan struct{})}
 	h.clients[c] = struct{}{}
@@ -368,6 +371,7 @@ type state struct {
 	Count      int            `json:"count"`
 	Digest     string         `json:"digest"`
 	Streaming  *StreamingWire `json:"streaming,omitempty"`
+	Steered    []SteeredWire  `json:"steered,omitempty"`
 	Pressure   string         `json:"pressure,omitempty"`
 	Retry      string         `json:"retry,omitempty"`
 	Notice     string         `json:"notice,omitempty"`
@@ -395,6 +399,9 @@ func (h *Hub) state() state {
 			Content:   snapshot.Streaming.Message.Content,
 			Reasoning: snapshot.Streaming.Message.ReasoningContent,
 		}
+	}
+	for _, entry := range snapshot.Steered {
+		s.Steered = append(s.Steered, SteeredWire{Item: entry.ItemID, Text: entry.Text})
 	}
 	return s
 }

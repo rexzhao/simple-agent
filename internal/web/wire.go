@@ -95,6 +95,7 @@ type Frame struct {
 	Running   *bool           `json:"running,omitempty"`
 	Streaming *StreamingWire  `json:"streaming,omitempty"` // in-flight assistant item
 	Tool      *ToolWire       `json:"tool,omitempty"`      // in-flight tool execution
+	Steered   []SteeredWire   `json:"steered,omitempty"`   // queued steer messages
 
 	// record
 	Record json.RawMessage `json:"r,omitempty"`
@@ -136,6 +137,14 @@ type ToolWire struct {
 	Item string `json:"item"`
 	Name string `json:"name,omitempty"`
 	Args string `json:"args,omitempty"`
+}
+
+// SteeredWire is one queued steer message: addressable by identity from
+// enqueue time; the eventual user.input record carries the same ItemID,
+// so the row merges in place when it lands.
+type SteeredWire struct {
+	Item string `json:"item"`
+	Text string `json:"text"`
 }
 
 func encodeFrame(f Frame) []byte {
@@ -196,6 +205,12 @@ func encodeEventFrame(event model.Event) (Frame, bool) {
 		f.Type, f.Try, f.TryMax, f.DelayMS, f.Reason = string(e.Type()), e.Attempt, e.MaxAttempts, e.Delay.Milliseconds(), e.Reason
 	case model.ErrorEvent:
 		f.Type, f.Text = string(e.Type()), e.Message
+	case model.SteerQueuedEvent:
+		f.Type, f.Item, f.Text = string(e.Type()), e.ItemID, e.Text
+	case model.SteerUpdatedEvent:
+		f.Type, f.Item, f.Text = string(e.Type()), e.ItemID, e.Text
+	case model.SteerWithdrawnEvent:
+		f.Type, f.Item = string(e.Type()), e.ItemID
 	default:
 		return Frame{}, false
 	}

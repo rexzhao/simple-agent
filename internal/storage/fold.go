@@ -37,6 +37,18 @@ type State struct {
 	Streaming  *StreamingItem
 	Running    *RunningTool
 	Compacting *CompactingItem
+	// Steered holds user inputs queued for mid-run injection (and, after
+	// the run ends, delivered by the next one). Entries are display-and-
+	// address-only until consumed: the drain commits a user.input record
+	// carrying the SAME ItemID, so observers merge by identity.
+	Steered []SteeredItem
+}
+
+// SteeredItem is one queued steer message. The ItemID is minted at
+// enqueue time — identity precedes persistence.
+type SteeredItem struct {
+	ItemID string
+	Text   string
 }
 
 // StreamingItem is the assistant message currently being generated. It is
@@ -139,6 +151,7 @@ func CopyState(state *State) State {
 		compacting := *state.Compacting
 		copied.Compacting = &compacting
 	}
+	copied.Steered = append([]SteeredItem(nil), state.Steered...)
 	return copied
 }
 

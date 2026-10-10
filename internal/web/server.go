@@ -48,6 +48,9 @@ func New(session *agent.Session) *Server {
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("GET /api/history", s.handleHistory)
 	mux.HandleFunc("POST /api/send", s.handleSend)
+	mux.HandleFunc("POST /api/steer", s.handleSteer)
+	mux.HandleFunc("PUT /api/steer", s.handleSteerUpdate)
+	mux.HandleFunc("DELETE /api/steer", s.handleSteerWithdraw)
 	mux.HandleFunc("POST /api/compact", s.handleCompact)
 	mux.HandleFunc("POST /api/stop", s.handleStop)
 	s.mux = mux
@@ -99,7 +102,11 @@ func (s *Server) guardAPI(w http.ResponseWriter, r *http.Request, write bool) bo
 			return false
 		}
 	}
-	if write {
+	// Only POST needs the content-type bar: browsers treat PUT and DELETE
+	// as preflighted methods regardless (a cross-site request never gets
+	// past the OPTIONS preflight our zero-CORS policy refuses), but a
+	// simple cross-site POST with text/plain does not preflight.
+	if write && r.Method == http.MethodPost {
 		if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 			http.Error(w, "content-type must be application/json", http.StatusUnsupportedMediaType)
 			return false
@@ -223,6 +230,76 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	// with zero latency (the channel is small — late attachment could
 	// stall the run goroutine).
 	s.hub.Wake()
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
+	if !s.guardAPI(w, r, true) {
+		return
+	}
+	var body struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Text) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_input"})
+		return
+	}
+	item, err := s.session.Steer(body.Text)
+	if err != nil {
+		if errors.Is(err, agent.ErrNoRun) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "no_run"})
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"item": item})
+}
+
+func (s *Server) handleSteerUpdate(w http.ResponseWriter, r *http.Request) {
+	if !s.guardAPI(w, r, true) {
+		return
+	}
+	var body struct {
+		Item string `json:"item"`
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if err := s.session.UpdateSteer(body.Item, body.Text); err != nil {
+		if errors.Is(err, agent.ErrNotQueued) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_queued"})
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleSteerWithdraw(w http.ResponseWriter, r *http.Request) {
+	if !s.guardAPI(w, r, true) {
+		return
+	}
+	item := r.URL.Query().Get("item")
+	if item == "" {
+		http.Error(w, "missing item", http.StatusBadRequest)
+		return
+	}
+	if err := s.session.WithdrawSteer(item); err != nil {
+		if errors.Is(err, agent.ErrNotQueued) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_queued"})
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
