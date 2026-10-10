@@ -58,6 +58,11 @@ type Store interface {
 	// owning project before assembling the agent (assembly precedes
 	// the lock; a failed assembly must not leave a zombie lock).
 	HasSession(projectID, sessionID string) bool
+	// Delete removes a stored session and its records, permanently.
+	// The session lock is taken first — a holder (a CLI mid-write, or
+	// this process) refuses the deletion instead of silently unlinking
+	// files under an active writer.
+	Delete(projectID, sessionID string) error
 	// ListSessions enumerates the stored sessions of one project,
 	// newest activity first (ID as the tiebreak). Sessions never
 	// materialized (no first record) are not listed: they hold nothing.

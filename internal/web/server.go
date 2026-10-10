@@ -52,6 +52,7 @@ func New(manager *Manager) *Server {
 	mux.HandleFunc("POST /api/s/{id}/steer", s.handleSteer)
 	mux.HandleFunc("PUT /api/s/{id}/steer", s.handleSteerUpdate)
 	mux.HandleFunc("DELETE /api/s/{id}/steer", s.handleSteerWithdraw)
+	mux.HandleFunc("DELETE /api/s/{id}", manager.DeleteSession)
 	mux.HandleFunc("POST /api/s/{id}/compact", s.handleCompact)
 	mux.HandleFunc("POST /api/s/{id}/stop", s.handleStop)
 	s.mux = mux

@@ -514,3 +514,107 @@ func writeAPIError(w http.ResponseWriter, status int, err error) {
 	}
 	writeJSON(w, status, map[string]string{"error": "", "message": err.Error()})
 }
+
+// DeleteSession removes a session permanently (the web delete). The
+// DeleteSession removes a session permanently (the web delete). The
+// registration gate applies as everywhere. A session this serve holds
+// open refuses while running (run_active) or watched / mid-request
+// (session_open — an SSE subscriber holds refs for its whole stream);
+// an otherwise-idle entry is torn down first. The closing set holds the
+// id THROUGH the storage deletion: a concurrent lazy open in that
+// window gets 503 (retryable), and after the deletion it converges to
+// 404 — a reopen can never race the removal. Every exit after the
+// claim clears it again.
+func (m *Manager) DeleteSession(w http.ResponseWriter, r *http.Request) {
+	if !guardAPI(w, r, true) {
+		return
+	}
+	id := r.PathValue("id")
+	if !jsonl.ValidSessionID(id) {
+		writeAPIError(w, http.StatusNotFound, fmt.Errorf("unknown session"))
+		return
+	}
+
+	// Pre-checks and the unlink happen under one critical section; the
+	// teardown and the storage deletion run outside it.
+	m.mu.Lock()
+	var entry *sessionEntry
+	if e := m.sessions[id]; e != nil {
+		if e.session.Running() {
+			m.mu.Unlock()
+			writeAPIError(w, http.StatusConflict, &apiError{code: "run_active"})
+			return
+		}
+		if e.refs > 0 {
+			m.mu.Unlock()
+			writeAPIError(w, http.StatusConflict, &apiError{code: "session_open"})
+			return
+		}
+		delete(m.sessions, id)
+		entry = e
+	}
+	if _, busy := m.closing[id]; busy {
+		m.mu.Unlock()
+		writeAPIError(w, http.StatusServiceUnavailable, &apiError{code: "session_closing"})
+		return
+	}
+	m.closing[id] = struct{}{}
+	m.mu.Unlock()
+
+	// Every path from here clears the closing claim.
+	clearClosing := func() {
+		m.mu.Lock()
+		delete(m.closing, id)
+		m.mu.Unlock()
+	}
+
+	if entry != nil {
+		entry.hub.Stop()
+		_ = entry.session.Close()
+	}
+
+	// The owning project through the registration gate (a lock-free
+	// probe, mirroring open). Unregistered sessions are 404 even for
+	// deletion: the gate covers every surface.
+	var ownerID string
+	var duplicate bool
+	m.mu.Lock()
+	for _, e := range m.entriesLocked() {
+		projectID := jsonl.ProjectID(e.Path)
+		if m.store.HasSession(projectID, id) {
+			if ownerID != "" {
+				duplicate = true
+				break
+			}
+			ownerID = projectID
+		}
+	}
+	m.mu.Unlock()
+	if duplicate {
+		clearClosing()
+		writeAPIError(w, http.StatusConflict, fmt.Errorf("multiple registered projects hold session %s", id))
+		return
+	}
+	if ownerID == "" {
+		clearClosing()
+		writeAPIError(w, http.StatusNotFound, fmt.Errorf("unknown session"))
+		return
+	}
+
+	if err := m.store.Delete(ownerID, id); err != nil {
+		clearClosing()
+		var held *jsonl.LockHeldError
+		switch {
+		case errors.As(err, &held):
+			writeAPIError(w, http.StatusConflict, &apiError{code: "session_locked", cause: err})
+		case errors.Is(err, storage.ErrSessionNotFound):
+			writeAPIError(w, http.StatusNotFound, fmt.Errorf("unknown session"))
+		default:
+			writeAPIError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	clearClosing()
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}

@@ -197,7 +197,7 @@ GET  /api/s/<id>/stream?from=<h>     POST /api/s/<id>/send
 GET  /api/s/<id>/state               POST /api/s/<id>/steer
 GET  /api/s/<id>/history             PUT  /api/s/<id>/steer
 POST /api/s/<id>/compact             DELETE /api/s/<id>/steer?item=
-POST /api/s/<id>/stop
+POST /api/s/<id>/stop                DELETE /api/s/<id>   （删除会话）
 ```
 
 - **注册门在 Manager 层，逐路由**：`jsonl.Store.Open(id)` 扫整个 data
@@ -218,6 +218,7 @@ POST /api/s/<id>/stop
   |---|---|---|---|
   | `session_closing` | 503 | 是 | 本进程驱逐 teardown 进行中 |
   | `session_locked` | 409 | 否 | 外部进程持锁（错误信息带 pid） |
+  | `session_open` | 409 | 否 | 删除时：会话正被观看/有在途请求（SSE 订阅全程持 refs） |
   | `run_active` | 409 | 否 | 单 run 槽占用 |
   | `no_run` | 409 | 否 | steer 要求运行中（回退 Send） |
   | `not_queued` | 404 | 否 | 编辑/撤回不存在的排队项 |

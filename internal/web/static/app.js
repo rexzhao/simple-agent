@@ -614,6 +614,51 @@ function renderSidebar() {
         meta.appendChild(badge);
       }
       link.append(title, meta);
+      // The delete affordance: one confirmation, then DELETE. A session
+      // this page is viewing must be left first — its own stream holds
+      // the server-side refs (session_open); navigate away, wait for
+      // the stream to actually close, then delete.
+      const del = document.createElement("button");
+      del.className = "delete";
+      del.textContent = "✕";
+      del.title = "delete session";
+      del.onclick = async e => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!confirm("Delete this session and all its records?")) return;
+        if (s.id === state.session) {
+          const closing = es;
+          location.hash = "";
+          // route() replaced the ES synchronously; the OLD one closes
+          // asynchronously — wait for it (bounded) before deleting.
+          for (let i = 0; i < 40 && closing && closing.readyState !== 2; i++) {
+            await new Promise(res => setTimeout(res, 50));
+          }
+        }
+        const st = state;
+        try {
+          const res = await fetch("/api/s/" + s.id, { method: "DELETE" });
+          if (st !== state) return;
+          if (res.ok) {
+            sessionCache.delete(s.id);
+            refreshProjects();
+          } else if (res.status === 409) {
+            const data = await res.json().catch(() => ({}));
+            if (st !== state) return;
+            showError(data.error === "session_open" ? "session is open in a view — close it first"
+              : data.error === "run_active" ? "stop the run first" : "session is locked by another process");
+          } else if (res.status === 404) {
+            sessionCache.delete(s.id);
+            refreshProjects();
+          } else {
+            const text = await res.text();
+            if (st === state) showError(text);
+          }
+        } catch (_) {
+          showError("delete failed");
+        }
+      };
+      link.appendChild(del);
       block.appendChild(link);
     }
     host.appendChild(block);

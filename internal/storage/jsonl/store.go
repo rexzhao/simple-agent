@@ -721,3 +721,57 @@ func (s *Store) HasSession(projectID, sessionID string) bool {
 	info, err := os.Stat(filepath.Join(s.root, projectID, sessionID))
 	return err == nil && info.IsDir()
 }
+
+// Delete removes a session permanently. The session lock is acquired
+// first: an external holder (a CLI mid-write) refuses the deletion
+// instead of letting files vanish under an active writer — on Unix the
+// advisory flock would not stop the unlink, so the lock is the only
+// guard. The manager additionally refuses sessions it has open.
+//
+// Windows cannot remove a directory while a handle inside it is open,
+// so the deletion is staged: the CONTENT (log segments) dies while the
+// lock is held — the data is gone under exclusive control — then the
+// lock releases and the empty directory follows. An external process
+// racing into that gap at worst resurrects an empty session whose
+// directory then disappears under it; its next append fails loudly
+// (ENOENT), never silently.
+func (s *Store) Delete(projectID, sessionID string) error {
+	if !ValidProjectID(projectID) {
+		return fmt.Errorf("invalid project id %q", projectID)
+	}
+	if !ValidSessionID(sessionID) {
+		return fmt.Errorf("invalid session id %q", sessionID)
+	}
+	dir := filepath.Join(s.root, projectID, sessionID)
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
+	}
+	lock, err := lockSession(dir)
+	if err != nil {
+		return err
+	}
+	// Remove the content under the lock; the lock file stays (its
+	// handle is ours until Release).
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		lock.Release()
+		return fmt.Errorf("delete session %q: %w", sessionID, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() == "lock" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
+			lock.Release()
+			return fmt.Errorf("delete session %q: %w", sessionID, err)
+		}
+	}
+	// The holder note goes with the content; Release would remove it
+	// anyway, but an empty-gap resurrection should not find stale
+	// holder info.
+	lock.Release()
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("delete session %q: %w", sessionID, err)
+	}
+	return nil
+}

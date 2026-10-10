@@ -1,6 +1,7 @@
 package jsonl
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -461,5 +462,49 @@ func TestListSessionsSkipsUnreadableSession(t *testing.T) {
 	}
 	if len(infos) != 1 || infos[0].Title != "good session" {
 		t.Fatalf("infos = %+v, want only the good session", infos)
+	}
+}
+
+// Delete removes the session directory; a held lock refuses it; a
+// missing session is not-found.
+func TestStoreDelete(t *testing.T) {
+	store, _ := testStore(t)
+	project := ProjectID(t.TempDir())
+	session, err := store.Create(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, session,
+		headerRecord("2026-10-10T01:00:00Z"),
+		userInput("u1", "2026-10-10T01:00:01Z", "doomed"))
+	id := session.ID()
+	dir := session.(*Session).Dir()
+
+	// Held by this handle: deletion refuses (the lock is the guard).
+	if err := store.Delete(project, id); err == nil {
+		t.Fatal("delete under a live session handle succeeded")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Released: deletion removes the directory.
+	if err := store.Delete(project, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("session dir still exists: %v", err)
+	}
+	if store.HasSession(project, id) {
+		t.Fatal("HasSession after delete")
+	}
+
+	// Gone: not-found, not an error about directories.
+	if err := store.Delete(project, id); !errors.Is(err, storage.ErrSessionNotFound) {
+		t.Fatalf("second delete: %v", err)
+	}
+	// Foreign project: not-found (the scoped gate).
+	if err := store.Delete(ProjectID(t.TempDir()), id); !errors.Is(err, storage.ErrSessionNotFound) {
+		t.Fatalf("foreign delete: %v", err)
 	}
 }

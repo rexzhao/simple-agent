@@ -217,3 +217,15 @@ func (s *Store) HasSession(projectID, sessionID string) bool {
 	defer s.mu.Unlock()
 	return s.projectOf[sessionID] == projectID
 }
+
+// Delete removes a session permanently.
+func (s *Store) Delete(projectID, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.projectOf[sessionID] != projectID {
+		return fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
+	}
+	delete(s.sessions, sessionID)
+	delete(s.projectOf, sessionID)
+	return nil
+}

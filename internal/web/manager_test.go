@@ -562,3 +562,101 @@ func copyTree(t *testing.T, src, dst string) error {
 	}
 	return nil
 }
+
+// The web delete: happy path (idle or never-opened), the refusals
+// (running, watched, locked, unregistered), and the convergence after
+// deletion (404).
+func TestDeleteSession(t *testing.T) {
+	provider := &steerFlowProvider{gate: make(chan struct{})}
+	t.Cleanup(provider.release)
+	manager, _, base, projectDir := newJSONLTestServer(t, provider)
+	store := jsonlStoreOf(t, manager)
+
+	deleteSession := func(id string) (*http.Response, map[string]string) {
+		req, _ := http.NewRequest("DELETE", base.URL+"/api/s/"+id, nil) //nolint:noctx // test
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := map[string]string{}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		resp.Body.Close()
+		return resp, body
+	}
+
+	// Unregistered: 404 (the gate covers deletion too).
+	unregistered := createJSONLSession(t, provider, store, t.TempDir())
+	resp, body := deleteSession(unregistered)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unregistered delete: %d %v", resp.StatusCode, body)
+	}
+
+	// Never-opened registered session: deleted.
+	victim := createJSONLSession(t, provider, store, projectDir)
+	resp, _ = deleteSession(victim)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("idle delete: %d", resp.StatusCode)
+	}
+	if store.HasSession(jsonl.ProjectID(projectDir), victim) {
+		t.Fatal("session still exists after delete")
+	}
+
+	// Watched (an SSE subscriber holds refs): session_open.
+	watched := createJSONLSession(t, provider, store, projectDir)
+	stream, err := http.Get(base.URL + "/api/s/" + watched + "/stream") //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Body.Close()
+	waitFor(t, 2*time.Second, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		e := manager.sessions[watched]
+		return e != nil && e.refs > 0
+	})
+	resp, body = deleteSession(watched)
+	if resp.StatusCode != http.StatusConflict || body["error"] != "session_open" {
+		t.Fatalf("watched delete: %d %v", resp.StatusCode, body)
+	}
+	stream.Body.Close()
+
+	// Running: run_active.
+	running := createJSONLSession(t, provider, store, projectDir)
+	if resp, err := http.Post(base.URL+"/api/s/"+running+"/send", "application/json", strings.NewReader(`{"text":"go"}`)); err != nil || resp.StatusCode != 200 { //nolint:noctx // test
+		t.Fatalf("send: %v %d", err, resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+	resp, body = deleteSession(running)
+	if resp.StatusCode != http.StatusConflict || body["error"] != "run_active" {
+		t.Fatalf("running delete: %d %v", resp.StatusCode, body)
+	}
+	provider.release()
+
+	// Externally locked: session_locked.
+	locked := createJSONLSession(t, provider, store, projectDir)
+	holder, err := store.OpenIn(jsonl.ProjectID(projectDir), locked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body = deleteSession(locked)
+	if resp.StatusCode != http.StatusConflict || body["error"] != "session_locked" {
+		t.Fatalf("locked delete: %d %v", resp.StatusCode, body)
+	}
+	holder.Close()
+
+	// After the refusals clear, deletion succeeds and later requests
+	// converge to 404.
+	resp, _ = deleteSession(locked)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("post-refusal delete: %d", resp.StatusCode)
+	}
+	resp, err = http.Get(base.URL + "/api/s/" + locked + "/state") //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("state after delete: %d, want 404", resp.StatusCode)
+	}
+}

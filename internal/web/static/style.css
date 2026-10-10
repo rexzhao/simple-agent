@@ -78,3 +78,13 @@ main:has(#rows:not(:empty)) #empty-view { display: none; }
 
 /* pre-first-snapshot sync state */
 #sync.sync-unknown { color: var(--dim); }
+
+/* session delete affordance inside the sidebar link */
+.session-link { position: relative; padding-right: 1.5em; }
+.session-link .delete {
+  position: absolute; right: .2em; top: .25em;
+  background: none; border: none; color: var(--dim); cursor: pointer;
+  font-size: 12px; padding: 0 .2em; visibility: hidden;
+}
+.session-link:hover .delete, .session-link:focus-within .delete { visibility: visible; }
+.session-link .delete:hover { color: var(--fg); }
