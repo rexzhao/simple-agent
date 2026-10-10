@@ -217,9 +217,22 @@ POST /api/s/<id>/stop
   404 而非 500——路径片段不进目录扫描
 - 会话 ID 全局随机，理论唯一；但 `Open`/`OpenIn` 取第一个匹配，复制
   目录会造出重名 → 多处命中返回 409（防御一行）
-- 404 未知/未注册会话；503 `session_closing`（可重试）；409 锁冲突与
-  `run_active`/`no_run`/`not_queued` 等稳定码语义不变；CSRF 守卫
-  （guardAPI）全量适用
+- **稳定码全集**（可枚举的契约表，页面与 CLI 按码 switch，不解析
+  散文）：
+
+  | 码 | HTTP | 可重试 | 含义 |
+  |---|---|---|---|
+  | `session_closing` | 503 | 是 | 本进程驱逐 teardown 进行中 |
+  | `session_locked` | 409 | 否 | 外部进程持锁（错误信息带 pid） |
+  | `run_active` | 409 | 否 | 单 run 槽占用 |
+  | `no_run` | 409 | — | steer 要求运行中 |
+  | `not_queued` | 404 | 否 | 编辑/撤回不存在的排队项 |
+  | `project_unavailable` | 500 | 否 | agent 装配失败（路径缺失等） |
+  | `empty_input` | 400 | 否 | 空文本 |
+  | （无码） | 404 | 否 | 未知会话 / 未注册项目 / 非法 id |
+
+  §2.3 的 CLI↔serve 互操作里"409 锁冲突"即 `session_locked`；CSRF
+  守卫（guardAPI）全量适用，未过守卫的请求不进入上表
 - 旧无前缀路由删除：仓内 `/api/...` 的唯一消费者是 `internal/web/static`
   与进程内工具，无外部客户端（已 grep 核实）；`docs/webui.md` §6 路由表
   加指针声明被本文取代
