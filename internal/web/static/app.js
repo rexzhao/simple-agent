@@ -630,11 +630,15 @@ function renderSidebar() {
         e.preventDefault();
         e.stopPropagation();
         if (!confirm("Delete this session and all its records?")) return;
-        // Re-entry guard: the retry loop spans seconds.
+        // Re-entry guard: the retry loop spans seconds. The identity is
+        // captured at click time; every exit re-enables the button and
+        // shows its text only if this view is still current — ONE guard
+        // discipline, inside done itself.
+        const st = state;
         del.disabled = true;
         const done = text => {
           del.disabled = false;
-          if (text !== undefined) showError(text);
+          if (text !== undefined && st === state) showError(text);
         };
         if (s.id === state.session) {
           // Our own view holds the server-side refs: navigate away and
@@ -648,7 +652,6 @@ function renderSidebar() {
             await new Promise(res => setTimeout(res, 50));
           }
         }
-        const st = state;
         try {
           // A response body is single-use: read it as TEXT once and
           // parse locally — the retry loop and the final branch share
@@ -695,7 +698,7 @@ function renderSidebar() {
             session_open: "session is open in a view — close it first",
             session_closing: "session is busy, try again",
           })[code] || raw || "delete failed";
-          done(st === state ? text : undefined);
+          done(text);
         } catch (_) {
           done("delete failed");
         }
