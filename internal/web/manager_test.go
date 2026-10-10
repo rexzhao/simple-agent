@@ -152,8 +152,12 @@ func TestRegistrationGatePerRoute(t *testing.T) {
 	}
 
 	// An invalid session id is 404, not 500 (no path fragments reach
-	// the directory scan).
-	req, _ := http.NewRequest("GET", base.URL+"/api/s/../../etc/state", nil) //nolint:noctx // test
+	// the directory scan). The traversal form that actually arrives at
+	// the API layer is the percent-encoded one: the client normalizes
+	// literal ../ sequences away before the wire (they resolve against
+	// the base URL), and the mux redirects whatever is left — the point
+	// here is the encoded fragment stays on the API and never 500s.
+	req, _ := http.NewRequest("GET", base.URL+"/api/s/..%2f..%2fetc/state", nil) //nolint:noctx // test
 	resp2, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -161,6 +165,17 @@ func TestRegistrationGatePerRoute(t *testing.T) {
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusNotFound {
 		t.Fatalf("traversal id: %d, want 404", resp2.StatusCode)
+	}
+	// And the literal form, normalized client-side to a non-API path,
+	// lands on the page redirect — never storage.
+	req, _ = http.NewRequest("GET", base.URL+"/api/s/../../etc/state", nil) //nolint:noctx // test
+	resp3, err := noRedirect().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode >= 500 || strings.HasPrefix(resp3.Header.Get("Location"), "/api") {
+		t.Fatalf("normalized traversal: %d %q", resp3.StatusCode, resp3.Header.Get("Location"))
 	}
 }
 

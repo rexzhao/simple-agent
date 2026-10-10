@@ -61,11 +61,11 @@ func TestPageReducerFixture(t *testing.T) {
 func TestStaticMIMETypes(t *testing.T) {
 	_, _, base := newTestServer(t, nil)
 	for _, c := range []struct{ path, want string }{
-		{"/app.js", "text/javascript"},
-		{"/chain.mjs", "text/javascript"},
-		{"/reducer.mjs", "text/javascript"},
-		{"/style.css", "text/css"},
-		{"/", "text/html"},
+		{"/log/app.js", "text/javascript"},
+		{"/log/chain.mjs", "text/javascript"},
+		{"/log/reducer.mjs", "text/javascript"},
+		{"/log/style.css", "text/css"},
+		{"/log", "text/html"},
 	} {
 		res, err := http.DefaultClient.Get(base.URL + c.path) //nolint:noctx // test
 		if err != nil {

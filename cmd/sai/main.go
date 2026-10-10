@@ -50,6 +50,7 @@ func main() {
 		provider    = flag.String("provider", "", "override default_provider")
 		modelName   = flag.String("model", "", "override default_model (model profile name)")
 		httpAddr    = flag.String("http", "", "serve the web UI on this address (e.g. 127.0.0.1:7420) instead of the interactive REPL")
+		httpStatic  = flag.String("http-static", "", "serve a chat client directory (e.g. clients/chat/dist) at /chat")
 	)
 	flag.Parse()
 
@@ -79,7 +80,7 @@ func main() {
 		if resumeID == "" && flag.NArg() > 0 {
 			resumeID = strings.TrimSpace(flag.Arg(0))
 		}
-		serve(*serverRoot, *httpAddr, *provider, *modelName, resumeID)
+		serve(*serverRoot, *httpAddr, *provider, *modelName, resumeID, *httpStatic)
 		return
 	}
 

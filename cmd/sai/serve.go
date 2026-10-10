@@ -18,7 +18,7 @@ import (
 // commands only — free-form input goes to the web page, so the REPL can
 // never race a page for a session's single run slot (and the hubs stay
 // the only consumers of the run event streams).
-func serve(serverRoot, addr, providerName, modelName, resumeID string) {
+func serve(serverRoot, addr, providerName, modelName, resumeID, staticDir string) {
 	factory, err := assembleFactory(serverRoot, providerName, modelName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
@@ -46,7 +46,15 @@ func serve(serverRoot, addr, providerName, modelName, resumeID string) {
 			os.Exit(1)
 		}
 	}
-	server := web.New(manager)
+	// The chat client is an external build; mounting a directory that
+	// does not exist would serve a broken /chat, so fail fast.
+	if staticDir != "" {
+		if info, err := os.Stat(staticDir); err != nil || !info.IsDir() {
+			fmt.Fprintf(os.Stderr, "sai: -http-static: not a directory: %s\n", staticDir)
+			os.Exit(1)
+		}
+	}
+	server := web.New(manager, web.WithStaticDir(staticDir))
 	httpServer := &http.Server{
 		Handler: server.Handler(),
 	}
@@ -57,6 +65,11 @@ func serve(serverRoot, addr, providerName, modelName, resumeID string) {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "sai: web UI on http://%s (server root %s)\n", listener.Addr(), serverRoot)
+	if staticDir != "" {
+		fmt.Fprintf(os.Stderr, "sai: chat client at /chat (from %s), log view at /log\n", staticDir)
+	} else {
+		fmt.Fprintf(os.Stderr, "sai: log view at /log (chat client not mounted; -http-static <dir>)\n")
+	}
 	fmt.Fprintf(os.Stderr, "sai: serve mode: the interactive REPL is disabled; this console accepts debug commands only\n")
 
 	go func() {

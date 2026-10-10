@@ -18,17 +18,67 @@ import (
 //go:embed static
 var staticFiles embed.FS
 
+// chatLanding is the /chat page when no client is served: the chat
+// client lives outside the binary (clients/chat, its own build chain)
+// and is mounted with WithStaticDir / the -http-static flag.
+const chatLanding = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sai chat</title>
+<style>
+:root { color-scheme: dark; }
+body { background: #16181d; color: #d7dae0; font: 14px/1.6 ui-monospace, monospace;
+       display: grid; place-items: center; min-height: 100vh; margin: 0; }
+main { max-width: 34em; padding: 2em; }
+a { color: #8ab4f8; }
+code { background: #22252c; padding: 0 2px; }
+</style>
+</head>
+<body>
+<main>
+  <p>the chat client is not being served.</p>
+  <p>build it and mount it:
+     <code>cd clients/chat &amp;&amp; npm install &amp;&amp; npm run build</code>, then start with
+     <code>-http-static clients/chat/dist</code>.</p>
+  <p><a href="/log">open the log view</a> instead.</p>
+</main>
+</body>
+</html>
+`
+
 // Server is the web UI: the manager (registered projects, lazily opened
 // sessions) behind the session-scoped routes (design:
 // docs/multi-session.md §4).
 type Server struct {
 	manager *Manager
 	mux     *http.ServeMux
+	opts    serverOptions
+}
+
+// serverOptions carries the Server configuration set through
+// ServerOption values.
+type serverOptions struct {
+	staticDir string
+}
+
+// ServerOption configures a Server.
+type ServerOption func(*serverOptions)
+
+// WithStaticDir serves a chat client directory (the clients/chat build
+// output, built with Vite base /chat/) at /chat, which is the default
+// landing. The embedded log view stays at /log either way.
+func WithStaticDir(dir string) ServerOption {
+	return func(o *serverOptions) { o.staticDir = dir }
 }
 
 // New builds the server over a manager.
-func New(manager *Manager) *Server {
+func New(manager *Manager, opts ...ServerOption) *Server {
 	s := &Server{manager: manager}
+	for _, opt := range opts {
+		opt(&s.opts)
+	}
 	// Windows derives MIME types from the registry, where .js/.mjs map
 	// to text/plain (or nothing) — module scripts enforce strict MIME
 	// checking and refuse to load. Pin the types for the assets we ship.
@@ -37,13 +87,34 @@ func New(manager *Manager) *Server {
 	_ = mime.AddExtensionType(".css", "text/css")
 	_ = mime.AddExtensionType(".html", "text/html; charset=utf-8")
 	mux := http.NewServeMux()
-	// The embedded tree lives under static/; strip the prefix so /
-	// serves index.html and the assets sit at /app.js, /style.css.
+	// Top-level routing: / is the chat client (default landing), /log is
+	// the embedded zero-dependency log view, /api/... is the wire
+	// contract. The chat client is an external build (clients/chat) and
+	// is mounted with WithStaticDir; without it /chat explains how.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/chat", http.StatusFound)
+	})
+	// The embedded log tree lives under static/; strip the prefix so
+	// /log serves index.html and the assets sit at /log/app.js etc.
 	page, err := fs.Sub(staticFiles, "static")
 	if err != nil {
 		panic("web: embedded static files: " + err.Error())
 	}
-	mux.Handle("/", http.FileServer(http.FS(page)))
+	// Exact + subtree patterns both point at the same handler: the
+	// subtree form is what serves nested assets, the exact form avoids
+	// a redirect hop for the bare path.
+	mux.Handle("/log/", http.StripPrefix("/log", http.FileServer(http.FS(page))))
+	mux.Handle("/log", http.StripPrefix("/log", http.FileServer(http.FS(page))))
+	chat := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Landing doubles as the mount-point instructions.
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(chatLanding))
+	}))
+	if s.opts.staticDir != "" {
+		chat = http.StripPrefix("/chat", http.FileServer(http.Dir(s.opts.staticDir)))
+	}
+	mux.Handle("/chat/", chat)
+	mux.Handle("/chat", chat)
 	mux.HandleFunc("GET /api/projects", manager.Projects)
 	mux.HandleFunc("GET /api/s/{id}/stream", s.handleStream)
 	mux.HandleFunc("GET /api/s/{id}/state", s.handleState)
@@ -55,12 +126,56 @@ func New(manager *Manager) *Server {
 	mux.HandleFunc("DELETE /api/s/{id}", manager.DeleteSession)
 	mux.HandleFunc("POST /api/s/{id}/compact", s.handleCompact)
 	mux.HandleFunc("POST /api/s/{id}/stop", s.handleStop)
+	// Unmatched /api paths answer with a JSON 404, never the page
+	// redirect: API consumers must not be sent wandering (a 3xx on an
+	// unknown route reads as "route exists" to a naive client).
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "", "message": "unknown api route"})
+	})
 	s.mux = mux
 	return s
 }
 
-// Handler returns the root handler.
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler returns the root handler. The mux is wrapped in CORS
+// support for loopback http origins — the dev workflow of the chat
+// client (a Vite server on another loopback port) needs to read our
+// responses and to preflight its JSON POSTs. This is a deliberate
+// trust extension, not a weakening: the server is loopback-only and
+// unauthenticated, so any local process can already call it directly;
+// admitting loopback-ORIGIN pages grants them no power an attacker
+// with local code execution doesn't already have. Non-loopback
+// origins get no CORS support and fail guardAPI exactly as before.
+func (s *Server) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" &&
+			strings.HasPrefix(r.URL.Path, "/api/") && loopbackOrigin(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+			if r.Method == http.MethodOptions {
+				// The mux registers no OPTIONS patterns (its method
+				// patterns would not match), so preflights must be
+				// answered before routing.
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+				w.Header().Set("Access-Control-Max-Age", "86400")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		s.mux.ServeHTTP(w, r)
+	})
+}
+
+// loopbackOrigin reports whether an Origin header value names a plain
+// http:// loopback origin (dev servers are http; https origins stay
+// rejected by guardAPI).
+func loopbackOrigin(origin string) bool {
+	u, ok := strings.CutPrefix(origin, "http://")
+	if !ok {
+		return false
+	}
+	return isLoopbackHost(u)
+}
 
 // Close stops the manager (sweeper, hubs, sessions, root lock).
 func (s *Server) Close() { s.manager.Close() }

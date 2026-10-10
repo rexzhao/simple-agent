@@ -49,9 +49,37 @@ func newTestServer(t *testing.T, turns [][]model.Event) (*agent.Session, *Server
 	return newTestManagerServer(t, &webFakeProvider{turns: turns})
 }
 
+// newTestManagerServerOpts is newTestManagerServer with ServerOptions
+// (e.g. WithStaticDir for route-level tests).
+func newTestManagerServerOpts(t *testing.T, provider model.Provider, opts ...ServerOption) (*agent.Session, *Server, *httptest.Server) {
+	t.Helper()
+	if provider == nil {
+		provider = &webFakeProvider{}
+	}
+	session, server, httpServer := newTestManagerServerInner(t, provider)
+	// Rebuild only the HTTP layer over the same manager when options
+	// are present: the session's hub is the manager's, so /api routes
+	// keep working.
+	if len(opts) > 0 {
+		optsServer := New(server.manager, opts...)
+		httpServer2 := httptest.NewServer(optsServer.Handler())
+		t.Cleanup(func() {
+			httpServer2.Close()
+			optsServer.Close()
+		})
+		return session, optsServer, httpServer2
+	}
+	return session, server, httpServer
+}
+
 // newTestManagerServer wires a full manager: server root + registry with
 // one project, a shared store, and the per-project agent factory.
 func newTestManagerServer(t *testing.T, provider model.Provider) (*agent.Session, *Server, *httptest.Server) {
+	t.Helper()
+	return newTestManagerServerInner(t, provider)
+}
+
+func newTestManagerServerInner(t *testing.T, provider model.Provider) (*agent.Session, *Server, *httptest.Server) {
 	t.Helper()
 	root := t.TempDir()
 	projectDir := t.TempDir()
