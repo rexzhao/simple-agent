@@ -3,7 +3,7 @@
 // window, resume-after-disconnect, scroll-back after resume — asserting
 // the {head, prefixAnchor, more, records.length} evolution. Run by
 // TestPageReducerFixture via `node reducer_check.mjs <base-url>`.
-import { initialState, applySnapshot, applyRecord, applyStatus, applyHistory } from "./reducer.mjs";
+import { initialState, initChain, applySnapshot, applyRecord, applyStatus, applyHistory } from "./reducer.mjs";
 
 const base = process.argv[2];
 if (!base) {
@@ -108,3 +108,48 @@ assert(state.more === !!data.more, "s3 more tracks server");
 
 console.log("reducer_check: OK (window 50, resume +" + snap2.records.length +
   ", backfill +" + data.records.length + ")");
+
+// Scenario 4: the multi-session switch semantics (data level — the DOM
+// generation guard lives in app.js; here we pin what the page's
+// per-session cache and reset must achieve). argv[3] is a second
+// session id in the same project.
+const secondID = process.argv[4];
+if (secondID) {
+  // (a) a switch is a FULL reset: a fresh state's genesis differs from
+  // the held session's head chain.
+  const stateB = initialState();
+  await initChain(stateB, secondID);
+  assert(stateB.head !== state.head, "s4 fresh session has its own genesis");
+  assert(stateB.records.length === 0, "s4 fresh state is empty");
+
+  // (b) the switch-away cache: a shallow copy of the held records plus
+  // the cursor fields. Switching back rehydrates and resumes from the
+  // held head — the server replays only the suffix.
+  const cache = {
+    records: state.records.slice(),
+    head: state.head,
+    prefixAnchor: state.prefixAnchor,
+    more: state.more,
+  };
+  const restored = initialState();
+  restored.session = state.session;
+  restored.records = cache.records.slice();
+  restored.head = cache.head;
+  restored.prefixAnchor = cache.prefixAnchor;
+  restored.more = cache.more;
+  // A record landed on session A while we were "away" (B's view).
+  const sentA = await post(api("/send"), { text: "while away" });
+  assert(sentA.ok, "s4 send on A accepted");
+  await waitSettled(cache.records.length + 2);
+  const snapA = await firstFrame(base + api("/stream?from=") + cache.head);
+  const fxA = await applySnapshot(restored, snapA);
+  assert(snapA.resumed, "s4 switch-back resumed from cached head");
+  assert(!fxA.reset, "s4 no reset on switch-back");
+  assert(restored.records.length === cache.records.length + 2, "s4 suffix only");
+  assert(restored.prefixAnchor === cache.prefixAnchor, "s4 cursor preserved");
+  assert(restored.head === snapA.d, "s4 head = server head after switch-back");
+
+  // (c) the cached original is untouched by the restore's mutations.
+  assert(cache.records.length !== restored.records.length, "s4 cache not aliased");
+  console.log("reducer_check: OK (switch: reset + cache resume +" + snapA.records.length + ")");
+}

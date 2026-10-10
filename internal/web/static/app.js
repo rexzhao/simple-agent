@@ -2,21 +2,54 @@
 //   page store == anchor prefix (server-attested) ∪ received record stream
 // verified continuously by recomputing the digest chain over what the page
 // holds and comparing it against the server's head in every status frame.
+//
+// Multi-session (docs/multi-session.md §6): the route is the hash
+// (#/s/<id>); switching sessions is a FULL state reset behind a
+// generation guard — in-flight frames of the old stream WILL arrive
+// after the switch (every switch, not a rare race), and the per-session
+// cache lets a switch back resume from the held head instead of
+// replaying.
 "use strict";
 
 import { chainStep } from "./chain.mjs";
 import { initialState, initChain, applySnapshot, applyRecord, applyStatus, applyHistory } from "./reducer.mjs";
 
-// ---------- state ----------
+// ---------- session views ----------
 
-// The chain/anchor/record store lives in the reducer (shared with the
-// fixture test); the page adds the DOM map and the connection bits.
-const state = Object.assign(initialState(), {
-  byItem: new Map(),  // itemID -> row element (committed + in-flight)
-  es: null,
-  reconnectFrom: "",
-  streaming: null,    // {item} of the in-flight assistant message
-});
+// `state` is the active session's reducer state. A switch replaces it
+// wholesale; async work captures the object it started with and drops
+// its effects when the object is no longer current — that identity
+// check IS the generation guard (the awaits inside chain folds are
+// exactly where an old stream's frame would land on the new session).
+let state = initialState();
+let es = null;
+
+// freshState builds a session view's state: the reducer fields plus the
+// page's own (identity-keyed row map, resume cursor, streaming slot).
+function freshState() {
+  return Object.assign(initialState(), {
+    byItem: new Map(),  // itemID -> row element (committed + in-flight)
+    reconnectFrom: "",
+    streaming: null,    // {item} of the in-flight assistant message
+  });
+}
+
+// The per-session cache: what a switch-away preserves so a switch back
+// can resume from the held head (?from=<head>) instead of replaying.
+// Keyed by session id — never one global blob. Record objects are
+// immutable JSON, so a shallow array copy is a complete snapshot.
+const sessionCache = new Map();
+
+function saveToCache() {
+  if (state.session && state.head) {
+    sessionCache.set(state.session, {
+      records: state.records.slice(),
+      head: state.head,
+      prefixAnchor: state.prefixAnchor,
+      more: state.more,
+    });
+  }
+}
 
 const rowsEl = document.getElementById("rows");
 const logEl = document.getElementById("log");
@@ -30,6 +63,11 @@ function enqueue(job) {
   queue = queue.then(job).catch(err => console.error("sai page:", err));
   return queue;
 }
+
+// api builds a session-scoped route for the ACTIVE session. Callers
+// that captured a state object must not use it after a switch — the
+// identity checks below are the guard.
+function api(suffix) { return "/api/s/" + state.session + suffix; }
 
 // ---------- rendering (escaped, log-style, no chat bubbles) ----------
 
@@ -123,10 +161,12 @@ function setSync(ok, serverHead) {
 // ---------- SSE ----------
 
 function connect() {
-  const url = state.reconnectFrom ? "/api/stream?from=" + encodeURIComponent(state.reconnectFrom) : "/api/stream";
-  const es = new EventSource(url);
-  state.es = es;
-  es.onmessage = e => {
+  const from = state.reconnectFrom;
+  const url = api("/stream") + (from ? "?from=" + encodeURIComponent(from) : "");
+  const myState = state;
+  const source = new EventSource(url);
+  es = source;
+  source.onmessage = e => {
     let frame;
     try {
       frame = JSON.parse(e.data);
@@ -134,27 +174,31 @@ function connect() {
       console.error("sai page: bad frame", err);
       return;
     }
-    enqueue(() => dispatch(frame));
+    enqueue(() => dispatch(frame, myState));
   };
-  es.onerror = () => {
+  source.onerror = () => {
     // EventSource retries on its own; the in-memory digest lets the
     // retry resume with ?from= instead of replaying.
-    state.reconnectFrom = state.head;
+    if (myState === state) myState.reconnectFrom = myState.head;
   };
 }
 
-async function dispatch(frame) {
+async function dispatch(frame, st) {
+  // The generation guard, checked after every await below: an old
+  // session's frame must never touch the new session's state or DOM.
+  if (st !== state) return;
   switch (frame.kind) {
     case "snapshot": {
-      const fx = await applySnapshot(state, frame);
+      const fx = await applySnapshot(st, frame);
+      if (st !== state) return;
       if (fx.reset) {
-        state.byItem = new Map();
+        st.byItem = new Map();
         rowsEl.replaceChildren();
       }
       for (const r of fx.appended) appendRecord(r);
       scrollToBottom();
-      state.reconnectFrom = "";
-      document.getElementById("load-more").hidden = !state.more;
+      st.reconnectFrom = "";
+      document.getElementById("load-more").hidden = !st.more;
       if (frame.streaming) beginStreamingItem(frame.streaming.item, frame.streaming);
       if (frame.tool) beginToolItem(frame.tool.item, frame.tool.name, frame.tool.args);
       // The authoritative queue: drop steer rows that are no longer
@@ -162,20 +206,21 @@ async function dispatch(frame) {
       // that would have merged them never comes).
       {
         const queuedIDs = new Set((frame.steered || []).map(e => e.item));
-        for (const [id, row] of state.byItem) {
+        for (const [id, row] of st.byItem) {
           if (row.classList.contains("steer-queued") && !queuedIDs.has(id)) {
             row.remove();
-            state.byItem.delete(id);
+            st.byItem.delete(id);
           }
         }
         for (const entry of frame.steered || []) beginSteerRow(entry.item, entry.text);
       }
       updateStatus();
-      if (frame.d) setSync(state.head === frame.d, frame.d);
+      if (frame.d) setSync(st.head === frame.d, frame.d);
       break;
     }
     case "record":
-      await applyRecord(state, frame.r);
+      await applyRecord(st, frame.r);
+      if (st !== state) return;
       appendRecord(frame.r);
       scrollToBottom();
       break;
@@ -183,25 +228,32 @@ async function dispatch(frame) {
       handleEvent(frame);
       break;
     case "status":
-      applyStatus(state, frame);
+      applyStatus(st, frame);
       updateStatus();
       if (frame.notice) showNotice(frame.notice);
-      if (frame.d) setSync(state.head === frame.d, frame.d);
+      if (frame.d) setSync(st.head === frame.d, frame.d);
       break;
   }
 }
 
 function updateStatus() {
-  document.getElementById("session").textContent = "session " + state.session;
-  document.getElementById("count").textContent = state.records.length + " records" + (state.more ? "+" : "");
+  document.getElementById("session").textContent = state.session ? "session " + state.session : "no session";
+  document.getElementById("count").textContent = state.session ? state.records.length + " records" + (state.more ? "+" : "") : "";
   const run = document.getElementById("runstate");
   run.textContent = state.running ? "running" : "idle";
   run.className = state.running ? "running" : "idle";
+  const composer = document.getElementById("composer");
+  const active = !!state.session;
+  document.getElementById("input").disabled = !active;
+  document.getElementById("compact").disabled = !active;
+  document.getElementById("stop").disabled = !active;
   // Steer keeps the composer usable while running.
   const send = document.getElementById("send");
   send.textContent = state.running ? "steer" : "send";
-  send.disabled = false;
-  document.getElementById("input").placeholder = state.running ? "steer a message…" : "message…";
+  send.disabled = !active;
+  document.getElementById("input").placeholder = !active ? "select a session…"
+    : state.running ? "steer a message…" : "message…";
+  renderSidebarCurrent();
 }
 
 function showNotice(text) {
@@ -310,7 +362,7 @@ function editSteer(itemID, row) {
   const current = row._body.querySelector(".content")?.textContent || "";
   const next = prompt("Edit steer message", current);
   if (next === null || !next.trim()) return;
-  fetch("/api/steer", {
+  fetch(api("/steer"), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ item: itemID, text: next }),
@@ -320,7 +372,7 @@ function editSteer(itemID, row) {
 }
 
 function withdrawSteer(itemID) {
-  fetch("/api/steer?item=" + encodeURIComponent(itemID), { method: "DELETE" })
+  fetch(api("/steer?item=" + encodeURIComponent(itemID)), { method: "DELETE" })
     .then(res => {
       if (!res.ok) showError("steer withdraw failed");
     });
@@ -396,22 +448,26 @@ logEl.addEventListener("scroll", () => {
 
 async function loadHistory() {
   if (!state.more || !state.prefixAnchor) return;
-  const res = await fetch("/api/history?before=" + encodeURIComponent(state.prefixAnchor) + "&limit=50");
+  const st = state;
+  const res = await fetch(api("/history?before=" + encodeURIComponent(st.prefixAnchor) + "&limit=50"));
+  if (st !== state) return;
   if (res.status === 409) {
     // Stale anchor (server restarted): resynchronize from scratch.
-    state.reconnectFrom = "";
-    state.es.close();
+    st.reconnectFrom = "";
+    if (es) es.close();
     connect();
     return;
   }
   const data = await res.json();
+  if (st !== state) return;
   // Backward verification and the store/cursor update live in the
   // reducer (shared with the fixture test); the head never changes —
   // history extension cannot alter a running hash's tail.
-  const outcome = await applyHistory(state, data);
+  const outcome = await applyHistory(st, data);
+  if (st !== state) return;
   if (outcome !== "ok") {
     setSync(false, "");
-    state.more = false;
+    st.more = false;
     document.getElementById("load-more").hidden = true;
     return;
   }
@@ -422,9 +478,9 @@ async function loadHistory() {
     row._body.appendChild(recordBody(r));
     if (rowsEl.firstChild) rowsEl.insertBefore(row, rowsEl.firstChild);
     else rowsEl.appendChild(row);
-    state.byItem.set(r.item, row);
+    st.byItem.set(r.item, row);
   }
-  document.getElementById("load-more").hidden = !state.more;
+  document.getElementById("load-more").hidden = !st.more;
   logEl.scrollTop += logEl.scrollHeight - prevHeight;
 }
 
@@ -435,11 +491,12 @@ async function loadHistory() {
 // to the other endpoint.
 document.getElementById("composer").addEventListener("submit", async e => {
   e.preventDefault();
+  if (!state.session) return;
   const input = document.getElementById("input");
   const text = input.value.trim();
   if (!text) return;
-  const send = () => postJSON2("/api/send", { text });
-  const steer = () => postJSON2("/api/steer", { text });
+  const send = () => postJSON2(api("/send"), { text });
+  const steer = () => postJSON2(api("/steer"), { text });
   let res = state.running ? await steer() : await send();
   if (res.status === 409) {
     const fallback = state.running ? send : steer;
@@ -461,48 +518,210 @@ async function postJSON2(path, body) {
 }
 
 document.getElementById("stop").addEventListener("click", () => {
-  fetch("/api/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  if (!state.session) return;
+  fetch(api("/stop"), { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 });
 
 document.getElementById("compact").addEventListener("click", async () => {
-  const res = await fetch("/api/compact", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  if (!state.session) return;
+  const res = await fetch(api("/compact"), { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
   if (res.status === 409) {
     const data = await res.json().catch(() => ({}));
     showError(data.error === "nothing_to_compact" ? "nothing to compact" : "busy");
   }
 });
 
+// ---------- sidebar (project/session list) ----------
+
+// `active` comes from /api/projects (TTL-cached server-side) — it means
+// "open in this serve process", NOT "running". The running chip is only
+// ever shown for the session this page is viewing, from its live
+// stream state.
+let projectsBody = { projects: [], registry_ok: true };
+
+async function refreshProjects() {
+  try {
+    const res = await fetch("/api/projects");
+    if (!res.ok) return;
+    const body = await res.json();
+    projectsBody = body;
+    renderSidebar();
+  } catch (_) { /* serve away; the next tick retries */ }
+}
+
+function renderSidebar() {
+  const host = document.getElementById("projects");
+  host.replaceChildren();
+  for (const p of projectsBody.projects || []) {
+    const block = document.createElement("div");
+    block.className = "project";
+    const path = document.createElement("div");
+    path.className = "project-path";
+    path.appendChild(textNode(p.path));
+    path.title = p.id;
+    block.appendChild(path);
+    for (const s of p.sessions || []) {
+      const link = document.createElement("a");
+      link.className = "session-link";
+      link.href = "#/s/" + s.id;
+      if (s.id === state.session) link.classList.add("current");
+      const title = document.createElement("span");
+      title.className = "title";
+      title.appendChild(textNode(s.title || s.id));
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      const when = document.createElement("span");
+      when.appendChild(textNode((s.created || "").slice(0, 10)));
+      meta.appendChild(when);
+      if (s.active) {
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.appendChild(textNode("open"));
+        meta.appendChild(badge);
+      }
+      // The running chip: only from the live view, never from `active`.
+      if (s.id === state.session && state.running) {
+        const badge = document.createElement("span");
+        badge.className = "badge running";
+        badge.appendChild(textNode("running"));
+        meta.appendChild(badge);
+      }
+      link.append(title, meta);
+      block.appendChild(link);
+    }
+    host.appendChild(block);
+  }
+}
+
+function renderSidebarCurrent() {
+  // Cheap refresh of just the current/running markers.
+  renderSidebar();
+}
+
+setInterval(refreshProjects, 5000);
+
+// ---------- routing ----------
+
+// The hash IS the route: #/s/<id> opens a session, anything else is the
+// list landing. hashchange covers back/forward; list clicks write the
+// hash; unknown ids are presented and sent back to the list.
+function route() {
+  const m = location.hash.match(/^#\/s\/([a-z0-9]+)$/);
+  if (m) {
+    openSession(m[1]);
+  } else {
+    showList();
+  }
+}
+
+window.addEventListener("hashchange", route);
+
+function teardownSession() {
+  saveToCache();
+  if (es) {
+    es.close();
+    es = null;
+  }
+}
+
+function showList() {
+  teardownSession();
+  state = freshState();
+  rowsEl.replaceChildren();
+  document.getElementById("load-more").hidden = true;
+  document.getElementById("notices").textContent = "";
+  const sync = document.getElementById("sync");
+  sync.className = "sync-unknown";
+  sync.textContent = "…";
+  updateStatus();
+}
+
+async function openSession(id) {
+  if (state.session === id && es) return; // already viewing
+  teardownSession();
+  state = freshState();
+  state.session = id;
+  rowsEl.replaceChildren();
+  document.getElementById("load-more").hidden = true;
+  document.getElementById("notices").textContent = "";
+  const sync = document.getElementById("sync");
+  sync.className = "sync-unknown";
+  sync.textContent = "…";
+
+  // Hydrate from the per-session cache: the rows re-render locally and
+  // the stream resumes from the held head. A miss simply replays.
+  const cached = sessionCache.get(id);
+  if (cached) {
+    state.records = cached.records.slice();
+    state.head = cached.head;
+    state.prefixAnchor = cached.prefixAnchor;
+    state.more = cached.more;
+    state.reconnectFrom = cached.head;
+    for (const r of state.records) appendRecord(r);
+    scrollToBottom();
+    document.getElementById("load-more").hidden = !state.more;
+  } else {
+    await initChain(state, id);
+    state.reconnectFrom = "";
+  }
+
+  // Probe before connecting: EventSource cannot read status codes, so
+  // the distinguishable failures are presented here (and only 503 is
+  // retried, by contract).
+  const st = state;
+  let res;
+  try {
+    res = await fetch(api("/state"));
+  } catch (_) {
+    showError("serve unreachable");
+    return;
+  }
+  if (st !== state) return;
+  if (res.status === 404) {
+    sessionCache.delete(id);
+    showError("session not found");
+    location.hash = "";
+    return;
+  }
+  if (res.status === 409) {
+    const data = await res.json().catch(() => ({}));
+    showError(data.error === "session_locked" ? "session is locked by another process" : "conflict");
+    return;
+  }
+  if (res.status === 503) {
+    // Our own eviction teardown: retry shortly.
+    showError("session is closing, retrying…");
+    setTimeout(() => { if (st === state && state.session === id) openSession(id); }, 1000);
+    return;
+  }
+  if (!res.ok) {
+    showError(await res.text());
+    return;
+  }
+  if (st !== state) return;
+  updateStatus();
+  connect();
+}
+
 // ---------- boot ----------
 
 // Refresh the status area from /api/state while the stream is down
 // (covers the gap between connects).
 setInterval(async () => {
-  if (state.es && state.es.readyState === 2) {
+  if (state.session && es && es.readyState === 2) {
+    const st = state;
     try {
-      const res = await fetch("/api/state");
+      const res = await fetch(api("/state"));
+      if (st !== state) return;
       if (res.ok) {
         const s = await res.json();
-        state.running = s.running;
+        if (st !== state) return;
+        st.running = s.running;
         updateStatus();
       }
     } catch (_) { /* server away */ }
   }
 }, 2000);
 
-(async () => {
-  // The genesis needs the served session id; the reducer owns the
-  // chain fields from here on.
-  try {
-    const res = await fetch("/api/state");
-    if (res.ok) {
-      const s = await res.json();
-      state.session = s.session;
-      history.replaceState(null, "", "?session=" + s.session);
-    }
-  } catch (_) { /* fall back to the URL guess below */ }
-  if (!state.session) {
-    state.session = new URLSearchParams(location.search).get("session") || "local";
-  }
-  await initChain(state, state.session);
-  connect();
-})();
+route();
+refreshProjects();

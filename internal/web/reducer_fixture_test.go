@@ -27,19 +27,22 @@ func TestPageReducerFixture(t *testing.T) {
 	for i := range turns {
 		turns[i] = []model.Event{model.TextDeltaEvent{Text: "answer"}}
 	}
-	session, _, base := newTestServer(t, turns)
+	session, server, base := newTestServer(t, turns)
 	for i := 0; i < 80; i++ {
 		if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "m"}); err != nil {
 			t.Fatalf("send %d: %v", i, err)
 		}
 		waitSettled(t, session)
 	}
+	// A second session in the same project for the switch-semantics
+	// scenario (scenario 4 in the fixture).
+	second := createSecondSession(t, server)
 
 	script, err := filepath.Abs(filepath.Join("static", "reducer_check.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(node, script, base.URL, session.ID())
+	cmd := exec.Command(node, script, base.URL, session.ID(), second)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("node reducer check failed: %v\n%s", err, out)
@@ -73,4 +76,33 @@ func TestStaticMIMETypes(t *testing.T) {
 			t.Errorf("%s Content-Type = %q, want %s", c.path, ct, c.want)
 		}
 	}
+}
+
+// createSecondSession opens a second session under the same project as
+// the test server's first one (the switch-semantics fixture scenario):
+// the manager's own factory builds the agent, so the project id matches.
+func createSecondSession(t *testing.T, s *Server) string {
+	t.Helper()
+	m := s.manager
+	m.mu.Lock()
+	entries := m.entriesLocked()
+	m.mu.Unlock()
+	if len(entries) == 0 {
+		t.Fatal("no registered project for a second session")
+	}
+	ag, err := m.agentFor(entries[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := ag.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.MaterializeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return created.ID()
 }

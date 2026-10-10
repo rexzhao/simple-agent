@@ -7,28 +7,39 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header id="status">
-  <span id="session"></span>
-  <span id="count"></span>
-  <span id="runstate" class="idle">idle</span>
-  <span id="sync" class="sync-unknown">…</span>
-  <span id="notices"></span>
-</header>
-<main id="log">
-  <div id="history-start">
-    <button id="load-more" hidden>load earlier records</button>
+<div id="layout">
+  <nav id="sidebar">
+    <div id="sidebar-head">sessions</div>
+    <div id="projects"></div>
+  </nav>
+  <div id="main">
+    <header id="status">
+      <span id="session"></span>
+      <span id="count"></span>
+      <span id="runstate" class="idle">idle</span>
+      <span id="sync" class="sync-unknown">…</span>
+      <span id="notices"></span>
+    </header>
+    <main id="log">
+      <div id="history-start">
+        <button id="load-more" hidden>load earlier records</button>
+      </div>
+      <div id="rows"></div>
+      <div id="empty-view">
+        <p>Select a session from the list.</p>
+      </div>
+    </main>
+    <footer>
+      <form id="composer">
+        <input id="input" type="text" placeholder="message…" autocomplete="off" autofocus>
+        <button type="submit" id="send">send</button>
+        <button type="button" id="compact">compact</button>
+        <button type="button" id="stop">stop</button>
+      </form>
+      <div id="error" class="hidden"></div>
+    </footer>
   </div>
-  <div id="rows"></div>
-</main>
-<footer>
-  <form id="composer">
-    <input id="input" type="text" placeholder="message…" autocomplete="off" autofocus>
-    <button type="submit" id="send">send</button>
-    <button type="button" id="compact">compact</button>
-    <button type="button" id="stop">stop</button>
-  </form>
-  <div id="error" class="hidden"></div>
-</footer>
+</div>
 <script type="module" src="/app.js"></script>
 </body>
 </html>
