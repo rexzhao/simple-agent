@@ -630,6 +630,12 @@ function renderSidebar() {
         e.preventDefault();
         e.stopPropagation();
         if (!confirm("Delete this session and all its records?")) return;
+        // Re-entry guard: the retry loop spans seconds.
+        del.disabled = true;
+        const done = text => {
+          del.disabled = false;
+          if (text !== undefined) showError(text);
+        };
         if (s.id === state.session) {
           // Our own view holds the server-side refs: navigate away and
           // let the hashchange task tear the stream down. The readyState
@@ -644,43 +650,54 @@ function renderSidebar() {
         }
         const st = state;
         try {
+          // A response body is single-use: read it as TEXT once and
+          // parse locally — the retry loop and the final branch share
+          // the same parse, never re-reading a consumed body.
           // session_open (a view still holds it) and session_closing
-          // (the sweeper or a prior delete is tearing it down) both
-          // converge with a retry — bounded, and the error text names
-          // the ones that need a human action.
-          let res;
+          // (the sweeper or a prior delete is tearing it down) converge
+          // with bounded retries; the others need a human action.
+          let res, raw = "", code = "";
+          const read = async r => {
+            raw = await r.text().catch(() => "");
+            try { code = (JSON.parse(raw) || {}).error || ""; } catch (_) { code = ""; }
+          };
           for (let attempt = 0; ; attempt++) {
             res = await fetch("/api/s/" + s.id, { method: "DELETE" });
             if (res.status !== 409 && res.status !== 503) break;
-            const data = await res.json().catch(() => ({}));
-            if (data.error !== "session_open" && data.error !== "session_closing") break;
-            if (data.error === "session_open" && attempt >= 5) {
-              if (st === state) showError("session is open in a view — close it first");
+            await read(res);
+            if (code !== "session_open" && code !== "session_closing") break;
+            if (attempt >= (code === "session_open" ? 5 : 10)) {
+              done(code === "session_open"
+                ? "session is open in a view — close it first"
+                : "session is busy, try again");
               return;
             }
             await new Promise(r => setTimeout(r, 200));
           }
-          if (res.ok) {
+          if (res.ok || res.status === 404) {
+            // Deleted, or already gone — either way it is a server-side
+            // fact: drop the cache and refresh regardless of which view
+            // is current now.
             sessionCache.delete(s.id);
-          } else if (res.status === 404) {
-            sessionCache.delete(s.id);
-          } else {
-            const raw = await res.text().catch(() => "");
-            let code = "";
-            try { code = (JSON.parse(raw) || {}).error || ""; } catch (_) { /* plain-text body */ }
-            const text = ({
-              run_active: "stop the run first",
-              session_locked: "session is locked by another process",
-              session_open: "session is open in a view — close it first",
-            })[code] || raw || "delete failed";
-            if (st === state) showError(text);
+            refreshProjects();
+            done();
             return;
           }
-          // A successful (or already-gone) deletion is a server-side
-          // fact: refresh regardless of which view is current now.
-          refreshProjects();
+          // 409/503 bodies were read (and parsed) inside the loop; only
+          // the other statuses (500 …) still have an unread body here.
+          if (res.status !== 409 && res.status !== 503) {
+            raw = await res.text().catch(() => "");
+            try { code = (JSON.parse(raw) || {}).error || ""; } catch (_) { code = ""; }
+          }
+          const text = ({
+            run_active: "stop the run first",
+            session_locked: "session is locked by another process",
+            session_open: "session is open in a view — close it first",
+            session_closing: "session is busy, try again",
+          })[code] || raw || "delete failed";
+          done(st === state ? text : undefined);
         } catch (_) {
-          showError("delete failed");
+          done("delete failed");
         }
       };
       row.appendChild(del);

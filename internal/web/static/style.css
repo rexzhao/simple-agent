@@ -93,3 +93,5 @@ main:has(#rows:not(:empty)) #empty-view { display: none; }
 .session-link > a { display: block; color: inherit; text-decoration: none; }
 .session-link { padding: 0; }
 .session-link > a { padding: .3em .4em; }
+
+.session-link .delete:disabled { opacity: .3; cursor: default; }
