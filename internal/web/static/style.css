@@ -1,0 +1,52 @@
+:root {
+  --bg: #101418; --fg: #cdd3d8; --dim: #5c6770; --line: #1d242b;
+  --accent: #7aa2f7; --err: #f7768e; --ok: #9ece6a; --warn: #e0af68;
+  --reasoning: #5c6770;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex; flex-direction: column;
+  background: var(--bg); color: var(--fg);
+  font: 13px/1.5 "Cascadia Code", "SF Mono", Consolas, monospace;
+}
+header {
+  display: flex; gap: 1em; align-items: baseline; padding: .5em 1em;
+  border-bottom: 1px solid var(--line); color: var(--dim); flex-wrap: wrap;
+}
+header .idle { color: var(--dim); }
+header .running { color: var(--warn); }
+#sync.synced { color: var(--ok); }
+#sync.drift { color: var(--err); }
+#notices { color: var(--warn); }
+main { flex: 1; overflow-y: auto; padding: 0 1em; }
+#load-more {
+  display: block; margin: .5em auto; background: none; color: var(--dim);
+  border: 1px solid var(--line); border-radius: 4px; padding: .2em 1em;
+  cursor: pointer;
+}
+.row {
+  display: grid; grid-template-columns: 7em 12em 1fr; gap: 0 1em;
+  padding: .15em 0; border-bottom: 1px solid var(--line);
+}
+.row .ts { color: var(--dim); }
+.row .type { color: var(--accent); overflow: hidden; text-overflow: ellipsis; }
+.row .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.row.user .type { color: var(--ok); }
+.row.failed .type, .row .error-text { color: var(--err); }
+.row .reasoning { color: var(--reasoning); }
+.row.streaming .type::after { content: " ▍"; animation: blink 1s step-end infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+footer { border-top: 1px solid var(--line); padding: .6em 1em; }
+form { display: flex; gap: .5em; }
+#input {
+  flex: 1; background: var(--line); color: var(--fg); border: none;
+  border-radius: 4px; padding: .45em .7em; font: inherit;
+}
+button {
+  background: var(--line); color: var(--fg); border: none;
+  border-radius: 4px; padding: .45em 1em; font: inherit; cursor: pointer;
+}
+button:disabled { opacity: .4; cursor: default; }
+#error { color: var(--err); padding-top: .4em; min-height: 1.2em; }
+.hidden { display: none; }

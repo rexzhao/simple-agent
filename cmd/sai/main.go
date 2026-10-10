@@ -49,6 +49,7 @@ func main() {
 		sessionID   = flag.String("session", "", "resume a stored session by id")
 		provider    = flag.String("provider", "", "override default_provider")
 		modelName   = flag.String("model", "", "override default_model (model profile name)")
+		httpAddr    = flag.String("http", "", "serve the web UI on this address (e.g. 127.0.0.1:7420) instead of the interactive REPL")
 	)
 	flag.Parse()
 
@@ -93,6 +94,10 @@ func main() {
 	// Color is for terminals only; pipes and files must stay plain.
 	colorEnabled = stdoutIsTerminal() && enableVirtualTerminal()
 
+	if *httpAddr != "" {
+		serve(cli, *httpAddr)
+		return
+	}
 	interrupts := make(chan os.Signal, 1)
 	signal.Notify(interrupts, os.Interrupt)
 	go func() {
@@ -488,6 +493,20 @@ func (c *cliApp) printRecord(record storage.Record) {
 		c.printer.line("")
 	}
 	c.printer.line(formatRecord(record))
+}
+
+// stopWatcher stops the record-printing watcher without closing the
+// session — serve mode hands terminal output over to the web UI (/tail
+// re-enables it on demand).
+func (c *cliApp) stopWatcher() {
+	if c.unwatch != nil {
+		c.unwatch()
+		c.unwatch = nil
+	}
+	if c.watcherDone != nil {
+		<-c.watcherDone
+		c.watcherDone = nil
+	}
 }
 
 // closeSession stops the watcher and closes the session.

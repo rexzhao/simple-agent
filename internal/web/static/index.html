@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sai log</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header id="status">
+  <span id="session"></span>
+  <span id="count"></span>
+  <span id="runstate" class="idle">idle</span>
+  <span id="sync" class="sync-unknown">…</span>
+  <span id="notices"></span>
+</header>
+<main id="log">
+  <div id="history-start">
+    <button id="load-more" hidden>load earlier records</button>
+  </div>
+  <div id="rows"></div>
+</main>
+<footer>
+  <form id="composer">
+    <input id="input" type="text" placeholder="message…" autocomplete="off" autofocus>
+    <button type="submit" id="send">send</button>
+    <button type="button" id="compact">compact</button>
+    <button type="button" id="stop">stop</button>
+  </form>
+  <div id="error" class="hidden"></div>
+</footer>
+<script src="/app.js"></script>
+</body>
+</html>

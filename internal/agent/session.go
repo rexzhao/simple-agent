@@ -187,6 +187,15 @@ func (s *Session) Subscribe() *Subscription {
 // The check, the durable append, and the running-flag transition happen in
 // one lock section, so a concurrent Send can never interleave its records
 // with another run's: the loser is rejected before anything is written.
+// Sentinel errors the transport layers map to stable wire codes.
+var (
+	// ErrRunActive is returned by Send and Compact when the single-flight
+	// run slot is taken.
+	ErrRunActive = errors.New("a run is already active; stop it first")
+	// ErrNothingToCompact is returned by Compact when the context is empty.
+	ErrNothingToCompact = errors.New("nothing to compact")
+)
+
 func (s *Session) Send(text string) error {
 	text = strings.TrimRight(text, "\r\n")
 	if strings.TrimSpace(text) == "" {
@@ -200,7 +209,7 @@ func (s *Session) Send(text string) error {
 	if s.running {
 		s.mu.Unlock()
 		cancel()
-		return fmt.Errorf("a run is already active; stop it first")
+		return ErrRunActive
 	}
 	stored, err := s.commitLocked(storage.Record{
 		ItemID: storage.NewUserInputID(), Type: storage.TypeUserInput,
@@ -422,11 +431,11 @@ func (s *Session) Compact() error {
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
-		return fmt.Errorf("a run is already active; stop it first")
+		return ErrRunActive
 	}
 	if len(s.state.Context) == 0 {
 		s.mu.Unlock()
-		return fmt.Errorf("nothing to compact")
+		return ErrNothingToCompact
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
