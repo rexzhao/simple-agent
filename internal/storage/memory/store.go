@@ -84,15 +84,16 @@ type Session struct {
 // ID returns the session ID, available before any record exists.
 func (s *Session) ID() string { return s.id }
 
-// Append stores one record.
+// Append stores one record. Mirrors the jsonl boundary: both
+// implementations fill an empty Time and return the same normalized
+// form, so no caller can observe a store-dependent digest, ordering
+// (listings sort by timestamps), or Modified value.
 func (s *Session) Append(record storage.Record) (storage.Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return storage.Record{}, fmt.Errorf("session is closed")
 	}
-	// Mirror the jsonl boundary: both implementations return the same
-	// normalized form so no caller can observe a store-dependent digest.
 	return s.log.append(record.Normalized())
 }
 
@@ -145,7 +146,15 @@ func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
 			infos = append(infos, info)
 		}
 	}
-	sort.Slice(infos, func(i, j int) bool { return infos[i].Modified.After(infos[j].Modified) })
+	// jsonl's comparator: activity first, ID as the stable tiebreak —
+	// without it, map iteration order leaks into listings whenever
+	// Modified values tie (e.g. records without timestamps).
+	sort.Slice(infos, func(i, j int) bool {
+		if !infos[i].Modified.Equal(infos[j].Modified) {
+			return infos[i].Modified.After(infos[j].Modified)
+		}
+		return infos[i].ID < infos[j].ID
+	})
 	return infos, nil
 }
 

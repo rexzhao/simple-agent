@@ -592,12 +592,12 @@ func isSegmentName(name string) bool {
 	return strings.HasPrefix(name, logArchivePrefix) && strings.HasSuffix(name, logArchiveSuffix)
 }
 
-// headScanLimit bounds the Title search. With the structural guard in
-// readSessionHead (header first, no immediate compaction), the first
-// user input follows the header within a couple of records; the limit
-// only bounds pathological files, so a small value is provably
-// sufficient and a large one costs nothing (the scan stops at the
-// first hit).
+// headScanLimit bounds how many records scanHead COLLECTS from the
+// segment head — the caller (readSessionHead) stops at the first user
+// input after its structural checks, so the limit only bounds
+// pathological files where no user input ever arrives. The structural
+// guard makes a handful of records provably sufficient for real
+// sessions; the generous value costs nothing when the hit comes early.
 const headScanLimit = 1000
 
 // readSessionHead reads Created and Title from the earliest segment — the

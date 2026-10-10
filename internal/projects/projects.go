@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -69,7 +70,7 @@ func Canonical(path string) string {
 // — the file is the interface, and its replacements are atomic elsewhere.
 func Load(path string) (*Registry, error) {
 	var data []byte
-	err := readFileWithRetry(path, func() (err error) {
+	err := readFileWithRetry(func() (err error) {
 		data, err = os.ReadFile(path)
 		return
 	})
@@ -112,6 +113,12 @@ func (r *Registry) Save(path string) error {
 	if err := temp.Close(); err != nil {
 		return fmt.Errorf("close registry staging: %w", err)
 	}
+	// os.CreateTemp creates with 0600 and rename preserves the mode —
+	// restore the intended 0644 so a shared server root stays readable
+	// by other users on Unix (no-op on Windows).
+	if err := os.Chmod(tempName, 0o644); err != nil {
+		return fmt.Errorf("chmod registry staging: %w", err)
+	}
 	if err := renameWithRetry(tempName, path); err != nil {
 		return fmt.Errorf("activate registry: %w", err)
 	}
@@ -126,9 +133,16 @@ var renameRetry = 25
 
 // sharingConflict reports whether an error is a transient Windows
 // sharing violation (rename-vs-open races on the registry file).
+// Permission denials join the retry set: under a bounded budget they
+// only cost a few tens of ms when permanent, and the string match
+// below is the only cross-platform branch that reliably catches
+// ERROR_SHARING_VIOLATED (os does not map it to fs.ErrPermission).
 func sharingConflict(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		return true
 	}
 	var linkErr *os.LinkError
 	if errors.As(err, &linkErr) {
@@ -160,7 +174,7 @@ func renameWithRetry(oldPath, newPath string) error {
 }
 
 // readFileWithRetry runs read once, retrying transient sharing conflicts.
-func readFileWithRetry(path string, read func() error) error {
+func readFileWithRetry(read func() error) error {
 	var err error
 	for attempt := 0; attempt < renameRetry; attempt++ {
 		if err = read(); err == nil {
