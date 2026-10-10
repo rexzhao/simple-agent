@@ -18,7 +18,7 @@ import (
 // commands only — free-form input goes to the web page, so the REPL can
 // never race a page for a session's single run slot (and the hubs stay
 // the only consumers of the run event streams).
-func serve(serverRoot, addr, providerName, modelName, resumeID, staticDir string) {
+func serve(serverRoot, addr, providerName, modelName, resumeID, staticDir string, devCORS bool) {
 	factory, err := assembleFactory(serverRoot, providerName, modelName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
@@ -54,7 +54,14 @@ func serve(serverRoot, addr, providerName, modelName, resumeID, staticDir string
 			os.Exit(1)
 		}
 	}
-	server := web.New(manager, web.WithStaticDir(staticDir))
+	var opts []web.ServerOption
+	if staticDir != "" {
+		opts = append(opts, web.WithStaticDir(staticDir))
+	}
+	if devCORS {
+		opts = append(opts, web.WithDevCORS())
+	}
+	server := web.New(manager, opts...)
 	httpServer := &http.Server{
 		Handler: server.Handler(),
 	}

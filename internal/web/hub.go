@@ -326,7 +326,8 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 	}
 	if snapshot.Running != nil {
 		f.Tool = &ToolWire{
-			Item: snapshot.Running.ItemID,
+			Item:   snapshot.Running.ItemID,
+			CallID: snapshot.Running.ToolCall.ID,
 			Name: snapshot.Running.ToolCall.Name,
 			Args: snapshot.Running.ToolCall.Arguments,
 		}

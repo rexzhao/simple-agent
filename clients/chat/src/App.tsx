@@ -86,9 +86,17 @@ export default function App() {
   );
 
   const sessions = useMemo(() => {
-    const out: { id: string; title: string; project: string }[] = [];
+    const out: { id: string; title: string; project: string; path: string }[] = [];
     for (const p of projects?.projects || []) {
-      for (const s of p.sessions) out.push({ id: s.id, title: s.title || "untitled", project: p.id });
+      for (const s of p.sessions)
+        out.push({
+          id: s.id,
+          title: s.title || "untitled",
+          project: p.id,
+          // The registered path (tail segment as the visible label,
+          // full path on the tooltip) — a project hash reads as noise.
+          path: p.path,
+        });
     }
     return out;
   }, [projects]);
@@ -127,10 +135,12 @@ export default function App() {
                       : "bg-transparent hover:bg-accent/50")
                   }
                   onClick={() => setSessionID(s.id)}
-                  title={s.project}
+                  title={s.path}
                 >
                   <span className="truncate">{s.title}</span>
-                  <span className="text-muted-foreground truncate text-xs">{s.project}</span>
+                  <span className="text-muted-foreground truncate text-xs">
+                    {s.path.replace(/[\\/]$/, "").split(/[\\/]/).pop()}
+                  </span>
                 </button>
               ))}
             </div>

@@ -61,6 +61,7 @@ type Server struct {
 // ServerOption values.
 type serverOptions struct {
 	staticDir string
+	devCors   bool
 }
 
 // ServerOption configures a Server.
@@ -71,6 +72,24 @@ type ServerOption func(*serverOptions)
 // landing. The embedded log view stays at /log either way.
 func WithStaticDir(dir string) ServerOption {
 	return func(o *serverOptions) { o.staticDir = dir }
+}
+
+// WithDevCORS enables CORS preflight answers and origin echoes for
+// loopback http origins on /api paths. OFF by default: the shipped dev
+// workflow (Vite) proxies /api and needs no CORS, so nobody should get
+// it implicitly.
+//
+// What the option really does, stated honestly: it widens the trust
+// boundary from LOCAL PROCESSES to LOCAL PAGES. Before, a loopback
+// page could neither write (JSON content-type needs a preflight our
+// zero-CORS policy refused) nor read (no ACAO header); with it, any
+// page served from a loopback origin can drive the API — including
+// the shell tools — and read the responses. That is the same power
+// any local process already has, which is why it is defensible at
+// all, but it is MORE than pages had, and it should never be the
+// default for a server that executes shell commands.
+func WithDevCORS() ServerOption {
+	return func(o *serverOptions) { o.devCors = true }
 }
 
 // New builds the server over a manager.
@@ -93,7 +112,10 @@ func New(manager *Manager, opts ...ServerOption) *Server {
 	// the embedded zero-dependency log view, /api/... is the wire
 	// contract. The chat client is an external build (clients/chat) and
 	// is mounted with WithStaticDir; without it /chat explains how.
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// Only the exact root redirects; anything else that matches no
+	// pattern is the mux's own 404 — a missing asset must surface as
+	// one, not as a 302 that the browser resolves into the chat page.
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/chat", http.StatusFound)
 	})
 	// The embedded log tree lives under static/; strip the prefix so
@@ -138,16 +160,13 @@ func New(manager *Manager, opts ...ServerOption) *Server {
 	return s
 }
 
-// Handler returns the root handler. The mux is wrapped in CORS
-// support for loopback http origins — the dev workflow of the chat
-// client (a Vite server on another loopback port) needs to read our
-// responses and to preflight its JSON POSTs. This is a deliberate
-// trust extension, not a weakening: the server is loopback-only and
-// unauthenticated, so any local process can already call it directly;
-// admitting loopback-ORIGIN pages grants them no power an attacker
-// with local code execution doesn't already have. Non-loopback
-// origins get no CORS support and fail guardAPI exactly as before.
+// Handler returns the root handler. With WithDevCORS the mux is
+// wrapped in CORS support for loopback http origins on /api paths —
+// see WithDevCORS for what that grants and why it is opt-in.
 func (s *Server) Handler() http.Handler {
+	if !s.opts.devCors {
+		return s.mux
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if origin := r.Header.Get("Origin"); origin != "" &&
 			strings.HasPrefix(r.URL.Path, "/api/") && loopbackOrigin(origin) {

@@ -34,10 +34,13 @@ async function request<T>(url: string, method: string, body?: unknown): Promise<
     }
     throw new APIError(res.status, code, raw);
   }
+  if (raw === "") return undefined as T;
   try {
     return JSON.parse(raw) as T;
   } catch {
-    return undefined as T;
+    // A 200 with an unparseable body is a broken contract, not a
+    // success — surface it here instead of a property access later.
+    throw new APIError(res.status, "", "bad JSON in 200 response");
   }
 }
 
@@ -50,7 +53,9 @@ export const postSend = (id: string, text: string) =>
 export const postSteer = (id: string, text: string) =>
   request<unknown>(`/api/s/${id}/steer`, "POST", { text });
 export const putSteer = (id: string, item: string, text: string) =>
-  request<unknown>(`/api/s/${id}/steer?item=${encodeURIComponent(item)}`, "PUT", { text });
+  // The update endpoint reads {item, text} from the BODY (only the
+  // withdraw takes the item as a query parameter).
+  request<unknown>(`/api/s/${id}/steer`, "PUT", { item, text });
 export const deleteSteer = (id: string, item: string) =>
   request<unknown>(`/api/s/${id}/steer?item=${encodeURIComponent(item)}`, "DELETE");
 export const postStop = (id: string) => request<unknown>(`/api/s/${id}/stop`, "POST", {});

@@ -51,6 +51,7 @@ func main() {
 		modelName   = flag.String("model", "", "override default_model (model profile name)")
 		httpAddr    = flag.String("http", "", "serve the web UI on this address (e.g. 127.0.0.1:7420) instead of the interactive REPL")
 		httpStatic  = flag.String("http-static", "", "serve a chat client directory (e.g. clients/chat/dist) at /chat")
+		httpDevCORS  = flag.Bool("http-dev-cors", false, "answer CORS for loopback origins on /api (direct dev-server connections; the Vite proxy flow needs no CORS)")
 	)
 	flag.Parse()
 
@@ -80,7 +81,7 @@ func main() {
 		if resumeID == "" && flag.NArg() > 0 {
 			resumeID = strings.TrimSpace(flag.Arg(0))
 		}
-		serve(*serverRoot, *httpAddr, *provider, *modelName, resumeID, *httpStatic)
+		serve(*serverRoot, *httpAddr, *provider, *modelName, resumeID, *httpStatic, *httpDevCORS)
 		return
 	}
 

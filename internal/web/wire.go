@@ -133,10 +133,15 @@ type StreamingWire struct {
 }
 
 // ToolWire is the in-flight tool execution of a mid-stream connection.
+// CallID is the model's tool-call id: the events that continue this
+// execution (tool_result) key by it, and a reconnecting client needs
+// the SAME key to attach the eventual result to this part. Item is the
+// eventual tool.result record's own identity.
 type ToolWire struct {
-	Item string `json:"item"`
-	Name string `json:"name,omitempty"`
-	Args string `json:"args,omitempty"`
+	Item   string `json:"item"`
+	CallID string `json:"call_id,omitempty"`
+	Name   string `json:"name,omitempty"`
+	Args   string `json:"args,omitempty"`
 }
 
 // SteeredWire is one queued steer message: addressable by identity from

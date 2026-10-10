@@ -3,6 +3,7 @@ package web
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,12 +115,18 @@ func TestStaticChatDir(t *testing.T) {
 	}
 }
 
-// TestCORSPreflight pins the dev-server contract: a loopback http origin
-// gets preflight answers on /api paths, a foreign origin gets nothing
-// (its preflight falls through to the redirect, which the browser treats
-// as CORS failure).
+// corsServer wires the dev-CORS variant used by both CORS tests.
+func corsServer(t *testing.T) *httptest.Server {
+	_, _, base := newTestManagerServerOpts(t, nil, WithDevCORS())
+	return base
+}
+
+// TestCORSPreflight pins the dev-server contract (opt-in via
+// WithDevCORS): a loopback http origin gets preflight answers on /api
+// paths, a foreign origin gets nothing (its preflight falls through
+// to the mux's 404, which the browser treats as CORS failure).
 func TestCORSPreflight(t *testing.T) {
-	_, _, base := newTestServer(t, nil)
+	base := corsServer(t)
 
 	req, _ := http.NewRequest(http.MethodOptions, base.URL+"/api/s/x/send", nil) //nolint:noctx // test
 	req.Header.Set("Origin", "http://localhost:5173")
@@ -157,11 +164,57 @@ func TestCORSPreflight(t *testing.T) {
 	}
 }
 
+// TestNoCorsByDefault pins that the loopback-origin echo is opt-in:
+// without WithDevCORS a loopback page can neither read responses nor
+// preflight — the shipped dev workflow (Vite proxy) needs no CORS.
+func TestNoCorsByDefault(t *testing.T) {
+	_, _, base := newTestServer(t, nil)
+
+	req, _ := http.NewRequest(http.MethodGet, base.URL+"/api/projects", nil) //nolint:noctx // test
+	req.Header.Set("Origin", "http://localhost:5173")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if got := res.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("default server: ACAO %q, want none", got)
+	}
+
+	req, _ = http.NewRequest(http.MethodOptions, base.URL+"/api/s/x/send", nil) //nolint:noctx // test
+	req.Header.Set("Origin", "http://localhost:5173")
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatal("default server: preflight must not be answered")
+	}
+}
+
+// TestUnknownPathIs404 pins that a missing asset or stray path is a
+// real 404, never a redirect into the chat page that the browser
+// would resolve as HTML — the /log asset-breakage class of bug.
+func TestUnknownPathIs404(t *testing.T) {
+	_, _, base := newTestServer(t, nil)
+	for _, p := range []string{"/nope.js", "/style.css", "/favicon.ico"} {
+		res, err := noRedirect().Get(base.URL + p) //nolint:noctx // test
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s: %d, want 404", p, res.StatusCode)
+		}
+	}
+}
+
 // TestCORSEcho pins that actual requests from a loopback origin carry
 // the echo so the browser can read the response (GET /api/projects
 // works from a dev server page).
 func TestCORSEcho(t *testing.T) {
-	_, _, base := newTestServer(t, nil)
+	base := corsServer(t)
 
 	req, _ := http.NewRequest(http.MethodGet, base.URL+"/api/projects", nil) //nolint:noctx // test
 	req.Header.Set("Origin", "http://127.0.0.1:5173")

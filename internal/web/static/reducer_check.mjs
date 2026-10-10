@@ -153,3 +153,26 @@ if (secondID) {
   assert(cache.records.length !== restored.records.length, "s4 cache not aliased");
   console.log("reducer_check: OK (switch: reset + cache resume +" + snapA.records.length + ")");
 }
+
+// Scenario 5: the STALE-ANCHOR reconnect. The browser's EventSource
+// auto-reconnects with its original URL — the from digest froze at
+// connect time — so if records landed and were folded meanwhile, the
+// replayed suffix OVERLAPS what we hold. Appending would duplicate;
+// the rebuild must keep the pre-anchor prefix (history pages included)
+// and end at the server head with no duplicates.
+{
+  const staleHead = state.head;
+  const n = state.records.length;
+  const sent5 = await post(api("/send"), { text: "stale anchor probe" });
+  assert(sent5.ok, "s5 send accepted");
+  await waitSettled(n + 2);
+  // The reconnect frame the server produces for the stale URL.
+  const snap5 = await firstFrame(base + api("/stream?from=") + staleHead);
+  assert(snap5.resumed, "s5 stale reconnect resumed");
+  assert(snap5.anchor === staleHead, "s5 anchor echoes the stale digest");
+  const fx5 = await applySnapshot(state, snap5);
+  assert(!fx5.reset, "s5 overlap rebuild is not a reset");
+  assert(state.records.length === n + snap5.records.length, "s5 no duplicates");
+  assert(state.head === snap5.d, "s5 head = server head after rebuild");
+  console.log("reducer_check: OK (stale anchor rebuild +" + snap5.records.length + ")");
+}

@@ -41,8 +41,10 @@ preflights for loopback origins, so a direct connection works too.
   steered queue (addressed by ItemID over SSE); `enqueue`/`steer`
   route to `/send` or `/steer` by run state with the 409 crossover
   fallback (Rule A); `edit`/`remove` map to `PUT`/`DELETE /steer`;
-  the unanchored steer-lane `move` ("run now") stops the live run and
-  leaves the item queued for the next drain point.
+  the unanchored steer-lane `move` ("run now") stops the live run,
+  withdraws the item, and starts a fresh run carrying its text — the
+  steered queue only drains at a run boundary, so a bare stop would
+  park the message forever.
 - `src/App.tsx` — sidebar (projects poll), status strip (chain
   verification), and the official assistant-ui `Thread` — the
   official-site look: Tailwind v4 + shadcn base components + the
@@ -59,8 +61,10 @@ preflights for loopback origins, so a direct connection works too.
 Known v1 gaps, on purpose: `context.compacted` / `session.created`
 records have no chat rendering (the `/log` view is the record-level
 truth), anchored queue moves are no-ops (the server queue is FIFO by
-mint time), and message edit/branch/regenerate are not wired (the wire
-protocol has no branching).
+mint time), message edit/branch/regenerate are not wired (the wire
+protocol has no branching), and there is no session-delete affordance
+in the chat client (the `/log` view has it; the runtime's onDelete is
+unreachable until a thread list is rendered).
 
 ## Sizes
 

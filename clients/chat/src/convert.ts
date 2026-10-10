@@ -31,6 +31,10 @@ export type ChatMessage = {
   parts: Part[];
   status: Status;
   createdAt?: Date;
+  // The run (user input through final response) a record belongs to —
+  // run scoping keeps failures and tool results from folding onto a
+  // PREVIOUS run's completed messages.
+  run?: string;
 };
 
 export function convertRecords(records: readonly Record[]): ChatMessage[] {
@@ -38,7 +42,7 @@ export function convertRecords(records: readonly Record[]): ChatMessage[] {
   for (const r of records) {
     switch (r.t) {
       case "user.input":
-        out.push({ id: r.item || r.ts, role: "user", parts: [{ type: "text", text: r.content || "" }], status: { type: "complete", reason: "stop" as const } });
+        out.push({ id: r.item || r.ts, role: "user", parts: [{ type: "text", text: r.content || "" }], status: { type: "complete", reason: "stop" as const }, run: r.run });
         break;
       case "assistant.message": {
         const parts: Part[] = [];
@@ -47,13 +51,19 @@ export function convertRecords(records: readonly Record[]): ChatMessage[] {
         for (const call of r.tool_calls || []) {
           parts.push({ type: "tool-call", toolCallId: call.id, toolName: call.name, argsText: call.arguments });
         }
-        out.push({ id: r.item || r.ts, role: "assistant", parts, status: { type: "complete", reason: "stop" as const } });
+        out.push({ id: r.item || r.ts, role: "assistant", parts, status: { type: "complete", reason: "stop" as const }, run: r.run });
         break;
       }
       case "tool.result": {
-        // Fold into the newest assistant message carrying this call.
+        // Fold into the newest assistant message OF THE SAME RUN carrying
+        // this call. The run guard matters: the join scans backward and
+        // must not cross a run boundary onto the previous round's
+        // message (safe today by write order — results land between
+        // their assistant and the next user input — but the guard makes
+        // it structural).
         for (let i = out.length - 1; i >= 0; i--) {
           const m = out[i];
+          if (m.run !== r.run) continue;
           if (m.role !== "assistant") continue;
           const part = m.parts.find(p => p.type === "tool-call" && p.toolCallId === r.tool_call_id);
           if (part && part.type === "tool-call") {
@@ -65,13 +75,20 @@ export function convertRecords(records: readonly Record[]): ChatMessage[] {
         break;
       }
       case "run.failed": {
-        // Fold onto the latest message as its error status; when the
-        // window holds none, surface a standalone error row.
-        const last = out[out.length - 1];
-        if (last && last.role === "assistant") {
-          last.status = { type: "incomplete", reason: "error", error: r.error };
+        // Fold onto the latest message OF THE SAME RUN; a failure of run
+        // N+1 must not re-mark run N's completed answer. No same-run
+        // message in the window: standalone error row.
+        let target: ChatMessage | undefined;
+        for (let i = out.length - 1; i >= 0; i--) {
+          if (out[i].run === r.run) {
+            target = out[i];
+            break;
+          }
+        }
+        if (target && target.role === "assistant") {
+          target.status = { type: "incomplete", reason: "error", error: r.error };
         } else {
-          out.push({ id: r.item || r.ts, role: "assistant", parts: [], status: { type: "incomplete", reason: "error", error: r.error } });
+          out.push({ id: r.item || r.ts, role: "assistant", parts: [], status: { type: "incomplete", reason: "error", error: r.error }, run: r.run });
         }
         break;
       }

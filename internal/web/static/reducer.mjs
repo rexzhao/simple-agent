@@ -30,15 +30,41 @@ export async function initChain(state, sessionID) {
 // anchors do not move) or reissues a window (a clean rebuild whose fold
 // starts from the server-attested anchor — never genesis: a running
 // hash converges to the same head from any correct anchor, and genesis
-// is only correct when nothing was truncated).
+// is only correct when nothing was truncated). A THIRD form exists:
+// a resume whose anchor is NOT our head — the EventSource reconnected
+// with its original URL (the from digest freezes at connect time)
+// after we already folded newer records, so the replayed suffix
+// OVERLAPS what we hold. Appending would duplicate; instead the
+// anchor is located in the held chain by folding, the records before
+// it (history pages included) are kept, and the suffix is folded from
+// the anchor. An anchor we cannot locate degrades to the window
+// rebuild.
 export async function applySnapshot(state, frame) {
   const effects = { reset: false, appended: [] };
+  const overlap = frame.resumed && frame.anchor !== state.head;
   if (!frame.resumed) {
     state.records = [];
     state.head = frame.anchor;
     state.prefixAnchor = frame.anchor;
     state.more = !!frame.more;
     effects.reset = true;
+  } else if (overlap) {
+    let h = state.prefixAnchor;
+    let k = 0;
+    for (; k < state.records.length; k++) {
+      if (h === frame.anchor) break;
+      h = await chainStep(h, state.records[k]);
+    }
+    if (h === frame.anchor) {
+      state.records = state.records.slice(0, k);
+      state.head = frame.anchor;
+    } else {
+      state.records = [];
+      state.head = frame.anchor;
+      state.prefixAnchor = frame.anchor;
+      state.more = !!frame.more;
+      effects.reset = true;
+    }
   }
   for (const r of frame.records || []) {
     state.records.push(r);

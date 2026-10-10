@@ -108,15 +108,46 @@ export function useSaiAdapter(
         steer: (message: AppendMessage) => {
           void sendOrSteer(sessionID, true, textOf(message)).catch(console.error);
         },
-        move: (_queueItemId: string, placement: { lane?: "queue" | "steer"; insertAfter?: string | null; insertBefore?: string | null }) => {
+        move: (queueItemId: string, placement: { lane?: "queue" | "steer"; insertAfter?: string | null; insertBefore?: string | null }) => {
           // The unanchored move into the steer lane is assistant-ui's
-          // interrupt semantics ("run now"): stop the live run; the
-          // item stays queued server-side and drains at the next run
-          // boundary. Anchored placement has no server counterpart —
-          // the server queue is strictly FIFO by mint time — so it is
-          // a no-op here.
-          if (placement.lane === "steer" && placement.insertAfter == null && placement.insertBefore == null && running) {
-            void postStop(sessionID).catch(console.error);
+          // interrupt semantics ("run now"): stop the live run, withdraw
+          // the item, and start a fresh run carrying its text — the
+          // steered queue only drains at a run boundary, and a stopped
+          // run leaves nothing to drain it, so "just stop" would park
+          // the message forever. Anchored placement has no server
+          // counterpart — the server queue is strictly FIFO by mint
+          // time — so it stays a no-op.
+          if (placement.lane === "steer" && placement.insertAfter == null && placement.insertBefore == null) {
+            const item = snap.steered.find(s => s.item === queueItemId);
+            if (!item || !sessionID) return;
+            void (async () => {
+              if (running) {
+                try {
+                  await postStop(sessionID);
+                } catch (e) {
+                  console.error(e);
+                  return;
+                }
+              }
+              // Withdraw first: the new run would drain the queue and
+              // double the input. not_queued (a race the drain won)
+              // is tolerable — the message is being processed anyway.
+              await deleteSteer(sessionID, queueItemId).catch(() => {});
+              for (let attempt = 0; attempt < 10; attempt++) {
+                try {
+                  await postSend(sessionID, item.text);
+                  return;
+                } catch (e) {
+                  if (e instanceof APIError && e.status === 409) {
+                    await new Promise(res => setTimeout(res, 300));
+                    continue;
+                  }
+                  console.error(e);
+                  return;
+                }
+              }
+              console.error("run now: the run did not settle in time; the message is lost from the queue — resend it");
+            })();
           }
         },
         edit: (queueItemId: string, message: AppendMessage) => {
@@ -133,7 +164,7 @@ export function useSaiAdapter(
             p.sessions.map(s => ({
               status: "regular" as const,
               id: s.id,
-              title: s.title || p.id,
+              title: s.title || "untitled",
             })),
           ),
           onSwitchToThread: (id: string) => {

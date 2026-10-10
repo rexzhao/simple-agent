@@ -72,7 +72,8 @@ export class SessionStore {
   async open(id: string) {
     if (!id || this.closed || (this.snap.session === id && this.es)) return;
     if (this.snap.session !== id) {
-      this.snap = { ...initialSnap, session: id, head: await chainGenesis(id), prefixAnchor: await chainGenesis(id) };
+      const genesis = await chainGenesis(id);
+      this.snap = { ...initialSnap, session: id, head: genesis, prefixAnchor: genesis };
     }
     this.connect();
   }
@@ -116,17 +117,49 @@ export class SessionStore {
   private async apply(frame: Frame) {
     switch (frame.kind) {
       case "snapshot": {
-        let records: Record[];
+        // A resumed snapshot whose anchor is NOT our head means the
+        // EventSource reconnected with its original URL (the from
+        // digest is frozen at connect time) after we already folded
+        // newer records — the replayed suffix overlaps what we hold.
+        // Rebuild from the anchor position instead of appending:
+        // locate the anchor in our held chain by folding, keep the
+        // records before it (history pages included), and take the
+        // server's suffix as the truth from there.
+        const overlap = frame.resumed && frame.anchor !== this.snap.head;
+        let records: Record[] = [];
         let head: string;
         let prefixAnchor: string;
-        if (frame.resumed) {
+        if (!frame.resumed) {
+          // Window reissue: clean rebuild from the server-attested
+          // anchor — never genesis (a running hash converges from any
+          // correct anchor; genesis is only correct when nothing was
+          // truncated).
+          prefixAnchor = frame.anchor || "";
+          head = prefixAnchor;
+        } else if (overlap) {
+          // Locate the anchor in our held chain by folding: everything
+          // folded BEFORE it (history pages included) is kept, and the
+          // server's suffix is folded from the anchor. Anchor not
+          // found (should not happen — we sent this digest) degrades
+          // to the window-reissue rebuild.
+          prefixAnchor = this.snap.prefixAnchor;
+          let h = this.snap.prefixAnchor;
+          let k = 0;
+          for (; k < this.snap.records.length; k++) {
+            if (h === frame.anchor) break;
+            h = await chainStep(h, this.snap.records[k]);
+          }
+          if (h === frame.anchor) {
+            records = this.snap.records.slice(0, k);
+            head = frame.anchor;
+          } else {
+            prefixAnchor = frame.anchor || "";
+            head = prefixAnchor;
+          }
+        } else {
           records = [...this.snap.records];
           head = this.snap.head;
           prefixAnchor = this.snap.prefixAnchor;
-        } else {
-          records = [];
-          head = frame.anchor || "";
-          prefixAnchor = frame.anchor || "";
         }
         for (const r of frame.records || []) {
           records.push(r);
@@ -271,7 +304,17 @@ function liveFromSnapshot(frame: Frame): LiveItem | null {
   if (frame.streaming.reasoning) parts.push({ type: "reasoning", text: frame.streaming.reasoning });
   if (frame.streaming.content) parts.push({ type: "text", text: frame.streaming.content });
   if (frame.tool && frame.tool.name) {
-    parts.push({ type: "tool-call", toolCallId: frame.tool.item, toolName: frame.tool.name, argsText: frame.tool.args || "", running: true });
+    // Key the part by the tool CALL id — the continuing events
+    // (tool_result) address it that way, so the eventual result
+    // attaches in place. The item id is the future tool.result
+    // record's own identity, NOT the call's.
+    parts.push({
+      type: "tool-call",
+      toolCallId: frame.tool.call_id || frame.tool.item,
+      toolName: frame.tool.name,
+      argsText: frame.tool.args || "",
+      running: true,
+    });
   }
   return { id: frame.streaming.item, parts, failed: false };
 }

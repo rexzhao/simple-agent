@@ -27,7 +27,7 @@ export type Record = {
 };
 
 export type StreamingWire = { item: string; content?: string; reasoning?: string };
-export type ToolWire = { item: string; name?: string; args?: string };
+export type ToolWire = { item: string; call_id?: string; name?: string; args?: string };
 export type SteeredWire = { item: string; text: string };
 
 export type Frame = {
