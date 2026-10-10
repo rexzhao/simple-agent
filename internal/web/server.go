@@ -18,17 +18,17 @@ import (
 //go:embed static
 var staticFiles embed.FS
 
-// Server is the web UI. It owns one session (single-session by design,
-// mirroring the CLI) and the hub that fans its streams out.
+// Server is the web UI: the manager (registered projects, lazily opened
+// sessions) behind the session-scoped routes (design:
+// docs/multi-session.md §4).
 type Server struct {
-	session *agent.Session
-	hub     *Hub
+	manager *Manager
 	mux     *http.ServeMux
 }
 
-// New builds the server for a live session.
-func New(session *agent.Session) *Server {
-	s := &Server{session: session, hub: NewHub(session)}
+// New builds the server over a manager.
+func New(manager *Manager) *Server {
+	s := &Server{manager: manager}
 	// Windows derives MIME types from the registry, where .js/.mjs map
 	// to text/plain (or nothing) — module scripts enforce strict MIME
 	// checking and refuse to load. Pin the types for the assets we ship.
@@ -44,27 +44,25 @@ func New(session *agent.Session) *Server {
 		panic("web: embedded static files: " + err.Error())
 	}
 	mux.Handle("/", http.FileServer(http.FS(page)))
-	mux.HandleFunc("GET /api/stream", s.handleStream)
-	mux.HandleFunc("GET /api/state", s.handleState)
-	mux.HandleFunc("GET /api/history", s.handleHistory)
-	mux.HandleFunc("POST /api/send", s.handleSend)
-	mux.HandleFunc("POST /api/steer", s.handleSteer)
-	mux.HandleFunc("PUT /api/steer", s.handleSteerUpdate)
-	mux.HandleFunc("DELETE /api/steer", s.handleSteerWithdraw)
-	mux.HandleFunc("POST /api/compact", s.handleCompact)
-	mux.HandleFunc("POST /api/stop", s.handleStop)
+	mux.HandleFunc("GET /api/projects", manager.Projects)
+	mux.HandleFunc("GET /api/s/{id}/stream", s.handleStream)
+	mux.HandleFunc("GET /api/s/{id}/state", s.handleState)
+	mux.HandleFunc("GET /api/s/{id}/history", s.handleHistory)
+	mux.HandleFunc("POST /api/s/{id}/send", s.handleSend)
+	mux.HandleFunc("POST /api/s/{id}/steer", s.handleSteer)
+	mux.HandleFunc("PUT /api/s/{id}/steer", s.handleSteerUpdate)
+	mux.HandleFunc("DELETE /api/s/{id}/steer", s.handleSteerWithdraw)
+	mux.HandleFunc("POST /api/s/{id}/compact", s.handleCompact)
+	mux.HandleFunc("POST /api/s/{id}/stop", s.handleStop)
 	s.mux = mux
 	return s
 }
 
-// Hub exposes the hub (for the serve-mode debug REPL's event tap).
-func (s *Server) Hub() *Hub { return s.hub }
-
 // Handler returns the root handler.
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// Close stops the hub.
-func (s *Server) Close() { s.hub.Stop() }
+// Close stops the manager (sweeper, hubs, sessions, root lock).
+func (s *Server) Close() { s.manager.Close() }
 
 // isLoopbackHost reports whether a Host header value (host or host:port)
 // names this machine only.
@@ -86,7 +84,7 @@ func isLoopbackHost(hostPort string) bool {
 // checks are (1) mutations must be JSON content-type — a preflighted
 // type that our zero-CORS policy never allows — and (2) any Origin, and
 // the Host, must be loopback. GETs check Origin too when present.
-func (s *Server) guardAPI(w http.ResponseWriter, r *http.Request, write bool) bool {
+func guardAPI(w http.ResponseWriter, r *http.Request, write bool) bool {
 	if !isLoopbackHost(r.Host) {
 		http.Error(w, "non-loopback host", http.StatusForbidden)
 		return false
@@ -122,9 +120,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
-	if !s.guardAPI(w, r, false) {
+	if !guardAPI(w, r, false) {
 		return
 	}
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -134,12 +138,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	client, snapshot, err := s.hub.register(r.URL.Query().Get("from"), windowParam(r))
+	client, snapshot, err := entry.hub.register(r.URL.Query().Get("from"), windowParam(r))
 	if err != nil {
 		http.Error(w, "register: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer s.hub.unregister(client)
+	defer entry.hub.unregister(client)
 
 	writeFrame := func(frame []byte) {
 		fmt.Fprintf(w, "data: %s\n\n", frame)
@@ -169,16 +173,27 @@ func windowParam(r *http.Request) int {
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	if !s.guardAPI(w, r, false) {
+	if !guardAPI(w, r, false) {
 		return
 	}
-	writeJSON(w, http.StatusOK, s.hub.state())
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	writeJSON(w, http.StatusOK, entry.hub.state())
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	if !s.guardAPI(w, r, false) {
+	if !guardAPI(w, r, false) {
 		return
 	}
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	before := r.URL.Query().Get("before")
 	if before == "" {
 		http.Error(w, "missing before", http.StatusBadRequest)
@@ -190,7 +205,7 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	records, anchor, more, stale := s.hub.history(before, limit)
+	records, anchor, more, stale := entry.hub.history(before, limit)
 	if stale {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "stale_anchor"})
 		return
@@ -203,9 +218,15 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
-	if !s.guardAPI(w, r, true) {
+	if !guardAPI(w, r, true) {
 		return
 	}
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	var body struct {
 		Text string `json:"text"`
 	}
@@ -217,7 +238,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_input"})
 		return
 	}
-	if err := s.session.Send(body.Text); err != nil {
+	if err := entry.session.Send(body.Text); err != nil {
 		if errors.Is(err, agent.ErrRunActive) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "run_active"})
 			return
@@ -229,14 +250,20 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	// Send; the wake is sent after Send returns, so the hub reattaches
 	// with zero latency (the channel is small — late attachment could
 	// stall the run goroutine).
-	s.hub.Wake()
+	entry.hub.Wake()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
-	if !s.guardAPI(w, r, true) {
+	if !guardAPI(w, r, true) {
 		return
 	}
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	var body struct {
 		Text string `json:"text"`
 	}
@@ -248,7 +275,7 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_input"})
 		return
 	}
-	item, err := s.session.Steer(body.Text)
+	item, err := entry.session.Steer(body.Text)
 	if err != nil {
 		if errors.Is(err, agent.ErrNoRun) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "no_run"})
@@ -261,9 +288,15 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSteerUpdate(w http.ResponseWriter, r *http.Request) {
-	if !s.guardAPI(w, r, true) {
+	if !guardAPI(w, r, true) {
 		return
 	}
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	var body struct {
 		Item string `json:"item"`
 		Text string `json:"text"`
@@ -272,7 +305,7 @@ func (s *Server) handleSteerUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	if err := s.session.UpdateSteer(body.Item, body.Text); err != nil {
+	if err := entry.session.UpdateSteer(body.Item, body.Text); err != nil {
 		if errors.Is(err, agent.ErrNotQueued) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_queued"})
 			return
@@ -284,15 +317,21 @@ func (s *Server) handleSteerUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSteerWithdraw(w http.ResponseWriter, r *http.Request) {
-	if !s.guardAPI(w, r, true) {
+	if !guardAPI(w, r, true) {
 		return
 	}
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	item := r.URL.Query().Get("item")
 	if item == "" {
 		http.Error(w, "missing item", http.StatusBadRequest)
 		return
 	}
-	if err := s.session.WithdrawSteer(item); err != nil {
+	if err := entry.session.WithdrawSteer(item); err != nil {
 		if errors.Is(err, agent.ErrNotQueued) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_queued"})
 			return
@@ -304,19 +343,25 @@ func (s *Server) handleSteerWithdraw(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
-	if !s.guardAPI(w, r, true) {
+	if !guardAPI(w, r, true) {
 		return
 	}
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	// Synchronous pre-checks where the answer is decidable now. They are
 	// advisory (TOCTOU): the authoritative single-flight check is inside
 	// Compact; a race that slips past these surfaces through the
 	// out-of-band notice instead of the response.
-	snapshot := s.session.Snapshot()
+	snapshot := entry.session.Snapshot()
 	if snapshot.Compacting != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "compacting"})
 		return
 	}
-	if s.session.Running() {
+	if entry.session.Running() {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "run_active"})
 		return
 	}
@@ -324,23 +369,30 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "nothing_to_compact"})
 		return
 	}
+	hub, session := entry.hub, entry.session
 	// Compact holds the single-flight slot for the whole summary (tens
 	// of seconds); the response must not.
 	go func() {
-		if err := s.session.Compact(); err != nil && !errors.Is(err, agent.ErrNothingToCompact) {
-			s.hub.Notice("compact failed: " + err.Error())
+		if err := session.Compact(); err != nil && !errors.Is(err, agent.ErrNothingToCompact) {
+			hub.Notice("compact failed: " + err.Error())
 			return
 		}
-		s.hub.Notice("")
+		hub.Notice("")
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
-	if !s.guardAPI(w, r, true) {
+	if !guardAPI(w, r, true) {
 		return
 	}
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	// Idempotent: stopping with no active run is a no-op.
-	s.session.Stop()
+	entry.session.Stop()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

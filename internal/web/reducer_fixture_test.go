@@ -29,7 +29,7 @@ func TestPageReducerFixture(t *testing.T) {
 	}
 	session, _, base := newTestServer(t, turns)
 	for i := 0; i < 80; i++ {
-		if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "m"}); err != nil {
+		if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "m"}); err != nil {
 			t.Fatalf("send %d: %v", i, err)
 		}
 		waitSettled(t, session)
@@ -39,7 +39,7 @@ func TestPageReducerFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(node, script, base.URL)
+	cmd := exec.Command(node, script, base.URL, session.ID())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("node reducer check failed: %v\n%s", err, out)

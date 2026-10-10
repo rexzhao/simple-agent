@@ -10,6 +10,13 @@ if (!base) {
   console.error("reducer_check: missing base url");
   process.exit(2);
 }
+const session = process.argv[3];
+if (!session) {
+  console.error("reducer_check: missing session id");
+  process.exit(2);
+}
+// Session-scoped routes (docs/multi-session.md §4).
+const api = (suffix) => "/api/s/" + session + suffix;
 
 function assert(cond, what) {
   if (!cond) {
@@ -52,7 +59,7 @@ async function post(path, body) {
 
 async function waitSettled(countAtLeast) {
   for (let i = 0; i < 200; i++) {
-    const s = await (await fetch(base + "/api/state")).json();
+    const s = await (await fetch(base + api("/state"))).json();
     if (!s.running && s.count >= countAtLeast) return s;
     await new Promise(r => setTimeout(r, 25));
   }
@@ -60,11 +67,11 @@ async function waitSettled(countAtLeast) {
 }
 
 const state = initialState();
-const st0 = await (await fetch(base + "/api/state")).json();
+const st0 = await (await fetch(base + api("/state"))).json();
 state.session = st0.session;
 
 // Scenario 1: first connect, truncated window.
-const snap1 = await firstFrame(base + "/api/stream?window=50");
+const snap1 = await firstFrame(base + api("/stream?window=50"));
 const fx1 = await applySnapshot(state, snap1);
 assert(!snap1.resumed, "s1 not resumed");
 assert(fx1.reset, "s1 reset");
@@ -75,10 +82,10 @@ assert(state.head === snap1.d && state.head === st0.digest, "s1 head = server he
 
 // Scenario 2: a new run lands, then a reconnect with from=head resumes.
 const before = { head: state.head, prefix: state.prefixAnchor, n: state.records.length, more: state.more };
-const sent = await post("/api/send", { text: "resume probe" });
+const sent = await post(api("/send"), { text: "resume probe" });
 assert(sent.ok, "s2 send accepted");
 const st1 = await waitSettled(st0.count + 2);
-const snap2 = await firstFrame(base + "/api/stream?from=" + state.head);
+const snap2 = await firstFrame(base + api("/stream?from=") + state.head);
 const fx2 = await applySnapshot(state, snap2);
 assert(snap2.resumed, "s2 resumed");
 assert(!fx2.reset, "s2 no reset");
@@ -91,7 +98,7 @@ assert(state.head === snap2.d && state.head === st1.digest, "s2 head = server he
 
 // Scenario 3: scroll-back after resume — prefix moves, head does not.
 const headAfterResume = state.head;
-const data = await (await fetch(base + "/api/history?before=" + encodeURIComponent(state.prefixAnchor) + "&limit=20")).json();
+const data = await (await fetch(base + api("/history?before=") + encodeURIComponent(state.prefixAnchor) + "&limit=20")).json();
 const out = await applyHistory(state, data);
 assert(out === "ok", "s3 backfill ok");
 assert(state.records.length === before.n + 2 + data.records.length, "s3 prepended");

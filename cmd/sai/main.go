@@ -72,6 +72,17 @@ func main() {
 		os.Exit(projectCommand(flag.Args()[1:]))
 	}
 
+	// Serve mode hosts many sessions and assembles per project through
+	// its own factory — no CLI agent is built for it.
+	if *httpAddr != "" {
+		resumeID := strings.TrimSpace(*sessionID)
+		if resumeID == "" && flag.NArg() > 0 {
+			resumeID = strings.TrimSpace(flag.Arg(0))
+		}
+		serve(*serverRoot, *httpAddr, *provider, *modelName, resumeID)
+		return
+	}
+
 	ag, project, err := assembleCurrentDir(*serverRoot, *provider, *modelName)
 	if err != nil {
 		log.Fatalf("sai: %v", err)
@@ -81,13 +92,14 @@ func main() {
 	// configuration drift.
 	fmt.Fprintf(os.Stderr, "sai: server root %s, project %s\n", *serverRoot, project)
 
-	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}}
 	// A -session flag (or an optional positional argument) resumes a
 	// stored session directly; a session which cannot be found is fatal.
 	resumeID := strings.TrimSpace(*sessionID)
 	if resumeID == "" && flag.NArg() > 0 {
 		resumeID = strings.TrimSpace(flag.Arg(0))
 	}
+
+	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}}
 	if resumeID != "" {
 		if err := cli.resume(resumeID); err != nil {
 			log.Fatalf("sai: %v", err)
@@ -99,11 +111,6 @@ func main() {
 	// Ctrl+C stops the active run; a second Ctrl+C when idle exits.
 	// Color is for terminals only; pipes and files must stay plain.
 	colorEnabled = stdoutIsTerminal() && enableVirtualTerminal()
-
-	if *httpAddr != "" {
-		serve(cli, *httpAddr)
-		return
-	}
 	interrupts := make(chan os.Signal, 1)
 	signal.Notify(interrupts, os.Interrupt)
 	go func() {
@@ -695,3 +702,7 @@ func appName() string {
 // resolvedServerRoot is the server root after flag/env/default resolution,
 // shared with the project registry subcommands.
 var resolvedServerRoot string
+
+// Store exposes the shared storage (the serve-mode manager needs it for
+// listing and scoped opens).
+func (f *agentFactory) Store() *jsonl.Store { return f.store }

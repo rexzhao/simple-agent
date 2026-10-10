@@ -711,3 +711,13 @@ func parseRecordTime(value string) time.Time {
 	}
 	return parsed
 }
+
+// HasSession probes whether a session directory exists under a project
+// without taking its lock — the owning-project lookup for lazy opens.
+func (s *Store) HasSession(projectID, sessionID string) bool {
+	if !ValidProjectID(projectID) || !ValidSessionID(sessionID) {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(s.root, projectID, sessionID))
+	return err == nil && info.IsDir()
+}

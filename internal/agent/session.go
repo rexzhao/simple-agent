@@ -419,6 +419,35 @@ func (s *Session) commit(record storage.Record, clear func(*storage.State)) erro
 	return nil
 }
 
+// MaterializeHeader commits the pending session.created record of a
+// fresh, never-run session. A lazily persisted session normally waits
+// for its first real record; hosts that need the session to exist on
+// disk before any run (the serve-mode session lifecycle) flush just
+// the header. It is a no-op for sessions that already committed
+// anything.
+func (s *Session) MaterializeHeader() error {
+	s.mu.Lock()
+	if s.pendingCreated == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	stored, err := s.appendLocked(*s.pendingCreated)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.pendingCreated = nil
+	var subs []*subscription
+	for sub := range s.subs {
+		subs = append(subs, sub)
+	}
+	s.mu.Unlock()
+	for _, sub := range subs {
+		sub.deliver([]storage.Record{stored})
+	}
+	return nil
+}
+
 // commitLocked stores one record (flushing the pending session.created of
 // a fresh session ahead of it, so every record flows through this one
 // write path), folds it into the durable state, and caches it. Callers

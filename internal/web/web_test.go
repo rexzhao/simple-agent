@@ -14,7 +14,9 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/internal/storage/memory"
 )
 
@@ -38,23 +40,69 @@ func (p *webFakeProvider) Stream(ctx context.Context, request model.Request) (<-
 	return events, nil
 }
 
-// newTestServer builds a live server over a deterministic fake run.
+// newTestServer builds a live manager-backed server over a deterministic
+// fake run: a registered project (temp dir), a memory store, and one
+// session created under it. The memory store's HasSession/OpenIn work
+// without materialization, so sessions with no records still resolve.
 func newTestServer(t *testing.T, turns [][]model.Event) (*agent.Session, *Server, *httptest.Server) {
 	t.Helper()
-	ag, err := agent.New(agent.Options{
-		Provider:     &webFakeProvider{turns: turns},
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
+	return newTestManagerServer(t, &webFakeProvider{turns: turns})
+}
+
+// newTestManagerServer wires a full manager: server root + registry with
+// one project, a shared store, and the per-project agent factory.
+func newTestManagerServer(t *testing.T, provider model.Provider) (*agent.Session, *Server, *httptest.Server) {
+	t.Helper()
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	registry := &projects.Registry{Projects: []projects.Entry{
+		{Path: projectDir, Added: time.Now().UTC()},
+	}}
+	if err := registry.Save(projects.FilePath(root)); err != nil {
+		t.Fatal(err)
+	}
+	store := memory.OpenStore()
+	factory := func(projectCwd string) (*agent.Agent, error) {
+		return agent.New(agent.Options{
+			Provider:     provider,
+			ProviderName: "test",
+			ModelID:      "model-test",
+			Storage:      store,
+			ProjectID:    jsonl.ProjectID(projectCwd),
+			CWD:          projectCwd,
+		})
+	}
+	manager, err := NewManager(ManagerOptions{
+		ServerRoot: root,
+		Store:      store,
+		AgentFor:   factory,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession()
+	ag, err := factory(projectDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := New(session)
+	// Create the session through the factory's agent (so the header
+	// content matches it), materialize the header, and reopen it
+	// THROUGH the manager — the returned object is the manager's, so
+	// direct sends notify the hub exactly like HTTP requests.
+	created, err := ag.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.MaterializeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	session, err := manager.Session(created.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(manager)
 	httpServer := httptest.NewServer(server.Handler())
 	t.Cleanup(func() {
 		httpServer.Close()
@@ -79,9 +127,9 @@ func (c *sseClient) close() {
 	<-c.done
 }
 
-func openStream(t *testing.T, base, from string) *sseClient {
+func openStream(t *testing.T, base string, session *agent.Session, from string) *sseClient {
 	t.Helper()
-	url := base + "/api/stream"
+	url := base + api(session, "/stream")
 	if from != "" {
 		url += "?from=" + from
 	}
@@ -161,21 +209,26 @@ func TestStreamMatchesSessionRecords(t *testing.T) {
 		model.TextDeltaEvent{Text: "hello "},
 		model.TextDeltaEvent{Text: "world"},
 	}
-	_, _, base := newTestServer(t, [][]model.Event{turn, turn})
+	session, _, base := newTestServer(t, [][]model.Event{turn, turn})
 
-	c := openStream(t, base.URL, "")
+	c := openStream(t, base.URL, session, "")
 	defer c.close()
 	snap := c.next(t, 2*time.Second)
 	if snap["kind"] != "snapshot" {
 		t.Fatalf("first frame is %v, want snapshot", snap["kind"])
 	}
-	// No records yet: anchor is the genesis, window empty.
-	if len(snap["records"].([]any)) != 0 {
-		t.Fatalf("fresh session snapshot has records: %v", snap["records"])
+	// A serve-side session materializes its header up front (the lazy
+	// "first record commits session.created" is a CLI-session
+	// behavior): exactly the header, nothing else.
+	initial := snap["records"].([]any)
+	if len(initial) != 1 || initial[0].(map[string]any)["t"] != "session.created" {
+		t.Fatalf("fresh serve session snapshot = %v, want only the header", initial)
 	}
 
-	// Drive one run and collect its records.
-	if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "hi"}); err != nil {
+	// Drive one run and collect its live records. The header was in the
+	// snapshot (materialized at session creation); the live stream
+	// carries the run's two records.
+	if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "hi"}); err != nil {
 		t.Fatal(err)
 	}
 	records := collectRecords(t, c, 5*time.Second)
@@ -183,12 +236,12 @@ func TestStreamMatchesSessionRecords(t *testing.T) {
 	for _, r := range records {
 		types = append(types, r["t"].(string))
 	}
-	// session.created, user.input, assistant.message — in order, exactly
-	// once each.
-	if len(records) != 3 || types[0] != "session.created" || types[1] != "user.input" || types[2] != "assistant.message" {
+	// user.input, assistant.message — in order, exactly once each; with
+	// the snapshot's header the full sequence is the session's records.
+	if len(records) != 2 || types[0] != "user.input" || types[1] != "assistant.message" {
 		t.Fatalf("record types = %v", types)
 	}
-	if content := records[2]["content"]; content != "hello world" {
+	if content := records[1]["content"]; content != "hello world" {
 		t.Fatalf("assistant content = %v", content)
 	}
 }
@@ -197,33 +250,14 @@ func TestStreamMatchesSessionRecords(t *testing.T) {
 // gated provider keeps the run deterministically in flight.
 func TestConcurrentSendOneWins(t *testing.T) {
 	gated := &gatedStream{gate: make(chan struct{})}
-	ag, err := agent.New(agent.Options{
-		Provider:     gated,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := ag.NewSession()
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := New(session)
-	httpServer := httptest.NewServer(server.Handler())
-	t.Cleanup(func() {
-		httpServer.Close()
-		server.Close()
-		_ = session.Close()
-	})
+	session, _, httpServer := newTestManagerServer(t, gated)
 
-	if err := postJSON(t, httpServer.URL, "/api/send", map[string]string{"text": "first"}); err != nil {
+	if err := postJSON(t, httpServer.URL, api(session, "/send"), map[string]string{"text": "first"}); err != nil {
 		t.Fatal(err)
 	}
 	// The run is gated mid-stream: a second send must be refused with
 	// the stable code, not an error string.
-	resp, err := http.DefaultClient.Post(httpServer.URL+"/api/send", "application/json", strings.NewReader(`{"text":"second"}`)) //nolint:noctx // test
+	resp, err := http.DefaultClient.Post(httpServer.URL+api(session, "/send"), "application/json", strings.NewReader(`{"text":"second"}`)) //nolint:noctx // test
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,28 +283,32 @@ func TestReconnectResumeAndFallback(t *testing.T) {
 	turn := []model.Event{model.TextDeltaEvent{Text: "one"}}
 	session, _, base := newTestServer(t, [][]model.Event{turn, turn})
 
-	c := openStream(t, base.URL, "")
+	c := openStream(t, base.URL, session, "")
 	defer c.close()
-	c.next(t, 2*time.Second) // snapshot
-	if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "first"}); err != nil {
+	snap0 := c.next(t, 2*time.Second) // snapshot: the materialized header
+	if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "first"}); err != nil {
 		t.Fatal(err)
 	}
 	records := collectRecords(t, c, 5*time.Second)
 
 	// The client's head: recompute the chain independently (the
-	// cross-implementation check the digest exists for).
+	// cross-implementation check the digest exists for) — snapshot
+	// records first, then the live ones, in order.
 	head := chainGenesis(session.ID())
+	for _, r := range recordsJSON(t, snapshotRecords(t, snap0)) {
+		head = chainStep(head, r)
+	}
 	for _, r := range recordsJSON(t, records) {
 		head = chainStep(head, r)
 	}
 
 	// Resume: the server's snapshot must anchor exactly at our head and
 	// replay nothing.
-	if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "second"}); err != nil {
+	if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "second"}); err != nil {
 		t.Fatal(err)
 	}
 	waitSettled(t, session)
-	c2 := openStream(t, base.URL, head)
+	c2 := openStream(t, base.URL, session, head)
 	snap := c2.next(t, 2*time.Second)
 	defer c2.close()
 	if snap["kind"] != "snapshot" || snap["resumed"] != true {
@@ -293,7 +331,7 @@ func TestReconnectResumeAndFallback(t *testing.T) {
 	}
 
 	// Fallback: an unknown digest replays the trailing window.
-	c3 := openStream(t, base.URL, strings.Repeat("ab", 32))
+	c3 := openStream(t, base.URL, session, strings.Repeat("ab", 32))
 	snap3 := c3.next(t, 2*time.Second)
 	defer c3.close()
 	if snap3["resumed"] == true {
@@ -309,35 +347,16 @@ func TestReconnectResumeAndFallback(t *testing.T) {
 // snapshot frame.
 func TestMidstreamConnectSeesStreaming(t *testing.T) {
 	gated := &gatedStream{gate: make(chan struct{})}
-	ag, err := agent.New(agent.Options{
-		Provider:     gated,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := ag.NewSession()
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := New(session)
-	httpServer := httptest.NewServer(server.Handler())
-	t.Cleanup(func() {
-		httpServer.Close()
-		server.Close()
-		_ = session.Close()
-	})
+	session, server, httpServer := newTestManagerServer(t, gated)
 
 	if err := session.Send("hi"); err != nil {
 		t.Fatal(err)
 	}
-	server.hub.Wake()
+	server.manager.sessions[session.ID()].hub.Wake()
 	// Let the streaming slot populate.
 	time.Sleep(100 * time.Millisecond)
 
-	c := openStream(t, httpServer.URL, "")
+	c := openStream(t, httpServer.URL, session, "")
 	defer c.close()
 	snap := c.next(t, 2*time.Second)
 	streaming, ok := snap["streaming"].(map[string]any)
@@ -357,16 +376,16 @@ func TestMidstreamConnectSeesStreaming(t *testing.T) {
 // INV6: two concurrent clients see identical record sequences.
 func TestMultiClientConsistency(t *testing.T) {
 	turn := []model.Event{model.TextDeltaEvent{Text: "answer"}}
-	_, _, base := newTestServer(t, [][]model.Event{turn})
+	session, _, base := newTestServer(t, [][]model.Event{turn})
 
-	c1 := openStream(t, base.URL, "")
-	c2 := openStream(t, base.URL, "")
+	c1 := openStream(t, base.URL, session, "")
+	c2 := openStream(t, base.URL, session, "")
 	defer c1.close()
 	defer c2.close()
 	c1.next(t, 2*time.Second)
 	c2.next(t, 2*time.Second)
 
-	if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "hi"}); err != nil {
+	if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "hi"}); err != nil {
 		t.Fatal(err)
 	}
 	r1 := collectRecords(t, c1, 5*time.Second)
@@ -387,14 +406,14 @@ func TestSlowClientDoesNotStallRun(t *testing.T) {
 	session, _, base := newTestServer(t, [][]model.Event{turn, turn, turn, turn, turn})
 
 	// Open a client and never read its body.
-	resp, err := http.DefaultClient.Get(base.URL + "/api/stream") //nolint:noctx // test
+	resp, err := http.DefaultClient.Get(base.URL + api(session, "/stream")) //nolint:noctx // test
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 
 	for i := 0; i < 3; i++ {
-		if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": fmt.Sprintf("m%d", i)}); err != nil {
+		if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": fmt.Sprintf("m%d", i)}); err != nil {
 			t.Fatalf("send %d: %v", i, err)
 		}
 		waitSettled(t, session)
@@ -414,13 +433,13 @@ func TestChainCrossImplementation(t *testing.T) {
 	turn := []model.Event{model.TextDeltaEvent{Text: "x"}}
 	session, _, base := newTestServer(t, [][]model.Event{turn})
 
-	if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "hi"}); err != nil {
+	if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "hi"}); err != nil {
 		t.Fatal(err)
 	}
 	waitSettled(t, session)
 
 	// The server's state digest.
-	res, err := http.DefaultClient.Get(base.URL + "/api/state") //nolint:noctx // test
+	res, err := http.DefaultClient.Get(base.URL + api(session, "/state")) //nolint:noctx // test
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,6 +501,11 @@ func storageRecord(item, typ, content, reasoning string, isErr bool) storage.Rec
 	return storage.Record{ItemID: item, Type: typ, Content: content, Reasoning: reasoning, IsError: isErr}
 }
 
+// api builds a session-scoped route path.
+func api(session *agent.Session, suffix string) string {
+	return "/api/s/" + session.ID() + suffix
+}
+
 func postJSON(t *testing.T, base, path string, body any) error {
 	t.Helper()
 	data, _ := json.Marshal(body)
@@ -538,13 +562,13 @@ func TestWindowAnchorFoldsToHead(t *testing.T) {
 	}
 	session, _, base := newTestServer(t, turns)
 	for i := 0; i < 130; i++ {
-		if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "m"}); err != nil {
+		if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "m"}); err != nil {
 			t.Fatalf("send %d: %v", i, err)
 		}
 		waitSettled(t, session)
 	}
 
-	res, err := http.DefaultClient.Get(base.URL + "/api/stream?window=100") //nolint:noctx // test
+	res, err := http.DefaultClient.Get(base.URL + api(session, "/stream?window=100")) //nolint:noctx // test
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,4 +602,18 @@ func TestWindowAnchorFoldsToHead(t *testing.T) {
 	if head != snap.Digest {
 		t.Fatalf("fold(anchor, window) = %s, want server head %s", head, snap.Digest)
 	}
+}
+
+// snapshotRecords extracts a snapshot frame's records as JSON maps.
+func snapshotRecords(t *testing.T, frame map[string]any) []map[string]any {
+	t.Helper()
+	raw, ok := frame["records"].([]any)
+	if !ok {
+		t.Fatalf("snapshot has no records: %v", frame)
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, r.(map[string]any))
+	}
+	return out
 }

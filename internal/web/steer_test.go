@@ -4,47 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/storage/memory"
 )
-
-// newTestServerWithProvider builds a live server over a custom provider
-// (for gated streams that hold a run open mid-flight).
-func newTestServerWithProvider(t *testing.T, provider model.Provider) (*agent.Session, *Server, *httptest.Server) {
-	t.Helper()
-	ag, err := agent.New(agent.Options{
-		Provider:     provider,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := ag.NewSession()
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := New(session)
-	httpServer := httptest.NewServer(server.Handler())
-	t.Cleanup(func() {
-		// Release any gated stream so session.Close (which waits for
-		// the run to settle) cannot hang when the test fails midway.
-		if g, ok := provider.(interface{ release() }); ok {
-			g.release()
-		}
-		httpServer.Close()
-		server.Close()
-		_ = session.Close()
-	})
-	return session, server, httpServer
-}
 
 // steerFlowProvider holds the stream open so the test can steer mid-run.
 type steerFlowProvider struct {
@@ -76,22 +41,25 @@ func (p *steerFlowProvider) release() {
 // the SSE stream, and the consumed record carries the same ItemID.
 func TestSteerEndpoints(t *testing.T) {
 	provider := &steerFlowProvider{gate: make(chan struct{})}
-	_, server, base := newTestServerWithProvider(t, provider)
+	// A gated stream must never wedge the cleanup path: manager.Close
+	// waits for every run to settle, and the gate outlives assertions.
+	t.Cleanup(provider.release)
+	session, server, base := newTestManagerServer(t, provider)
 
 	// Idle: steer refuses with the stable code.
-	res, _ := http.DefaultClient.Post(base.URL+"/api/steer", "application/json", strings.NewReader(`{"text":"x"}`)) //nolint:noctx // test
+	res, _ := http.DefaultClient.Post(base.URL+api(session, "/steer"), "application/json", strings.NewReader(`{"text":"x"}`)) //nolint:noctx // test
 	res.Body.Close()
 	if res.StatusCode != http.StatusConflict {
 		t.Fatalf("idle steer: %d, want 409", res.StatusCode)
 	}
 
 	// Start a run, then steer twice through the API.
-	if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "go"}); err != nil {
+	if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "go"}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
 	steer := func(text string) string {
-		resp, err := http.DefaultClient.Post(base.URL+"/api/steer", "application/json", strings.NewReader(`{"text":"`+text+`"}`)) //nolint:noctx // test
+		resp, err := http.DefaultClient.Post(base.URL+api(session, "/steer"), "application/json", strings.NewReader(`{"text":"`+text+`"}`)) //nolint:noctx // test
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -111,7 +79,7 @@ func TestSteerEndpoints(t *testing.T) {
 	drop := steer("drop")
 
 	// The queue is visible in /api/state.
-	stRes, err := http.DefaultClient.Get(base.URL + "/api/state") //nolint:noctx // test
+	stRes, err := http.DefaultClient.Get(base.URL + api(session, "/state")) //nolint:noctx // test
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,13 +91,13 @@ func TestSteerEndpoints(t *testing.T) {
 	}
 
 	// Withdraw one, edit the other.
-	req, _ := http.NewRequest("DELETE", base.URL+"/api/steer?item="+drop, nil)
+	req, _ := http.NewRequest("DELETE", base.URL+api(session, "/steer?item=")+drop, nil)
 	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 200 { //nolint:noctx // test
 		t.Fatalf("withdraw: %v %d", err, resp.StatusCode)
 	} else {
 		resp.Body.Close()
 	}
-	put, _ := http.NewRequest("PUT", base.URL+"/api/steer", strings.NewReader(`{"item":"`+keep+`","text":"keep, edited"}`))
+	put, _ := http.NewRequest("PUT", base.URL+api(session, "/steer"), strings.NewReader(`{"item":"`+keep+`","text":"keep, edited"}`))
 	put.Header.Set("Content-Type", "application/json")
 	if resp, err := http.DefaultClient.Do(put); err != nil || resp.StatusCode != 200 { //nolint:noctx // test
 		t.Fatalf("update: %v %d", err, resp.StatusCode)
@@ -137,7 +105,7 @@ func TestSteerEndpoints(t *testing.T) {
 		resp.Body.Close()
 	}
 	// A withdrawn id is gone.
-	put2, _ := http.NewRequest("PUT", base.URL+"/api/steer", strings.NewReader(`{"item":"`+drop+`","text":"x"}`))
+	put2, _ := http.NewRequest("PUT", base.URL+api(session, "/steer"), strings.NewReader(`{"item":"`+drop+`","text":"x"}`))
 	put2.Header.Set("Content-Type", "application/json")
 	if resp, err := http.DefaultClient.Do(put2); err != nil || resp.StatusCode != 404 { //nolint:noctx // test
 		t.Fatalf("update withdrawn: %v %d", err, resp.StatusCode)
@@ -149,7 +117,7 @@ func TestSteerEndpoints(t *testing.T) {
 	// lands as user.input with the SAME item id; the dropped one never
 	// lands.
 	close(provider.gate)
-	c := openStream(t, base.URL, "")
+	c := openStream(t, base.URL, session, "")
 	defer c.close()
 	deadline := time.After(10 * time.Second)
 	var keepLanded, dropLanded bool

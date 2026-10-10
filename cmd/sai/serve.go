@@ -9,29 +9,55 @@ import (
 	"os/signal"
 	"strings"
 
+	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/web"
 )
 
-// serve runs web mode: the UI server plus a debug REPL that accepts
+// serve runs web mode: the multi-session manager (registered projects,
+// lazily opened sessions) behind the UI, plus a debug REPL that accepts
 // commands only — free-form input goes to the web page, so the REPL can
-// never race the page for the session's single run slot (and the hub
-// stays the only consumer of the run event stream).
-func serve(cli *cliApp, addr string) {
-	// The web page is the display surface now; the terminal becomes a
-	// pure command console (/tail re-enables live terminal output).
-	cli.stopWatcher()
-	server := web.New(cli.session)
+// never race a page for a session's single run slot (and the hubs stay
+// the only consumers of the run event streams).
+func serve(serverRoot, addr, providerName, modelName, resumeID string) {
+	factory, err := assembleFactory(serverRoot, providerName, modelName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
+		os.Exit(1)
+	}
+	manager, err := web.NewManager(web.ManagerOptions{
+		ServerRoot: serverRoot,
+		Store:      factory.Store(),
+		AgentFor: func(projectCwd string) (*agent.Agent, error) {
+			ag, _, err := factory.Agent(projectCwd)
+			return ag, err
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
+		os.Exit(1)
+	}
+	// -session pre-opens through the same registration gate as every
+	// route: the lock is claimed up front and the page initially
+	// selects it.
+	if resumeID != "" {
+		if err := manager.Preopen(resumeID); err != nil {
+			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
+			manager.Close()
+			os.Exit(1)
+		}
+	}
+	server := web.New(manager)
 	httpServer := &http.Server{
 		Handler: server.Handler(),
 	}
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
-		_ = cli.session.Close()
+		manager.Close()
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "sai: web UI on http://%s (session %s)\n", listener.Addr(), cli.session.ID())
-	fmt.Fprintln(os.Stderr, "sai: serve mode: the interactive REPL is disabled; this console accepts debug commands only")
+	fmt.Fprintf(os.Stderr, "sai: web UI on http://%s (server root %s)\n", listener.Addr(), serverRoot)
+	fmt.Fprintf(os.Stderr, "sai: serve mode: the interactive REPL is disabled; this console accepts debug commands only\n")
 
 	go func() {
 		if err := httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -40,27 +66,23 @@ func serve(cli *cliApp, addr string) {
 	}()
 
 	// Orderly shutdown shared by /quit and the interrupt path: stop
-	// accepting, stop any run, close the session (flushes the log,
-	// finishes any segment switch, releases the session lock), and name
-	// the session for a later resume.
+	// accepting, stop the manager (sweeper, every hub and session —
+	// flushing logs, releasing every session lock), release the root
+	// lock.
 	shutdown := func() {
 		_ = httpServer.Close()
 		server.Close()
-		_ = cli.session.Close()
-		if cli.session.Persisted() {
-			fmt.Fprintf(os.Stderr, "sai: session %s\n", cli.session.ID())
-		}
 	}
 
-	// Ctrl+C mirrors the REPL: the first stops the active run, a second
-	// when idle exits through the orderly path.
+	// Ctrl+C mirrors the REPL: the first stops every active run, a
+	// second when idle exits through the orderly path.
 	interrupts := make(chan os.Signal, 1)
 	signal.Notify(interrupts, os.Interrupt)
 	go func() {
 		for range interrupts {
-			if cli.session.Running() {
-				cli.session.Stop()
-				fmt.Fprintln(os.Stderr, "\rsai: stopping run")
+			if anyRunning(manager) {
+				manager.StopRuns()
+				fmt.Fprintln(os.Stderr, "\rsai: stopping runs")
 				continue
 			}
 			fmt.Fprintln(os.Stderr, "\rsai: shutting down")
@@ -96,4 +118,9 @@ func serve(cli *cliApp, addr string) {
 		fmt.Fprintf(os.Stderr, "sai: unknown command %q (try /help)\n", text)
 	}
 	shutdown()
+}
+
+// anyRunning reports whether any open session has an active run.
+func anyRunning(manager *web.Manager) bool {
+	return manager.HasRunning()
 }

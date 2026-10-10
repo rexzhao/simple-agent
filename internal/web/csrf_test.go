@@ -14,10 +14,10 @@ import (
 // can fire simple cross-site POSTs (text/plain), and /api/send executes
 // shell commands.
 func TestCSRFWriteGuards(t *testing.T) {
-	_, _, base := newTestServer(t, [][]model.Event{{model.TextDeltaEvent{Text: "x"}}})
+	session, _, base := newTestServer(t, [][]model.Event{{model.TextDeltaEvent{Text: "x"}}})
 
 	// Simple cross-site POST: text/plain, foreign origin.
-	req, _ := http.NewRequest("POST", base.URL+"/api/send", strings.NewReader(`{"text":"pwned"}`))
+	req, _ := http.NewRequest("POST", base.URL+api(session, "/send"), strings.NewReader(`{"text":"pwned"}`))
 	req.Header.Set("Content-Type", "text/plain")
 	req.Header.Set("Origin", "http://evil.example")
 	resp, err := http.DefaultClient.Do(req)
@@ -30,7 +30,7 @@ func TestCSRFWriteGuards(t *testing.T) {
 	}
 
 	// JSON but foreign origin: still refused.
-	req2, _ := http.NewRequest("POST", base.URL+"/api/send", strings.NewReader(`{"text":"pwned"}`))
+	req2, _ := http.NewRequest("POST", base.URL+api(session, "/send"), strings.NewReader(`{"text":"pwned"}`))
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Origin", "http://evil.example")
 	resp2, err := http.DefaultClient.Do(req2)
@@ -43,7 +43,7 @@ func TestCSRFWriteGuards(t *testing.T) {
 	}
 
 	// JSON but no content-type: refused (the CSRF-relevant part).
-	req3, _ := http.NewRequest("POST", base.URL+"/api/send", strings.NewReader(`{"text":"x"}`))
+	req3, _ := http.NewRequest("POST", base.URL+api(session, "/send"), strings.NewReader(`{"text":"x"}`))
 	resp3, err := http.DefaultClient.Do(req3)
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +54,7 @@ func TestCSRFWriteGuards(t *testing.T) {
 	}
 
 	// Same-origin JSON goes through.
-	if err := postJSON(t, base.URL, "/api/send", map[string]string{"text": "fine"}); err != nil {
+	if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "fine"}); err != nil {
 		t.Fatalf("same-origin JSON POST failed: %v", err)
 	}
 }
@@ -63,9 +63,9 @@ func TestCSRFWriteGuards(t *testing.T) {
 func TestCSRFNoGetMutations(t *testing.T) {
 	_, server, _ := newTestServer(t, nil)
 	rec := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/api/send", nil)
+	req, _ := http.NewRequest("GET", "/api/s/some/session/send", nil)
 	server.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed && rec.Code != http.StatusNotFound {
-		t.Fatalf("GET /api/send: %d, want 405/404 (route not registered for GET)", rec.Code)
+		t.Fatalf("GET send route: %d, want 405/404 (route not registered for GET)", rec.Code)
 	}
 }

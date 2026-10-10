@@ -132,7 +132,22 @@ func (a *Agent) NewSession() (*Session, error) {
 // OpenSession reopens a stored session by ID, rebuilding its state by
 // folding the records.
 func (a *Agent) OpenSession(id string) (*Session, error) {
-	stored, err := a.store.Open(id)
+	return a.openSession(a.store.Open, id)
+}
+
+// OpenSessionIn reopens a stored session scoped to one project: the id
+// resolves inside the project's storage namespace only. The serve-mode
+// registration gate is structural at this level — a session living under
+// an unregistered project is not found, even though the store can see
+// its directory.
+func (a *Agent) OpenSessionIn(projectID, id string) (*Session, error) {
+	return a.openSession(func(sessionID string) (storage.Session, error) {
+		return a.store.OpenIn(projectID, sessionID)
+	}, id)
+}
+
+func (a *Agent) openSession(open func(string) (storage.Session, error), id string) (*Session, error) {
+	stored, err := open(id)
 	if err != nil {
 		return nil, err
 	}

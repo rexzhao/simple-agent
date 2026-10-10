@@ -37,10 +37,7 @@ func lockSession(dir string) (*fileLock, error) {
 	if err := lockFileExclusive(file); err != nil {
 		file.Close()
 		holder := readLockHolder(filepath.Join(dir, "holder"))
-		if holder == "" {
-			return nil, fmt.Errorf("session %s is locked by another process", filepath.Base(dir))
-		}
-		return nil, fmt.Errorf("session %s is locked by another process (holder: %s; may be stale)", filepath.Base(dir), holder)
+		return nil, &LockHeldError{Target: "session " + filepath.Base(dir), Holder: holder}
 	}
 	lock := &fileLock{file: file, holder: filepath.Join(dir, "holder")}
 	// Best-effort holder info for the next loser's error message.
@@ -68,4 +65,51 @@ func readLockHolder(path string) string {
 		holder = holder[:200]
 	}
 	return holder
+}
+
+// LockHeldError reports a session (or path) lock held by another process.
+// Callers classify it with errors.As — never by parsing the message. The
+// holder string is informational (a pid note for humans); mutual exclusion
+// never depends on it.
+type LockHeldError struct {
+	Target string
+	Holder string
+}
+
+func (e *LockHeldError) Error() string {
+	if e.Holder == "" {
+		return fmt.Sprintf("%s is locked by another process", e.Target)
+	}
+	return fmt.Sprintf("%s is locked by another process (holder: %s; may be stale)", e.Target, e.Holder)
+}
+
+// AcquirePathLock takes an exclusive OS lock on a dedicated file that is
+// never renamed or replaced — the serve-mode root lock (<serverRoot>/
+// serve.lock). Locking a file that atomic writers replace (rename) would
+// leave the lock stranded on the old inode while the path points at a new
+// one; dedicated files have no such lifecycle.
+func AcquirePathLock(path string) (*PathLock, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open lock file: %w", err)
+	}
+	if err := lockFileExclusive(file); err != nil {
+		file.Close()
+		return nil, &LockHeldError{Target: path}
+	}
+	return &PathLock{file: file}, nil
+}
+
+// PathLock is a held dedicated-file lock.
+type PathLock struct {
+	file *os.File
+}
+
+// Release drops the lock.
+func (p *PathLock) Release() {
+	if p == nil || p.file == nil {
+		return
+	}
+	p.file.Close()
+	p.file = nil
 }

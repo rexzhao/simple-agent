@@ -210,3 +210,10 @@ func parseLastTime(records []storage.Record) time.Time {
 	}
 	return parsed
 }
+
+// HasSession probes whether a session exists under a project.
+func (s *Store) HasSession(projectID, sessionID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.projectOf[sessionID] == projectID
+}

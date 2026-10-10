@@ -50,6 +50,11 @@ type Store interface {
 	// registration gate is structural (no scan across unregistered
 	// projects) and the id→dir resolution cannot cross it.
 	OpenIn(projectID, sessionID string) (Session, error)
+	// HasSession probes whether a session exists under a project
+	// WITHOUT taking its lock — the serve manager uses it to find the
+	// owning project before assembling the agent (assembly precedes
+	// the lock; a failed assembly must not leave a zombie lock).
+	HasSession(projectID, sessionID string) bool
 	// ListSessions enumerates the stored sessions of one project,
 	// newest activity first (ID as the tiebreak). Sessions never
 	// materialized (no first record) are not listed: they hold nothing.

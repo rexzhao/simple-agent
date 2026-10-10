@@ -48,6 +48,12 @@ type Hub struct {
 	// runs). attachMu is not needed: only the loop goroutine touches it.
 	events <-chan model.Event
 
+	// onClients, when set, is called (outside h.mu) on every subscriber
+	// count transition — the manager's eviction clock restarts on both
+	// attach and detach, so idle time is measured from the moment the
+	// last activity ended, not from some stale request.
+	onClients func(count int)
+
 	stopOnce sync.Once
 }
 
@@ -276,7 +282,8 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 		window = DefaultWindow
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	// NOT deferred: the client-count observer must run outside h.mu
+	// (it takes the manager's lock).
 
 	total := len(h.records)
 	start := total - window
@@ -294,6 +301,7 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 	windowed = append(windowed, h.records[start:total]...)
 	encoded, err := json.Marshal(windowed)
 	if err != nil {
+		h.mu.Unlock()
 		return nil, nil, err
 	}
 
@@ -329,12 +337,37 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 
 	c := &client{ch: make(chan []byte, clientBufferSize), done: make(chan struct{})}
 	h.clients[c] = struct{}{}
+	count := len(h.clients)
+	onClients := h.onClients
+	h.mu.Unlock()
+	if onClients != nil {
+		onClients(count)
+	}
 	return c, encodeFrame(f), nil
 }
 
 func (h *Hub) unregister(c *client) {
 	h.mu.Lock()
 	h.dropClientLocked(c)
+	count := len(h.clients)
+	onClients := h.onClients
+	h.mu.Unlock()
+	if onClients != nil {
+		onClients(count)
+	}
+}
+
+// Subscribers reports the current subscriber count.
+func (h *Hub) Subscribers() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.clients)
+}
+
+// SetClientObserver installs the subscriber-count transition callback.
+func (h *Hub) SetClientObserver(fn func(count int)) {
+	h.mu.Lock()
+	h.onClients = fn
 	h.mu.Unlock()
 }
 
