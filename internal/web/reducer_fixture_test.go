@@ -117,7 +117,7 @@ func createSecondSession(t *testing.T, s *Server) string {
 func TestChatStoreMirror(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
-		t.Skip("node not available; the chat store mirror check needs node >= 22.6")
+		t.Skip("node not available; the chat store mirror check needs node >= 23.6 (unflagged type stripping)")
 	}
 	script, err := filepath.Abs(filepath.Join("testdata", "store_check.mjs"))
 	if err != nil {

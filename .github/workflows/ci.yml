@@ -21,7 +21,7 @@ jobs:
       # checks — drift cannot land silently — is absent from CI.
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
       - run: go test ./...
       - run: go vet ./...
       - name: Gofmt gate
