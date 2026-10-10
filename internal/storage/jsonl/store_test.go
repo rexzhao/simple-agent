@@ -479,3 +479,40 @@ func recordTypes(records []storage.Record) []string {
 	}
 	return types
 }
+
+// TestAppendNormalizesInvalidUTF8 verifies the jsonl boundary: a record
+// with invalid UTF-8 bytes (raw command output) is stored, returned, and
+// read back in the normalized form — in-memory and on-disk never diverge.
+func TestAppendNormalizesInvalidUTF8(t *testing.T) {
+	store := newTestStore(t)
+	session, err := store.Create(ProjectID(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	stored, err := session.Append(storage.Record{
+		ItemID: "r1", Type: storage.TypeToolResult, Content: "out\xff\xfeend",
+	})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if stored.Content != "out\ufffdend" { // one replacement per invalid run
+		t.Fatalf("returned record not normalized: %q", stored.Content)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := store.Open(session.ID())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer reopened.Close()
+	records, err := reopened.Records()
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if len(records) != 1 || records[0].Content != stored.Content {
+		t.Fatalf("read-back diverged: %+v", records)
+	}
+}

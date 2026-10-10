@@ -86,7 +86,9 @@ func (s *Session) Append(record storage.Record) (storage.Record, error) {
 	if s.closed {
 		return storage.Record{}, fmt.Errorf("session is closed")
 	}
-	return s.log.append(record)
+	// Mirror the jsonl boundary: both implementations return the same
+	// normalized form so no caller can observe a store-dependent digest.
+	return s.log.append(record.Normalized())
 }
 
 // Records returns every stored record in order.

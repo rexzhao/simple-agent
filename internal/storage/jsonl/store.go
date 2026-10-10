@@ -314,6 +314,10 @@ func (s *Session) Dir() string {
 func (s *Session) Append(record storage.Record) (storage.Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The append boundary is where invalid UTF-8 dies: everything
+	// downstream (the JSON line, the returned record, the fold, the
+	// digest chain) sees the normalized form only.
+	record = record.Normalized()
 	if s.log == nil {
 		// First append materializes the session: take the session lock
 		// before creating anything on disk.

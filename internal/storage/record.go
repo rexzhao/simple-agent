@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -70,6 +71,41 @@ type WireToolCall struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
+}
+
+// replacementRune is what encoding/json substitutes for invalid UTF-8
+// bytes when marshaling. Normalized uses the same character so that a
+// normalized record is byte-identical to its persisted JSON form.
+const replacementRune = "\uFFFD"
+
+// Normalized returns the record with every text field coerced to valid
+// UTF-8. Without this, json.Marshal silently replaces invalid bytes with
+// U+FFFD at persistence time: the in-memory record, the folded state, and
+// anything hashing either side (the web digest chain) would diverge from
+// what is stored and from what a resume reads back. Sources of invalid
+// bytes are real — raw command output (tools/shell), non-UTF-8 files,
+// git diff on binaries. Storage implementations apply this at the append
+// boundary; callers fold and deliver only the returned (normalized)
+// record.
+func (r Record) Normalized() Record {
+	r.ItemID = strings.ToValidUTF8(r.ItemID, replacementRune)
+	r.Type = strings.ToValidUTF8(r.Type, replacementRune)
+	r.Time = strings.ToValidUTF8(r.Time, replacementRune)
+	r.RunID = strings.ToValidUTF8(r.RunID, replacementRune)
+	r.Provider = strings.ToValidUTF8(r.Provider, replacementRune)
+	r.Model = strings.ToValidUTF8(r.Model, replacementRune)
+	r.CWD = strings.ToValidUTF8(r.CWD, replacementRune)
+	r.Content = strings.ToValidUTF8(r.Content, replacementRune)
+	r.Reasoning = strings.ToValidUTF8(r.Reasoning, replacementRune)
+	r.ToolCallID = strings.ToValidUTF8(r.ToolCallID, replacementRune)
+	r.ToolName = strings.ToValidUTF8(r.ToolName, replacementRune)
+	r.Error = strings.ToValidUTF8(r.Error, replacementRune)
+	for i := range r.ToolCalls {
+		r.ToolCalls[i].ID = strings.ToValidUTF8(r.ToolCalls[i].ID, replacementRune)
+		r.ToolCalls[i].Name = strings.ToValidUTF8(r.ToolCalls[i].Name, replacementRune)
+		r.ToolCalls[i].Arguments = strings.ToValidUTF8(r.ToolCalls[i].Arguments, replacementRune)
+	}
+	return r
 }
 
 // WireToolCalls converts model tool calls to their wire form.
