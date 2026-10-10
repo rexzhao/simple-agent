@@ -85,6 +85,8 @@ assert(!fx2.reset, "s2 no reset");
 assert(snap2.records.length === 2, "s2 suffix = 2 records");
 assert(state.records.length === before.n + 2, "s2 appended");
 assert(state.prefixAnchor === before.prefix, "s2 prefixAnchor unchanged");
+assert(snap2.anchor === before.head, "s2 server anchor = our head");
+assert(state.more === before.more, "s2 more untouched");
 assert(state.head === snap2.d && state.head === st1.digest, "s2 head = server head");
 
 // Scenario 3: scroll-back after resume — prefix moves, head does not.

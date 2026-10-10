@@ -4,7 +4,7 @@
 // live server — the two page-state bugs of the first review round
 // (prefixAnchor overwritten on resume, the chain folded from genesis
 // instead of the anchor) both lived here, in CI's blind spot.
-import { chainStep } from "./chain.mjs";
+import { chainGenesis, chainStep } from "./chain.mjs";
 
 export function initialState() {
   return {
@@ -15,6 +15,15 @@ export function initialState() {
     more: false,      // history exists before the prefix anchor
     running: false,
   };
+}
+
+// initChain establishes the pre-snapshot placeholders: the genesis of
+// the session's chain. The reducer is the sole owner of the chain
+// fields — app.js never writes head/prefixAnchor directly.
+export async function initChain(state, sessionID) {
+  state.session = sessionID;
+  state.head = await chainGenesis(sessionID);
+  state.prefixAnchor = state.head;
 }
 
 // A snapshot either resumes (the suffix appends to what we hold; the

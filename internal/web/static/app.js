@@ -4,8 +4,8 @@
 // holds and comparing it against the server's head in every status frame.
 "use strict";
 
-import { chainGenesis, chainStep } from "./chain.mjs";
-import { initialState, applySnapshot, applyRecord, applyStatus, applyHistory } from "./reducer.mjs";
+import { chainStep } from "./chain.mjs";
+import { initialState, initChain, applySnapshot, applyRecord, applyStatus, applyHistory } from "./reducer.mjs";
 
 // ---------- state ----------
 
@@ -153,7 +153,6 @@ async function dispatch(frame) {
       scrollToBottom();
       state.reconnectFrom = "";
       document.getElementById("load-more").hidden = !state.more;
-      state.running = !!frame.running;
       if (frame.streaming) beginStreamingItem(frame.streaming.item, frame.streaming);
       if (frame.tool) beginToolItem(frame.tool.item, frame.tool.name, frame.tool.args);
       updateStatus();
@@ -390,7 +389,8 @@ setInterval(async () => {
 }, 2000);
 
 (async () => {
-  // The genesis needs the served session id.
+  // The genesis needs the served session id; the reducer owns the
+  // chain fields from here on.
   try {
     const res = await fetch("/api/state");
     if (res.ok) {
@@ -402,7 +402,6 @@ setInterval(async () => {
   if (!state.session) {
     state.session = new URLSearchParams(location.search).get("session") || "local";
   }
-  state.head = await chainGenesis(state.session);
-  state.prefixAnchor = state.head;
+  await initChain(state, state.session);
   connect();
 })();
