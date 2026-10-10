@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"mime"
 	"net"
 	"net/http"
 	"strconv"
@@ -28,6 +29,13 @@ type Server struct {
 // New builds the server for a live session.
 func New(session *agent.Session) *Server {
 	s := &Server{session: session, hub: NewHub(session)}
+	// Windows derives MIME types from the registry, where .js/.mjs map
+	// to text/plain (or nothing) — module scripts enforce strict MIME
+	// checking and refuse to load. Pin the types for the assets we ship.
+	_ = mime.AddExtensionType(".js", "text/javascript")
+	_ = mime.AddExtensionType(".mjs", "text/javascript")
+	_ = mime.AddExtensionType(".css", "text/css")
+	_ = mime.AddExtensionType(".html", "text/html; charset=utf-8")
 	mux := http.NewServeMux()
 	// The embedded tree lives under static/; strip the prefix so /
 	// serves index.html and the assets sit at /app.js, /style.css.
