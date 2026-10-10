@@ -217,16 +217,20 @@ POST /api/s/<id>/stop
   404 而非 500——路径片段不进目录扫描
 - 会话 ID 全局随机，理论唯一；但 `Open`/`OpenIn` 取第一个匹配，复制
   目录会造出重名 → 多处命中返回 409（防御一行）
-- **稳定码全集**（可枚举的契约表，页面与 CLI 按码 switch，不解析
-  散文）：
+- **错误码全集**（可枚举的契约表，页面与 CLI 按码 switch，不解析
+  散文；成功路径不入表——如 `POST /compact` 的 202 异步语义、
+  `POST /send`/`steer` 的 200）：
 
   | 码 | HTTP | 可重试 | 含义 |
   |---|---|---|---|
   | `session_closing` | 503 | 是 | 本进程驱逐 teardown 进行中 |
   | `session_locked` | 409 | 否 | 外部进程持锁（错误信息带 pid） |
   | `run_active` | 409 | 否 | 单 run 槽占用 |
-  | `no_run` | 409 | — | steer 要求运行中 |
+  | `no_run` | 409 | 否 | steer 要求运行中（回退 Send） |
   | `not_queued` | 404 | 否 | 编辑/撤回不存在的排队项 |
+  | `stale_anchor` | 409 | 否 | `history?before=` 锚点未知（链重建）；重试同请求仍会 stale，正确动作是丢弃持有记录与链、按 Rule A 全量重放——链路协议的正常信号，页面 Rule A 的唯一触发码 |
+  | `nothing_to_compact` | 409 | 否 | `compact`：上下文为空 |
+  | `compacting` | 409 | 否 | `compact`：已有压缩在飞（单飞槽） |
   | `project_unavailable` | 500 | 否 | agent 装配失败（路径缺失等） |
   | `empty_input` | 400 | 否 | 空文本 |
   | （无码） | 404 | 否 | 未知会话 / 未注册项目 / 非法 id |
