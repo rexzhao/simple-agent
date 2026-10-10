@@ -68,25 +68,30 @@ ping/pong + close 约 200 行；消息小、纯文本、无分片）。测试用
   按 NS 升序（最旧先投）
 - 投递确认后 `Read` 标记已读；崩溃/未确认 → 邮件保持未读，重启重拉
 
-## 3. Steer：正交的 agent 能力（新增，无 mailbox 知识）
+## 3. Steer：正交的 agent 能力（已实现，与 mailbox 无关）
 
-run 循环按迭代推进（模型请求 → 工具批次 → 下一迭代），`messages`
-是循环内的本地切片。Steer 语义：
+steer = "尽快进入会话的用户输入"，一个队列两个排干点（pi 的
+steering + followUp 两队列坍缩为一个语义）：
 
-- `Session.Steer(text) error`：**仅入队**（`s.steerQ`，锁保护）；
-  非运行态返回错误（调用方回退 Send）。不落盘——见下面的确认协议
-- run 循环在**每次迭代顶部**排干 steerQ：对每条文本，commit 一条
-  `user.input` 记录（RunID = 当前 run，落盘）**并**追加进 `messages`
-  ——提交与消费在循环内原子完成，Fold 顺序 = 记录顺序，mid-run
-  压缩重建上下文时自然包含
-- run 在最终消息期间到达的 steer（无下一迭代）→ 队列残留 → run
-  结束时丢弃（不落盘、未消费）
+- `Session.Steer(text) (ItemID, error)`：**入队即铸 ItemID**（身份先于
+  持久化），非运行态返回 ErrNoRun（调用方回退 Send）。队列在瞬态区
+  （`State.Steered`，Snapshot/snapshot 首帧可见），可经
+  `UpdateSteer`/`WithdrawSteer` 编辑/撤回
+- run 循环**每次迭代顶部**（建请求前）排干：每条 commit 一条
+  `user.input` 记录（**同一 ItemID**）并追加进 `messages`——提交与
+  消费原子，Fold 顺序 = 记录顺序，mid-run 压缩重建时两侧同步
+- **最终响应分支**排干非空则续轮（= followup）；预算边缘
+  （iteration == maxIterations）不排干、留队给下一个 run——**这是
+  队列残留的主要正常路径**（每轮都 steer 的用户会把预算用尽，
+  MaxIterations=N 至多吸收 N-1 次续轮）
+- 残留条目不丢弃：下一个 run 的首个迭代顶部投递（顺序在该 run
+  触发输入之后）。**RunID 归属**：记录带的是**消费它的 run** 的
+  RunID，不是输入时刻的 run——按 RunID grep 时注意这个语义
+- 排干提交的文本是**规范化后**的（与 Append 同一规范化），wire
+  历史/折叠/磁盘不分叉
 
-**恰好一次投递协议**（插件侧，只用公共 API）：插件给每封邮件的注入
-文本带上邮件 ID 标记；`Steer` 后通过 `Subscribe()` 观察——看到含该
-标记的 `user.input` 记录 = 已消费（删除待办、标记邮件已读）；run
-结束（观察到 settle）仍未见记录 = 未消费 → 经 `Send()` 重投为
-followup。Steer 消费即落盘，所以崩溃后邮件仍未读、重启重拉，无丢失。
+mailbox 通知注入直接用 Steer/Send，无需恰好一次协议：通知丢失无害
+（下次 notify 重试），邮件本体由 agent 经工具拉取。
 
 竞态窗口：settle 与 Steer 之间——`Steer` 返回运行态错误或入队后未
 消费，都收敛到 followup 重投，幂等。

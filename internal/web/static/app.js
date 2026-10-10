@@ -157,7 +157,19 @@ async function dispatch(frame) {
       document.getElementById("load-more").hidden = !state.more;
       if (frame.streaming) beginStreamingItem(frame.streaming.item, frame.streaming);
       if (frame.tool) beginToolItem(frame.tool.item, frame.tool.name, frame.tool.args);
-      for (const entry of frame.steered || []) beginSteerRow(entry.item, entry.text);
+      // The authoritative queue: drop steer rows that are no longer
+      // queued (withdrawn while this page was disconnected — the record
+      // that would have merged them never comes).
+      {
+        const queuedIDs = new Set((frame.steered || []).map(e => e.item));
+        for (const [id, row] of state.byItem) {
+          if (row.classList.contains("steer-queued") && !queuedIDs.has(id)) {
+            row.remove();
+            state.byItem.delete(id);
+          }
+        }
+        for (const entry of frame.steered || []) beginSteerRow(entry.item, entry.text);
+      }
       updateStatus();
       if (frame.d) setSync(state.head === frame.d, frame.d);
       break;

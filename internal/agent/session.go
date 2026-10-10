@@ -267,18 +267,20 @@ func (s *Session) Steer(text string) (string, error) {
 	}
 	itemID := storage.NewUserInputID()
 	s.state.Steered = append(s.state.Steered, storage.SteeredItem{ItemID: itemID, Text: text})
-	// The events channel closes only after settle (defer order), and
-	// settle needs this lock — with running still true the send cannot
-	// race a close. A full buffer drops the notice: best-effort, like
-	// every transient event; the queue itself is in Snapshot.
-	events := s.events
-	s.mu.Unlock()
-	if events != nil {
+	// The send stays INSIDE the critical section: run's defer order is
+	// settle → close(events), and settle needs this lock — observing
+	// running==true while holding it implies close(events) has not run.
+	// (A select with default does NOT protect a send on a closed channel:
+	// the send panics before default is consulted; the lock is the only
+	// guard.) The send itself is non-blocking — best-effort, like every
+	// transient event; the queue itself is in Snapshot.
+	if s.events != nil {
 		select {
-		case events <- model.SteerQueuedEvent{ItemID: itemID, Text: text}:
+		case s.events <- model.SteerQueuedEvent{ItemID: itemID, Text: text}:
 		default:
 		}
 	}
+	s.mu.Unlock()
 	return itemID, nil
 }
 
@@ -326,8 +328,20 @@ func (s *Session) WithdrawSteer(itemID string) error {
 
 // drainSteered consumes the steer queue into the run's message list,
 // committing each entry as a user.input record carrying its original
-// ItemID. Callers are the run loop, at iteration boundaries. Returns
-// how many entries were consumed.
+// ItemID. Callers are the run loop, at iteration boundaries BEFORE
+// `request.Messages = messages` — that is what keeps the local slice
+// and the folded Context in the same order across a mid-run compaction
+// (the compaction rebuilds messages from the fold, which already
+// contains the drained records).
+//
+// The queue is emptied before committing: a mid-batch commit failure
+// loses the not-yet-committed entries — the run is failing anyway and
+// the queue is transient by design.
+//
+// The committed text is the NORMALIZED record content (the same
+// normalization the storage append applies), so the wire history, the
+// folded context, and the disk never diverge — the raw entry.Text may
+// contain invalid UTF-8 that Append would replace.
 func (s *Session) drainSteered(messages *[]model.Message, runID string) (int, error) {
 	s.mu.Lock()
 	if len(s.state.Steered) == 0 {
@@ -339,13 +353,14 @@ func (s *Session) drainSteered(messages *[]model.Message, runID string) (int, er
 	s.mu.Unlock()
 
 	for _, entry := range queued {
-		if err := s.commit(storage.Record{
+		record := storage.Record{
 			ItemID: entry.ItemID, Type: storage.TypeUserInput,
 			RunID: runID, Content: entry.Text,
-		}, nil); err != nil {
+		}.Normalized()
+		if err := s.commit(record, nil); err != nil {
 			return 0, fmt.Errorf("persist steered input: %w", err)
 		}
-		*messages = append(*messages, model.Message{Role: model.MessageRoleUser, Content: entry.Text})
+		*messages = append(*messages, model.Message{Role: model.MessageRoleUser, Content: record.Content})
 	}
 	return len(queued), nil
 }

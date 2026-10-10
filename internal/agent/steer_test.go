@@ -204,3 +204,48 @@ type recordView struct {
 }
 
 var _ = strings.TrimSpace // keep strings imported for future asserts
+
+// TestSteerSettleRaceCanary is a regression sentinel for the send-on-
+// closed-channel panic: steering concurrently with runs that settle
+// immediately. The Steer send must stay inside the session lock — a
+// select with default does not protect a closed channel.
+func TestSteerSettleRaceCanary(t *testing.T) {
+	// An endless instant provider: followup continuations also consume
+	// streams, so a finite turn script would exhaust and fall into the
+	// retry backoff.
+	_, session := newTestAgent(t, &endlessProvider{}, nil)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, _ = session.Steer("race")
+				time.Sleep(200 * time.Microsecond) // throttle: the queue would outgrow the drains
+			}
+		}()
+	}
+	for i := 0; i < 50; i++ {
+		_ = session.Send("go")
+		waitSettled(t, session)
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// endlessProvider answers instantly, forever.
+type endlessProvider struct{}
+
+func (p *endlessProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
+	events := make(chan model.Event, 1)
+	events <- model.TextDeltaEvent{Text: "x"}
+	close(events)
+	return events, nil
+}
