@@ -298,7 +298,7 @@ OpenIn(projectID, sessionID string) (Session, error)
 | 同一 server root 跑两个 serve | 第二个启动时 root 级锁 fail fast（§2.1） |
 | CLI 未注册的 cwd 跑出会话 | 存储里存在，serve 不可见（注册制字面语义）；需要时 `sai project add` |
 | 注册后目录被移动 | `ProjectID` 变了 → 旧 ID 目录下的会话在新路径的 CLI 与 serve **都**不可达——数据在磁盘上，CLI 切回旧路径才看得到；re-add 新路径只让项目重新出现且为空 |
-| 找回旧会话的配方 | `ProjectID` 只依赖路径字符串：`sai project add <原路径>` **即使该目录已不存在**也能把旧 ID 下的会话重新列出来（注册表是真相，与"路径不存在→项目仍列出"一致）；点开才在装配阶段 500 `project_unavailable`，目录恢复后即可正常打开 |
+| 找回旧会话的配方 | `ProjectID` 只依赖路径字符串：`sai project add <原路径>` **即使该目录已不存在**也能把旧 ID 下的会话重新列出来（注册表是真相，与"路径不存在→项目仍列出"一致）；点开才在装配阶段 500 `project_unavailable`，目录恢复后即可正常打开。**原路径 = 当时注册的那一串**：`ProjectID` 只做 Abs+Clean+大小写折叠，不解析符号链接、不统一盘符形式——同一目录的等价写法（映射盘符 vs UNC、junction vs 目标路径）算出**不同 ID**，表现为项目存在但列表为空（不是报错），勿误读为数据丢失 |
 | projects.json 损坏 | 启动报错退出；运行中重读损坏 → 保留上一份好表 + 暴露错误；`sai project add` 拒绝写入（§1） |
 | 复制会话目录造出重名 ID | `OpenIn` 多处命中 → 409 |
 
