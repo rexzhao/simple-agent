@@ -171,24 +171,17 @@ func agentFactory(serverRoot, providerName, modelName string)
 
 ```
 GET /api/projects
-  → {
-       "projects": [
-         { "id": "pxxxxx…", "path": "F:\\work\\paperhub",
-           "sessions": [{ "id": "s0000…", "title": "…",
-                          "created": …, "modified": …, "active": true }] }
-       ],
-       "unregistered": [
-         { "id": "pyyyyy…", "cwd_hint": "F:/work/old-path",
-           "sessions": […], "openable": false }
-       ]
-     }
+  → {"projects": [{
+       "id":   "pxxxxx…",
+       "path": "F:\\work\\paperhub",
+       "sessions": [{ "id": "s0000…", "title": "…",
+                      "created": …, "modified": …, "active": true }]
+     }]}
 ```
 
-- **未注册项目角落用独立数组**，不用 `path: null`——结构性不可打开，
-  页面不可能误把打开动作接到它上面；`cwd_hint` 取自其会话的
-  `session.created.CWD`，display-only。**注册门在 open/执行，不在
-  list**：角落只读目录、不取锁、不装配 agent，展示标题不构成授权
-  （§1 不被破坏）
+- **只列注册项目**（决策 #2 的字面语义）：未注册目录即使存储里有
+  会话也不出现在任何列表里——发现历史不是列表页的职责，知道原路径
+  的人 `sai project add` 即可
 
 - `active` = 该会话当前在本 serve 进程内打开（≠ 运行中；页面展示
   "运行中"一律用 run 状态，不用 `active`——惰性打开会让任何一次浏览
@@ -277,10 +270,7 @@ OpenIn(projectID, sessionID string) (Session, error)
 - **容忍截断尾行**：CLI 持锁写时 serve 可以列它——并发追加中的最后
   一行可能不完整，解析失败跳过该行，不算错误
 - memory：`Create` 时顺手登记
-- **不新增 `ListProjects`**：项目列表的来源是注册表，不是存储扫描；
-  但列表页给"**未注册项目**"一个角落——列出 `<root>` 下没有注册条目
-  的 projectID 目录（标注不可打开 + 提示 `sai project add <原路径>`），
-  让历史仍可发现
+- **不新增 `ListProjects`**：项目列表的来源是注册表，不是存储扫描
 
 ## 6. 页面
 
@@ -306,8 +296,8 @@ OpenIn(projectID, sessionID string) (Session, error)
 |---|---|
 | 注册路径在磁盘上不存在 | 项目仍列出（注册表是真相）；打开其会话 → 装配失败 → 500 `project_unavailable`（顺序见 §3.1，不留僵尸锁） |
 | 同一 server root 跑两个 serve | 第二个启动时 root 级锁 fail fast（§2.1） |
-| CLI 未注册的 cwd 跑出会话 | 存储里存在，serve 主列表不可见；出现在"未注册项目"角落（§5） |
-| 注册后目录被移动 | `ProjectID` 变了 → 旧 ID 目录下的会话在新路径的 CLI 与 serve **都**不可达——数据在磁盘上，CLI 切回旧路径才看得到；re-add 新路径只让项目重新出现且为空。列表的未注册角落提示原路径供 `sai project add` |
+| CLI 未注册的 cwd 跑出会话 | 存储里存在，serve 不可见（注册制字面语义）；需要时 `sai project add` |
+| 注册后目录被移动 | `ProjectID` 变了 → 旧 ID 目录下的会话在新路径的 CLI 与 serve **都**不可达——数据在磁盘上，CLI 切回旧路径才看得到；re-add 新路径只让项目重新出现且为空 |
 | projects.json 损坏 | 启动报错退出；运行中重读损坏 → 保留上一份好表 + 暴露错误；`sai project add` 拒绝写入（§1） |
 | 复制会话目录造出重名 ID | `OpenIn` 多处命中 → 409 |
 
@@ -327,7 +317,7 @@ OpenIn(projectID, sessionID string) (Session, error)
   Created = 原始创建时间、Title = 归档段里的原始首输入、起点缺失 → 空）；
   截断尾行容忍；`OpenIn` 项目域内解析与重名 409；不存在的 projectID
 - **web/Manager**：`/api/projects` 形状（注册表+枚举+active 合并、无
-  records 计数、unregistered 角落）；注册门逐路由 404（stream/send/
+  records 计数）；注册门逐路由 404（stream/send/
   steer/compact/state/history 对未注册项目的会话）；驱逐清扫者——并发
   "首请求打开"×清扫者交错 → 断言请求只可能 200 或 503，**绝不出现已
   关闭会话被使用**；驱逐后再请求能重开（锁已释放）；扫帚绝不驱逐
