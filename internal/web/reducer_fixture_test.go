@@ -111,7 +111,7 @@ func createSecondSession(t *testing.T, s *Server) string {
 // mirror of the page reducer) and the page reducer itself against
 // identical synthetic frame sequences, asserting agreement on every
 // shared field — the mirror-consistency that would otherwise live in
-// CI's blind spot (the store is TypeScript; node >= 23.6 runs it via (unflagged type stripping)
+// CI's blind spot (the store is TypeScript; node >= 23.6 runs it via
 // type stripping). Serverless: the server contract is pinned by
 // TestPageReducerFixture. Skips without node.
 func TestChatStoreMirror(t *testing.T) {
