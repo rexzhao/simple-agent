@@ -75,11 +75,16 @@ v2 并入设计评审结论：两项前置工程（§0 会话锁、§3 CSRF）�
 
 ```
 cmd/sai            -http <addr> 启动 serve 模式：web server + debug REPL
+                   -http-static <dir> 在 /chat 托管独立构建的聊天客户端
 internal/web       server.go   HTTP mux + 生命周期 + 关停（Stop+Close，
                                flush 日志、不留 log.jsonl.next、释放会话锁）
                    hub.go      记录/事件的单消费者 fan-out（全程非阻塞）
                    wire.go     model.Event → tagged JSON（事件无 json tag）
-                   static/     index.html + app.js + style.css（go:embed）
+                   static/     index.html + app.js + style.css（go:embed，
+                               托管在 /log）
+clients/chat/      独立构建的 assistant-ui 聊天客户端（React+Vite，
+                   dist 构建产物；不进 go:embed，自己的 npm 构建链；
+                   见 clients/chat/README.md）
 ```
 
 - **进程模式**：`sai -http 127.0.0.1:7420` 启动 web server，同时保留
@@ -255,6 +260,15 @@ tag（内部类型不加），`wire.go` 做判别编码：
 【已取代】路由已加会话前缀（`/api/s/<id>/...`）并新增
 `GET /api/projects`，见 `docs/multi-session.md` §4；下表保留作
 第一阶段的历史记录。
+
+**顶层路由（现行）**：`/` 302 → `/chat`；`/chat` 聊天客户端
+（`-http-static <dir>` 托管 clients/chat 构建产物；未挂载时是
+指引页）；`/log` 零依赖 log 视图（go:embed）；未匹配的 `/api/...`
+一律 JSON 404（不给页面重定向）。**CORS**：对 loopback http 来源
+的 `/api/` 请求回预检应答与来源回声——聊天客户端开发流（Vite 在
+另一 loopback 端口）需要读响应与预检 JSON POST；这是有意的信任
+扩展而非削弱：serve 本就 loopback-only 无认证，本地进程本可直接
+调用；非 loopback 来源照旧被拒。
 
 | 路由 | 方法 | 作用 |
 |---|---|---|
