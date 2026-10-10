@@ -146,14 +146,22 @@ func (s *Store) Open(id string) (storage.Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The lock precedes recovery and the log open: both touch files a
+	// concurrent writer could be mid-switch on.
+	lock, err := lockSession(dir)
+	if err != nil {
+		return nil, err
+	}
 	if err := recoverSegments(dir); err != nil {
+		lock.Release()
 		return nil, err
 	}
 	log, err := OpenLog(filepath.Join(dir, logFileName))
 	if err != nil {
+		lock.Release()
 		return nil, err
 	}
-	return &Session{id: id, project: filepath.Base(filepath.Dir(dir)), store: s, log: log}, nil
+	return &Session{id: id, project: filepath.Base(filepath.Dir(dir)), store: s, log: log, lock: lock}, nil
 }
 
 // recoverSegments completes or discards an interrupted compaction switch.
@@ -283,6 +291,7 @@ type Session struct {
 	project string
 	store   *Store
 	log     *Log
+	lock    *fileLock
 
 	mu sync.Mutex
 }
@@ -306,11 +315,20 @@ func (s *Session) Append(record storage.Record) (storage.Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.log == nil {
-		log, err := OpenLog(filepath.Join(s.store.root, s.project, s.id, logFileName))
+		// First append materializes the session: take the session lock
+		// before creating anything on disk.
+		dir := filepath.Join(s.store.root, s.project, s.id)
+		lock, err := lockSession(dir)
 		if err != nil {
 			return storage.Record{}, err
 		}
+		log, err := OpenLog(filepath.Join(dir, logFileName))
+		if err != nil {
+			lock.Release()
+			return storage.Record{}, err
+		}
 		s.log = log
+		s.lock = lock
 	}
 	if record.Type == storage.TypeContextCompacted {
 		return s.appendCompactionLocked(record)
@@ -429,15 +447,20 @@ func (s *Session) Records() ([]storage.Record, error) {
 	return s.log.Records()
 }
 
-// Close closes the underlying log. A session which never materialized has
-// nothing on disk and nothing to close. The session must not be appended
-// to after.
+// Close closes the underlying log and releases the session lock. A
+// session which never materialized has nothing on disk and nothing to
+// close. The session must not be appended to after.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	log := s.log
+	lock := s.lock
+	s.log = nil
+	s.lock = nil
 	s.mu.Unlock()
-	if log == nil {
-		return nil
+	var err error
+	if log != nil {
+		err = log.Close()
 	}
-	return log.Close()
+	lock.Release()
+	return err
 }

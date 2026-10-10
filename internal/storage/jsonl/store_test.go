@@ -272,6 +272,9 @@ func TestCompactionSwitchesSegments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	// The session holds a range-locked lock file: without Close, Windows
+	// cannot even delete the temp dir.
+	defer func() { _ = session.Close() }()
 	appendRecord(t, session, storage.Record{ItemID: "h1", Type: storage.TypeSessionCreated, Provider: "p", CWD: "/w"})
 	appendRecord(t, session, storage.Record{ItemID: "u1", Type: storage.TypeUserInput, Content: "old turn"})
 	appendRecord(t, session, storage.Record{ItemID: "a1", Type: storage.TypeAssistantMessage, Content: "old answer"})
@@ -287,8 +290,9 @@ func TestCompactionSwitchesSegments(t *testing.T) {
 	for _, entry := range entries {
 		names = append(names, entry.Name())
 	}
-	if len(names) != 2 || !contains(names, logFileName) || !contains(names, "log-0000.jsonl") {
-		t.Fatalf("segment files = %v, want log.jsonl + log-0000.jsonl", names)
+	if len(names) != 4 || !contains(names, logFileName) || !contains(names, "log-0000.jsonl") ||
+		!contains(names, "lock") || !contains(names, "holder") {
+		t.Fatalf("segment files = %v, want log.jsonl + log-0000.jsonl (+ lock/holder)", names)
 	}
 
 	// The active segment is self-contained: header copy + compaction +
@@ -327,8 +331,8 @@ func TestCompactionSwitchesSegments(t *testing.T) {
 	appendRecord(t, session, storage.Record{ItemID: "a2", Type: storage.TypeAssistantMessage, Content: "post answer"})
 	appendRecord(t, session, storage.Record{ItemID: "x2", Type: storage.TypeContextCompacted, Content: "summary two"})
 	entries, _ = os.ReadDir(dir)
-	if len(entries) != 3 {
-		t.Fatalf("segment files after second switch = %d, want 3", len(entries))
+	if len(entries) != 5 { // two archives + active + lock + holder
+		t.Fatalf("segment files after second switch = %d, want 5", len(entries))
 	}
 	records, err = session.Records()
 	if err != nil {
