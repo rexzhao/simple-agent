@@ -5,21 +5,18 @@
 "use strict";
 
 import { chainGenesis, chainStep } from "./chain.mjs";
+import { initialState, applySnapshot, applyRecord, applyStatus, applyHistory } from "./reducer.mjs";
 
 // ---------- state ----------
 
-const state = {
-  session: "",
-  head: "",           // digest after all folded records
-  prefixAnchor: "",   // digest BEFORE the first held record (history cursor)
-  records: [],        // the page's record store
+// The chain/anchor/record store lives in the reducer (shared with the
+// fixture test); the page adds the DOM map and the connection bits.
+const state = Object.assign(initialState(), {
   byItem: new Map(),  // itemID -> row element (committed + in-flight)
-  more: false,
-  running: false,
-  streaming: null,    // {item} of the in-flight assistant message
   es: null,
   reconnectFrom: "",
-};
+  streaming: null,    // {item} of the in-flight assistant message
+});
 
 const rowsEl = document.getElementById("rows");
 const logEl = document.getElementById("log");
@@ -105,15 +102,6 @@ function appendRecord(r) {
 
 // ---------- chain + self-check ----------
 
-async function handleRecords(records) {
-  for (const r of records) {
-    state.records.push(r);
-    state.head = await chainStep(state.head, r);
-    appendRecord(r);
-  }
-  scrollToBottom();
-}
-
 function setSync(ok, serverHead) {
   const el = document.getElementById("sync");
   el.classList.remove("sync-unknown", "synced", "drift");
@@ -153,28 +141,15 @@ function connect() {
 
 async function dispatch(frame) {
   switch (frame.kind) {
-    case "snapshot":
-      if (!frame.resumed) {
-        // Rule A: a miss is a clean rebuild, never a chain continuation.
-        // The rebuild folds from the server-attested ANCHOR — the digest
-        // before the first windowed record — not from genesis: with a
-        // truncated window (more=true) folding from genesis produces a
-        // head that never matches the server. A running hash converges
-        // to the same head from any correct starting anchor.
-        state.records = [];
+    case "snapshot": {
+      const fx = await applySnapshot(state, frame);
+      if (fx.reset) {
         state.byItem = new Map();
         rowsEl.replaceChildren();
-        state.head = frame.anchor;
       }
+      for (const r of fx.appended) appendRecord(r);
+      scrollToBottom();
       state.reconnectFrom = "";
-      await handleRecords(frame.records || []);
-      // The prefix anchor is the digest BEFORE the first held record —
-      // the cursor for scroll-back. Only a (re)issued window updates
-      // it: on a resume the server's anchor is our own head (the end
-      // of what we hold), not the beginning — adopting it would make
-      // the next scroll-back re-fetch and duplicate the newest window.
-      if (!frame.resumed) state.prefixAnchor = frame.anchor;
-      state.more = !!frame.more;
       document.getElementById("load-more").hidden = !state.more;
       state.running = !!frame.running;
       if (frame.streaming) beginStreamingItem(frame.streaming.item, frame.streaming);
@@ -182,14 +157,17 @@ async function dispatch(frame) {
       updateStatus();
       if (frame.d) setSync(state.head === frame.d, frame.d);
       break;
+    }
     case "record":
-      await handleRecords([frame.r]);
+      await applyRecord(state, frame.r);
+      appendRecord(frame.r);
+      scrollToBottom();
       break;
     case "event":
       handleEvent(frame);
       break;
     case "status":
-      state.running = !!frame.running;
+      applyStatus(state, frame);
       updateStatus();
       if (frame.notice) showNotice(frame.notice);
       if (frame.d) setSync(state.head === frame.d, frame.d);
@@ -309,14 +287,11 @@ async function loadHistory() {
     return;
   }
   const data = await res.json();
-  // Backward verification: fold(anchor, records) must equal the prefix
-  // anchor of our first held record — both ends known, stronger than
-  // forward.
-  let h = data.anchor;
-  for (const r of data.records) {
-    h = await chainStep(h, r);
-  }
-  if (h !== state.prefixAnchor) {
+  // Backward verification and the store/cursor update live in the
+  // reducer (shared with the fixture test); the head never changes —
+  // history extension cannot alter a running hash's tail.
+  const outcome = await applyHistory(state, data);
+  if (outcome !== "ok") {
     setSync(false, "");
     state.more = false;
     document.getElementById("load-more").hidden = true;
@@ -325,15 +300,12 @@ async function loadHistory() {
   // Prepend in order, keeping scroll anchored.
   const prevHeight = logEl.scrollHeight;
   for (const r of data.records) {
-    state.records.unshift(r);
     const row = rowFor(r, false);
     row._body.appendChild(recordBody(r));
     if (rowsEl.firstChild) rowsEl.insertBefore(row, rowsEl.firstChild);
     else rowsEl.appendChild(row);
     state.byItem.set(r.item, row);
   }
-  state.prefixAnchor = data.anchor;
-  state.more = !!data.more;
   document.getElementById("load-more").hidden = !state.more;
   logEl.scrollTop += logEl.scrollHeight - prevHeight;
 }
