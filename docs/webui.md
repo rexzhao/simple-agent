@@ -115,8 +115,9 @@ internal/web       server.go   HTTP mux + 生命周期 + 关停（Stop+Close，
   进程同样会损坏）
 - **零依赖**：SSE 是纯 HTTP；无 WebSocket 库、无前端框架、无构建
   步骤。静态资源 go:embed 进二进制。
-- **单会话**：一个 server 进程一个会话（与 CLI 同构）。会话切换/
-  列表是后续阶段。
+- **单会话**：一个 server 进程一个会话（与 CLI 同构）。
+  【已取代】多项目/多会话、路由前缀与装配见 `docs/multi-session.md`，
+  以该文为准；本文的快照协议/摘要链/hub 语义仍然有效。
 
 ## 4. 一致性协议（核心）
 
@@ -250,6 +251,10 @@ tag（内部类型不加），`wire.go` 做判别编码：
 不靠错误字符串匹配。
 
 ## 6. API
+
+【已取代】路由已加会话前缀（`/api/s/<id>/...`）并新增
+`GET /api/projects`，见 `docs/multi-session.md` §4；下表保留作
+第一阶段的历史记录。
 
 | 路由 | 方法 | 作用 |
 |---|---|---|
