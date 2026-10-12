@@ -62,7 +62,14 @@ type client struct {
 	done chan struct{}
 }
 
-// NewHub starts the hub for the session.
+// NewHub starts the hub for the session. The record mirror is seeded
+// SYNCHRONOUSLY, before any client can register: the seeding used to
+// live inside the run goroutine, and a client registering in that
+// window received a snapshot with records:[] — the historical records
+// then landed in the mirror without ever being re-sent (records only
+// fan out on arrival), so the client rendered an empty thread until a
+// reconnect. Records arriving between Subscribe and the goroutine's
+// first consume are buffered by the subscription — nothing is lost.
 func NewHub(session *agent.Session) *Hub {
 	h := &Hub{
 		session: session,
@@ -72,7 +79,13 @@ func NewHub(session *agent.Session) *Hub {
 		clients: make(map[*client]struct{}),
 		genesis: chainGenesis(session.ID()),
 	}
-	go h.run()
+	sub := session.Subscribe()
+	h.mu.Lock()
+	for _, r := range sub.Initial() {
+		h.extendLocked(r)
+	}
+	h.mu.Unlock()
+	go h.run(sub)
 	return h
 }
 
@@ -104,20 +117,14 @@ func (h *Hub) Notice(text string) {
 	h.mu.Unlock()
 }
 
-func (h *Hub) run() {
+func (h *Hub) run(sub *agent.Subscription) {
 	// h.done is closed by Stop only — a return here (session closed)
 	// must not race a second close.
-	sub := h.session.Subscribe()
+	//
+	// The subscription was created (and the mirror seeded) in NewHub.
 	// Whatever ends the loop, the subscription is released: a dead
 	// subscriber blocks the committer once its buffer fills.
 	defer sub.Stop()
-	// Seed the mirror and the chain from the atomic snapshot: no record
-	// can be missed or duplicated between Initial and the channel.
-	h.mu.Lock()
-	for _, r := range sub.Initial() {
-		h.extendLocked(r)
-	}
-	h.mu.Unlock()
 
 	for {
 		select {
