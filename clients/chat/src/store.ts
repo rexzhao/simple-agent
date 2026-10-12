@@ -49,11 +49,28 @@ const initialSnap: Snap = {
   notice: "",
 };
 
+export type EventSourceLike = {
+  onmessage: ((ev: { data: string }) => void) | null;
+  onerror: (() => void) | null;
+  close(): void;
+};
+
 export class SessionStore {
   snap: Snap = initialSnap;
   private listeners = new Set<() => void>();
-  private es: EventSource | null = null;
+  private es: EventSourceLike | null = null;
   private closed = false;
+  // Bumped on detach: an open() awaiting its genesis must not connect
+  // a store the view has already left.
+  private epoch = 0;
+  // Serialized frame processing (see connect).
+  private frameQueue: Promise<void> = Promise.resolve();
+  private esFactory: (url: string) => EventSourceLike;
+
+  constructor(esFactory?: (url: string) => EventSourceLike) {
+    this.esFactory =
+      esFactory ?? ((url: string) => new EventSource(url) as unknown as EventSourceLike);
+  }
 
   subscribe = (cb: () => void) => {
     this.listeners.add(cb);
@@ -71,8 +88,13 @@ export class SessionStore {
   // a full snapshot; a cached one resumes from its held head.
   async open(id: string) {
     if (!id || this.closed || (this.snap.session === id && this.es)) return;
+    const epoch = this.epoch;
     if (this.snap.session !== id) {
       const genesis = await chainGenesis(id);
+      // Detached while awaiting (the view switched away): connecting
+      // now would open a stream for a session nobody is looking at —
+      // and the stream HOLDS server-side refs.
+      if (this.epoch !== epoch || this.closed) return;
       this.snap = { ...initialSnap, session: id, head: genesis, prefixAnchor: genesis };
     }
     this.connect();
@@ -82,8 +104,14 @@ export class SessionStore {
     if (!this.snap.session) return;
     const from = this.snap.head && this.snap.records.length ? this.snap.head : "";
     const url = `/api/s/${this.snap.session}/stream` + (from ? `?from=${encodeURIComponent(from)}` : "");
-    const es = new EventSource(url);
+    const es = this.esFactory(url);
     this.es = es;
+    // Frames are SERIALIZED through a promise queue: apply awaits the
+    // digest fold (async crypto), and two frames arriving in one tick
+    // would otherwise read the same stale snapshot — the later commit
+    // silently dropping the earlier record and skewing the chain. The
+    // log page serializes the same way (its enqueue); status frames
+    // queuing behind record frames also fixes premature drift reports.
     es.onmessage = (ev) => {
       let frame: Frame;
       try {
@@ -91,7 +119,9 @@ export class SessionStore {
       } catch {
         return;
       }
-      void this.apply(frame);
+      this.frameQueue = this.frameQueue.then(() => this.apply(frame)).catch(() => {
+        /* a bad frame must not kill the chain */
+      });
     };
     es.onerror = () => {
       // EventSource auto-reconnects; the reconnect replays from our
@@ -104,6 +134,7 @@ export class SessionStore {
   // resumes from the head. The server releases its refs when the
   // connection drops (the lazy-open/evict cycle).
   detach() {
+    this.epoch++;
     this.es?.close();
     this.es = null;
     this.commit({ connected: false });

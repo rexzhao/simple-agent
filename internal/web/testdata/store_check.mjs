@@ -12,7 +12,7 @@
 // reducer_check.mjs against a live serve.
 import { initialState, initChain, applySnapshot, applyRecord } from "../static/reducer.mjs";
 import { SessionStore } from "../../../clients/chat/src/store.ts";
-import { chainStep } from "../static/chain.mjs";
+import { chainGenesis, chainStep } from "../static/chain.mjs";
 
 const failures = [];
 function assert(cond, what) {
@@ -59,13 +59,17 @@ function agree(step) {
 
 // ---- 1. window snapshot: clean rebuild from the server anchor ----
 const w = [rec("user.input", { content: "m1" }), rec("assistant.message", { content: "a1" }), rec("user.input", { content: "m2" })];
-const anchor0 = await fold(red.head, w);
+// Wire semantics: the snapshot anchor is the digest BEFORE the first
+// delivered record (for a full window over a fresh state, genesis);
+// d carries the digest AFTER them.
+const windowDigest = await fold(red.head, w);
 {
-  const frame = { kind: "snapshot", anchor: anchor0, resumed: false, more: true, records: w, running: true, d: anchor0 };
+  const frame = { kind: "snapshot", anchor: red.head, resumed: false, more: true, records: w, running: true, d: windowDigest };
   await applySnapshot(red, frame);
   await apply(frame);
   agree("s1 window");
   assert(store.snap.running === true, "s1 running");
+  assert(store.snap.verified === true, "s1 verified against the after-digest");
 }
 
 // ---- 2. a committed record appends on both ----
@@ -141,7 +145,7 @@ const r4 = rec("assistant.message", { content: "a2" });
 // The client holds [w, r4, r5, r6]; the reconnect URL froze at the
 // digest after r5. The replayed suffix (r6, r7) overlaps r6.
 {
-  const staleAnchor = store.snap.records.length ? await fold(anchor0, store.snap.records.slice(0, -1)) : anchor0;
+  const staleAnchor = store.snap.records.length ? await fold(store.snap.prefixAnchor, store.snap.records.slice(0, -1)) : store.snap.prefixAnchor;
   const suffix = store.snap.records.slice(-1); // r6 replayed
   const r7 = rec("user.input", { content: "m4" });
   const full = [...suffix, r7];
@@ -183,9 +187,61 @@ const r4 = rec("assistant.message", { content: "a2" });
   assert(store.snap.prefixAnchor === "deadbeef", "s9 cursor moved to anchor");
 }
 
+// ---- 10. the burst: frames fired SYNCHRONOUSLY through onmessage ----
+// apply awaits the digest fold (async crypto); without serialization,
+// same-tick frames read the same stale snapshot and the later commit
+// silently drops the earlier record (and a status frame can report
+// drift on a chain still being folded). The store must serialize.
+{
+  const created = [];
+  class FakeES {
+    constructor() {
+      this.onmessage = null;
+      this.onerror = null;
+    }
+    close() {}
+  }
+  const burstStore = new SessionStore(url => {
+    const es = new FakeES();
+    created.push(es);
+    return es;
+  });
+  await burstStore.open("burst-session");
+  assert(created.length === 1, "s10 es created");
+
+  const w = [rec("user.input", { content: "b1" }), rec("assistant.message", { content: "b2" }), rec("user.input", { content: "b3" })];
+  const genesisB = await chainGenesis("burst-session");
+  let h = genesisB;
+  for (const r of w) h = await chainStep(h, r);
+  const anchorB = genesisB; // wire: anchor = digest BEFORE the window
+  const r4 = rec("assistant.message", { content: "b4" });
+  const r5 = rec("user.input", { content: "b5" });
+  const h4 = await chainStep(h, r4);
+  const h5 = await chainStep(h4, r5);
+
+  // ONE synchronous burst: snapshot + two records + a status frame
+  // carrying the FINAL digest. No awaits between deliveries.
+  const send = f => created[0].onmessage({ data: JSON.stringify(f) });
+  send({ kind: "snapshot", anchor: anchorB, resumed: false, more: false, records: w, running: false, d: h });
+  send({ kind: "record", r: r4 });
+  send({ kind: "record", r: r5 });
+  send({ kind: "status", running: false, d: h5 });
+
+  // Drain the queue (deterministically: wait for the record count).
+  for (let i = 0; i < 200 && burstStore.snap.records.length < 5; i++) {
+    await new Promise(r => setTimeout(r, 5));
+  }
+  const bs = burstStore.snap;
+  assert(bs.records.length === 5, "s10 no records lost in the burst: " + bs.records.length);
+  assert(bs.head === h5, "s10 head converged");
+  assert(bs.verified === true, "s10 status frame did not report drift (serialized behind the records)");
+  const idsB = bs.records.map(r => r.item);
+  assert(new Set(idsB).size === 5, "s10 no duplicates");
+}
+
 if (failures.length) {
   console.error("store_check: FAILED");
   for (const f of failures) console.error("  - " + f);
   process.exit(1);
 }
-console.log("store_check: OK (9 scenarios, mirror consistent)");
+console.log("store_check: OK (10 scenarios, mirror consistent + serialized burst)");
