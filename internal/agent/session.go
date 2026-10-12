@@ -261,26 +261,28 @@ func (s *Session) Steer(text string) (string, error) {
 		return "", fmt.Errorf("input is empty")
 	}
 	s.mu.Lock()
-	if !s.running {
-		s.mu.Unlock()
+	// defer: a panic past this point (a send on a channel the lock
+	// reasoning wrongly assumed open) must not wedge the session —
+	// one recovered panic with the lock held hangs every later caller.
+	defer s.mu.Unlock()
+	// A steer needs a run that will consume the queue. The signal is
+	// the OPEN events channel, not running alone: a manual Compact holds
+	// the slot with running=true and NO channel (nothing drains the
+	// queue until the next Send), and the channel-invariant established
+	// under this lock (non-nil ⟺ open) makes the send below safe.
+	if !s.running || s.events == nil {
 		return "", ErrNoRun
 	}
 	itemID := storage.NewUserInputID()
 	s.state.Steered = append(s.state.Steered, storage.SteeredItem{ItemID: itemID, Text: text})
-	// The send stays INSIDE the critical section: run's defer order is
-	// settle → close(events), and settle needs this lock — observing
-	// running==true while holding it implies close(events) has not run.
-	// (A select with default does NOT protect a send on a closed channel:
-	// the send panics before default is consulted; the lock is the only
-	// guard.) The send itself is non-blocking — best-effort, like every
-	// transient event; the queue itself is in Snapshot.
-	if s.events != nil {
-		select {
-		case s.events <- model.SteerQueuedEvent{ItemID: itemID, Text: text}:
-		default:
-		}
+	// Best-effort, like every transient event; the queue itself is in
+	// Snapshot. (A select with default does NOT protect a send on a
+	// closed channel — the send panics before default is consulted; the
+	// invariant above is the only guard.)
+	select {
+	case s.events <- model.SteerQueuedEvent{ItemID: itemID, Text: text}:
+	default:
 	}
-	s.mu.Unlock()
 	return itemID, nil
 }
 
@@ -602,6 +604,14 @@ func (s *Session) Compact() error {
 	s.running = true
 	s.cancel = cancel
 	s.done = done
+	// A manual compaction runs WITHOUT an events channel. The reference
+	// MUST be dropped here: running=true with the previous run's CLOSED
+	// channel still attached is exactly the Steer panic shape (the send
+	// on a closed channel, with s.mu held — one recovered panic and the
+	// whole session is wedged). settle deliberately does NOT nil it
+	// (post-settle consumers drain buffered events off the last
+	// channel); Send re-points it at a fresh open channel with the slot.
+	s.events = nil
 	s.mu.Unlock()
 
 	defer close(done)
