@@ -67,7 +67,18 @@ truth), anchored queue moves are no-ops (the server queue is FIFO by
 mint time), message edit/branch/regenerate are not wired (the wire
 protocol has no branching), and there is no session-delete affordance
 in the chat client (the `/log` view has it; the runtime's onDelete is
-unreachable until a thread list is rendered).
+unreachable until a thread list is rendered — and once deletion lands
+here, a deep link to a deleted session becomes a common path: copy
+the log view's three-line unknown-id handling, hint + hash clear,
+instead of the current silent empty view).
+
+Also known: a deep link to an UNKNOWN session id (or one this serve
+cannot open) selects it, fails to connect, and stays an empty view
+with a disabled composer — no explanation, no bounce to the list.
+And `execute_provider_tool` calls that land in the page provider's
+session-switch/reconnect window answer "provider connection closed"
+(the page cannot answer after its socket closes; the broker could
+queue or retry across provider reconnects).
 
 ## Sizes
 
