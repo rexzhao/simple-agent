@@ -147,6 +147,38 @@ assert(!!notReady.error && /not ready/.test(notReady.error.message), "s7 not rea
 const gm = await ws2.request("provider/getManifest", {});
 assert(gm.result.manifest_version === 1, "s8 getManifest");
 
+// ---- 9. the private-network gate: prefix-regex bypasses must not pass ----
+const { allowedBrokerHost } = await import("../../../clients/chat/src/pageProvider.ts");
+const gate = [
+  ["ws://10.0.0.5:8637/hub/provider", true],
+  ["ws://127.0.0.1:8637/hub/provider", true],
+  ["ws://localhost:8637/hub/provider", true],
+  ["ws://192.168.1.4:8637/hub/provider", true],
+  ["ws://172.20.1.1:8637/hub/provider", true],
+  // Public domains that merely START with the private prefixes.
+  ["ws://10.evil.com:8637/hub", false],
+  ["ws://127.evil.com:8637/hub", false],
+  ["ws://192.168.evil.com:8637/hub", false],
+  ["ws://10.0.0.1.attacker.tld/x", false],
+  // Out-of-range / public / wrong scheme.
+  ["ws://172.32.0.9:8637/x", false],
+  ["ws://8.8.8.8:8637/x", false],
+  ["http://10.0.0.5:8637/hub", false],
+  ["not a url", false],
+  // The WHATWG parser normalizes decimal host forms to dotted quad —
+  // 2130706433 IS 127.0.0.1, so it is correctly allowed.
+  ["ws://2130706433:8637/x", true],
+  // IPv4-mapped IPv6 and unique-local IPv6.
+  ["ws://[::ffff:127.0.0.1]:8637/x", true],
+  ["ws://[::ffff:8.8.8.8]:8637/x", false],
+  ["ws://[fc00::5]:8637/x", true],
+  ["ws://[fe80::5]:8637/x", false],
+];
+for (const [url, want] of gate) {
+  const got = allowedBrokerHost(url);
+  assert(got === want, `s9 gate ${url}: got ${got}, want ${want}`);
+}
+
 if (failures.length) {
   console.error("page_provider_check: FAILED");
   for (const f of failures) console.error("  - " + f);

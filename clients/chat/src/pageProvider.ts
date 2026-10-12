@@ -306,6 +306,10 @@ const STORAGE_KEY = "sai.pageProvider";
 // debug surface is for the LAN broker that fronts the agent's
 // providers; an arbitrary internet wss endpoint must be a deliberate,
 // code-edited decision, not a URL away.
+// The IPv4 checks are STRICT dotted quads: prefix regexes wave through
+// public domains like 10.evil.com or 192.168.attacker.tld. The
+// WHATWG parser normalizes decimal/octal/hex host forms to dotted
+// quad, so the strict shape is not bypassable by those spellings.
 export function allowedBrokerHost(url: string): boolean {
   let parsed: URL;
   try {
@@ -316,16 +320,29 @@ export function allowedBrokerHost(url: string): boolean {
   if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return false;
   const host = parsed.hostname.replace(/^\[|\]$/g, "");
   if (host === "localhost" || host === "::1") return true;
-  if (/^127\./.test(host)) return true;
-  if (/^10\./.test(host)) return true;
-  if (/^192\.168\./.test(host)) return true;
-  const m172 = /^172\.(\d+)\./.exec(host);
-  if (m172) {
-    const n = Number(m172[1]);
-    if (n >= 16 && n <= 31) return true;
+  // IPv4-mapped IPv6: the WHATWG parser canonicalizes
+  // ::ffff:127.0.0.1 to hex (::ffff:7f00:1) — accept both spellings
+  // and judge the embedded v4.
+  const mappedDotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(host);
+  if (mappedDotted) return isPrivateIPv4(mappedDotted[1]);
+  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(host);
+  if (mappedHex) {
+    const hi = parseInt(mappedHex[1], 16);
+    const lo = parseInt(mappedHex[2], 16);
+    return isPrivateIPv4(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
   }
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return isPrivateIPv4(host);
   // IPv6 unique-local (fc00::/7).
-  if (/^f[cd]/i.test(host)) return true;
+  if (/^f[cd][0-9a-f:]*$/i.test(host)) return true;
+  return false;
+}
+
+function isPrivateIPv4(host: string): boolean {
+  const parts = host.split(".").map(Number);
+  if (parts.some(p => p > 255)) return false;
+  if (parts[0] === 127 || parts[0] === 10) return true;
+  if (parts[0] === 192 && parts[1] === 168) return true;
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
   return false;
 }
 

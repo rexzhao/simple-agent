@@ -104,3 +104,19 @@ description states it is dispatched, not confirmed.
 
 Other console tools: `sai.list()`, `sai.snap()`, `sai.messages()`,
 `sai.select(id)` — live state inspection from DevTools.
+
+## The blank-view evidence chain
+
+The "select a session, blank content" investigation ended with four
+independently verified layers, each with its own fixture:
+
+| Layer | Check | What it pins |
+|---|---|---|
+| server snapshot | TestFirstStreamSeesHistory | the first-ever /stream carries the history (the hub seeding race) |
+| store state machine | store_check.mjs (TestChatStoreMirror) | mirror consistency with the log page's reducer, 9 scenarios |
+| conversion | convert_check.mjs (TestConvertFixture) | every shape through the REAL runtime validator |
+| render | render_check.mjs (TestRenderFixture) | the SSR probe: real records -> real Thread HTML, and the ADAPTER SHAPE (`useExternalStoreRuntime(adapter)`, not `{adapter}` — written wrong twice) |
+
+Note: `dist/` is manually built and gitignored — after pulling server
+or client changes, `npm run build` before (re)starting serve, or the
+page may be an older bundle than the binary expects.

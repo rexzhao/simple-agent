@@ -83,6 +83,7 @@ export default function App() {
   const [providerActive, setProviderActive] = useState(false);
   const [providerHost, setProviderHost] = useState("");
   const [pendingBroker, setPendingBroker] = useState<string | null>(null);
+  const [refusedBroker, setRefusedBroker] = useState<string | null>(null);
 
   const startProvider = (url: string, persist: boolean, send: boolean) => {
     provider.sendEnabled = send;
@@ -117,7 +118,13 @@ export default function App() {
     const stored = readStoredPageProviderConfig();
     if (stored && allowedBrokerHost(stored)) startProvider(stored, false, false);
     const pending = pendingPageProviderURL();
-    if (pending) setPendingBroker(allowedBrokerHost(pending) ? pending : null);
+    if (pending) {
+      // A refused target says so — silence here reads as "nothing
+      // happened", and the README's stance is that non-private targets
+      // are a deliberate, code-edited decision.
+      if (allowedBrokerHost(pending)) setPendingBroker(pending);
+      else setRefusedBroker(pending);
+    }
   });
   useEffect(() => {
     provider.setSession(sessionID);
@@ -296,6 +303,17 @@ export default function App() {
             </div>
           </nav>
           <div className="relative flex min-w-0 flex-1 flex-col">
+            {refusedBroker && (
+              <div className="bg-destructive/20 border-border flex min-h-7 items-baseline gap-3 border-b px-4 py-1 text-xs">
+                <span>page-provider target refused (loopback/private-network ws only): {refusedBroker}</span>
+                <button
+                  className="text-muted-foreground cursor-pointer border-none bg-transparent underline"
+                  onClick={() => setRefusedBroker(null)}
+                >
+                  dismiss
+                </button>
+              </div>
+            )}
             {pendingBroker && (
               // A ?page-provider= link asks; it never connects by
               // itself. Confirming is session-only (no persistence);

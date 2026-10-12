@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -182,5 +183,59 @@ func TestConvertFixture(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "convert_check: OK") {
 		t.Fatalf("convert_check.mjs: unexpected output\n%s", out)
+	}
+}
+
+// TestRenderFixture pins the chat render layer, browser-free: it
+// builds the SSR probe (vite --ssr, the entry lives in the client as
+// src/render-check-entry.tsx) and renders the REAL Thread against a
+// live in-process session. The adapter SHAPE is the load-bearing
+// assertion — useExternalStoreRuntime(adapter) wrapped as {adapter}
+// has been written twice by mistake, and only this layer catches it.
+// Skips without node or without clients/chat/node_modules.
+func TestRenderFixture(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; the render check needs node >= 23.6")
+	}
+	chatDir, err := filepath.Abs(filepath.Join("..", "..", "clients", "chat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(chatDir, "node_modules")); err != nil {
+		t.Skip("clients/chat node_modules absent; run npm install there")
+	}
+	// Enough turns for a real conversation with distinct texts.
+	turns := make([][]model.Event, 3)
+	for i := range turns {
+		turns[i] = []model.Event{model.TextDeltaEvent{Text: "render probe answer " + strconv.Itoa(i)}}
+	}
+	session, _, base := newTestServer(t, turns)
+	for i := 0; i < 3; i++ {
+		if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "render probe question"}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+		waitSettled(t, session)
+	}
+	// Build the SSR bundle (node runs vite's bin directly).
+	viteBin := filepath.Join(chatDir, "node_modules", "vite", "bin", "vite.js")
+	build := exec.Command(node, viteBin, "build", "--ssr", "src/render-check-entry.tsx", "--outDir", ".render-dist")
+	build.Dir = chatDir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("vite build --ssr: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(filepath.Join(chatDir, ".render-dist"))
+	})
+	script, err := filepath.Abs(filepath.Join("testdata", "render_check.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, script, base.URL, session.ID(), "render probe answer 2").CombinedOutput()
+	if err != nil {
+		t.Fatalf("render_check.mjs: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "render_check: OK") {
+		t.Fatalf("render_check.mjs: unexpected output\n%s", out)
 	}
 }
