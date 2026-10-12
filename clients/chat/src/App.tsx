@@ -9,6 +9,8 @@ import { Thread } from "@/components/thread.aui";
 import { getProjects } from "./api";
 import { useSaiAdapter } from "./runtime";
 import { SessionStore } from "./store";
+import { convertLive, convertRecords } from "./convert";
+import { PageProvider, clearPageProviderConfig, readPageProviderConfig } from "./pageProvider";
 import type { ProjectsResponse } from "./types";
 
 // ---- projects sidebar (own poll, like the log page) ----
@@ -35,12 +37,49 @@ function useProjects(): ProjectsResponse | null {
   return projects;
 }
 
+// composerSend drives the REAL input path: the native value setter
+// (React 19 controlled components ignore plain .value writes), the
+// input event, then the send button — not the API. The point of the
+// debug tool is operating the page as the human does.
+function composerSend(text: string): { ok: boolean; error?: string } {
+  const ta = document.querySelector<HTMLTextAreaElement>(".aui-composer-input");
+  if (!ta) return { ok: false, error: "composer input not found" };
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  if (!setter) return { ok: false, error: "no value setter" };
+  setter.call(ta, text);
+  ta.dispatchEvent(new Event("input", { bubbles: true }));
+  const btn = document.querySelector<HTMLElement>(".aui-composer-send");
+  if (!btn) return { ok: false, error: "send button not found" };
+  btn.click();
+  return { ok: true };
+}
+
 // ---- app ----
 
 export default function App() {
   const projects = useProjects();
   const [sessionID, setSessionID] = useState("");
   const stores = useMemo(() => new Map<string, SessionStore>(), []);
+  const provider = useMemo(() => new PageProvider(), []);
+
+  // The page-as-provider debug surface: enabled by ?page-provider=<ws-url>
+  // (persisted) or window.sai.pageProvider(url); inert otherwise. The
+  // commands are refreshed every render so the provider always reads
+  // live state; setSession re-registers under sai-chat-<session>.
+  const providerConfigured = useMemo(() => {
+    const url = readPageProviderConfig();
+    if (url) provider.start(url);
+    return !!url;
+  }, [provider]);
+  useEffect(() => {
+    provider.setSession(sessionID);
+  }, [sessionID, provider]);
+  useEffect(
+    () => () => {
+      provider.stop();
+    },
+    [provider],
+  );
 
   // Detach every store we are not looking at (each live SSE stream
   // holds server-side refs); attach the current one.
@@ -103,6 +142,67 @@ export default function App() {
 
   const verified = snap ? snap.verified : null;
   const notice = snap ? snap.notice : "";
+
+  // The provider's command bus + the console API (window.sai) read the
+  // same live state. Both are assigned every render: fresh closures,
+  // no staleness. Read-only state plus the two intentional actions
+  // (select/send) — the tool is loopback-local either way.
+  provider.commands = {
+    state: () => ({
+      url: location.href,
+      session: sessionID,
+      connected: !!snap?.connected,
+      running: !!snap?.running,
+      compacting: !!snap?.compacting,
+      records: snap?.records.length ?? 0,
+      more: !!snap?.more,
+      verified: snap?.verified ?? null,
+      queue: snap?.steered ?? [],
+    }),
+    sessions: () => sessions,
+    selectSession: id => setSessionID(id),
+    readConversation: () => {
+      const msgs = convertRecords(snap?.records ?? []);
+      const live = convertLive(snap?.live ?? null);
+      if (live) msgs.push(live);
+      return msgs;
+    },
+    send: composerSend,
+    text: () => document.body.innerText,
+  };
+  const saiConsole = {
+    list: () => [...stores.entries()].map(([id, s]) => ({
+      id,
+      connected: s.snap.connected,
+      records: s.snap.records.length,
+      running: s.snap.running,
+      verified: s.snap.verified,
+      head: s.snap.head.slice(0, 12),
+    })),
+    snap: (id?: string) => stores.get(id ?? sessionID)?.getSnapshot() ?? null,
+    messages: (id?: string) => {
+      const s = stores.get(id ?? sessionID);
+      return s ? convertRecords(s.getSnapshot().records) : [];
+    },
+    select: (id: string) => setSessionID(id),
+    pageProvider: (url?: string) => {
+      const u = url || "ws://10.10.6.68:8637/hub/provider";
+      provider.start(u);
+      try {
+        localStorage.setItem("sai.pageProvider", u);
+      } catch {
+        /* private mode */
+      }
+      return "page provider: " + u;
+    },
+    pageProviderOff: () => {
+      provider.stop();
+      clearPageProviderConfig();
+      return "page provider: off";
+    },
+    pageProviderStatus: () => ({ configured: providerConfigured, session: sessionID }),
+  };
+  (window as unknown as Record<string, unknown>).sai = saiConsole;
 
   return (
     <TooltipProvider>

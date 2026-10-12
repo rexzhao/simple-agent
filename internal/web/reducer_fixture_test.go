@@ -2,6 +2,7 @@ package web
 
 import (
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -130,5 +131,56 @@ func TestChatStoreMirror(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "store_check: OK") {
 		t.Fatalf("store_check.mjs: unexpected output\n%s", out)
+	}
+}
+
+// TestPageProviderFixture runs the page-as-provider protocol check
+// (registration, session-keyed re-registration, tool/describe and
+// tool/call dispatch over a fake WebSocket). Live mode against a real
+// broker is opt-in via SAI_LIVE_BROKER. Skips without node.
+func TestPageProviderFixture(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; the page provider check needs node >= 23.6")
+	}
+	script, err := filepath.Abs(filepath.Join("testdata", "page_provider_check.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(node, script)
+	if v := os.Getenv("SAI_LIVE_BROKER"); v != "" {
+		cmd.Env = append(os.Environ(), "SAI_LIVE_BROKER="+v)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("page_provider_check.mjs: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "page_provider_check: OK") {
+		t.Fatalf("page_provider_check.mjs: unexpected output\n%s", out)
+	}
+}
+
+// TestConvertFixture runs the chat conversion through the REAL
+// assistant-ui validator (fromThreadMessageLike) — the coverage the
+// status-on-user crash proved missing. Skips without node or without
+// clients/chat/node_modules.
+func TestConvertFixture(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; the convert check needs node >= 23.6")
+	}
+	script, err := filepath.Abs(filepath.Join("testdata", "convert_check.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("convert_check.mjs: %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "SKIP") {
+		t.Skip("convert check skipped: clients/chat node_modules absent")
+	}
+	if !strings.Contains(string(out), "convert_check: OK") {
+		t.Fatalf("convert_check.mjs: unexpected output\n%s", out)
 	}
 }

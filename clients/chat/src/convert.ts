@@ -135,11 +135,12 @@ export function toThreadMessageLike(m: ChatMessage, _idx: number): ThreadMessage
       isError: p.isError,
     };
   });
-  return {
-    role: m.role,
-    content: parts,
-    id: m.id,
-    createdAt: m.createdAt,
-    status: m.role === "assistant" ? m.status : undefined,
-  };
+  // Split by role so the type system enforces what the runtime
+  // validates at runtime: a status on a user message is a compile
+  // error here, not an "status is only supported for assistant
+  // messages" crash in the browser.
+  if (m.role === "user") {
+    return { role: "user", content: parts, id: m.id, createdAt: m.createdAt };
+  }
+  return { role: "assistant", content: parts, id: m.id, createdAt: m.createdAt, status: m.status };
 }
