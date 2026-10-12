@@ -119,12 +119,30 @@ refs == 0 && hub.Subscribers() == 0 && !session.Running() && idle ≥ 30s
 
 ```
 web.Manager（取代 web.New(session)）
-├── registry    按需读 projects.json（损坏语义见 §1）
-├── agents      map[projectID]*agent.Agent   惰性，每项目一个
+├── registry    按需读 projects.json（损坏语义见 §1）；stat 门控缓存
+│               （mtime+size，独立互斥）——未变更只花一次 os.Stat
+├── agents      map[projectID]*agent.Agent   惰性，每项目一个（装配双重检查）
 ├── sessions    map[sessionID]*sessionEntry  惰性，含 hub 与 refs
-├── closing     map[string]struct{}          驱逐竞态的错误来源判别
+├── closing     map[string]struct{}          驱逐/删除竞态的错误来源判别
+├── opening     map[sessionID]chan struct{}  打开中占位：同 id 并发打开
+│               只做一次 IO，等待者挂在 channel 上（不占 m.mu）
 └── sweeper     10s 周期，执行 §2.2 的驱逐
 ```
+
+**注册表缓存语义**：启动时文件**缺失**或损坏 → fail-fast 退出（§1）；
+**运行中**损坏 → 保最后好表 + `registry_ok=false`；运行中**删除** → 读到
+空表（与启动语义不同：serve 已在运行，退出不是选项）。stat 门控
+（mtime+size）漏检的极限情形是"同尺寸两次写落在同一 mtime tick"——
+下一次写即自愈，满足"最迟下一次请求"。
+
+**锁域（v3.4 修订）**：`m.mu` 只保护内存状态（agents/sessions/closing/
+opening）。打开一个会话的全部磁盘 IO——注册表读取、agent 装配、
+`OpenSessionIn` 的段重放——都在锁外执行（openSlow）：一个会话的慢打开
+不再阻塞其他会话的请求。同一 id 的并发打开由 opening 占位去重：先到者
+做 IO，后到者在 channel 上等结果再走快路径；打开失败（锁冲突/404/损坏/
+装配失败）清除占位，下一次请求真实重试。**发布时复查 closing**：打开期
+间若删除已认领该 id，打开方丢弃刚打开的会话（close 掉）返回 503；
+DeleteSession 在认领后**等待在途打开排空**再动存储，删除永不与重放竞速。
 
 ### 3.1 agent-per-project
 

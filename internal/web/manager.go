@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -21,7 +22,11 @@ import (
 // the single-session binding — the routes resolve the session per request
 // (design: docs/multi-session.md §3).
 //
-// Locking: m.mu guards agents/sessions/closing and the registry cache.
+// Locking: m.mu guards agents/sessions/closing/opening — MEMORY state
+// only; all disk IO (registry read, agent assembly, session open)
+// happens outside it. The registry cache has its own mutex (a slow disk
+// read must not hold the sessions map); the opening set dedups
+// concurrent opens of one id (waiters block on a channel, not on m.mu).
 // The only other lock ever held under m.mu is a hub's (Subscribers) —
 // hub observers run OUTSIDE the hub lock and take m.mu, so the ordering
 // is strictly m.mu → hub.mu.
@@ -32,15 +37,32 @@ type Manager struct {
 	rootLock *jsonl.PathLock
 
 	mu       sync.Mutex
-	registry *projects.Registry // last good (runtime reload corruption never clears it)
-	regErr   error
 	agents   map[string]*agent.Agent // projectID → agent (never evicted; bounded by registrations)
 	sessions map[string]*sessionEntry
 	closing  map[string]struct{}
+	// opening holds one placeholder per id with an open in flight: the
+	// claimer does the IO lock-free; concurrent opens of the same id
+	// wait on its done channel and re-enter the fast path.
+	opening map[string]chan struct{}
+	// closed makes a post-Close open claim refuse instead of racing
+	// the shutdown's teardown.
+	closed bool
 
 	projectsMu     sync.Mutex
 	projectsCache  []byte    // marshaled /api/projects body
 	projectsCached time.Time // when it was built
+
+	// regMu guards the registry cache: stat-gated (mtime+size), so an
+	// unchanged projects.json costs one os.Stat, not a parse. Its own
+	// mutex — a slow read must not hold m.mu. regEntries IS the last
+	// good table (a failed runtime reload never clears it); the parsed
+	// Registry itself is not retained — nothing reads it.
+	regMu      sync.Mutex
+	regEntries []projects.Entry // cached Deduped(); SHARED — callers must not mutate
+	regErr     error
+	regModTime time.Time
+	regSize    int64
+	regLoaded  bool
 
 	sweeperStop chan struct{}
 	sweeperDone chan struct{}
@@ -97,23 +119,37 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 		}
 		return nil, err
 	}
-	registry, err := projects.Load(projects.FilePath(options.ServerRoot))
+	registryPath := projects.FilePath(options.ServerRoot)
+	statBefore, statBeforeErr := os.Stat(registryPath)
+	registry, err := projects.Load(registryPath)
 	if err != nil {
 		lock.Release()
 		return nil, err
 	}
+	// The cache's stat must bracket the Load: a write landing between
+	// stat and Load (a startup-moment `sai project add`) would leave
+	// "new mtime + old content" — invisible until the NEXT write. When
+	// the two stats disagree, skip caching the stat; the first
+	// registryEntries call reloads.
+	statAfter, statAfterErr := os.Stat(registryPath)
 	m := &Manager{
 		root:        options.ServerRoot,
 		store:       options.Store,
 		agentFor:    options.AgentFor,
 		rootLock:    lock,
-		registry:    registry,
+		regEntries:  registry.Deduped(),
+		regLoaded:   true,
 		agents:      make(map[string]*agent.Agent),
 		sessions:    make(map[string]*sessionEntry),
 		closing:     make(map[string]struct{}),
+		opening:     make(map[string]chan struct{}),
 		sweeperStop: make(chan struct{}),
 		sweeperDone: make(chan struct{}),
 	}
+	if statBeforeErr == nil && statAfterErr == nil &&
+		statBefore.ModTime().Equal(statAfter.ModTime()) && statBefore.Size() == statAfter.Size() {
+		m.regModTime, m.regSize = statAfter.ModTime(), statAfter.Size()
+	} // else: the cached stat stays unset — registryEntries reloads.
 	go m.sweepLoop()
 	return m, nil
 }
@@ -130,6 +166,20 @@ func (m *Manager) Close() {
 		<-m.sweeperDone
 
 		m.mu.Lock()
+		m.closed = true
+		// In-flight opens discard at publish (they see m.closed); wait
+		// for the set to drain so nothing publishes into the teardown.
+		for len(m.opening) > 0 {
+			var inFlight []chan struct{}
+			for _, ch := range m.opening {
+				inFlight = append(inFlight, ch)
+			}
+			m.mu.Unlock()
+			for _, ch := range inFlight {
+				<-ch
+			}
+			m.mu.Lock()
+		}
 		entries := make([]*sessionEntry, 0, len(m.sessions))
 		for id, entry := range m.sessions {
 			entries = append(entries, entry)
@@ -229,49 +279,103 @@ func (m *Manager) open(id string) (*sessionEntry, func(), int, error) {
 		return nil, nil, http.StatusNotFound, fmt.Errorf("unknown session")
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if entry := m.sessions[id]; entry != nil {
 		entry.refs++
 		entry.idleSince = time.Now()
+		m.mu.Unlock()
 		return entry, m.releaseFunc(id), 0, nil
 	}
 	if _, busy := m.closing[id]; busy {
 		// Our own teardown is mid-flight: the next request reopens
 		// (lazily) once it finishes. Retryable by contract.
+		m.mu.Unlock()
 		return nil, nil, http.StatusServiceUnavailable, &apiError{code: "session_closing"}
 	}
+	if m.closed {
+		m.mu.Unlock()
+		return nil, nil, http.StatusServiceUnavailable, &apiError{code: "session_closing"}
+	}
+	if inFlight, busy := m.opening[id]; busy {
+		// Someone is already opening this id: wait for their result
+		// (on the channel, NOT under m.mu) and re-enter. The recursion
+		// is bounded — the winner clears the placeholder before closing
+		// its done channel, so each level corresponds to one completed
+		// open attempt. COST NOTE: if the winner FAILED, every waiter
+		// re-enters and becomes an opener in turn — N waiters, N open
+		// attempts. Acceptable: failure is rare, and the alternative
+		// (result propagation) needs a bigger structure.
+		m.mu.Unlock()
+		<-inFlight
+		return m.open(id)
+	}
+	opened := make(chan struct{})
+	m.opening[id] = opened
+	m.mu.Unlock()
 
+	// ALL the IO runs lock-free (openSlow); the placeholder dedups
+	// concurrent opens of this id.
+	entry, status, err := m.openSlow(id)
+
+	m.mu.Lock()
+	publish := err == nil
+	if publish {
+		if _, busy := m.closing[id]; busy {
+			// A delete claimed the id while we were opening: it is
+			// waiting for us (its storage delete must never race our
+			// replay) — discard what we opened, tell the client to
+			// retry.
+			publish = false
+			status, err = http.StatusServiceUnavailable, &apiError{code: "session_closing"}
+		}
+	}
+	if publish {
+		entry.refs = 1
+		m.sessions[id] = entry
+	}
+	delete(m.opening, id)
+	close(opened)
+	m.mu.Unlock()
+	if !publish && entry != nil {
+		entry.hub.Stop()
+		_ = entry.session.Close()
+	}
+	if !publish {
+		return nil, nil, status, err
+	}
+	return entry, m.releaseFunc(id), 0, nil
+}
+
+// openSlow does every piece of open IO with NO manager lock held: the
+// registry read (stat-gated cache), the per-project session probe, the
+// agent assembly (deduped), and the session open itself (which takes
+// the OS session lock and replays the active segment). One caller
+// holds the opening placeholder for this id.
+func (m *Manager) openSlow(id string) (*sessionEntry, int, error) {
 	// Find the owning registered project — a lock-free probe, so the
 	// agent assembly (which may fail) happens BEFORE the session lock:
 	// a failed assembly must not leave a zombie locked entry.
 	// The same id under two REGISTERED projects means hand-copied
 	// directories: refuse instead of silently picking the first
 	// (design §4).
+	entries, _ := m.registryEntries()
 	var ownerPath, ownerID string
-	for _, entry := range m.entriesLocked() {
+	for _, entry := range entries {
 		projectID := jsonl.ProjectID(entry.Path)
 		if !m.store.HasSession(projectID, id) {
 			continue
 		}
 		if ownerID != "" {
-			return nil, nil, http.StatusConflict, fmt.Errorf("multiple registered projects hold session %s", id)
+			return nil, http.StatusConflict, fmt.Errorf("multiple registered projects hold session %s", id)
 		}
 		ownerPath, ownerID = entry.Path, projectID
 	}
 	if ownerID == "" {
-		return nil, nil, http.StatusNotFound, fmt.Errorf("unknown session")
+		return nil, http.StatusNotFound, fmt.Errorf("unknown session")
 	}
 
-	ag := m.agents[ownerID]
-	if ag == nil {
-		assembled, err := m.agentFor(ownerPath)
-		if err != nil {
-			// No lock was taken; nothing to clean up.
-			return nil, nil, http.StatusInternalServerError, &apiError{code: "project_unavailable", cause: err}
-		}
-		m.agents[ownerID] = assembled
-		ag = assembled
+	ag, err := m.agentForCached(ownerID, ownerPath)
+	if err != nil {
+		return nil, http.StatusInternalServerError, &apiError{code: "project_unavailable", cause: err}
 	}
 
 	session, err := ag.OpenSessionIn(ownerID, id)
@@ -280,20 +384,19 @@ func (m *Manager) open(id string) (*sessionEntry, func(), int, error) {
 		if errors.As(err, &held) {
 			// Held by another process (a CLI, most likely): not
 			// retryable from this serve — the page must not loop.
-			return nil, nil, http.StatusConflict, &apiError{code: "session_locked", cause: err}
+			return nil, http.StatusConflict, &apiError{code: "session_locked", cause: err}
 		}
 		if errors.Is(err, storage.ErrSessionNotFound) {
-			return nil, nil, http.StatusNotFound, fmt.Errorf("unknown session")
+			return nil, http.StatusNotFound, fmt.Errorf("unknown session")
 		}
 		// Segment corruption, permissions: real errors, surfaced.
-		return nil, nil, http.StatusInternalServerError, err
+		return nil, http.StatusInternalServerError, err
 	}
 
 	entry := &sessionEntry{
 		session:   session,
 		hub:       NewHub(session),
 		projectID: ownerID,
-		refs:      1,
 		idleSince: time.Now(),
 	}
 	entry.hub.SetClientObserver(func(int) {
@@ -303,8 +406,32 @@ func (m *Manager) open(id string) (*sessionEntry, func(), int, error) {
 		entry.idleSince = time.Now()
 		m.mu.Unlock()
 	})
-	m.sessions[id] = entry
-	return entry, m.releaseFunc(id), 0, nil
+	return entry, 0, nil
+}
+
+// agentForCached returns the project's agent, assembling it at most
+// effectively once: concurrent first-opens of one project may both
+// assemble (the factory is pure), but only one object is kept — the
+// loser is stateless garbage.
+func (m *Manager) agentForCached(ownerID, ownerPath string) (*agent.Agent, error) {
+	m.mu.Lock()
+	ag := m.agents[ownerID]
+	m.mu.Unlock()
+	if ag != nil {
+		return ag, nil
+	}
+	assembled, err := m.agentFor(ownerPath)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	if existing := m.agents[ownerID]; existing != nil {
+		m.mu.Unlock()
+		return existing, nil
+	}
+	m.agents[ownerID] = assembled
+	m.mu.Unlock()
+	return assembled, nil
 }
 
 // releaseFunc returns the refs decrement for one resolved request.
@@ -318,20 +445,40 @@ func (m *Manager) releaseFunc(id string) func() {
 	}
 }
 
-// entriesLocked returns the deduped registry entries; the caller holds
-// m.mu. A corrupt runtime reload keeps the last good table (never an
-// empty one) and records the error for /api/projects to expose.
-func (m *Manager) entriesLocked() []projects.Entry {
-	if registry, err := projects.Load(projects.FilePath(m.root)); err != nil {
-		if m.regErr == nil {
-			log.Printf("sai: serve: registry reload failed, keeping last good table: %v", err)
-		}
-		m.regErr = err
-	} else {
-		m.registry = registry
-		m.regErr = nil
+// registryEntries returns the deduped registry entries through a
+// stat-gated cache (mtime+size): an unchanged projects.json costs one
+// os.Stat, not a parse — the read happens with NO manager lock held,
+// so a slow disk never blocks session traffic. A failed reload keeps
+// the last good table (never an empty one) and records the error for
+// /api/projects to expose as registry_ok=false. (A MISSING file at
+// startup is different — NewManager fails on it — but a file deleted
+// at runtime reads as an empty table here, matching §1's semantics.)
+//
+// The returned slice is SHARED cache state: callers must not mutate
+// elements or order (a sort here would silently corrupt every later
+// reader).
+func (m *Manager) registryEntries() ([]projects.Entry, error) {
+	path := projects.FilePath(m.root)
+	info, statErr := os.Stat(path)
+	m.regMu.Lock()
+	defer m.regMu.Unlock()
+	if statErr == nil && m.regLoaded && info.ModTime().Equal(m.regModTime) && info.Size() == m.regSize {
+		return m.regEntries, m.regErr
 	}
-	return m.registry.Deduped()
+	registry, loadErr := projects.Load(path)
+	if loadErr != nil {
+		if m.regErr == nil {
+			log.Printf("sai: serve: registry reload failed, keeping last good table: %v", loadErr)
+		}
+		m.regErr = loadErr
+		return m.regEntries, m.regErr
+	}
+	m.regEntries = registry.Deduped()
+	m.regErr = nil
+	if statErr == nil {
+		m.regModTime, m.regSize, m.regLoaded = info.ModTime(), info.Size(), true
+	}
+	return m.regEntries, nil
 }
 
 // sweepLoop evicts idle sessions: no in-flight request, no subscriber,
@@ -432,9 +579,8 @@ func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	entries, regErr := m.registryEntries()
 	m.mu.Lock()
-	entries := m.entriesLocked()
-	regErr := m.regErr
 	openIDs := make(map[string]bool) // open in this process → `active`
 	for id := range m.sessions {
 		openIDs[id] = true
@@ -576,13 +722,26 @@ func (m *Manager) DeleteSession(w http.ResponseWriter, r *http.Request) {
 		_ = entry.session.Close()
 	}
 
+	// A lazy open may be mid-flight on this id: the closing claim makes
+	// it discard its result at publish — wait for that here so the
+	// storage delete never races the open's replay.
+	for {
+		m.mu.Lock()
+		inFlight := m.opening[id]
+		m.mu.Unlock()
+		if inFlight == nil {
+			break
+		}
+		<-inFlight
+	}
+
 	// The owning project through the registration gate (a lock-free
 	// probe, mirroring open). Unregistered sessions are 404 even for
 	// deletion: the gate covers every surface.
+	entries, _ := m.registryEntries()
 	var ownerID string
 	var duplicate bool
-	m.mu.Lock()
-	for _, e := range m.entriesLocked() {
+	for _, e := range entries {
 		projectID := jsonl.ProjectID(e.Path)
 		if m.store.HasSession(projectID, id) {
 			if ownerID != "" {
@@ -592,7 +751,6 @@ func (m *Manager) DeleteSession(w http.ResponseWriter, r *http.Request) {
 			ownerID = projectID
 		}
 	}
-	m.mu.Unlock()
 	if duplicate {
 		clearClosing()
 		writeAPIError(w, http.StatusConflict, fmt.Errorf("multiple registered projects hold session %s", id))

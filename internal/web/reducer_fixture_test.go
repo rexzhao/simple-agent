@@ -87,9 +87,7 @@ func TestStaticMIMETypes(t *testing.T) {
 func createSecondSession(t *testing.T, s *Server) string {
 	t.Helper()
 	m := s.manager
-	m.mu.Lock()
-	entries := m.entriesLocked()
-	m.mu.Unlock()
+	entries, _ := m.registryEntries()
 	if len(entries) == 0 {
 		t.Fatal("no registered project for a second session")
 	}
