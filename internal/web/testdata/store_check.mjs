@@ -239,9 +239,23 @@ const r4 = rec("assistant.message", { content: "a2" });
   assert(new Set(idsB).size === 5, "s10 no duplicates");
 }
 
+// ---- 11. a started event for an item whose record already landed ----
+// The wire reorder guard: no live row may be resurrected for an item
+// the durable record already closed.
+{
+  const r = rec("assistant.message", { item: "superseded-1", content: "done already" });
+  await apply({ kind: "record", r });
+  await applyRecord(red, r);
+  const before = store.snap.live;
+  await apply({ kind: "event", t: "assistant_message_started", item: "superseded-1" });
+  assert(store.snap.live === before, "s11 started after record does not resurrect a live item");
+  await apply({ kind: "event", t: "text_delta", item: "superseded-1", text: "late" });
+  assert(store.snap.live === before, "s11 late deltas attach to nothing");
+}
+
 if (failures.length) {
   console.error("store_check: FAILED");
   for (const f of failures) console.error("  - " + f);
   process.exit(1);
 }
-console.log("store_check: OK (10 scenarios, mirror consistent + serialized burst)");
+console.log("store_check: OK (11 scenarios, mirror consistent + serialized burst + reorder guard)");

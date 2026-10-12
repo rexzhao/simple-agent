@@ -138,6 +138,22 @@ func (h *Hub) run(sub *agent.Subscription) {
 	for {
 		select {
 		case rec := <-sub.Records():
+			// Causal order: the run emits an item's events BEFORE committing
+			// its record, and the events channel is buffered — so by the
+			// time a record is readable here, its preceding events are
+			// already queued. The select picks randomly, so without this
+			// drain a record could precede its own completed event and a
+			// client would re-create a live item the record already closed.
+			// The wake that attaches the run's channel can itself lag the
+			// records (select randomness) — or h.events may still hold the
+			// PREVIOUS run's drained channel. Sync to the session's current
+			// channel by identity before draining: attaching an
+			// already-drained closed channel is harmless (the settle path
+			// self-cleans it).
+			if ch := h.session.Events(); ch != nil && ch != h.events {
+				h.events = ch
+			}
+			h.drainEvents()
 			h.mu.Lock()
 			h.extendLocked(rec)
 			h.fanoutLocked(encodeRecordFrame(rec))
@@ -159,6 +175,12 @@ func (h *Hub) run(sub *agent.Subscription) {
 			// on one channel would silently split the events.
 			if ch := h.session.Events(); ch != nil && ch != h.events {
 				h.events = ch
+				// Drain events already buffered in the attached channel
+				// BEFORE any status frame: an instant run can settle before
+				// the wake arrives, and the channel (already closed) still
+				// holds the run's events — an idle status racing ahead of
+				// them reads as "the run never emitted anything".
+				h.drainEvents()
 				// The run may have settled before the wake arrived —
 				// the attached channel can already be closed — and the
 				// run's records are queued ahead of the status. A status
@@ -168,6 +190,26 @@ func (h *Hub) run(sub *agent.Subscription) {
 		case <-sub.Done():
 			return
 		case <-h.done:
+			return
+		}
+	}
+}
+
+// drainEvents delivers events already buffered in h.events, in
+// order, without letting the main select reorder them behind a record
+// or a status frame. A closed channel reads as instantly-ready
+// forever — the ok check is what stops the loop — and the close
+// itself is left for the main loop's settle path (a second
+// drainThenStatus is a harmless idempotent snapshot).
+func (h *Hub) drainEvents() {
+	for {
+		select {
+		case ev, ok := <-h.events:
+			if !ok {
+				return
+			}
+			h.handleEvent(ev)
+		default:
 			return
 		}
 	}

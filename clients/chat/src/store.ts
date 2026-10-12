@@ -240,6 +240,11 @@ export class SessionStore {
       case "assistant_message_started": {
         if (!frame.item) break;
         if (this.snap.live && this.snap.live.id === frame.item) break;
+        // A record with this ItemID already landed (the wire can
+        // reorder around a reconnect, and the server drain is a
+        // best-effort): the durable record supersedes any transient
+        // item — do not resurrect a live row for it.
+        if (this.snap.records.some(r => r.item === frame.item)) break;
         this.commit({ live: { id: frame.item, parts: [], failed: false } });
         break;
       }
