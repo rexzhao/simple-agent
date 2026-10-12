@@ -53,10 +53,13 @@ preflights for loopback origins, so a direct connection works too.
 
   The registry layout the components expect is reconstructed under
   `src/components/assistant-ui/elements/` and `src/utils/` (the CLI
-  drops the files flat); `thread.aui.tsx` carries one local patch —
-  the queued-steer rows in the composer (upstream has no queue
-  rendering), and `tooltip-icon-button.tsx` uses the Base UI `delay`
-  prop name.
+  drops the files flat); `thread.aui.tsx` carries three local patches — the
+  queued-steer rows in the composer (upstream has no queue rendering),
+  `w-full` on the thread root (the registry root has no width class and
+  collapses to zero width in a shrink-to-fit wrapper), and
+  `turnAnchor="bottom"` (the nova preset anchors turns at the top and
+  defaults autoScroll OFF — classic chat behavior wanted).
+  `tooltip-icon-button.tsx` uses the Base UI `delay` prop name.
 
 Known v1 gaps, on purpose: `context.compacted` / `session.created`
 records have no chat rendering (the `/log` view is the record-level
