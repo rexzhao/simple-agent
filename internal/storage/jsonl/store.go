@@ -80,19 +80,22 @@ func ValidProjectID(id string) bool {
 	return true
 }
 
-// ValidSessionID accepts the identifiers this package stores: path-safe
-// and not a reserved directory name.
+// ValidSessionID accepts exactly the identifiers this package mints:
+// "s" followed by the 26-character base32 body of NewItemID. Session
+// ids are never user-chosen, so anything else is foreign — on disk, on
+// the wire, or in a URL. (The previous loose check — "path-safe and
+// not reserved" — accepted Windows hostilities like "..." or "CON":
+// Win32 strips trailing dots, so HasSession("...") resolved to the
+// project directory itself; that it failed only on the lock path was
+// luck, not design.)
 func ValidSessionID(id string) bool {
-	if len(id) == 0 || len(id) > 128 || id != strings.TrimSpace(id) {
+	if len(id) != 27 || id[0] != 's' {
 		return false
 	}
-	for _, r := range id {
-		if r == '/' || r == '\\' || r < 0x20 || r == 0x7f {
+	for _, char := range id[1:] {
+		if !strings.ContainsRune(base32Alphabet, char) {
 			return false
 		}
-	}
-	if id == "." || id == ".." || id == "blobs" {
-		return false
 	}
 	return true
 }

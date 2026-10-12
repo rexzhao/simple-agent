@@ -341,7 +341,7 @@ func TestListSessionsTitleIsFirstInput(t *testing.T) {
 func TestListSessionsHeaderlessStart(t *testing.T) {
 	store, _ := testStore(t)
 	project := ProjectID(t.TempDir())
-	dir := filepath.Join(store.Root(), project, "s00003894headerless01")
+	dir := filepath.Join(store.Root(), project, "s000038940123456789abcdefgh")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -516,3 +516,28 @@ func TestAppendNormalizesInvalidUTF8(t *testing.T) {
 		t.Fatalf("read-back diverged: %+v", records)
 	}
 }
+
+// TestValidSessionIDStrictShape pins the tightened validation: session
+// ids are exactly what NewSessionID mints. The Windows hazards ("...",
+// "CON", trailing dots) and arbitrary strings are all foreign now.
+func TestValidSessionIDStrictShape(t *testing.T) {
+	good := storage.NewSessionID()
+	if !ValidSessionID(good) {
+		t.Fatalf("minted id rejected: %q", good)
+	}
+	for _, bad := range []string{
+		"", ".", "..", "...", "CON", "blobs",
+		"s",                                              // too short
+		"s" + strings.Repeat("0", 25),                    // one short
+		"s" + strings.Repeat("0", 27),                    // one long
+		"u" + strings.Repeat("0", 26),                    // wrong kind
+		"s" + strings.Repeat("i", 26),                    // i not in the alphabet
+		"s" + strings.Repeat("0", 25) + " ",              // whitespace
+		strings.Repeat("0", 27),                          // no prefix
+		"s0000389560h59pb15q9vcfzpdw\x00",                // control byte
+	} {
+		if ValidSessionID(bad) {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+}
