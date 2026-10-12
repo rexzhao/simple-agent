@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -932,21 +933,20 @@ func (p *ctxGatedProvider) Stream(ctx context.Context, request model.Request) (<
 // + ctx cancelled" row fail.
 func TestTurnOutcomeTable(t *testing.T) {
 	ctxErr := context.Canceled
-	failErr := errors.New("provider exploded")
 	for _, c := range []struct {
 		name      string
 		completed bool
 		ctxErr    error
 		failure   string
-		want      error
+		want      error // nil = expect nil; ErrInterrupted = expect interrupted; else compare by message
 	}{
 		{"success", true, nil, "", nil},
 		{"success + late stop", true, ctxErr, "", nil},
 		{"success + late stop + stale failure", true, ctxErr, "stale", nil},
 		{"interrupted", false, ctxErr, "", ErrInterrupted},
 		{"interrupted + provider error", false, ctxErr, "provider", ErrInterrupted},
-		{"failed", false, nil, "provider", failErr},
-		{"idle (no path)", false, nil, "", nil},
+		{"failed", false, nil, "provider", errors.New("provider")},
+		{"idle (no path — bug)", false, nil, "", errors.New("run ended without an outcome")},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got := turnOutcome(c.completed, c.ctxErr, c.failure)
@@ -962,10 +962,10 @@ func TestTurnOutcomeTable(t *testing.T) {
 				}
 				return
 			}
-			// The failure case returns a NEW error with the failure text;
-			// compare by message, not identity.
-			if got == nil || got.Error() != c.failure {
-				t.Fatalf("turnOutcome(%v, %v, %q) = %v, want failure %q", c.completed, c.ctxErr, c.failure, got, c.failure)
+			// Failure and fallback both return NEW errors; compare by
+			// message, not identity.
+			if got == nil || got.Error() != c.want.Error() {
+				t.Fatalf("turnOutcome(%v, %v, %q) = %v, want %q", c.completed, c.ctxErr, c.failure, got, c.want.Error())
 			}
 		})
 	}
@@ -1005,5 +1005,71 @@ func TestCompactOutcomeTable(t *testing.T) {
 				t.Fatalf("compactOutcome(%v, %v) = %v, want %v", c.err, c.ctxErr, got, c.want)
 			}
 		})
+	}
+}
+
+// TestSuccessfulTurnRunErrNil pins F1's wiring: a completed turn run's
+// Err() is nil. If someone deletes `completed = true` from the execute
+// path, the fallback branch returns "run ended without an outcome"
+// and this test fails — the pure-function table can't catch that
+// (it only tests the function's logic, not the call site's arguments).
+func TestSuccessfulTurnRunErrNil(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "done"}, model.MessageDoneEvent{}},
+	}}
+	_, session := newTestAgent(t, provider, nil)
+	r, err := session.Start(context.Background(), "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-r.Done()
+	if r.Err() != nil {
+		t.Fatalf("successful turn run: Err() = %v, want nil (completed flag not set?)", r.Err())
+	}
+}
+
+// TestCompactRunClosesEventsChannel pins the Events() post-settle drain
+// contract for compact runs: after a manual compaction finishes, the
+// channel Events() returns must be CLOSED (a range consumer terminates,
+// a buffered-events drain completes). Review's overlay probe P1 covers
+// this; this is the permanent in-repo form.
+func TestCompactRunClosesEventsChannel(t *testing.T) {
+	provider := &failSummaryProvider{
+		fail: atomic.Bool{},
+		turns: [][]model.Event{
+			{model.TextDeltaEvent{Text: "answer one"}},
+			{model.TextDeltaEvent{Text: "summary ok " + strings.Repeat("word ", 10)},
+				model.MessageDoneEvent{}},
+		},
+	}
+	_, session := newTestAgent(t, provider, nil)
+	if err := session.Send("hello"); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+
+	r, err := session.StartCompact(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-r.Done()
+
+	// Events() must return a CLOSED channel after the compact run
+	// finishes — the post-settle drain contract.
+	ch := session.Events()
+	if ch == nil {
+		t.Fatal("Events() = nil after compact run — expected the closed channel")
+	}
+	// Drain with a bound: read until the channel reports closed.
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return // closed ✓
+			}
+		case <-timeout:
+			t.Fatal("Events() channel not closed after compact run finished")
+		}
 	}
 }

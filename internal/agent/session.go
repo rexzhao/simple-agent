@@ -1340,7 +1340,12 @@ func turnOutcome(completed bool, ctxErr error, failure string) error {
 	case failure != "":
 		return errors.New(failure)
 	}
-	return nil
+	// No path claimed the outcome — the run ended without completing,
+	// being interrupted, or failing. This is a bug in the execute path
+	// (e.g. someone deleted `completed = true`); surfacing it as an
+	// error makes the wiring testable instead of silently returning
+	// nil for a run that never claimed success.
+	return errors.New("run ended without an outcome")
 }
 
 // compactOutcome is the compact-run counterpart: compactContext
