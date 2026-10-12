@@ -87,6 +87,14 @@ export function useSaiAdapter(
       convertMessage: toThreadMessageLike,
       hasEarlier: snap.more,
       onLoadEarlier: async () => {
+        // No scroll compensation needed — measured, not assumed: the
+        // runtime anchors the prepend itself (smooth-scroll to the old
+        // first message's shifted position, i.e. top + delta). The
+        // "jump to mid-history" seen in testing was the test harness
+        // scrolling the button into view before clicking; a real user
+        // must scroll to the top to reach the button, which is exactly
+        // the anchor base the runtime holds. An earlier stabilizer
+        // patch here fought the runtime's animation — removed.
         await activeStore?.loadEarlier();
       },
       onNew: async (message: AppendMessage) => {

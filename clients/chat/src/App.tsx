@@ -75,7 +75,28 @@ function providerHostOf(url: string): string {
 
 export default function App() {
   const projects = useProjects();
-  const [sessionID, setSessionID] = useState("");
+  // Hash routing, same contract as the log page: #/s/<id> selects a
+  // session (deep links, back/forward, and automation written against
+  // the log page's convention all work); anything else is the list.
+  const [sessionID, setSessionIDState] = useState(() => {
+    const m = location.hash.match(/^#\/s\/([a-z0-9]+)$/);
+    return m ? m[1] : "";
+  });
+  const setSessionID = (id: string) => {
+    setSessionIDState(id);
+    // Writing the hash fires hashchange, which re-selects the same id
+    // (a no-op) — idempotent by construction.
+    if (id) location.hash = "/s/" + id;
+    else if (location.hash) history.replaceState(null, "", location.pathname);
+  };
+  useEffect(() => {
+    const onHash = () => {
+      const m = location.hash.match(/^#\/s\/([a-z0-9]+)$/);
+      setSessionIDState(m ? m[1] : "");
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
   const stores = useMemo(() => new Map<string, SessionStore>(), []);
   const provider = useMemo(() => new PageProvider(), []);
   // The page-as-provider state the UI reflects: active connection and
