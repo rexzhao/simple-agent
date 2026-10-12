@@ -135,6 +135,10 @@ func ModelToolCalls(calls []WireToolCall) []model.ToolCall {
 // Durable reports whether the record must survive a power failure.
 // Failures are durable so the reason a run died survives a crash;
 // everything else in the vocabulary is already terminal content.
+// Durable reports whether the log must flush this record to disk
+// before acknowledging it (the durable record set). Every record type
+// currently in existence is durable; the switch is kept as the single
+// place a future transient record type declares itself.
 func (r Record) Durable() bool {
 	switch r.Type {
 	case TypeSessionCreated, TypeUserInput, TypeAssistantMessage,

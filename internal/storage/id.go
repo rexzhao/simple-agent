@@ -54,8 +54,9 @@ func NewToolCallID() string { return NewItemID(itemKindToolCall) }
 func NewRunID() string { return "run-" + NewItemID(itemKindRun)[1:] }
 
 // NewItemID returns a time-ordered, collision-resistant identifier: the
-// kind prefix followed by base32 of 48 bits of millisecond time plus 80
-// bits of crypto randomness.
+// kind prefix followed by base32 of 16 raw bytes — a 64-bit millisecond
+// timestamp (the top two bytes of which are zero until the year 33658)
+// and 64 bits of crypto randomness.
 func NewItemID(kind string) string {
 	var raw [16]byte
 	binary.BigEndian.PutUint64(raw[:8], uint64(time.Now().UnixMilli()))

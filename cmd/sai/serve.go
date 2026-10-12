@@ -100,7 +100,7 @@ func serve(serverRoot, addr, providerName, modelName, resumeID, staticDir string
 	signal.Notify(interrupts, os.Interrupt)
 	go func() {
 		for range interrupts {
-			if anyRunning(manager) {
+			if manager.HasRunning() {
 				manager.StopRuns()
 				fmt.Fprintln(os.Stderr, "\rsai: stopping runs")
 				continue
@@ -138,9 +138,4 @@ func serve(serverRoot, addr, providerName, modelName, resumeID, staticDir string
 		fmt.Fprintf(os.Stderr, "sai: unknown command %q (try /help)\n", text)
 	}
 	shutdown()
-}
-
-// anyRunning reports whether any open session has an active run.
-func anyRunning(manager *web.Manager) bool {
-	return manager.HasRunning()
 }

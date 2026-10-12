@@ -53,7 +53,8 @@ func usage() {
 }
 
 // registryPath resolves the registry location from the already-resolved
-// server root (main sets serverRootEnv-resolved global before dispatch).
+// server root (main resolves the flag/env before dispatching the
+// subcommand).
 func registryPath() string {
 	return projects.FilePath(resolvedServerRoot)
 }

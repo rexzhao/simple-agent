@@ -155,35 +155,6 @@ func CopyState(state *State) State {
 	return copied
 }
 
-// Summary describes one stored session, for a future listing consumer.
-type Summary struct {
-	ID           string
-	Title        string
-	Provider     string
-	Model        string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	MessageCount int
-}
-
-// Summarize folds a record sequence into a listing summary.
-func Summarize(sessionID string, records []Record) Summary {
-	state := NewState(sessionID)
-	for _, record := range records {
-		Fold(state, record)
-	}
-	messages := 0
-	for _, message := range state.Context {
-		if message.Role == model.MessageRoleUser || message.Role == model.MessageRoleAssistant {
-			messages++
-		}
-	}
-	return Summary{
-		ID: sessionID, Title: state.Title, Provider: state.Provider, Model: state.Model,
-		CreatedAt: state.CreatedAt, UpdatedAt: state.UpdatedAt, MessageCount: messages,
-	}
-}
-
 // parseTime is a forgiving RFC3339 parser: an unparseable timestamp yields
 // the zero time rather than an error, because timestamps are diagnostic and
 // must never block a fold.

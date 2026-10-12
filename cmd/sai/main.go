@@ -149,9 +149,6 @@ func main() {
 	}
 }
 
-// assemble performs the one-time startup assembly: load the config,
-// resolve the model, build the provider, tools, and storage, and construct
-// the agent with everything injected.
 // agentFactory assembles one agent per project: everything project-
 // independent (config, provider, store) is resolved once; everything
 // else (tool executor, system prompt, project id) is bound to the

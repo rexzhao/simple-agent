@@ -8,8 +8,10 @@
 **目标**：最小版本的本地 CLI agent——单二进制、单工具（shell）、会话持久化为
 append-only JSONL。为将来 WebUI 预留统一的 item 流模型，但不为它写任何代码。
 
-**非目标**：List/会话选择器（砍掉，将来需要再加回）、旧日志兼容、WebUI 本体、
-并行工具执行、非输入触发的 run。
+**非目标（v0 立项时）**：List/会话选择器、旧日志兼容、并行工具执行、非输入触发的
+run。（前两条后来 overturned：多会话 serve 已落地 ListSessions/SessionInfo 与
+web.Manager——见 docs/multi-session.md 与 docs/webui.md；非目标条目保留作历史
+记录。）
 
 ## 2. 包结构与依赖规则
 
@@ -205,7 +207,7 @@ session    会话：一个 log.jsonl
 |---|---|
 | internal/chatapp | 并入 agent |
 | internal/eventbus durable 词汇表 + sessionlog.Publisher | agent 直接 commit |
-| Store.List / Summary | 无（将来 WebUI 需要时加回，Summarize 纯函数保留） |
+| Store.List / Summary | 后来 overturned：storage.SessionInfo + jsonl.ListSessions 支撑多会话 serve（docs/multi-session.md）；Summarize/Summary 已删除 |
 | storage 级 RecordsAfter / Subscribe | 通知上移到 agent.Session 的 commit 通知（携带记录本身） |
 | State.LastSeq | 无，行序即文件序 |
 | TurnID / turn 字段 / MaxTurns 命名 | RunID / MaxIterations |
@@ -225,10 +227,19 @@ CLI 的在场渲染：delta 逐字写终端（reasoning 带 `·` 行标记），
 （记录流与事件流分属两个 channel，无法证明顺序时的克录记录先暂存，
 事件排干后统一裁决）。spinner 只标记静默阶段（等首 token、工具执行中）。
 
-WebUI 将来的桥只做一件事：把事件流按序转发（WebSocket/SSE），UI 端按
-ItemID upsert、按 RunID 分组。CLI 现在直接消费同一事件流，零额外成本。
+WebUI 的桥（已落地，internal/web）：hub 把记录流与事件流按因果序经 SSE 转发
+（快照优先 + 摘要链断点续传，docs/webui.md），两个 UI 端（/log 零依赖页与
+/chat 聊天客户端）按 ItemID upsert。CLI 直接消费同一事件流，零额外成本。
 
-## 12. 已记录的未来需求（未设计）
+## 12. 已知限制与已记录的未来需求
+
+**内存随会话生命周期增长（已知限制）**：agent.Session.records、web Hub 的
+records/chain/index 都保留完整扁平记录流，压缩后不裁剪——与"成本 ∝ 有效上下文"
+的目标相悖。冷却是唯一回头扫的点（softCooldownElapsed 只需回溯到最后一条
+context.compacted），因此内存中的记录尾可以按冷却窗口截断；hub 镜像只需保留
+窗口 + 摘要索引。尚未实施：先量化（长会话的常驻内存）再决定裁剪点。
+
+## 13. 已记录的未来需求（未设计）
 
 - ~~**/clear 只重置 context window，不新开 session**~~——需求已取消：
   /clear 保持现状（新开 session），上下文重置由 /compact 承担。

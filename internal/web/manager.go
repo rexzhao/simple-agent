@@ -516,7 +516,6 @@ func writeAPIError(w http.ResponseWriter, status int, err error) {
 }
 
 // DeleteSession removes a session permanently (the web delete). The
-// DeleteSession removes a session permanently (the web delete). The
 // registration gate applies as everywhere. A session this serve holds
 // open refuses while running (run_active) or watched / mid-request
 // (session_open — an SSE subscriber holds refs for its whole stream);

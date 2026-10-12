@@ -181,12 +181,6 @@ func (s *Session) Subscribe() *Subscription {
 	return &Subscription{session: s, sub: sub, initial: records}
 }
 
-// Send appends the user input durably and starts the run. It returns as
-// soon as the run is launched; output arrives on Events and via Subscribe.
-//
-// The check, the durable append, and the running-flag transition happen in
-// one lock section, so a concurrent Send can never interleave its records
-// with another run's: the loser is rejected before anything is written.
 // Sentinel errors the transport layers map to stable wire codes.
 var (
 	// ErrRunActive is returned by Send and Compact when the single-flight
@@ -201,6 +195,12 @@ var (
 	ErrNotQueued = errors.New("no such queued steer message")
 )
 
+// Send appends the user input durably and starts the run. It returns as
+// soon as the run is launched; output arrives on Events and via Subscribe.
+//
+// The check, the durable append, and the running-flag transition happen in
+// one lock section, so a concurrent Send can never interleave its records
+// with another run's: the loser is rejected before anything is written.
 func (s *Session) Send(text string) error {
 	text = strings.TrimRight(text, "\r\n")
 	if strings.TrimSpace(text) == "" {
@@ -849,6 +849,13 @@ func (s *Session) run(ctx context.Context, runID string, request model.Request, 
 		}
 
 		for _, toolCall := range message.ToolCalls {
+			// An interrupted run leaves no closing records: each executed
+			// tool call would otherwise commit an error result for a run
+			// that is already being abandoned ("中断不留收尾记录"). The
+			// deferred failure commit skips interrupted runs.
+			if ctx.Err() != nil {
+				return
+			}
 			resultItemID := storage.NewToolResultID()
 			s.beginTool(resultItemID, toolCall)
 			result := executeToolCall(ctx, s.agent.toolExecutor, enabledTools, toolCall, resultItemID, events)
@@ -956,8 +963,12 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 				if call.ID == "" {
 					// The provider issued no id; mint one. Providers pair
 					// assistant tool calls with results by id, so a minted
-					// id is valid as long as both sides agree on it.
+					// id is valid as long as both sides agree on it — and
+					// the corrected event is what goes downstream, so the
+					// UI's id matches the eventual record's.
 					call.ID = storage.NewToolCallID()
+					event.ToolCall = call
+					outputEvent = event
 				}
 				s.applyStreaming(assistantItemID, func(m *model.Message) { m.ToolCalls = append(m.ToolCalls, call) })
 			case model.MessageDoneEvent, model.UsageEvent:
