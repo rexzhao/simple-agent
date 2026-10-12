@@ -327,10 +327,10 @@ channel 发送"这类 panic（P0-1）、以及"Compact 拿槽但无事件流"这
 // Run 拥有自己的取消和等待信号。事件不走 Run——它们走会话级流（§14.2）。
 type Run struct {
     session *Session
-    ctx     context.Context
+    ctx     context.Context  // derived from the SESSION's ctx, not the caller's
     cancel  context.CancelFunc
     done    chan struct{}   // close once, by the run goroutine
-    err     error           // read after Done; nil = success / interrupted
+    err     error           // nil = success; ErrInterrupted = user-interrupted; else failure
     kind    RunKind         // RunTurn | RunCompact
 }
 
@@ -338,32 +338,38 @@ type Run struct {
 func (s *Session) Start(ctx context.Context, input string) (*Run, error)
 func (s *Session) StartCompact(ctx context.Context) (*Run, error)
 func (s *Session) CurrentRun() *Run  // nil when idle
-func (r *Run) Stop()                 // cancel；不等 Done（见下）
+func (r *Run) Stop()                 // cancel；不等 Done
 func (r *Run) Done() <-chan struct{}
 func (r *Run) Err() error
 func (s *Session) Run(ctx context.Context, input string) error // 同步入口
 ```
 
-- **Run 不拥有事件 channel**（v2 修订，原 A0）：事件流是 session 级的
-  （§14.2），只在 Session.Close 时关闭。这消除了 P0-1 的根因——
-  "per-run channel + 交叉修改 close 时机"——因为**流的生命周期与会话
-  对齐，close 只发生一次**，且由 Close（唯一 tear-down 路径）执行。
+- **ctx 语义**（N2 定案）：调用方的 ctx **只在 Start 返回之前有效**——
+  Start 检查它（已取消则直接失败，**在 commit 之前**——不给
+  一个从未启动的 run 留下 user.input 记录），然后**不再关联**。Run 的生命
+  周期 ctx 从 Session 自身派生，只受 `Run.Stop()` 和
+  `Session.Close()` 控制。web 的 handleSend 传 `r.Context()` 不会
+  在 HTTP 请求返回时意外杀掉 run。调用方确实想绑定生命周期时，
+  用显式的 `RunOption`（默认关闭，本里程碑不实现）。
+- **中断入口**：R2 之后中断只有 `Run.Stop()` 和 `Session.Close()`
+  两条路——CLI 的 Ctrl-C 信号处理与 web 的 `/api/stop` 都走
+  `Run.Stop()`（stage 1 起 handleSend/handleStop 改为传 ctx 的
+  Start/Stop）。
+- **Err 语义**（N1）：`nil` = 成功；`ErrInterrupted`（哨兵，
+  `errors.Is` 可判）= 被 Stop/中断；其他 = 失败（对应 run.failed）。
+- **Run 不拥有事件 channel**：事件流是 session 级的（§14.2）。
 - **单飞**：`Start` 在锁内检查 `currentRun != nil && !currentRun.isDone()`
   → ErrRunActive。`StartCompact` 同门。
-- **Run 结束的拆卸**（v2 修订，原 B5）：run goroutine 的 defer 序列：
-  1. 清瞬态槽（Streaming/Running/Compacting 置 nil——今天的 settle 干
-     的事，不能只关 done）；
-  2. **在流内发终态 Status{Running:false}**（§14.2——消费方靠这个判定
-     run 结束，不靠 done）；
+- **Run 结束的拆卸**：run goroutine 的 defer 序列：
+  1. 清瞬态槽（Streaming/Running/Compacting 置 nil）；
+  2. 在流内发终态 `Status{Running:false}`（保证路径，§14.2）；
   3. 锁内置 `session.currentRun = nil`；
   4. `close(done)`。
-- **Done() 是补充信号**（v2 修订，原 A1）：`close(done)` 只保证生产端
-  不再发，**不保证缓冲中的事件已被消费**。消费方判定 run 结束必须
-  drain 到流内终态 `Status{Running:false}`（或订阅 channel close）。
-  CLI 与 hub 都按流内终态实现（§14.7 step 3/4）。
-- **Stop() 不等 Done**：cancel 立即返回；Done 留给想等的人。
-- **同步入口**：`Session.Run(ctx, input)`——Start + `<-Done` + 返回
-  `Err()`。CLI 的阻塞式等待用它，但**渲染完成**要另管（§14.7 step 4）。
+- **Done() 是补充信号**：消费方判定 run 结束必须 drain 到流内终态。
+- **手动压缩**（N3）：`StartCompact` 产生的 run 也有事件流——
+  CompactionStarted/Completed/Failed、Status{Compacting:true/false}
+  都走流。这消除了 handleCompact 的 5ms/200ms 轮询（那些轮询正是因为
+  手动压缩没有事件流才加的）。步骤 3 验收加"删除 handleCompact 轮询"。
 
 ### 14.2 单一有序会话流
 
@@ -374,83 +380,108 @@ func (s *Session) Run(ctx context.Context, input string) error // 同步入口
 **设计**：
 
 ```go
-// SessionEvent 归属 internal/agent（v2 修订，原 B1：不能放 internal/model，
-// 因为 RecordCommitted 携带 storage.Record；§14.8 的"移出 internal/model"
-// 措辞修正为"B 的 sessionhost 移出 internal 时一起搬"。）
+// SessionEvent 归属 internal/agent。
 package agent
 
 type SessionEvent interface{ isSessionEvent() }
 
-// 三种具体事件（实现细节，B 阶段可拆类型）：
-// RecordCommitted{Record storage.Record}   — 已落盘记录
-// Transient{Event model.Event}             — delta/started/completed/tool/steer 事件
-// Status{Running, Compacting bool; Notice string} — 低频控制帧（含 run 终态）
+// 三种具体事件：
+// RecordCommitted{Record storage.Record}
+// Transient{Event model.Event}
+// Status{Running, Compacting bool}  // N4: 不含 Notice——那是 hub 的展示层概念
 
-// 订阅接口：快照 + 后续增量，原子获得（同一锁段：copy state → register → unlock）
 func (s *Session) Stream() *StreamSubscription
 
 type StreamSubscription struct {
-    Initial() StreamSnapshot   // records + transient slots + steered queue + status
+    Initial() StreamSnapshot
     Events() <-chan SessionEvent
+    Lost() <-chan struct{}  // B3: 摘除信号；收到后调用方必须 Stop() 并重新 Stream()
     Stop()
 }
 ```
 
-**流的归属与生命周期**（v2 修订，原 A0）：
-- **session 级**，一个 Session 一条流（fan-out 到多个订阅者），
-  在 Session.Close 时关闭。**永不 per-run 关闭**。
-- 事件的生产方有两个（都是合法的）：
-  - **run goroutine**：delta、started、completed、tool 事件、
-    RecordCommitted（commit 通知）、run 终态 Status。
-  - **API goroutine**（Steer/UpdateSteer/WithdrawSteer 的调用者）：
-    steer_queued/steered/withdrawn 事件。**这是流必须 session 级的
-    原因**——per-run channel 上这些发送方会踩到 run 的生命周期窗口。
-- **跨 run 顺序**（v2 修订，原 A1）：同一条流上的 FIFO 保证
-  run N 的全部事件在 run N+1 的首事件之前。happens-before 链：
-  N 的末次发送 < N 的 close(done) < 锁内置 currentRun=nil <
-  N+1 的 Start 拿锁 < N+1 的首次发送。
+**流的归属与生命周期**：
+- **session 级**，一个 Session 一条流。**订阅 channel 永远不 close**
+  （B1，原 a 方案）：结束信号用单独的 `Lost()` channel——被摘除时
+  close(Lost)，订阅方收到后自行 Stop + 重连。这消除了"锁外多生产者
+  发送 vs Close 关闭"的 send-on-closed 竞态（P0-1 同类）。
+  Session.Close 做的事：标记 session 关闭 → 摘除全部订阅者
+  （close 各自的 Lost）→ 等待 run 排空。订阅 channel 本身不关。
+- **事件生产方**（两个，都合法）：run goroutine 与 API goroutine（steer）。
+
+**全序规则**（B2 定案 + R3 边界）：
+- **在 `s.mu` 内分配流序号**。每条 SessionEvent 在锁内获得一个
+  递增的 `seq`，fan-out 按 seq 顺序投递。状态变更与流序号在
+  同一个锁段分配——**"状态变更顺序 = 流内事件顺序"是结构保证**。
+- **fan-out 队列无上限**（R3）：生产者在锁内入队**永不阻塞**
+  （append 到 slice，无容量上限）。dispatcher 的投递全部非阻塞
+  （select+default / 摘除），队列以 CPU 速度被清空——生产速率
+  （LLM 流式输出）远低于消费速率（内存操作）。
+- **dispatcher 是唯一的发送方**（R3）：生产者入队（锁内、
+  永不阻塞），dispatcher 投递（锁外、非阻塞）——单发送方 +
+  永不 close 的订阅 channel ⟹ 无 send-on-closed 可能。
+- **Lost 只关一次**（R3）：**只有 dispatcher 关闭 Lost**。订阅方
+  主动 `Stop()` 时只是把自己从 fan-out 列表移除（锁内），不碰
+  Lost——Lost 的 close 是 dispatcher 的摘除动作，且摘除后该
+  订阅者已不在列表上，不会再被摘第二次。单关闭方 + 单次
+  列表移除 ⟹ 无 double-close 可能。不需要 sync.Once。
+- **dispatcher 生命周期**（R3）：Session.Open 时启动；Close 时
+  通过一个 `stopDispatcher` channel 通知退出，Session.Close
+  等 `<-dispatcherDone` 后才关 storage。Close 期间 run 产生的
+  事件： dispatcher 收到 stop 后清空队列、关全部 Lost、退出
+  ——订阅方收到 Lost 重连时发现 session 已关（Stream() 返回
+  错误或空快照 + 立即 Lost），自然终止。
+- **Session.Close 的完整顺序**（R3）：1) 取消 session ctx
+  （停止 run）→ 2) 等 run 排空（< -done）→ 3) 摘除全部订阅者
+  （关各自的 Lost）→ 4) 停 dispatcher（关 stopDispatcher，
+  等 dispatcherDone）→ 5) 关 storage。
+- 这同时解掉"Status{Running:true} 在锁内发 vs 锁外发送纪律"的矛盾：
+  **全部入队都在锁内**（与状态变更同锁段），**全部投递都在锁外**
+  （dispatcher goroutine）。发送纪律的"锁外"指的是投递，不是入队。
 
 **顺序保证**：
 - **run 内**：同一 item 的 started/delta 在 RecordCommitted 之前
-  （发送同 goroutine、channel FIFO）。
-- **completed 与 RecordCommitted**：commit 先、completed 后（现状
-  不变——失败的 commit 要发 Failed 不是 Completed）。消费方幂等：
-  收到 RecordCommitted 后忽略同 ItemID 的后续 completed。
-- **Status 帧**：running=true 在 run 首事件之前（Start 在锁内发）、
-  running=false 在最后一条 RecordCommitted 之后（run goroutine 的
- 拆卸序列，§14.1）。
+  （同 goroutine、seq 递增）。
+- **completed 与 RecordCommitted**：commit 先、completed 后。消费方
+  幂等。
+- **跨 run**：N 的末次入队 < N 的 close(done) < 锁内置 currentRun=nil
+  < N+1 的 Start 拿锁 < N+1 的首次入队。
+- **steer 消费 vs steer_queued**（B2 的具体场景）：Steer 持锁入队
+  seq(k) 的 steer_queued；drainSteered 持锁 commit user.input 并
+  入队 seq(k+1) 的 RecordCommitted。seq(k) < seq(k+1) ⟹ 客户端
+  先收到 steer_queued 再收到消费记录——**不会出现已消费的排队消息
+  复活**。
+- **Status 帧**：running=true 在 run 首事件之前、running=false 在
+  最后一条 RecordCommitted 之后（拆卸序列 + seq 递增）。
 
-**通知发送纪律**（v2 补，原 B5）：**锁外发送**。现状 commit 的规则
-照抄：持锁修改状态、锁外发通知。API goroutine 的 steer 事件同理
-（今天的 Steer 在锁内发——Milestone A 迁到流上时统一改锁外，
-非阻塞或带取消出口，见下）。
-
-**订阅方慢时**（v3 修订，review 阻塞项：终态 Status 不参与取消出口）：
+**背压与摘除**（B3 修订）：
 - channel 缓冲 `streamBuffer = 1024`。
-- **Transient（delta）与非终态 Status**：满了就丢（`select+default`
-  或 `select + ctx.Done`）。无损——store 里的记录是终态事实，
-  重连 snapshot 或 /history 可补齐。
-- **RecordCommitted**：**有界**——缓冲满即标记该订阅者死亡并丢弃
-  （与 Transient 同理：记录在持久层，重连 snapshot 或 /history
-  可补齐）。订阅者慢或离开不阻塞发送方；摘除对后续 fan-out 生效。
-  不走无限阻塞——阻塞慢订阅者只拖住 run 前进，无收益。
-- **终态 Status{Running:false} 走保证路径**：锁外发送、**不参与
-  取消出口**。取消出口的 select 在 ctx 已取消时两分支同时就绪、
-  随机选——终态被随机丢弃意味着 hub/CLI 永远等不到 run 结束
-  （UI 永久 running、驱逐失效——正是 §14 要消灭的那类）。“死
-  订阅者卡住拆卸”的解法是**摘除该订阅者**（有界标记 + 跳过），
-  不是丢终态。**权威收敛**：running/compacting 本来就是 Session
-  持有的权威状态（流内 Status 只是变更通知），一个活着但停止
-  消费的订阅者即使错过了终态帧，重连时 Initial()/快照也携带
-  正确的 running=false——不需要发送侧 watchdog。同理，hub/CLI
-  删除 drainThenStatus 后“status 晚于其前所有 RecordCommitted”
-  由流的 FIFO 顺序保证（§14.2 已有）。
-- **无订阅方**：fan-out 层发现零订阅者 ⟹ Transient 直接丢弃；
-  RecordCommitted 同上（store 已有）。run 不受影响。
-- **最后一个订阅者在缓冲满时离开**：记录通知也有界——缓冲满即
-  标记该订阅者死亡并丢弃（与 Transient 同理：记录在持久层，
-  重连 snapshot 或 /history 可补齐）。不阻塞发送方；摘除对
-  后续 fan-out 生效。
+- **水位线**：delta（Transient）在缓冲超过 **3/4** 时开始丢弃，
+  给 RecordCommitted 和终态 Status 预留 1/4 空间——降低摘除频率。
+- **RecordCommitted / Status**：缓冲满即**摘除该订阅者**——
+  close(Lost) + 从 fan-out 列表移除。订阅方收到 Lost 后重新
+  `Stream()`（从 Initial 重建，hub 侧触发 window reissue 给它的
+  SSE 客户端）。
+- **终态 Status 的保证路径**：终态入队后，即使所有订阅者都满了，
+  dispatcher 也不阻塞——它投递到空列表（全部摘除后），然后 run
+  goroutine 正常拆卸。权威收敛（running/compacting 是 Session 的
+  状态，Initial()/重连拿到正确值）兜底。
+- **读者契约**：收到 `Lost()`（或自己 `Stop()`）后**不得再读
+  `Events()`**——必须重新 `Stream()`。半途已投递但未消费的事件按
+  "重连重放"处理（Initial + window reissue），不作为真值。
+- **无死锁**：队列无上限 ⟹ 入队永不阻塞 ⟹ 终态入队不会因订阅者
+  慢而卡住拆卸 ⟹ Close 的"等 run 排空"与终态入队不会互等——
+  结构上不存在死锁路径。
+- **无订阅方**：dispatcher 对空列表无操作。
+- **摘除恢复测试计划**：慢订阅者被摘除 → 收到 Lost → 重新 Stream()
+  → Initial() 与最终状态一致（step 5 的验收项）。
+
+**通知与 Notice 的分层**（N4）：
+- agent 层的 SessionEvent.Status 只带 Running/Compacting——
+  **不含 Notice**。Notice 是 hub 的展示层缓存（生命周期规则、
+  ClearNotices 语义都在 hub），由 hub 从 Transient 事件
+  （CompactionFailedEvent、ProviderRetryEvent 等）自行推导。
+- agent 不发 Status{Notice} 帧。
 
 ### 14.3 steer 的归属
 
@@ -458,14 +489,13 @@ type StreamSubscription struct {
 Session（状态层）持有。
 
 - 队列在 `State.Steered`。Snapshot 能看到。事件走会话流。
-- **准入谓词**（v2 修订，原 B3）：`CurrentRun() != nil &&
-  CurrentRun().kind == RunTurn`。压缩 run（kind == RunCompact）
-  **不满足**——返回 ErrNoRun（与今天 `!s.running || s.events == nil`
-  的效果一致：压缩持槽但无 run 可消费）。**不允许**压缩期间的
-  steer 被静默收进队列（那是行为回归）。
-- **消费时机**（v2 修订，原 B4，按现码写）：run 的迭代边界——
-  首迭代前 + 每迭代末（`iteration < maxIterations` 时）。预算耗尽
-  的那次终态不 drain（留在队列给下一个 run）。
+- **准入谓词**：`CurrentRun() != nil && CurrentRun().kind == RunTurn`。
+  压缩 run 不满足——返回 ErrNoRun。
+- **消费时机**：run 的迭代边界——首迭代前 + 每迭代末
+  （`iteration < maxIterations` 时）。预算耗尽的那次终态不 drain。
+- **消费 vs 事件的顺序**：drainSteered 与 steer_queued 的 seq 在
+  同一把 `s.mu` 下分配（§14.2 全序规则）——入队先于消费记录，
+  消费者不会看到已消费条目的排队事件"复活"。
 - Run 结束时剩余条目留给下一个 run（用户确认，语义不变）。
 
 ### 14.4 内存（原 P1-7）：只保留活跃段
@@ -478,50 +508,59 @@ hub 的 mirror/chain/index 同样。
 - **Session.records 截断到活跃段**：commit 检测到 context.compacted
   时截断为 `[session.created 副本, context.compacted]`（与 jsonl 段
   切换对齐）。内存中的 records 与 fresh Open 重放一致。
-- **软冷却计数**（v2 修订，原 A4）：改为状态层的**两个**计数器：
+- **软冷却计数**：改为状态层的两个计数器：
   - `inputsSinceCompacted int`：距上次成功压缩的 user.input 数
     （compacted commit 时清零；user.input commit 时递增）。
-    通过条件：`≥ 2`。
-  - `inputsSinceSoftAttempt int`：距上次软尝试（成功或失败）的
-    user.input 数（尝试时清零；user.input commit 时递增）。
-    通过条件：`≥ 2`。
-  - 冷却通过 = **两者都满足**（成功的 compacted 锚和失败的尝试锚
-    取更晚者）。
-  - **off-by-one 边界（可测断言）**：软尝试之后**第 1 个新输入
-    不重试、第 2 个重试恰好一次**——与现有
-    TestSoftCompactFailureContinuesRun 的计数断言同口径，迁移后
-    继续用这个断言。计数在 user.input commit **之后**递增——
-    触发本次 run 的输入计入。两个新输入 ⟹ 计数从 0 → 2 ⟹ 通过。
-  - **重建**（原 A4b）：`inputsSinceCompacted` 在 Open 重放时从
-    活跃段重建（扫到最后一条 context.compacted 后数 user.input）。
-    `inputsSinceSoftAttempt` 是纯内存（失败标记重启即清——§13
-    的"重启给一次新机会"语义，不变）。
+  - `inputsSinceSoftAttempt int`：距上次软尝试的 user.input 数。
+  - 冷却通过 = 两者都满足 ≥2。
+  - **off-by-one 断言**：软尝试之后第 1 个新输入不重试、第 2 个
+    重试恰好一次（与现有计数断言同口径）。
+  - **重建**：`inputsSinceCompacted` 在 Open 重放时从活跃段重建；
+    `inputsSinceSoftAttempt` 纯内存。
 - **hub 镜像**：records/chain 保留活跃段（同源截断）。
-- **截断通知**（v3 修订，review：重发 snapshot 替代 status 字段）：
-  commit context.compacted 时，hub **对已连接客户端重发一次
-  snapshot 帧**（复用现有 window-reissue 路径——`resumed:false`
-  + 新锚 + 窗口记录）。客户端现有逻辑天然处理：
-  `!frame.resumed → prefixAnchor = frame.anchor; head = prefixAnchor`
-  干净重建（客户端代码本来就为截断留了口——“genesis is only
-  correct when nothing was truncated”）。**不引入新字段**：
-  digest 链以锚为种子，同一条记录在旧链与新链的 digest 不同，
-  “信任服务端置 verified=true”只是把不一致藏起来——重发
-  snapshot 让客户端自己 fold 新链，`verified` 仍诚实。/log
-  客户端同样无需改动（同一套 snapshot 重建逻辑）。
-- **/history stale_anchor 的静默失败**（v2 修订，原 A3b）：
-  客户端 `loadEarlier` 收到 stale_anchor 时不静默——把
-  `prefixAnchor` 重置为当前链头（截断 snapshot 已同步过）
-  并重试一次；仍失败则显示“已到活跃段开头”。hub 侧 /history
-  在 stale_anchor 时可以**直接返回当前活跃段的更早记录**
-  （before 游标不认识就从头开始）而非 409——两种方案都行，
-  实现阶段定，写进实现注释。
+
+**digest 链跨段的设计**（B4 定案：**逐段独立，零持久化**）：
+- **段 0（活跃段无 context.compacted）**：genesis =
+  `H(chainVersion + sessionID)`——与现有定义**完全相同**。
+  现有会话、两个客户端零改动。
+- **压缩后的段**：genesis = `H(chainVersion + sessionID + "/" +
+  context.compacted 的 ItemID)`。该 ItemID 在截断时和 fresh Open
+  时都能拿到（就是活跃段的第二条记录），**不依赖任何额外存储**、
+  不要求 storage 层知道 digest 链、不修改段头（§13 的“逐字副本”
+  不变）。
+- **重启一致性**：截断时 hub 的 genesis 基于活跃段的 compacted
+  ItemID；重启后 fresh Open 读同一段、拿到同一 ItemID、算出同一
+  genesis，fold 同一记录集 ⟹ **同一条链**（结构保证）。
+- **将来跨段回滚**：每个归档段用自己的 genesis 独立校验
+  （genesis = H(version + sessionID + "/" + 该段首条 compacted 的
+  ItemID)）；服务端按段顺序返回，客户端逐段校验——不需要
+  首尾哈希衔接。
+- **测试**（step 5 验收）：压缩 → 截断 → 记录链头 → 重启
+  （Close + Open）→ fresh Open 的链头 == 截断时的链头。再加
+  **线级断言**：重锚 snapshot 后，hub 广播的 head 与客户端
+  按 `frame.anchor + records` 折出的 head 相等。
+- **公式实现约定**：Go 侧一个参数化 helper
+  `chainGenesis(sessionID, compactionItemID)`（writer/hub/
+  校验方共用，hub 不另写公式）；JS 侧 chain.mjs 的
+  chainGenesis 同参数化（本里程碑不受影响——服务器总给
+  anchor——但 fixture 加一个"压缩后段"用例提前钉住 Go↔JS
+  一致性）。
+
+**截断通知**：commit context.compacted 时，hub 对已连接客户端重发
+snapshot 帧（`resumed:false` + 新锚 + 窗口记录）。客户端现有逻辑
+天然处理。**不引入新字段**。
+
+**/history stale_anchor**（N5，定案）：保留 409 stale_anchor，
+客户端收到后重置 prefixAnchor 为当前链头并重试一次；仍失败则显示
+"已到活跃段开头"。"游标不认识就从头返回"**不采纳**——它会破坏
+`fold(anchor, records) == prefixAnchor` 的校验契约（客户端会把
+结果当 drift 丢掉）。
 
 ### 14.5 对外线协议
 
 **原则不变**：SSE 帧（snapshot/record/event/status）、digest 链
 规则、`/api/s/{id}/...` 路由、稳定码表不动。chat 和 /log 客户端
-不需要协议变更——截断通知也走现有的 snapshot 帧重发（§14.4），
-无新字段。两个客户端的 snapshot 重建逻辑已为截断留了口。
+不需要协议变更——截断通知走现有 snapshot 帧重发，无新字段。
 
 hub 内部改消费 SessionEvent 流，帧映射：
 RecordCommitted → record 帧、Transient → event 帧、Status →
@@ -530,21 +569,20 @@ status 帧。快照帧从 Initial 拼装；截断时的 snapshot 重发复用
 
 ### 14.6 已知限制（milestone A 边界）
 
-- **回滚以活跃段为界**：翻历史翻不过压缩点。将来的扩展：读归档
-  段（log-NNNN.jsonl），段边界处归档段末链 = 活跃段 prefixAnchor，
-  从磁盘读不经内存。**不堵死**：内存截断保留活跃段全量；归档段
-  完整在磁盘；digest 链逐段独立（段首有 genesis 锚）。
+- **回滚以活跃段为界**：翻历史翻不过压缩点。将来扩展：读归档段，
+  段边界衔接见 §14.4 的链跨段设计（逐段独立 genesis，
+  各归档段独立校验，不需首尾衔接）。不堵死。
 - CLI stderr 提示的 e2e 未写（低优先）。
 
 ### 14.7 迁移顺序与回归保护
 
 | 步骤 | 内容 | 回归保护 | doc-sync |
 |---|---|---|---|
-| 1 | Run 对象；Send/Compact 走 Start/StartCompact；删 Session 上的 events/cancel/done（**事件流暂留 Subscribe+Events 原样**） | 现有全部测试不改断言（Steer/Compact/Stop/Close/竞争）；steer 准入谓词改为 kind==RunTurn（行为等价：压缩期间 ErrNoRun） | multi-session.md §3 锁域段补"currentRun 指针替代 running flag"；webui.md 不变 |
-| 2 | SessionEvent/Stream；旧 Subscribe/Events 变**纯转译薄适配**（同一事件只有一个生产路径：流；适配器不新增状态不新增生产点）；过渡期保住旧契约（Events 在 run settle 时 close） | 新增顺序测试：同一场景同时打新旧两接口，断言顺序一致；全部旧测试绿 | design §7/§11 更新"两 channel → 单流" |
-| 3 | hub 迁到 Stream；删 Wake/drainEvents/drainThenStatus；handleSend 不再 Wake | TestEventRecordCausalOrder 断言变强（单流内 started/delta 先于 record——不再需要 drain 补丁）；全部 web fixture 不改预期全绿 | webui.md §连接更新 |
-| 4 | CLI 迁到 Stream + 同步 Run()；删 parked/reconcileParked/liveShown/waitForRecords；**渲染完成 = join liveWriter goroutine + 流内终态 drain** | CLI 渲染测试继续过；新增**输出字节级**测试：提示符在末条 delta 之后（不是事件顺序，是渲染字节顺序） | development.md 若提及轮询则更新 |
-| 5 | 内存截断到活跃段；冷却计数改状态层（双计数器 + Open 重建）；hub 截断 snapshot 重发 + /history stale 处理 | 冷却四测不改断言全过（TestSoftCompactFailure* 的**计数断言**保留：第 1 新输入不重试、第 2 恰好一次）；内存测试：多次压缩后 Session.records ≤ 活跃段 + 2；hub 镜像 ≤ 窗口 + 活跃段；fixture 增 snapshot 重发场景 | multi-session.md 补截断语义与冷却计数器；design §13 补 Open 重建 |
+| 1 | Run 对象；Send/Compact 走 Start/StartCompact；删 Session 上的 events/cancel/done（事件流暂留 Subscribe+Events 原样） | 现有全部测试不改断言；steer 准入 kind==RunTurn 行为等价；TestSteerSettleRaceCanary 不改过 | multi-session.md §3 锁域段补 currentRun 指针 |
+| 2 | SessionEvent/Stream（seq 全序 + dispatcher + Lost 信号）；旧 Subscribe/Events 变纯转译薄适配 | 双接口同场景顺序测试；steer 消费 vs 事件顺序测试；慢订阅者摘除→Lost→重连恢复测试 | design §7/§11 更新 |
+| 3 | hub 迁到 Stream；删 Wake/drainEvents/drainThenStatus；删 handleCompact 轮询 | TestEventRecordCausalOrder 断言变强；全部 web fixture 不改预期 | webui.md 更新 |
+| 4 | CLI 迁到 Stream + 同步 Run()；删 parked/reconcileParked/liveShown/waitForRecords | CLI 渲染测试过；输出字节级：提示符在末条 delta 之后 | development.md 若提及轮询 |
+| 5 | 内存截断；冷却双计数器；hub 截断 snapshot 重发；/history stale 保留 409 | 冷却四测计数断言保留；内存测试 records ≤ 活跃段+2；重启一致性：截断时链头 == 重启后 fresh Open 链头；摘除恢复测试 | multi-session.md + design §13 |
 
 每步单独送审 → commit → 通知 opus 验收。
 
@@ -554,3 +592,4 @@ status 帧。快照帧从 Initial 拼装；截断时的 snapshot 重发复用
   model.Event）；B 的 sessionhost 移出 internal 时一起搬。
 - Run 对象不泄漏 storage 细节——B 的 sessionhost 可以持有 *Run。
 - Stream 的快照语义与 B 的 Namespace 化正交。
+- seq 全序机制与 B 的 Hooks 正交（seq 分配在 Session 内部）。
