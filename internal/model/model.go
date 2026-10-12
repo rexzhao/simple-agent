@@ -121,6 +121,7 @@ const (
 	EventTypeToolResult                EventType = "tool_result"
 	EventTypeCompactionStarted         EventType = "compaction_started"
 	EventTypeCompactionCompleted       EventType = "compaction_completed"
+	EventTypeCompactionFailed          EventType = "compaction_failed"
 	EventTypeContextPressure           EventType = "context_pressure"
 	EventTypeUsage                     EventType = "usage"
 	EventTypeResponseState             EventType = "response_state"
@@ -266,6 +267,19 @@ type CompactionCompletedEvent struct {
 
 func (CompactionCompletedEvent) Type() EventType {
 	return EventTypeCompactionCompleted
+}
+
+// CompactionFailedEvent reports an in-run compaction that failed
+// without committing anything. Under soft pressure the run continues
+// with the original request (the failure is a notice, not a run
+// failure); under hard pressure the run fails right after this event.
+type CompactionFailedEvent struct {
+	ItemID string
+	Reason string
+}
+
+func (CompactionFailedEvent) Type() EventType {
+	return EventTypeCompactionFailed
 }
 
 // ContextPressureEvent reports that the request exceeded the hard input

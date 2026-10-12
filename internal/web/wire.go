@@ -200,6 +200,8 @@ func encodeEventFrame(event model.Event) (Frame, bool) {
 		f.Type, f.Item = string(e.Type()), e.ItemID
 	case model.CompactionCompletedEvent:
 		f.Type, f.Item = string(e.Type()), e.ItemID
+	case model.CompactionFailedEvent:
+		f.Type, f.Item, f.Text = string(e.Type()), e.ItemID, e.Reason
 	case model.ContextPressureEvent:
 		f.Type, f.Est, f.Limit = string(e.Type()), e.EstimatedTokens, e.HardInputLimit
 	case model.UsageEvent:

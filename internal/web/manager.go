@@ -319,11 +319,11 @@ func (m *Manager) open(id string) (*sessionEntry, func(), int, error) {
 	m.mu.Lock()
 	publish := err == nil
 	if publish {
-		if _, busy := m.closing[id]; busy {
-			// A delete claimed the id while we were opening: it is
-			// waiting for us (its storage delete must never race our
-			// replay) — discard what we opened, tell the client to
-			// retry.
+		if _, busy := m.closing[id]; busy || m.closed {
+			// A delete claimed the id while we were opening (it is
+			// waiting for us — its storage delete must never race our
+			// replay), or the manager is closing: discard what we
+			// opened, tell the client to retry.
 			publish = false
 			status, err = http.StatusServiceUnavailable, &apiError{code: "session_closing"}
 		}

@@ -251,3 +251,56 @@ func TestEventRecordCausalOrder(t *testing.T) {
 		t.Fatalf("insufficient events: %d stream events, %d completed", checkedStreams, checkedCompleted)
 	}
 }
+
+// TestCompactionFailedEventWireAndNotice pins the degraded soft
+// compaction's two web surfaces: the event maps onto a wire frame, and
+// the hub caches it as the notice so /api/state carries it to pages
+// that reconnect later.
+func TestCompactionFailedEventWireAndNotice(t *testing.T) {
+	provider := &webFakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "x"}, model.MessageDoneEvent{}},
+	}}
+	session, srv, base := newTestManagerServer(t, provider)
+
+	// The wire frame.
+	frame, ok := encodeEventFrame(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"})
+	if !ok || frame.Type != "compaction_failed" || frame.Item != "x1" || frame.Text != "summary was empty" {
+		t.Fatalf("encodeEventFrame = %+v ok=%v", frame, ok)
+	}
+
+	// Precondition: no notice yet.
+	res, err := http.Get(base.URL + api(session, "/state")) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st struct {
+		Notice string `json:"notice"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&st)
+	res.Body.Close()
+	if st.Notice != "" {
+		t.Fatalf("precondition: notice = %q, want empty", st.Notice)
+	}
+
+	// Feed the event the way the events channel would; /api/state must
+	// then carry it (pages that reconnect later still see it).
+	entry, release, _, err := srv.manager.open(session.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"})
+	release()
+
+	res2, err := http.Get(base.URL + api(session, "/state")) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st2 struct {
+		Notice string `json:"notice"`
+	}
+	_ = json.NewDecoder(res2.Body).Decode(&st2)
+	res2.Body.Close()
+	if !strings.Contains(st2.Notice, "compaction failed") || !strings.Contains(st2.Notice, "summary was empty") {
+		t.Fatalf("notice = %q, want the compaction failure cached", st2.Notice)
+	}
+}

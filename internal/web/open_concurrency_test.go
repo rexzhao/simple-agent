@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -299,5 +300,62 @@ func TestRegistryCacheRefreshesOnWrite(t *testing.T) {
 	entries, regErr := manager.registryEntries()
 	if regErr == nil || len(entries) != 2 {
 		t.Fatalf("corrupt registry: err=%v entries=%d, want last-good 2 + error", regErr, len(entries))
+	}
+}
+
+// TestOpenDuringCloseDiscards: a Close that lands while an open is
+// mid-flight makes the open discard its result (503) instead of
+// publishing a doomed entry into a torn-down map — the publish check
+// covers m.closed, matching the Close comment. The discard must also
+// release the session's OS lock: the jsonl store below proves it by
+// reopening the session through an independent path afterwards.
+func TestOpenDuringCloseDiscards(t *testing.T) {
+	jsonlStore, err := jsonl.OpenStore(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &gateStore{
+		Store:     jsonlStore,
+		slowDelay: 600 * time.Millisecond,
+		entered:   make(chan struct{}),
+	}
+	manager, base, ids := newOpenTestServer(t, store)
+	store.slowID = ids[0]
+
+	openDone := make(chan int, 1)
+	go func() { openDone <- getState(t, base.URL, ids[0]) }()
+	<-store.entered
+
+	closed := make(chan struct{})
+	go func() {
+		manager.Close()
+		close(closed)
+	}()
+
+	if code := <-openDone; code != http.StatusServiceUnavailable {
+		t.Fatalf("open during close: %d, want 503 (discarded)", code)
+	}
+	<-closed
+
+	// No zombie state: nothing published, no placeholder left.
+	manager.mu.Lock()
+	sessions, opening := len(manager.sessions), len(manager.opening)
+	manager.mu.Unlock()
+	if sessions != 0 || opening != 0 {
+		t.Fatalf("post-close state: sessions=%d opening=%d, want 0/0", sessions, opening)
+	}
+
+	// The discarded session's OS lock was released: an independent
+	// open through the store succeeds (it would conflict if the
+	// discard had leaked the session open).
+	entries, _ := manager.registryEntries()
+	projectID := jsonl.ProjectID(entries[0].Path)
+	entry, err := jsonlStore.OpenIn(projectID, ids[0])
+	_ = entry
+	if err != nil {
+		t.Fatalf("independent reopen after discard: %v (OS lock leaked?)", err)
+	}
+	if entry != nil {
+		_ = entry.Close()
 	}
 }

@@ -60,6 +60,16 @@ type Session struct {
 	state *storage.State
 	// records is the in-process flat record stream. After a compaction
 	// it is deliberately LONGER than the on-disk active segment: the
+	// softRetryAfterIndex anchors the soft-compaction retry cooldown:
+	// the record position at the moment of a failed or churned soft
+	// attempt (no record lands to anchor it). The retry needs two NEW
+	// user inputs PAST that point — the same cadence a successful
+	// compaction imposes through its record. softRetryArmed=false means
+	// no cooldown pending. (Anchoring matters: arming happens after the
+	// triggering input has already landed, so counting from the stream's
+	// end would pass after ONE new input.)
+	softRetryArmed      bool
+	softRetryAfterIndex int
 	// pre-compaction records stay here (cooldown scans and the CLI's
 	// flat printed counter need them) while jsonl archives them. A
 	// consumer subscribing mid-session sees the flat stream; a fresh
@@ -714,12 +724,35 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 	sendEvent(ctx, events, model.CompactionStartedEvent{ItemID: itemID})
 	compacted, err := s.compactContext(ctx, itemID, pressure, estimateRequestTokens(request), events)
 	if err != nil {
+		// An interruption is not a failure to downgrade: the run is
+		// being stopped, and the existing failure machinery skips the
+		// run.failed record for it.
+		if ctx.Err() != nil {
+			return request, false, err
+		}
+		// Soft pressure: the compaction was an optimization — its
+		// failure degrades to a notice, the run continues with the
+		// ORIGINAL request, and the same cooldown as success applies
+		// (two new user inputs) so a failing summary is not retried
+		// every iteration. Hard pressure keeps failing the run: the
+		// request cannot be sent safely.
+		if pressure == pressureSoft {
+			s.beginSoftCompactCooldown()
+			sendEvent(ctx, events, model.CompactionFailedEvent{ItemID: itemID, Reason: err.Error()})
+			return request, false, nil
+		}
 		return request, false, err
 	}
 	if !compacted {
+		// Soft churn (the summary would not reclaim enough): not an
+		// error, but the same cooldown discipline applies.
+		if pressure == pressureSoft {
+			s.beginSoftCompactCooldown()
+		}
 		return request, false, nil
 	}
 	sendEvent(ctx, events, model.CompactionCompletedEvent{ItemID: itemID})
+	s.clearSoftCompactCooldown()
 	// Note: under hard pressure the run may still fail right after this
 	// event — the summary was committed (it is a real, smaller context)
 	// but the rebuilt request still exceeds the safe limit. Completed +
@@ -753,7 +786,9 @@ func (s *Session) hasCompactableAnswer() bool {
 }
 
 // softCooldownElapsed reports whether at least two user inputs were
-// committed since the last compaction.
+// committed since the last compaction — and, after a failed or churned
+// soft attempt (which commits no marker record), since that attempt:
+// a failing summary must not be retried on every iteration.
 func (s *Session) softCooldownElapsed() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -761,12 +796,50 @@ func (s *Session) softCooldownElapsed() bool {
 	for i := len(s.records) - 1; i >= 0; i-- {
 		switch s.records[i].Type {
 		case storage.TypeContextCompacted:
-			return inputs >= 2
+			return inputs >= 2 && s.softCooldownSatisfiedLocked()
 		case storage.TypeUserInput:
 			inputs++
 		}
 	}
-	return true
+	return s.softCooldownSatisfiedLocked()
+}
+
+// softCooldownSatisfiedLocked: after a soft-attempt failure, the retry
+// waits for two NEW user inputs past the attempt's anchor — the same
+// cadence a successful compaction imposes through its record anchor.
+// Callers hold s.mu (RLock ok: the marker is written under the full
+// lock).
+func (s *Session) softCooldownSatisfiedLocked() bool {
+	if !s.softRetryArmed {
+		return true
+	}
+	inputs := 0
+	for i := s.softRetryAfterIndex; i < len(s.records); i++ {
+		if s.records[i].Type == storage.TypeUserInput {
+			inputs++
+			if inputs >= 2 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// beginSoftCompactCooldown arms the failure cooldown at the current
+// record position. A later success clears it (its own record is the
+// marker).
+func (s *Session) beginSoftCompactCooldown() {
+	s.mu.Lock()
+	s.softRetryArmed = true
+	s.softRetryAfterIndex = len(s.records)
+	s.mu.Unlock()
+}
+
+// clearSoftCompactCooldown drops the failure cooldown (on success).
+func (s *Session) clearSoftCompactCooldown() {
+	s.mu.Lock()
+	s.softRetryArmed = false
+	s.mu.Unlock()
 }
 
 // run drives one agent run: iterate (request the model, execute the tool

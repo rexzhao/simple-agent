@@ -436,6 +436,12 @@ func (c *cliApp) send(text string) error {
 					retry.Attempt, retry.MaxAttempts, retry.Reason)
 				continue
 			}
+			// A degraded soft compaction: the run continues with the
+			// original request; the user should still know it happened.
+			if failed, ok := event.(model.CompactionFailedEvent); ok {
+				fmt.Fprintf(os.Stderr, "sai: compaction failed (soft pressure; run continues): %s\n", failed.Reason)
+				continue
+			}
 			live.handle(event)
 		}
 		live.settle()

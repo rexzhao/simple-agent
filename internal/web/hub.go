@@ -254,6 +254,12 @@ func (h *Hub) handleEvent(ev model.Event) {
 		h.mu.Lock()
 		h.lastRetry = formatRetry(e)
 		h.mu.Unlock()
+	case model.CompactionFailedEvent:
+		// A degraded soft compaction: cached as the notice so a page
+		// that reconnects later still sees it via /api/state.
+		h.mu.Lock()
+		h.lastNotice = "compaction failed (soft pressure; run continues): " + e.Reason
+		h.mu.Unlock()
 	}
 	if frame, ok := encodeEventFrame(ev); ok {
 		h.mu.Lock()
