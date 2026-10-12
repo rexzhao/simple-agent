@@ -29,7 +29,9 @@ export type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   parts: Part[];
-  status: Status;
+  // Assistant messages only — the runtime rejects a status on user
+  // messages ("status is only supported for assistant messages").
+  status?: Status;
   createdAt?: Date;
   // The run (user input through final response) a record belongs to —
   // run scoping keeps failures and tool results from folding onto a
@@ -42,7 +44,9 @@ export function convertRecords(records: readonly Record[]): ChatMessage[] {
   for (const r of records) {
     switch (r.t) {
       case "user.input":
-        out.push({ id: r.item || r.ts, role: "user", parts: [{ type: "text", text: r.content || "" }], status: { type: "complete", reason: "stop" as const }, run: r.run });
+        // No status on user messages — the runtime throws "status is
+        // only supported for assistant messages" (browser-caught).
+        out.push({ id: r.item || r.ts, role: "user", parts: [{ type: "text", text: r.content || "" }], run: r.run });
         break;
       case "assistant.message": {
         const parts: Part[] = [];
@@ -136,6 +140,6 @@ export function toThreadMessageLike(m: ChatMessage, _idx: number): ThreadMessage
     content: parts,
     id: m.id,
     createdAt: m.createdAt,
-    status: m.status,
+    status: m.role === "assistant" ? m.status : undefined,
   };
 }
