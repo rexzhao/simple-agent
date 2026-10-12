@@ -117,6 +117,15 @@ func (h *Hub) Notice(text string) {
 	h.mu.Unlock()
 }
 
+// BroadcastStatus pushes a status frame without touching the notice —
+// for state the server knows before any event could carry it (a
+// compaction taking the slot, for instance).
+func (h *Hub) BroadcastStatus() {
+	h.mu.Lock()
+	h.broadcastStatusLocked()
+	h.mu.Unlock()
+}
+
 func (h *Hub) run(sub *agent.Subscription) {
 	// h.done is closed by Stop only — a return here (session closed)
 	// must not race a second close.
@@ -269,12 +278,14 @@ func (h *Hub) dropClientLocked(c *client) {
 // state. Callers hold h.mu.
 func (h *Hub) broadcastStatusLocked() {
 	running := h.session.Running()
+	compacting := h.session.Snapshot().Compacting != nil
 	frame := encodeFrame(Frame{
-		Kind:    "status",
-		Running: &running,
-		Digest:  h.chainHeadLocked(),
-		Count:   len(h.records),
-		Notice:  h.lastNotice,
+		Kind:       "status",
+		Running:    &running,
+		Compacting: &compacting,
+		Digest:     h.chainHeadLocked(),
+		Count:      len(h.records),
+		Notice:     h.lastNotice,
 	})
 	h.fanoutLocked(frame)
 }
@@ -314,15 +325,17 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 
 	snapshot := h.session.Snapshot()
 	running := h.session.Running()
+	compacting := snapshot.Compacting != nil
 	f := Frame{
-		Kind:    "snapshot",
-		Anchor:  h.chainAtLocked(start),
-		Resumed: resumed,
-		Total:   total,
-		More:    start > 0,
-		Records: encoded,
-		Running: &running,
-		Digest:  h.chainHeadLocked(),
+		Kind:       "snapshot",
+		Anchor:     h.chainAtLocked(start),
+		Resumed:    resumed,
+		Total:      total,
+		More:       start > 0,
+		Records:    encoded,
+		Running:    &running,
+		Compacting: &compacting,
+		Digest:     h.chainHeadLocked(),
 	}
 	if snapshot.Streaming != nil {
 		f.Streaming = &StreamingWire{

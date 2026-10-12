@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 )
@@ -510,11 +511,28 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	// Compact holds the single-flight slot for the whole summary (tens
 	// of seconds); the response must not.
 	go func() {
-		if err := session.Compact(); err != nil && !errors.Is(err, agent.ErrNothingToCompact) {
-			hub.Notice("compact failed: " + err.Error())
-			return
+		errCh := make(chan error, 1)
+		go func() { errCh <- session.Compact() }()
+		// Keep the transient state visible: status frames while the
+		// compaction holds the slot. A client that assumes idle
+		// mid-compact is exactly what routed sends into the steer path
+		// (the panic of the compact/steer bug). The final Notice
+		// broadcast carries the end state.
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case err := <-errCh:
+				if err != nil && !errors.Is(err, agent.ErrNothingToCompact) {
+					hub.Notice("compact failed: " + err.Error())
+					return
+				}
+				hub.Notice("")
+				return
+			case <-ticker.C:
+				hub.BroadcastStatus()
+			}
 		}
-		hub.Notice("")
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
