@@ -29,6 +29,11 @@ jobs:
       - name: Install chat client dependencies
         working-directory: clients/chat
         run: npm ci
+      # vite build does not typecheck, and node running .ts strips types
+      # without checking them — the only real type gate is tsc.
+      - name: Typecheck chat client
+        working-directory: clients/chat
+        run: npm run check
       - run: go test ./...
       - run: go vet ./...
       - name: Gofmt gate

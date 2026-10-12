@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSyncExternalStore } from "react";
 import {
   AssistantRuntimeProvider,
@@ -63,6 +63,12 @@ async function composerSend(text: string): Promise<{ ok: boolean; confirmed?: bo
   return { ok: true, confirmed: false };
 }
 
+// The session route, shared with the log page's convention.
+function parseSessionHash(): string {
+  const m = location.hash.match(/^#\/s\/([a-z0-9]+)$/);
+  return m ? m[1] : "";
+}
+
 function providerHostOf(url: string): string {
   try {
     return new URL(url).host;
@@ -78,22 +84,16 @@ export default function App() {
   // Hash routing, same contract as the log page: #/s/<id> selects a
   // session (deep links, back/forward, and automation written against
   // the log page's convention all work); anything else is the list.
-  const [sessionID, setSessionIDState] = useState(() => {
-    const m = location.hash.match(/^#\/s\/([a-z0-9]+)$/);
-    return m ? m[1] : "";
-  });
-  const setSessionID = (id: string) => {
+  const [sessionID, setSessionIDState] = useState(() => parseSessionHash());
+  const setSessionID = useCallback((id: string) => {
     setSessionIDState(id);
     // Writing the hash fires hashchange, which re-selects the same id
     // (a no-op) — idempotent by construction.
     if (id) location.hash = "/s/" + id;
     else if (location.hash) history.replaceState(null, "", location.pathname);
-  };
+  }, []);
   useEffect(() => {
-    const onHash = () => {
-      const m = location.hash.match(/^#\/s\/([a-z0-9]+)$/);
-      setSessionIDState(m ? m[1] : "");
-    };
+    const onHash = () => setSessionIDState(parseSessionHash());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -177,19 +177,17 @@ export default function App() {
     [stores],
   );
 
-  const adapter = useSaiAdapter(
-    stores,
-    sessionID,
-    projects,
-    setSessionID,
-    (id) => {
+  const onDeleted = useCallback(
+    (id: string) => {
       const store = stores.get(id);
       if (store) {
         store.destroy();
         stores.delete(id);
       }
     },
+    [stores],
   );
+  const adapter = useSaiAdapter(stores, sessionID, projects, setSessionID, onDeleted);
   const runtime = useExternalStoreRuntime(adapter);
 
   // The status strip reads the current session's snapshot directly —

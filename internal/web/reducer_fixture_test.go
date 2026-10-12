@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -217,21 +218,26 @@ func TestRenderFixture(t *testing.T) {
 		}
 		waitSettled(t, session)
 	}
-	// Build the SSR bundle (node runs vite's bin directly).
+	// Build the SSR bundle into a per-PROCESS directory inside the
+	// client tree: the bundle externalizes react and resolves it from
+	// the client's node_modules by relative location (a system temp dir
+	// breaks that), while parallel go test PROCESSES each build their
+	// own (CI's ./... and -race runs are separate processes).
+	outDir := filepath.Join(chatDir, fmt.Sprintf(".render-dist-%d", os.Getpid()))
 	viteBin := filepath.Join(chatDir, "node_modules", "vite", "bin", "vite.js")
-	build := exec.Command(node, viteBin, "build", "--ssr", "src/render-check-entry.tsx", "--outDir", ".render-dist")
+	build := exec.Command(node, viteBin, "build", "--ssr", "src/render-check-entry.tsx", "--outDir", outDir, "--emptyOutDir")
 	build.Dir = chatDir
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("vite build --ssr: %v\n%s", err, out)
 	}
 	t.Cleanup(func() {
-		_ = os.RemoveAll(filepath.Join(chatDir, ".render-dist"))
+		_ = os.RemoveAll(outDir)
 	})
 	script, err := filepath.Abs(filepath.Join("testdata", "render_check.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command(node, script, base.URL, session.ID(), "render probe answer 2").CombinedOutput()
+	out, err := exec.Command(node, script, base.URL, session.ID(), "render probe answer 2", filepath.Join(outDir, "render-check-entry.js")).CombinedOutput()
 	if err != nil {
 		t.Fatalf("render_check.mjs: %v\n%s", err, out)
 	}

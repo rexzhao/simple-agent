@@ -4,17 +4,21 @@
 // store / convert+validator / RENDER). Asserts the conversation text
 // actually lands in the rendered Thread HTML.
 //
-// Usage: node render_check.mjs <base-url> <session-id> <needle>
-// (needle = a text that must appear in the rendered HTML).
+// Usage: node render_check.mjs <base-url> <session-id> <needle> [bundle-path]
+// (needle = a text that must appear in the rendered HTML; bundle-path
+// defaults to the client's .render-dist for manual runs).
 const base = process.argv[2];
 const sid = process.argv[3];
 const needle = process.argv[4];
+const bundlePath = process.argv[5] || "../../../clients/chat/.render-dist/render-check-entry.js";
 if (!base || !sid || !needle) {
   console.error("render_check: missing args (base-url session-id needle)");
   process.exit(2);
 }
 
-const { renderProbe } = await import("../../../clients/chat/.render-dist/render-check-entry.js");
+const { pathToFileURL } = await import("node:url");
+const isURL = /^[a-z]+:/.test(bundlePath);
+const { renderProbe } = await import(isURL ? bundlePath : pathToFileURL(bundlePath).href);
 const out = await renderProbe(base, sid);
 
 const failures = [];
