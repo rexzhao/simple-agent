@@ -434,12 +434,22 @@ func TestCompactionEventsBroadcastImmediately(t *testing.T) {
 	}}
 	session, srv, base := newTestManagerServer(t, provider)
 
-	res, err := http.Get(base.URL + api(session, "/stream")) //nolint:noctx // test
+	streamCtx, cancelStream := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStream()
+	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, base.URL+api(session, "/stream"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.DefaultClient.Do(req) //nolint:noctx // test
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
 	br := bufio.NewReader(res.Body)
+	// The request context bounds the whole read: a regression that
+	// makes the status broadcast go missing manifests as SILENCE — the
+	// context fires, ReadString errors, the assertion path runs — not
+	// a hang to the package timeout.
 	nextFrame := func() Frame {
 		t.Helper()
 		for {
@@ -469,6 +479,7 @@ func TestCompactionEventsBroadcastImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer release()
 	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"})
 	f := nextFrame()
 	if f.Kind == "event" {
@@ -491,5 +502,4 @@ func TestCompactionEventsBroadcastImmediately(t *testing.T) {
 	if f.Kind != "status" || f.Notice != "" {
 		t.Fatalf("frame after the completion = kind %s notice %q, want a status frame with an empty notice", f.Kind, f.Notice)
 	}
-	release()
 }
