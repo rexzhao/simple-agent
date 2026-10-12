@@ -800,3 +800,210 @@ func TestMaterializeHeader(t *testing.T) {
 		t.Fatalf("after second materialize: %d records, want 1", got)
 	}
 }
+
+// TestSettleOrderCanary pins the C1 invariant from milestone A at the
+// Done edge: the moment a Run's done channel closes, the session is
+// fully retired — Running() is false, Start succeeds, Steer returns
+// ErrNoRun. The teardown clears currentRun under the lock BEFORE
+// closing done, so the done-edge observation guarantees retirement.
+// (The earlier "wait until Running()==false" formulation was a
+// tautology — it polled the same lock the teardown writes — and had
+// no kill power against a reordering that closes done before settle.)
+func TestSettleOrderCanary(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "done"}, model.MessageDoneEvent{}},
+	}}
+	_, session := newTestAgent(t, provider, nil)
+
+	r, err := session.Start(context.Background(), "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-r.Done()
+
+	// The Done edge: these must hold IMMEDIATELY, no polling, in this
+	// order — Steer first (it's the one the old canary missed), then
+	// Running, then Start.
+	if _, err := session.Steer("no target"); err != ErrNoRun {
+		t.Fatalf("Steer right after <-Done: %v, want ErrNoRun", err)
+	}
+	if session.Running() {
+		t.Fatal("Running() still true right after <-Done — settle did not retire before done close")
+	}
+	if err := session.Send("immediate follow-up"); err != nil {
+		t.Fatalf("Send right after <-Done: %v (currentRun not cleared?)", err)
+	}
+	waitSettled(t, session)
+}
+
+// TestRunErrSemantics pins the N1 contract on all five paths.
+func TestRunErrSemantics(t *testing.T) {
+	t.Run("FailedTurnRun", func(t *testing.T) {
+		provider := &fakeProvider{turns: [][]model.Event{}} // no turns → provider error
+		_, session := newTestAgent(t, provider, nil)
+		r, err := session.Start(context.Background(), "hello")
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-r.Done()
+		if r.Err() == nil {
+			t.Fatal("failed turn run: Err() = nil, want non-nil")
+		}
+		if errors.Is(r.Err(), ErrInterrupted) {
+			t.Fatalf("failed turn run: Err() = ErrInterrupted, want a real failure")
+		}
+	})
+
+	// The two interruption sub-tests are the WIRING-level coverage:
+	// the table-driven tests pin the pure function's priority order,
+	// but only these catch a call site passing the wrong argument
+	// (e.g. ctx.Err() → nil would silently misclassify every
+	// interruption as a failure — review verified with that exact
+	// mutation that no other test in the repo catches it).
+	t.Run("InterruptedTurnRun", func(t *testing.T) {
+		gate := make(chan struct{})
+		t.Cleanup(func() { close(gate) })
+		provider := &ctxGatedProvider{gate: gate}
+		_, session := newTestAgent(t, provider, nil)
+		r, err := session.Start(context.Background(), "hello")
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Stop()
+		<-r.Done()
+		if !errors.Is(r.Err(), ErrInterrupted) {
+			t.Fatalf("interrupted turn run: Err() = %v, want ErrInterrupted", r.Err())
+		}
+	})
+
+	t.Run("InterruptedCompactRun", func(t *testing.T) {
+		provider := &blockSummaryProvider{
+			release: make(chan struct{}),
+			entered: make(chan struct{}),
+			turns:   [][]model.Event{{model.TextDeltaEvent{Text: "answer"}}},
+		}
+		t.Cleanup(func() { close(provider.release) })
+		_, session := newTestAgent(t, provider, nil)
+		if err := session.Send("hello"); err != nil {
+			t.Fatal(err)
+		}
+		waitSettled(t, session)
+
+		r, err := session.StartCompact(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-provider.entered
+		r.Stop()
+		<-r.Done()
+		if !errors.Is(r.Err(), ErrInterrupted) {
+			t.Fatalf("interrupted compact: Err() = %v, want ErrInterrupted", r.Err())
+		}
+	})
+}
+
+// ctxGatedProvider blocks on a gate but honors ctx cancellation —
+// unlike gatedProvider, which ignores ctx and hangs interrupted runs.
+type ctxGatedProvider struct {
+	gate chan struct{}
+}
+
+func (p *ctxGatedProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
+	events := make(chan model.Event)
+	go func() {
+		defer close(events)
+		select {
+		case events <- model.TextDeltaEvent{Text: "partial"}:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-p.gate:
+			events <- model.TextDeltaEvent{Text: " message"}
+		case <-ctx.Done():
+		}
+	}()
+	return events, nil
+}
+
+// TestTurnOutcomeTable pins the N1 priority order as a pure-function
+// table: completed > interrupted > failed. Kill-verified by design —
+// swapping the first two branches of turnOutcome makes the "completed
+// + ctx cancelled" row fail.
+func TestTurnOutcomeTable(t *testing.T) {
+	ctxErr := context.Canceled
+	failErr := errors.New("provider exploded")
+	for _, c := range []struct {
+		name      string
+		completed bool
+		ctxErr    error
+		failure   string
+		want      error
+	}{
+		{"success", true, nil, "", nil},
+		{"success + late stop", true, ctxErr, "", nil},
+		{"success + late stop + stale failure", true, ctxErr, "stale", nil},
+		{"interrupted", false, ctxErr, "", ErrInterrupted},
+		{"interrupted + provider error", false, ctxErr, "provider", ErrInterrupted},
+		{"failed", false, nil, "provider", failErr},
+		{"idle (no path)", false, nil, "", nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := turnOutcome(c.completed, c.ctxErr, c.failure)
+			if c.want == nil {
+				if got != nil {
+					t.Fatalf("turnOutcome(%v, %v, %q) = %v, want nil", c.completed, c.ctxErr, c.failure, got)
+				}
+				return
+			}
+			if c.want == ErrInterrupted {
+				if !errors.Is(got, ErrInterrupted) {
+					t.Fatalf("turnOutcome(%v, %v, %q) = %v, want ErrInterrupted", c.completed, c.ctxErr, c.failure, got)
+				}
+				return
+			}
+			// The failure case returns a NEW error with the failure text;
+			// compare by message, not identity.
+			if got == nil || got.Error() != c.failure {
+				t.Fatalf("turnOutcome(%v, %v, %q) = %v, want failure %q", c.completed, c.ctxErr, c.failure, got, c.failure)
+			}
+		})
+	}
+}
+
+// TestCompactOutcomeTable pins the compact-run counterpart: success
+// (err == nil) takes priority over a late Stop.
+func TestCompactOutcomeTable(t *testing.T) {
+	ctxErr := context.Canceled
+	compactErr := errors.New("compact: summary was empty")
+	for _, c := range []struct {
+		name   string
+		err    error
+		ctxErr error
+		want   error
+	}{
+		{"success", nil, nil, nil},
+		{"success + late stop", nil, ctxErr, nil},
+		{"interrupted", compactErr, ctxErr, ErrInterrupted},
+		{"failed", compactErr, nil, compactErr},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := compactOutcome(c.err, c.ctxErr)
+			if c.want == nil {
+				if got != nil {
+					t.Fatalf("compactOutcome(%v, %v) = %v, want nil", c.err, c.ctxErr, got)
+				}
+				return
+			}
+			if c.want == ErrInterrupted {
+				if !errors.Is(got, ErrInterrupted) {
+					t.Fatalf("compactOutcome(%v, %v) = %v, want ErrInterrupted", c.err, c.ctxErr, got)
+				}
+				return
+			}
+			if got == nil || got.Error() != c.want.Error() {
+				t.Fatalf("compactOutcome(%v, %v) = %v, want %v", c.err, c.ctxErr, got, c.want)
+			}
+		})
+	}
+}

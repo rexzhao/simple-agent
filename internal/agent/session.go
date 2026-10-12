@@ -48,10 +48,55 @@ var providerRetryBackoff = func(attempt int) time.Duration {
 	return time.Duration(5*(1<<(attempt-1))) * time.Second
 }
 
-// Session is one conversation: the state layer above a dumb record store.
-// commit is the only write path (append → fold → clear transient → notify,
-// under one lock). Exactly one run may be active; Send while running is
-// rejected.
+// RunKind distinguishes the two kinds of single-flight work a session
+// can be running.
+type RunKind int
+
+const (
+	// RunTurn is a conversational run (user input → iterations → final
+	// response). Only this kind accepts Steer.
+	RunTurn RunKind = iota
+	// RunCompact is a context compaction. It occupies the single-flight
+	// slot but does not consume the steer queue.
+	RunCompact
+)
+
+// Run owns one execution's runtime resources: its cancel, its done
+// signal, and (until milestone A step 2 replaces them with the session
+// stream) its per-run event channel. The Session holds a pointer to
+// the current run; the run's teardown clears it under the session
+// lock before closing done — the C1 invariant: anyone who observes
+// the run as finished can immediately Start a new one or get ErrNoRun
+// from Steer.
+type Run struct {
+	session *Session
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
+	events  chan model.Event // buffered; closed by the run goroutine
+	err     error
+	kind    RunKind
+}
+
+// Stop cancels the run. It does not wait — use Done for that.
+func (r *Run) Stop() { r.cancel() }
+
+// Done is closed once, by the run goroutine, after the session's
+// currentRun pointer has been cleared. It is a supplementary signal:
+// consumers that need to know the run's events are fully delivered
+// must drain the events channel (milestone A step 2's stream will
+// make this a non-issue with the in-stream terminal status).
+func (r *Run) Done() <-chan struct{} { return r.done }
+
+// Err returns the run's outcome. Only defined after Done is closed;
+// reading it before Done is a data race.
+// nil = success; ErrInterrupted = user-interrupted before completion;
+// other = failure (the run.failed record was committed).
+func (r *Run) Err() error { return r.err }
+
+// Session is the state layer: it owns the folded state, the commit
+// path, the record stream, and the current run pointer. See
+// docs/design.md for the layering.
 type Session struct {
 	agent   *Agent
 	storage storage.Session
@@ -74,11 +119,15 @@ type Session struct {
 	// pendingCreated is the session.created record of a fresh session,
 	// committed ahead of the first real record. Nil on reopened sessions.
 	pendingCreated *storage.Record
-	running        bool
-	cancel         context.CancelFunc
-	events         chan model.Event
-	done           chan struct{}
-	subs           map[*subscription]struct{}
+	// currentRun is the active single-flight execution, or nil when
+	// idle. Replaces the running/cancel/events/done field quartet —
+	// those resources belong to the Run (design §14.1).
+	currentRun *Run
+	// lastRun survives the current run's teardown: Events() and the
+	// test helpers drain buffered events off it after settle (the
+	// post-settle drain contract).
+	lastRun *Run
+	subs    map[*subscription]struct{}
 }
 
 // ID returns the session ID, available before the first record.
@@ -114,7 +163,14 @@ func (s *Session) Snapshot() storage.State {
 func (s *Session) Running() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.running
+	return s.currentRun != nil
+}
+
+// CurrentRun returns the active run, or nil when idle.
+func (s *Session) CurrentRun() *Run {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentRun
 }
 
 // Compacting reports whether a compaction currently holds the run
@@ -126,13 +182,19 @@ func (s *Session) Compacting() bool {
 	return s.state.Compacting != nil
 }
 
-// Events returns the transient event stream of the run: the active one,
-// or the previous run's closed channel (receiving drains any buffered
-// events, then returns false immediately).
+// Events returns the transient event stream of the run: the active
+// one, or the previous run's closed channel (receiving drains any
+// buffered events, then returns false immediately).
 func (s *Session) Events() <-chan model.Event {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.events
+	if s.currentRun != nil {
+		return s.currentRun.events
+	}
+	if s.lastRun != nil {
+		return s.lastRun.events
+	}
+	return nil
 }
 
 // Subscription delivers committed records to one subscriber.
@@ -210,42 +272,60 @@ var (
 	ErrNotQueued = errors.New("no such queued steer message")
 )
 
-// Send appends the user input durably and starts the run. It returns as
-// soon as the run is launched; output arrives on Events and via Subscribe.
-//
-// The check, the durable append, and the running-flag transition happen in
-// one lock section, so a concurrent Send can never interleave its records
-// with another run's: the loser is rejected before anything is written.
+// ErrInterrupted is returned by Run.Err when the run was stopped by
+// the user (Stop) rather than failing.
+var ErrInterrupted = errors.New("run interrupted")
+
+// Send appends the user input durably and starts the run. It returns
+// as soon as the run is launched; output arrives on Events and via
+// Subscribe. A convenience wrapper over Start for callers that don't
+// need the Run object (the CLI's synchronous path migrates to a direct
+// Start + Done in milestone A step 4).
 func (s *Session) Send(text string) error {
-	text = strings.TrimRight(text, "\r\n")
-	if strings.TrimSpace(text) == "" {
-		return fmt.Errorf("input is empty")
+	_, err := s.Start(context.Background(), text)
+	return err
+}
+
+// Start appends the user input durably and starts a conversational
+// run, returning the Run object. The caller's ctx is only checked
+// here (before commit); the run's lifetime is controlled solely by
+// Run.Stop() and Session.Close().
+func (s *Session) Start(ctx context.Context, input string) (*Run, error) {
+	input = strings.TrimRight(input, "\r\n")
+	if strings.TrimSpace(input) == "" {
+		return nil, fmt.Errorf("input is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	runID := newRunID()
-	events := make(chan model.Event, 256)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx2, cancel := context.WithCancel(context.Background())
+	r := &Run{
+		session: s,
+		ctx:     ctx2,
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		events:  make(chan model.Event, 256),
+		kind:    RunTurn,
+	}
 
 	s.mu.Lock()
-	if s.running {
+	if s.currentRun != nil {
 		s.mu.Unlock()
 		cancel()
-		return ErrRunActive
+		return nil, ErrRunActive
 	}
 	stored, err := s.commitLocked(storage.Record{
 		ItemID: storage.NewUserInputID(), Type: storage.TypeUserInput,
-		RunID: runID, Content: text,
+		RunID: runID, Content: input,
 	})
 	if err != nil {
 		s.mu.Unlock()
 		cancel()
-		return err
+		return nil, err
 	}
 	request := s.agent.buildRequest(s.state.Context)
-	s.running = true
-	s.cancel = cancel
-	s.events = events
-	done := make(chan struct{})
-	s.done = done
+	s.currentRun = r
 	var subs []*subscription
 	for sub := range s.subs {
 		subs = append(subs, sub)
@@ -257,8 +337,8 @@ func (s *Session) Send(text string) error {
 	for _, sub := range subs {
 		sub.deliver(stored)
 	}
-	go s.run(ctx, runID, request, events, done)
-	return nil
+	go r.execute(runID, request)
+	return r, nil
 }
 
 // Steer queues a user input for mid-run injection: the run consumes it
@@ -280,12 +360,12 @@ func (s *Session) Steer(text string) (string, error) {
 	// reasoning wrongly assumed open) must not wedge the session —
 	// one recovered panic with the lock held hangs every later caller.
 	defer s.mu.Unlock()
-	// A steer needs a run that will consume the queue. The signal is
-	// the OPEN events channel, not running alone: a manual Compact holds
-	// the slot with running=true and NO channel (nothing drains the
-	// queue until the next Send), and the channel-invariant established
-	// under this lock (non-nil ⟺ open) makes the send below safe.
-	if !s.running || s.events == nil {
+	// A steer needs a conversational run that will consume the queue.
+	// The signal is the run's kind, not running alone: a manual Compact
+	// holds the slot with no consumer for the queue. The channel guard
+	// is structural: the run goroutine is the only one that closes it,
+	// and it does so only after clearing currentRun under this lock.
+	if s.currentRun == nil || s.currentRun.kind != RunTurn {
 		return "", ErrNoRun
 	}
 	itemID := storage.NewUserInputID()
@@ -293,9 +373,9 @@ func (s *Session) Steer(text string) (string, error) {
 	// Best-effort, like every transient event; the queue itself is in
 	// Snapshot. (A select with default does NOT protect a send on a
 	// closed channel — the send panics before default is consulted; the
-	// invariant above is the only guard.)
+	// kind guard above is the real protection.)
 	select {
-	case s.events <- model.SteerQueuedEvent{ItemID: itemID, Text: text}:
+	case s.currentRun.events <- model.SteerQueuedEvent{ItemID: itemID, Text: text}:
 	default:
 	}
 	return itemID, nil
@@ -312,9 +392,9 @@ func (s *Session) UpdateSteer(itemID, text string) error {
 	for i := range s.state.Steered {
 		if s.state.Steered[i].ItemID == itemID {
 			s.state.Steered[i].Text = text
-			if s.running && s.events != nil {
+			if s.currentRun != nil && s.currentRun.kind == RunTurn {
 				select {
-				case s.events <- model.SteerUpdatedEvent{ItemID: itemID, Text: text}:
+				case s.currentRun.events <- model.SteerUpdatedEvent{ItemID: itemID, Text: text}:
 				default:
 				}
 			}
@@ -331,9 +411,9 @@ func (s *Session) WithdrawSteer(itemID string) error {
 	for i := range s.state.Steered {
 		if s.state.Steered[i].ItemID == itemID {
 			s.state.Steered = append(s.state.Steered[:i], s.state.Steered[i+1:]...)
-			if s.running && s.events != nil {
+			if s.currentRun != nil && s.currentRun.kind == RunTurn {
 				select {
-				case s.events <- model.SteerWithdrawnEvent{ItemID: itemID}:
+				case s.currentRun.events <- model.SteerWithdrawnEvent{ItemID: itemID}:
 				default:
 				}
 			}
@@ -386,10 +466,10 @@ func (s *Session) drainSteered(messages *[]model.Message, runID string) (int, er
 // failure record, the user input simply stays unanswered.
 func (s *Session) Stop() {
 	s.mu.RLock()
-	cancel := s.cancel
+	r := s.currentRun
 	s.mu.RUnlock()
-	if cancel != nil {
-		cancel()
+	if r != nil {
+		r.cancel()
 	}
 }
 
@@ -398,10 +478,10 @@ func (s *Session) Stop() {
 func (s *Session) Close() error {
 	s.Stop()
 	s.mu.RLock()
-	done := s.done
+	r := s.currentRun
 	s.mu.RUnlock()
-	if done != nil {
-		<-done
+	if r != nil {
+		<-r.done
 	}
 	return s.storage.Close()
 }
@@ -584,18 +664,30 @@ func (s *Session) commitToolResult(resultItemID, runID string, iteration int, re
 	}, func(state *storage.State) { state.Running = nil })
 }
 
-// settle clears the run slot and the transient region. It is the last
-// state change before the run's done channel closes: whatever the exit
-// path, a settled session never shows a streaming message, a running
-// tool, or an in-flight compaction in its Snapshot (the partial content
-// lived only in the failure events).
-func (s *Session) settle() {
+// settle is the run's teardown, called from the run goroutine's
+// defer chain. C1 invariant: clear transient slots + move currentRun
+// to lastRun + clear currentRun happen in ONE lock section; close(done)
+// happens outside the lock, last. Anyone who observes Running()==false
+// (or currentRun==nil) can immediately Start a new run or get ErrNoRun
+// from Steer — the run is fully retired before done closes.
+//
+// The transient-slot clearing (Streaming/Running/Compacting) is a
+// DEFENSIVE fallback: on normal paths, commit's clear callback and
+// item-specific commits clear these slots as they land. There is no
+// end-to-end observable window where settle is the first to clear a
+// slot — it exists for the interrupted/panic paths where items never
+// complete. No dedicated test covers it (by design: the observable
+// behavior is "interrupted runs leave no phantom slots in Snapshot",
+// which the interruption tests cover).
+func (s *Session) settle(r *Run) {
 	s.mu.Lock()
-	s.running = false
-	s.cancel = nil
 	s.state.Streaming = nil
 	s.state.Running = nil
 	s.state.Compacting = nil
+	if s.currentRun == r {
+		s.lastRun = r
+		s.currentRun = nil
+	}
 	s.mu.Unlock()
 }
 
@@ -603,38 +695,63 @@ func (s *Session) settle() {
 // summary. The compaction item's identity is minted before the model
 // call; the context.compacted record lands only on success — a failed or
 // interrupted compaction leaves the context untouched. Exclusive with
-// Send: the run slot is held for the duration of the summary call.
+// Start: the run slot is held for the duration of the summary call.
 func (s *Session) Compact() error {
+	r, err := s.StartCompact(context.Background())
+	if err != nil {
+		return err
+	}
+	// Hold the Run reference from StartCompact — CurrentRun() may already
+	// be nil if the goroutine settled before we get here (a fast summary
+	// or a caller racing the start).
+	<-r.Done()
+	return r.Err()
+}
+
+// StartCompact starts a context compaction as a run, returning the Run
+// object. The compaction occupies the single-flight slot.
+func (s *Session) StartCompact(ctx context.Context) (*Run, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ctx2, cancel := context.WithCancel(context.Background())
+	r := &Run{
+		session: s,
+		ctx:     ctx2,
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		events:  make(chan model.Event, 256), // N3: compact runs also have events
+		kind:    RunCompact,
+	}
+
 	s.mu.Lock()
-	if s.running {
+	if s.currentRun != nil {
 		s.mu.Unlock()
-		return ErrRunActive
+		cancel()
+		return nil, ErrRunActive
 	}
 	if len(s.state.Context) == 0 {
 		s.mu.Unlock()
-		return ErrNothingToCompact
+		cancel()
+		return nil, ErrNothingToCompact
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	s.running = true
-	s.cancel = cancel
-	s.done = done
-	// A manual compaction runs WITHOUT an events channel. The reference
-	// MUST be dropped here: running=true with the previous run's CLOSED
-	// channel still attached is exactly the Steer panic shape (the send
-	// on a closed channel, with s.mu held — one recovered panic and the
-	// whole session is wedged). settle deliberately does NOT nil it
-	// (post-settle consumers drain buffered events off the last
-	// channel); Send re-points it at a fresh open channel with the slot.
-	s.events = nil
+	s.currentRun = r
 	s.mu.Unlock()
 
-	defer close(done)
-	defer s.settle()
-	defer cancel()
+	go func() {
+		// Teardown order mirrors Run.execute, but the interruption
+		// check must happen BEFORE cancel() — a deferred cancel would
+		// make ctx.Err() always non-nil at normalization time, turning
+		// every successful compact into ErrInterrupted.
+		defer close(r.done)
+		defer close(r.events)
+		defer func() { s.settle(r) }()
 
-	_, err := s.compactContext(ctx, storage.NewContextCompactedID(), pressureNone, 0, nil)
-	return err
+		_, err := s.compactContext(r.ctx, storage.NewContextCompactedID(), pressureNone, 0, r.events)
+		r.err = compactOutcome(err, r.ctx.Err())
+		cancel() // cleanup: after the result is captured
+	}()
+	return r, nil
 }
 
 // compactContext generates and commits a context summary, replacing the
@@ -841,15 +958,28 @@ func (s *Session) clearSoftCompactCooldown() {
 // run drives one agent run: iterate (request the model, execute the tool
 // calls it asked for) until the model returns a final response without
 // tool calls, the iteration budget is exhausted, or the run is stopped.
-func (s *Session) run(ctx context.Context, runID string, request model.Request, events chan model.Event, done chan struct{}) {
+func (r *Run) execute(runID string, request model.Request) {
+	s := r.session
+	ctx, events, done := r.ctx, r.events, r.done
+
+	// Teardown order (C1): settle clears transient slots + retires the
+	// currentRun pointer in ONE lock section; close(events) and
+	// close(done) happen outside the lock, last. The happens-before
+	// chain: settle's lock-release < any observer's lock-acquire
+	// (sees currentRun==nil) < a new Start's lock-acquire.
 	defer close(done)
 	defer close(events)
-	defer s.settle()
-
+	defer func() { s.settle(r) }()
 	// A failure is recorded only when the run was not interrupted: an
 	// interruption leaves the user input unanswered, which is its own
 	// state. This defer runs before settle (LIFO).
 	var failure string
+	// completed is set at the normal-success return point (the final
+	// response with no tool calls): a Stop arriving AFTER that point
+	// must not rewrite a successful outcome as interrupted (A1).
+	var completed bool
+
+	defer func() { r.err = turnOutcome(completed, ctx.Err(), failure) }()
 	defer func() {
 		if failure == "" || ctx.Err() != nil {
 			return
@@ -923,6 +1053,7 @@ func (s *Session) run(ctx context.Context, runID string, request model.Request, 
 					continue
 				}
 			}
+			completed = true
 			return
 		}
 
@@ -1192,4 +1323,35 @@ func toolErrorResult(toolCall model.ToolCall, format string, args ...any) model.
 		Content:    fmt.Sprintf(format, args...),
 		IsError:    true,
 	})
+}
+
+// turnOutcome is the N1 error semantics for conversational runs,
+// extracted as a pure function so the priority order is testable
+// directly (table-driven) instead of through end-to-end hooks.
+// The path the run ended on determines the outcome, NOT the ctx state
+// after the fact: a Stop arriving after the successful return must not
+// rewrite nil as ErrInterrupted.
+func turnOutcome(completed bool, ctxErr error, failure string) error {
+	switch {
+	case completed:
+		return nil
+	case ctxErr != nil:
+		return ErrInterrupted
+	case failure != "":
+		return errors.New(failure)
+	}
+	return nil
+}
+
+// compactOutcome is the compact-run counterpart: compactContext
+// returning nil means success (or soft churn dropped) — a late Stop
+// must not rewrite it as interrupted.
+func compactOutcome(err, ctxErr error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr != nil {
+		return ErrInterrupted
+	}
+	return err
 }

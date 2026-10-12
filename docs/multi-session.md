@@ -167,7 +167,8 @@ func agentFactory(serverRoot, providerName, modelName string)
 - hub 生命周期 = `活动 run OR 有订阅者`（run 可以在无人观看时继续跑，
   hub 的事件消费与落盘无关——现状语义保持）
 - hub 暴露带锁的 `Subscribers() int`（fanout 内部已有全部信息）
-- run 状态用现成的 `session.Running()`
+- run 状态用现成的 `session.Running()`（milestone A §14.1 后：
+  `currentRun != nil` 的派生——压缩 run 也占槽，不被驱逐）
 
 ### 3.3 会话→项目归属
 

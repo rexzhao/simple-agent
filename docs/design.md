@@ -358,8 +358,9 @@ func (s *Session) Run(ctx context.Context, input string) error // 同步入口
 - **Err 语义**（N1）：`nil` = 成功；`ErrInterrupted`（哨兵，
   `errors.Is` 可判）= 被 Stop/中断；其他 = 失败（对应 run.failed）。
 - **Run 不拥有事件 channel**：事件流是 session 级的（§14.2）。
-- **单飞**：`Start` 在锁内检查 `currentRun != nil && !currentRun.isDone()`
-  → ErrRunActive。`StartCompact` 同门。
+- **单飞**：`Start` 在锁内检查 `currentRun != nil` → 拒绝。settle 在
+  锁内清 currentRun ⟹ 观察到 nil 即安全（无需 isDone 辅助字段——
+  拆卸序保证指针清除先于 done close，而 Start 只看指针）。
 - **Run 结束的拆卸**：run goroutine 的 defer 序列：
   1. 清瞬态槽（Streaming/Running/Compacting 置 nil）；
   2. 在流内发终态 `Status{Running:false}`（保证路径，§14.2）；
@@ -405,8 +406,9 @@ type StreamSubscription struct {
   （B1，原 a 方案）：结束信号用单独的 `Lost()` channel——被摘除时
   close(Lost)，订阅方收到后自行 Stop + 重连。这消除了"锁外多生产者
   发送 vs Close 关闭"的 send-on-closed 竞态（P0-1 同类）。
-  Session.Close 做的事：标记 session 关闭 → 摘除全部订阅者
-  （close 各自的 Lost）→ 等待 run 排空。订阅 channel 本身不关。
+  Session.Close 按下文 R3 的五步顺序执行（取消 ctx → 等 run 排空 →
+  通知 dispatcher 摘除全部订阅者 → 停 dispatcher → 关 storage）。
+  订阅 channel 本身不关。dispatcher 在 NewSession 和 Open 时都要启动。
 - **事件生产方**（两个，都合法）：run goroutine 与 API goroutine（steer）。
 
 **全序规则**（B2 定案 + R3 边界）：
@@ -431,10 +433,11 @@ type StreamSubscription struct {
   事件： dispatcher 收到 stop 后清空队列、关全部 Lost、退出
   ——订阅方收到 Lost 重连时发现 session 已关（Stream() 返回
   错误或空快照 + 立即 Lost），自然终止。
-- **Session.Close 的完整顺序**（R3）：1) 取消 session ctx
-  （停止 run）→ 2) 等 run 排空（< -done）→ 3) 摘除全部订阅者
-  （关各自的 Lost）→ 4) 停 dispatcher（关 stopDispatcher，
-  等 dispatcherDone）→ 5) 关 storage。
+- **Session.Close 的完整顺序**（R3，C3 修订）：1) 取消当前 run 的
+  ctx（`Stop()`）→ 2) 等 run 排空（< -done）→ 3) 通知 dispatcher 摘除
+  全部订阅者（由 dispatcher 关闭各自的 Lost）→ 4) 停 dispatcher
+  （关 stopDispatcher，等 dispatcherDone）→ 5) 关 storage。
+  dispatcher 在 NewSession 和 Open 时都要启动。
 - 这同时解掉"Status{Running:true} 在锁内发 vs 锁外发送纪律"的矛盾：
   **全部入队都在锁内**（与状态变更同锁段），**全部投递都在锁外**
   （dispatcher goroutine）。发送纪律的"锁外"指的是投递，不是入队。
