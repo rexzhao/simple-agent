@@ -31,6 +31,10 @@ export type Snap = {
   connected: boolean;
   verified: boolean | null; // null = not yet comparable
   notice: string;
+  // The single in-flight tool execution (the server has one Running
+  // slot). It overlays the matching tool-call part of the last
+  // assistant message with its executing state.
+  tool: { callID: string; name: string; args: string } | null;
 };
 
 const initialSnap: Snap = {
@@ -47,6 +51,7 @@ const initialSnap: Snap = {
   connected: false,
   verified: null,
   notice: "",
+  tool: null,
 };
 
 export type EventSourceLike = {
@@ -204,6 +209,7 @@ export class SessionStore {
           more: !!frame.more,
           running: !!frame.running,
           live,
+          tool: frame.tool && frame.tool.call_id ? { callID: frame.tool.call_id, name: frame.tool.name || "", args: frame.tool.args || "" } : null,
           steered: frame.steered || [],
           connected: true,
           verified: frame.d ? frame.d === head : this.snap.verified,
@@ -214,9 +220,11 @@ export class SessionStore {
         if (!frame.r) break;
         const records = [...this.snap.records, frame.r];
         const head = await chainStep(this.snap.head, frame.r);
+        // The durable result supersedes the transient executing slot.
+        const tool = frame.r.t === "tool.result" ? null : this.snap.tool;
         // The committed record supersedes the live item by ItemID.
         const live = this.snap.live && this.snap.live.id !== frame.r.item ? this.snap.live : dropLiveIfEmpty(this.snap.live, frame.r);
-        this.commit({ records, head, live, verified: null });
+        this.commit({ records, head, live, tool, verified: null });
         break;
       }
       case "event": {
@@ -224,8 +232,12 @@ export class SessionStore {
         break;
       }
       case "status": {
+        const running = frame.running ?? this.snap.running;
         this.commit({
-          running: frame.running ?? this.snap.running,
+          running,
+          // A settled run has no tool in flight (the server's Running
+          // slot exists only inside a run).
+          tool: running ? this.snap.tool : null,
           compacting: !!frame.compacting,
           notice: frame.notice || "",
           verified: frame.d ? frame.d === this.snap.head : this.snap.verified,
@@ -259,13 +271,25 @@ export class SessionStore {
       }
       case "tool_started":
       case "tool_call_done": {
+        // The executing slot lives on the SNAPSHOT, not the live item:
+        // the assistant.message record lands (dropping the live item)
+        // BEFORE its tool calls execute — the events arrive with no
+        // live item to hang them on.
+        if (!frame.call_id) break;
+        this.commit({
+          tool: { callID: frame.call_id, name: frame.name || "", args: frame.args || "" },
+        });
         const live = this.snap.live;
-        if (!live || !frame.call_id) break;
-        const parts = upsertTool(live.parts, frame.call_id, frame.name || "", frame.args || "", frame.t === "tool_call_done");
-        this.commit({ live: { ...live, parts } });
+        if (live) {
+          const parts = upsertTool(live.parts, frame.call_id, frame.name || "", frame.args || "", frame.t === "tool_call_done");
+          this.commit({ live: { ...live, parts } });
+        }
         break;
       }
       case "tool_result": {
+        if (this.snap.tool && frame.call_id === this.snap.tool.callID) {
+          this.commit({ tool: null });
+        }
         const live = this.snap.live;
         if (!live || !frame.call_id) break;
         const parts = attachResult(live.parts, frame.call_id, frame.text || "", !!frame.is_err);

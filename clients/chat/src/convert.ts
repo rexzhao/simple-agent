@@ -18,6 +18,10 @@ type Part =
       argsText: string;
       result?: string;
       isError?: boolean;
+      // Overlaid by the adapter when this call is the server's in-flight
+      // tool execution (the executing state lives on the store's tool
+      // slot, not in the record).
+      running?: boolean;
     };
 
 type Status =
@@ -133,6 +137,7 @@ export function toThreadMessageLike(m: ChatMessage, _idx: number): ThreadMessage
       argsText: p.argsText,
       result: p.result,
       isError: p.isError,
+      isPreliminary: p.running,
     };
   });
   // Split by role so the type system enforces what the runtime

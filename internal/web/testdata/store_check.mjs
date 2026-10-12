@@ -253,9 +253,46 @@ const r4 = rec("assistant.message", { content: "a2" });
   assert(store.snap.live === before, "s11 late deltas attach to nothing");
 }
 
+// ---- 12. the in-flight tool slot ----
+// The assistant record lands BEFORE its tools execute, so the events
+// arrive with no live item: the executing state lives on the snapshot
+// slot and overlays the record's call part.
+{
+  const am = rec("assistant.message", { content: "calling", tool_calls: [{ id: "c9", name: "shell", arguments: "{}" }] });
+  await apply({ kind: "record", r: am });
+  await applyRecord(red, am);
+  assert(store.snap.tool === null, "s12 no slot before tool_started");
+  await apply({ kind: "event", t: "tool_started", item: am.item, call_id: "c9", name: "shell", args: "{}" });
+  assert(store.snap.tool && store.snap.tool.callID === "c9", "s12 slot set by tool_started");
+  await apply({ kind: "event", t: "tool_result", call_id: "c9", name: "shell", text: "out" });
+  assert(store.snap.tool === null, "s12 slot cleared by tool_result event");
+  // Again, cleared by the durable record instead.
+  await apply({ kind: "event", t: "tool_started", item: am.item, call_id: "c9", name: "shell", args: "{}" });
+  const tr = rec("tool.result", { tool_call_id: "c9", tool_name: "shell", content: "out" });
+  await apply({ kind: "record", r: tr });
+  await applyRecord(red, tr);
+  assert(store.snap.tool === null, "s12 slot cleared by the tool.result record");
+  // A settled run clears it too.
+  await apply({ kind: "event", t: "tool_started", item: am.item, call_id: "c9", name: "shell", args: "{}" });
+  await apply({ kind: "status", running: false, d: store.snap.head });
+  assert(store.snap.tool === null, "s12 slot cleared by the settled status");
+  // The reconnect snapshot: tool without streaming still sets the slot.
+  await apply({
+    kind: "snapshot",
+    anchor: store.snap.prefixAnchor,
+    resumed: true,
+    records: [],
+    running: true,
+    streaming: undefined,
+    tool: { item: "i-tool", call_id: "c9", name: "shell", args: "{}" },
+    d: store.snap.head,
+  });
+  assert(store.snap.tool && store.snap.tool.callID === "c9", "s12 snapshot sets the slot (tool without streaming)");
+}
+
 if (failures.length) {
   console.error("store_check: FAILED");
   for (const f of failures) console.error("  - " + f);
   process.exit(1);
 }
-console.log("store_check: OK (11 scenarios, mirror consistent + serialized burst + reorder guard)");
+console.log("store_check: OK (12 scenarios: mirror + burst + reorder guard + tool slot)");

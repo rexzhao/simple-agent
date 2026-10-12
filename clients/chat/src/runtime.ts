@@ -27,6 +27,7 @@ const emptySnapshot: Snap = {
   connected: false,
   verified: null,
   notice: "",
+  tool: null,
 };
 const emptySnap = () => emptySnapshot;
 
@@ -75,6 +76,17 @@ export function useSaiAdapter(
     const messages = convertRecords(snap.records);
     const live = convertLive(snap.live);
     if (live) messages.push(live);
+    // Overlay the executing tool: its call part sits on the last
+    // assistant message (the record landed before execution began).
+    if (snap.tool) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.role !== "assistant") continue;
+        const part = m.parts.find(p => p.type === "tool-call" && p.toolCallId === snap.tool?.callID);
+        if (part && part.type === "tool-call") part.running = true;
+        break;
+      }
+    }
 
     const sessionID = snap.session;
     const running = snap.running || snap.compacting;
