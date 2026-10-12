@@ -422,3 +422,74 @@ func TestNoticeClearedByNextSend(t *testing.T) {
 		t.Fatalf("notice after the next Send = %q, want empty", st2.Notice)
 	}
 }
+
+// TestCompactionEventsBroadcastImmediately pins the folded-in behavior
+// of the notice lifecycle: compaction_failed and compaction_completed
+// push their status frames INSIDE the event handler — a connected page
+// sees the notice the moment the event lands (not at the run's settle,
+// and not as a bare event frame).
+func TestCompactionEventsBroadcastImmediately(t *testing.T) {
+	provider := &webFakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "x"}, model.MessageDoneEvent{}},
+	}}
+	session, srv, base := newTestManagerServer(t, provider)
+
+	res, err := http.Get(base.URL + api(session, "/stream")) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	br := bufio.NewReader(res.Body)
+	nextFrame := func() Frame {
+		t.Helper()
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var f Frame
+			if err := json.Unmarshal([]byte(strings.TrimRight(line[6:], "\n")), &f); err != nil {
+				t.Fatalf("frame: %v (%s)", err, line)
+			}
+			return f
+		}
+	}
+	// Consume the connect-time snapshot.
+	if f := nextFrame(); f.Kind != "snapshot" {
+		t.Fatalf("first frame = %s, want snapshot", f.Kind)
+	}
+
+	// No run is active: feed the events the way the events channel
+	// would. The failure must arrive as a STATUS frame carrying the
+	// notice — not as a bare event frame.
+	entry, release, _, err := srv.manager.open(session.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"})
+	f := nextFrame()
+	if f.Kind == "event" {
+		t.Fatal("the failure arrived as a bare event frame — the status broadcast is missing")
+	}
+	if f.Kind != "status" || !strings.Contains(f.Notice, "compaction failed") {
+		t.Fatalf("frame after the failure = kind %s notice %q, want a status frame carrying the failure", f.Kind, f.Notice)
+	}
+
+	// And the completion clears it — also immediately. (The failure's
+	// own event frame is still queued ahead; skip event frames.)
+	entry.hub.handleEvent(model.CompactionCompletedEvent{ItemID: "x1"})
+	for {
+		f = nextFrame()
+		if f.Kind == "event" {
+			continue
+		}
+		break
+	}
+	if f.Kind != "status" || f.Notice != "" {
+		t.Fatalf("frame after the completion = kind %s notice %q, want a status frame with an empty notice", f.Kind, f.Notice)
+	}
+	release()
+}
