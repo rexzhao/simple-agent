@@ -40,10 +40,15 @@ class FakeWS {
     this.open = true;
     this.onopen?.();
   }
-  request(method, params) {
-    this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", id: "q-" + this.sent.length, method, params }) });
-    const frame = this.sent[this.sent.length - 1];
-    return frame;
+  // Broker-side helpers. tool/call is async on the provider side, so
+  // request() awaits until the reply frame lands.
+  async request(method, params) {
+    const n = this.sent.length;
+    this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", id: "q-" + n, method, params }) });
+    for (let i = 0; i < 100 && this.sent.length === n; i++) {
+      await new Promise(r => setTimeout(r, 5));
+    }
+    return this.sent[this.sent.length - 1];
   }
   notify(method, params) {
     this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", method, params }) });
@@ -85,40 +90,47 @@ const reg2 = ws2.sent.find(m => m.method === "provider/register");
 assert(reg2.params.provider_id === "sai-chat-sess-abc", "s2 provider id keyed by session");
 
 // ---- 3. tool/describe ----
-const desc = ws2.request("tool/describe", { name: "page_send" });
+const desc = await ws2.request("tool/describe", { name: "page_send" });
 assert(desc.result.read_only === false, "s3 page_send not read_only");
 assert(!!desc.result.input_schema.properties.text, "s3 input schema");
-const descRO = ws2.request("tool/describe", { name: "page_state" });
+const descRO = await ws2.request("tool/describe", { name: "page_state" });
 assert(descRO.result.read_only === true, "s3 page_state read_only");
-const descUnknown = ws2.request("tool/describe", { name: "nope" });
-assert(!!descUnknown.result.error, "s3 unknown tool describe errors");
+const descUnknown = await ws2.request("tool/describe", { name: "nope" });
+// Unknown tools are a PROTOCOL error (JSON-RPC error frame), not a
+// result-shaped error — one failure style per channel.
+assert(!!descUnknown.error && descUnknown.error.code === -32602, "s3 unknown tool describe is a JSON-RPC error");
 
 // ---- 4. tool/call with commands wired ----
 provider.commands = {
   state: () => ({ session: "sess-abc", running: false }),
   sessions: () => [{ id: "sess-abc", title: "t" }],
   selectSession: id => {
-    provider.commands = { ...provider.commands, _selected: id } && provider.commands;
     selected = id;
   },
   readConversation: () => [{ role: "user", parts: [] }],
-  send: () => ({ ok: true }),
+  send: async () => ({ ok: true, confirmed: true }),
   text: () => "page text",
 };
 let selected = "";
-const callState = ws2.request("tool/call", { name: "page_state", arguments: {} });
+const callState = await ws2.request("tool/call", { name: "page_state", arguments: {} });
 assert(callState.result.status === "success" && callState.result.content.session === "sess-abc", "s4 page_state");
-const callSelect = ws2.request("tool/call", { name: "page_select_session", arguments: { session_id: "sess-xyz" } });
+const callSelect = await ws2.request("tool/call", { name: "page_select_session", arguments: { session_id: "sess-xyz" } });
 assert(callSelect.result.status === "success" && selected === "sess-xyz", "s4 select dispatch");
-const callSend = ws2.request("tool/call", { name: "page_send", arguments: { text: "hello" } });
-assert(callSend.result.status === "success", "s4 send");
-const callRead = ws2.request("tool/call", { name: "page_read_conversation", arguments: {} });
+const callRead = await ws2.request("tool/call", { name: "page_read_conversation", arguments: {} });
 assert(callRead.result.content[0].role === "user", "s4 read_conversation");
 
+// page_send is opt-in: disabled by default, enabled answers with the
+// confirmed flag from the bounded composer check.
+const sendDisabled = await ws2.request("tool/call", { name: "page_send", arguments: { text: "hello" } });
+assert(sendDisabled.result.status === "error" && /disabled/.test(sendDisabled.result.error), "s4 page_send disabled by default");
+provider.sendEnabled = true;
+const callSend = await ws2.request("tool/call", { name: "page_send", arguments: { text: "hello" } });
+assert(callSend.result.status === "success" && callSend.result.content.confirmed === true, "s4 send with confirmation");
+
 // ---- 5. validation and unknown tools ----
-const sendNoText = ws2.request("tool/call", { name: "page_send", arguments: {} });
+const sendNoText = await ws2.request("tool/call", { name: "page_send", arguments: {} });
 assert(sendNoText.result.status === "error", "s5 send without text errors");
-const unknown = ws2.request("tool/call", { name: "nope", arguments: {} });
+const unknown = await ws2.request("tool/call", { name: "nope", arguments: {} });
 assert(unknown.result.status === "error", "s5 unknown tool errors");
 
 // ---- 6. notifications (no id) get no response ----
@@ -128,11 +140,11 @@ assert(ws2.sent.length === before, "s6 notification ignored");
 
 // ---- 7. no commands wired ----
 provider.commands = null;
-const notReady = ws2.request("tool/call", { name: "page_state", arguments: {} });
-assert(notReady.result.status === "error" && /not ready/.test(notReady.result.error), "s7 not ready");
+const notReady = await ws2.request("tool/call", { name: "page_state", arguments: {} });
+assert(!!notReady.error && /not ready/.test(notReady.error.message), "s7 not ready is a JSON-RPC error");
 
 // ---- 8. provider/getManifest ----
-const gm = ws2.request("provider/getManifest", {});
+const gm = await ws2.request("provider/getManifest", {});
 assert(gm.result.manifest_version === 1, "s8 getManifest");
 
 if (failures.length) {

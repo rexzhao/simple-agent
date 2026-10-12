@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSyncExternalStore } from "react";
 import {
   AssistantRuntimeProvider,
@@ -10,7 +10,7 @@ import { getProjects } from "./api";
 import { useSaiAdapter } from "./runtime";
 import { SessionStore } from "./store";
 import { convertLive, convertRecords } from "./convert";
-import { PageProvider, clearPageProviderConfig, readPageProviderConfig } from "./pageProvider";
+import { PageProvider, allowedBrokerHost, clearPageProviderConfig, pendingPageProviderURL, readStoredPageProviderConfig, storePageProviderConfig } from "./pageProvider";
 import type { ProjectsResponse } from "./types";
 
 // ---- projects sidebar (own poll, like the log page) ----
@@ -41,7 +41,10 @@ function useProjects(): ProjectsResponse | null {
 // (React 19 controlled components ignore plain .value writes), the
 // input event, then the send button — not the API. The point of the
 // debug tool is operating the page as the human does.
-function composerSend(text: string): { ok: boolean; error?: string } {
+// The result is DISPATCHED, not delivered: a bounded poll watches the
+// composer clear (the runtime empties it when the send lands), so the
+// caller can tell "clicked" from "accepted".
+async function composerSend(text: string): Promise<{ ok: boolean; confirmed?: boolean; error?: string }> {
   const ta = document.querySelector<HTMLTextAreaElement>(".aui-composer-input");
   if (!ta) return { ok: false, error: "composer input not found" };
   const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
@@ -51,7 +54,21 @@ function composerSend(text: string): { ok: boolean; error?: string } {
   const btn = document.querySelector<HTMLElement>(".aui-composer-send");
   if (!btn) return { ok: false, error: "send button not found" };
   btn.click();
-  return { ok: true };
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 100));
+    const now = document.querySelector<HTMLTextAreaElement>(".aui-composer-input");
+    if (!now) break;
+    if (now.value === "") return { ok: true, confirmed: true };
+  }
+  return { ok: true, confirmed: false };
+}
+
+function providerHostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
 }
 
 // ---- app ----
@@ -61,16 +78,47 @@ export default function App() {
   const [sessionID, setSessionID] = useState("");
   const stores = useMemo(() => new Map<string, SessionStore>(), []);
   const provider = useMemo(() => new PageProvider(), []);
+  // The page-as-provider state the UI reflects: active connection and
+  // a pending ?page-provider= link awaiting confirmation.
+  const [providerActive, setProviderActive] = useState(false);
+  const [providerHost, setProviderHost] = useState("");
+  const [pendingBroker, setPendingBroker] = useState<string | null>(null);
 
-  // The page-as-provider debug surface: enabled by ?page-provider=<ws-url>
-  // (persisted) or window.sai.pageProvider(url); inert otherwise. The
-  // commands are refreshed every render so the provider always reads
-  // live state; setSession re-registers under sai-chat-<session>.
-  const providerConfigured = useMemo(() => {
-    const url = readPageProviderConfig();
-    if (url) provider.start(url);
-    return !!url;
-  }, [provider]);
+  const startProvider = (url: string, persist: boolean, send: boolean) => {
+    provider.sendEnabled = send;
+    provider.start(url);
+    setProviderActive(true);
+    setProviderHost((() => {
+      try {
+        return new URL(url).host;
+      } catch {
+        return url;
+      }
+    })());
+    if (persist) storePageProviderConfig(url);
+  };
+  const stopProvider = () => {
+    provider.stop();
+    provider.sendEnabled = false;
+    clearPageProviderConfig();
+    setProviderActive(false);
+    setProviderHost("");
+  };
+
+  // Provider bootstrap, in an effect with a once-ref: StrictMode
+  // double-invokes render-phase code, and a double start() would leak
+  // a second socket registered under the same provider id. The stored
+  // config is the explicit console action's persistence; the query
+  // param becomes a confirmation banner instead of connecting.
+  const bootstrapped = useRef(false);
+  useEffect(() => {
+    if (bootstrapped.current) return;
+    bootstrapped.current = true;
+    const stored = readStoredPageProviderConfig();
+    if (stored && allowedBrokerHost(stored)) startProvider(stored, false, false);
+    const pending = pendingPageProviderURL();
+    if (pending) setPendingBroker(allowedBrokerHost(pending) ? pending : null);
+  });
   useEffect(() => {
     provider.setSession(sessionID);
   }, [sessionID, provider]);
@@ -185,22 +233,24 @@ export default function App() {
       return s ? convertRecords(s.getSnapshot().records) : [];
     },
     select: (id: string) => setSessionID(id),
-    pageProvider: (url?: string) => {
-      const u = url || "ws://10.10.6.68:8637/hub/provider";
-      provider.start(u);
-      try {
-        localStorage.setItem("sai.pageProvider", u);
-      } catch {
-        /* private mode */
-      }
-      return "page provider: " + u;
+    pageProvider: (url: string, opts?: { send?: boolean }) => {
+      // Explicit DevTools action: the only path that persists. The
+      // broker URL is required — no baked-in default.
+      if (!url) return "usage: sai.pageProvider(ws://host:port/hub/provider, {send: true})";
+      if (!allowedBrokerHost(url)) return "refused: only loopback/private-network ws targets";
+      startProvider(url, true, !!opts?.send);
+      return "page provider: " + url + (opts?.send ? " (send enabled)" : " (read-only; {send:true} to enable page_send)");
     },
     pageProviderOff: () => {
-      provider.stop();
-      clearPageProviderConfig();
+      stopProvider();
       return "page provider: off";
     },
-    pageProviderStatus: () => ({ configured: providerConfigured, session: sessionID }),
+    pageProviderStatus: () => ({
+      active: providerActive,
+      host: providerHost,
+      send: provider.sendEnabled,
+      session: sessionID,
+    }),
   };
   (window as unknown as Record<string, unknown>).sai = saiConsole;
 
@@ -246,6 +296,29 @@ export default function App() {
             </div>
           </nav>
           <div className="relative flex min-w-0 flex-1 flex-col">
+            {pendingBroker && (
+              // A ?page-provider= link asks; it never connects by
+              // itself. Confirming is session-only (no persistence);
+              // dismissing clears it for this load.
+              <div className="bg-accent/30 border-border flex min-h-7 items-baseline gap-3 border-b px-4 py-1 text-xs">
+                <span>connect this page to the debug broker at {providerHostOf(pendingBroker)}?</span>
+                <button
+                  className="text-accent-foreground cursor-pointer border-none bg-transparent underline"
+                  onClick={() => {
+                    startProvider(pendingBroker, false, false);
+                    setPendingBroker(null);
+                  }}
+                >
+                  connect (this session)
+                </button>
+                <button
+                  className="text-muted-foreground cursor-pointer border-none bg-transparent underline"
+                  onClick={() => setPendingBroker(null)}
+                >
+                  dismiss
+                </button>
+              </div>
+            )}
             <div className="text-muted-foreground border-border flex min-h-7 items-baseline gap-4 border-b px-4 py-1 text-xs">
               <span
                 className={
@@ -255,6 +328,17 @@ export default function App() {
                 {verified === false ? "chain drift!" : verified ? "verified" : "…"}
               </span>
               {notice && <span className="text-accent-foreground">{notice}</span>}
+              {providerActive && (
+                // The visible trace of an active debug connection, with
+                // the one-click disconnect: a page being operable by an
+                // agent must not be indistinguishable from an idle one.
+                <span className="text-accent-foreground ml-auto flex items-baseline gap-2">
+                  provider: {providerHost}{provider.sendEnabled ? " (send)" : ""}
+                  <button className="cursor-pointer border-none bg-transparent underline" onClick={stopProvider}>
+                    disconnect
+                  </button>
+                </span>
+              )}
             </div>
             <div className="aui-root relative flex min-h-0 flex-1 flex-col items-center justify-start">
               <Thread autoFocus />

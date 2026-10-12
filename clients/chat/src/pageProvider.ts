@@ -8,18 +8,34 @@
 // (sai-chat-<session id>, "list" when none) — the agent in session X
 // addresses the page showing X deterministically, no discovery dance.
 // Switching sessions re-registers under the new id (the broker drops
-// the old registration when the socket closes).
+// the old registration when the socket closes). Duplicate-id semantics
+// (verified live): an active registration is NOT displaced by a newer
+// one; the newer takes over only after the older disconnects. The id
+// carries no credential — anyone who can reach the broker could claim
+// it during the page's reconnect gaps. The broker is an unauthenticated
+// LAN debug surface; the page provider inherits that same trust class.
 //
-// Enabling: ?page-provider=<ws-url> on the page URL (persisted to
-// localStorage), or window.sai.pageProvider(url) from the console.
-// Unset, the module is inert — zero behavior change.
+// Enabling (three doors, in order of user intent):
+//   1. window.sai.pageProvider(url, {send}) — explicit DevTools action:
+//      persists to localStorage, auto-connects on later loads.
+//   2. ?page-provider=<ws-url> — NOT persisted, NOT auto-connecting: a
+//      crafted link must not silently wire the page to a foreign
+//      broker (page_send drives the real composer, which reaches the
+//      agent's shell tools). The page shows a confirmation banner; a
+//      confirmed link is session-only.
+//   3. window.sai.pageProviderOff() — stop + clear the stored config.
+// Only loopback/private-network brokers are accepted as targets.
+// page_send is opt-in SEPARATELY (it upgrades read-only debugging to
+// driving execution).
+
+export type SendResult = { ok: boolean; confirmed?: boolean; error?: string };
 
 export type PageCommands = {
   state(): Record<string, unknown>;
   sessions(): unknown[];
   selectSession(id: string): void;
   readConversation(): unknown[];
-  send(text: string): { ok: boolean; error?: string };
+  send(text: string): Promise<SendResult>;
   text(): string;
 };
 
@@ -30,7 +46,14 @@ const TOOLS: ToolEntry[] = [
   { name: "page_sessions", summary: "The sessions the page lists (the projects poll view).", group: "page" },
   { name: "page_select_session", summary: "Switch the page to a session by id (the real route switch).", group: "page" },
   { name: "page_read_conversation", summary: "The currently rendered conversation (roles and parts) — what the human sees.", group: "page" },
-  { name: "page_send", summary: "Type a message into the composer and click send — the real UI path, not the API.", group: "page" },
+  {
+    name: "page_send",
+    summary:
+      "Type a message into the composer and click send — the real UI path, not the API. Dispatched, not confirmed: " +
+      "the result carries whether the composer cleared within a bound. Opt-in on the page (it drives execution); " +
+      "disabled pages answer with the enabling instructions.",
+    group: "page",
+  },
   { name: "page_text", summary: "document.body.innerText — a full-page text snapshot.", group: "page" },
 ];
 
@@ -85,6 +108,9 @@ export class PageProvider {
   private reqID = 0;
 
   commands: PageCommands | null = null;
+  // page_send drives the real composer, which reaches the agent's
+  // shell tools — it is opt-in, separately from connecting.
+  sendEnabled = false;
 
   constructor(wsFactory?: (url: string) => WebSocketLike) {
     this.wsFactory = wsFactory ?? ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
@@ -103,6 +129,10 @@ export class PageProvider {
     this.retryDelay = 250;
     this.ws?.close();
     this.ws = null;
+  }
+
+  get connected() {
+    return !this.stopped && this.ws !== null;
   }
 
   // setSession re-registers under sai-chat-<session>: the provider id
@@ -169,18 +199,25 @@ export class PageProvider {
     }
     // Notifications (server/welcome, manifest changes) carry no id.
     if (msg.id === undefined || msg.id === null || !msg.method) return;
-    switch (msg.method) {
-      case "tool/describe":
-        this.reply(msg.id, this.describe(msg.params));
-        break;
-      case "tool/call":
-        this.reply(msg.id, this.call(msg.params));
-        break;
-      case "provider/getManifest":
-        this.reply(msg.id, MANIFEST);
-        break;
-      default:
-        this.replyError(msg.id, -32601, "unknown method " + msg.method);
+    try {
+      const id = msg.id as string | number;
+      switch (msg.method) {
+        case "tool/describe":
+          this.replyResult(id, this.describe(msg.params));
+          break;
+        case "tool/call":
+          void this.call(msg.params)
+            .then(r => this.replyResult(id, r))
+            .catch(e => this.replyError(id, -32603, String(e)));
+          break;
+        case "provider/getManifest":
+          this.reply(id, MANIFEST);
+          break;
+        default:
+          this.replyError(msg.id, -32601, "unknown method " + msg.method);
+      }
+    } catch (e) {
+      this.replyError(msg.id, -32603, String(e));
     }
   }
 
@@ -192,54 +229,71 @@ export class PageProvider {
     this.send({ jsonrpc: "2.0", id, error: { code, message } });
   }
 
-  private describe(params: Record<string, unknown> | undefined) {
+  // replyResult distinguishes a value from a protocol-level error, so
+  // the three failure styles (unknown tool, call-level failure,
+  // transport error) each keep their own channel instead of blurring
+  // into results.
+  private replyResult(id: string | number, r: { error?: string; value?: unknown }) {
+    if (r.error !== undefined) this.replyError(id, -32602, r.error);
+    else this.reply(id, r.value);
+  }
+
+  private describe(params: Record<string, unknown> | undefined): { error?: string; value?: unknown } {
     const name = String(params?.name || "");
     const tool = TOOLS.find(t => t.name === name);
     if (!tool) return { error: "unknown tool " + name };
     return {
-      name: tool.name,
-      title: tool.name,
-      description: tool.summary,
-      group: tool.group,
-      read_only: name !== "page_send" && name !== "page_select_session",
-      destructive: false,
-      input_schema: INPUT_SCHEMAS[name],
-      output_schema: { type: "object" },
+      value: {
+        name: tool.name,
+        title: tool.name,
+        description: tool.summary,
+        group: tool.group,
+        read_only: name !== "page_send" && name !== "page_select_session",
+        destructive: false,
+        input_schema: INPUT_SCHEMAS[name],
+        output_schema: { type: "object" },
+      },
     };
   }
 
-  private call(params: Record<string, unknown> | undefined) {
+  private async call(params: Record<string, unknown> | undefined): Promise<{ error?: string; value?: unknown }> {
     const name = String(params?.name || "");
     const args = (params?.arguments || {}) as Record<string, unknown>;
     const cmds = this.commands;
-    if (!cmds) return { status: "error", error: "page not ready" };
-    try {
-      switch (name) {
-        case "page_state":
-          return { status: "success", content: cmds.state() };
-        case "page_sessions":
-          return { status: "success", content: cmds.sessions() };
-        case "page_select_session": {
-          const id = String(args.session_id || "");
-          if (!id) return { status: "error", error: "session_id required" };
-          cmds.selectSession(id);
-          return { status: "success", content: { selected: id } };
-        }
-        case "page_read_conversation":
-          return { status: "success", content: cmds.readConversation() };
-        case "page_send": {
-          const text = String(args.text ?? "");
-          if (!text) return { status: "error", error: "text required" };
-          const out = cmds.send(text);
-          return out.ok ? { status: "success", content: { sent: true } } : { status: "error", error: out.error };
-        }
-        case "page_text":
-          return { status: "success", content: cmds.text() };
-        default:
-          return { status: "error", error: "unknown tool " + name };
+    if (!cmds) return { error: "page not ready" };
+    switch (name) {
+      case "page_state":
+        return { value: { status: "success", content: cmds.state() } };
+      case "page_sessions":
+        return { value: { status: "success", content: cmds.sessions() } };
+      case "page_select_session": {
+        const id = String(args.session_id || "");
+        if (!id) return { value: { status: "error", error: "session_id required" } };
+        cmds.selectSession(id);
+        return { value: { status: "success", content: { selected: id } } };
       }
-    } catch (e) {
-      return { status: "error", error: String(e) };
+      case "page_read_conversation":
+        return { value: { status: "success", content: cmds.readConversation() } };
+      case "page_send": {
+        const text = String(args.text ?? "");
+        if (!text) return { value: { status: "error", error: "text required" } };
+        if (!this.sendEnabled) {
+          return {
+            value: {
+              status: "error",
+              error: "page_send is disabled on this page — enable with sai.pageProvider(url, {send: true}) in the browser console",
+            },
+          };
+        }
+        const out = await cmds.send(text);
+        return out.ok
+          ? { value: { status: "success", content: { sent: true, confirmed: !!out.confirmed } } }
+          : { value: { status: "error", error: out.error } };
+      }
+      case "page_text":
+        return { value: { status: "success", content: cmds.text() } };
+      default:
+        return { value: { status: "error", error: "unknown tool " + name } };
     }
   }
 }
@@ -248,20 +302,64 @@ export class PageProvider {
 
 const STORAGE_KEY = "sai.pageProvider";
 
-export function readPageProviderConfig(): string {
-  const param = new URLSearchParams(location.search).get("page-provider");
-  if (param) {
-    try {
-      localStorage.setItem(STORAGE_KEY, param);
-    } catch {
-      /* private mode */
-    }
-    return param;
+// allowedBrokerHost: only loopback or private-network brokers. The
+// debug surface is for the LAN broker that fronts the agent's
+// providers; an arbitrary internet wss endpoint must be a deliberate,
+// code-edited decision, not a URL away.
+export function allowedBrokerHost(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
   }
+  if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return false;
+  const host = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host === "::1") return true;
+  if (/^127\./.test(host)) return true;
+  if (/^10\./.test(host)) return true;
+  if (/^192\.168\./.test(host)) return true;
+  const m172 = /^172\.(\d+)\./.exec(host);
+  if (m172) {
+    const n = Number(m172[1]);
+    if (n >= 16 && n <= 31) return true;
+  }
+  // IPv6 unique-local (fc00::/7).
+  if (/^f[cd]/i.test(host)) return true;
+  return false;
+}
+
+// pendingPageProviderURL reads the ?page-provider= query parameter and
+// strips it from the URL. It does NOT persist and does NOT connect:
+// the App turns it into a confirmation banner (session-only connect).
+export function pendingPageProviderURL(): string {
+  const param = new URLSearchParams(location.search).get("page-provider");
+  if (!param) return "";
+  try {
+    const clean = new URL(location.href);
+    clean.searchParams.delete("page-provider");
+    history.replaceState(null, "", clean);
+  } catch {
+    /* private mode */
+  }
+  return param;
+}
+
+// readStoredPageProviderConfig is the auto-connect path: only the
+// explicit console action persists (window.sai.pageProvider).
+export function readStoredPageProviderConfig(): string {
   try {
     return localStorage.getItem(STORAGE_KEY) || "";
   } catch {
     return "";
+  }
+}
+
+export function storePageProviderConfig(url: string) {
+  try {
+    localStorage.setItem(STORAGE_KEY, url);
+  } catch {
+    /* private mode */
   }
 }
 
