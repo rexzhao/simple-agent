@@ -304,3 +304,121 @@ func TestCompactionFailedEventWireAndNotice(t *testing.T) {
 		t.Fatalf("notice = %q, want the compaction failure cached", st2.Notice)
 	}
 }
+
+// TestNoticeClearedByNextSend pins the notice lifecycle: a soft
+// compaction failure surfaces on the status frame and /api/state, and
+// the user's next accepted Send clears it (notices describe a past
+// event; a new action supersedes them) — it never sticks indefinitely.
+func TestNoticeClearedByNextSend(t *testing.T) {
+	provider := &webFakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "a1"}, model.MessageDoneEvent{}},
+		{model.TextDeltaEvent{Text: "a2"}, model.MessageDoneEvent{}},
+	}}
+	session, srv, base := newTestManagerServer(t, provider)
+	if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "q1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return !session.Running() })
+
+	// Feed a compaction failure the way the events channel would.
+	entry, release, _, err := srv.manager.open(session.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"})
+	release()
+
+	// Visible on /api/state.
+	res, err := http.Get(base.URL + api(session, "/state")) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st struct {
+		Notice string `json:"notice"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&st)
+	res.Body.Close()
+	if !strings.Contains(st.Notice, "compaction failed") {
+		t.Fatalf("notice after the event = %q, want the failure", st.Notice)
+	}
+
+	// The next accepted Send clears it — observed from a subscriber
+	// attached BEFORE the send. The reading happens on one connection
+	// with a manual loop (readFrames' helper hides the per-line
+	// interleaving this needs): snapshot first, then the send, then
+	// frames until a status carrying an empty notice.
+	streamRes, err := http.Get(base.URL + api(session, "/stream")) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer streamRes.Body.Close()
+	br := bufio.NewReader(streamRes.Body)
+	readLine := func() (string, error) {
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return "", err
+			}
+			if strings.HasPrefix(line, "data: ") {
+				return strings.TrimRight(line[6:], "\n"), nil
+			}
+		}
+	}
+	// The snapshot lands first; consume it.
+	if _, err := readLine(); err != nil {
+		t.Fatal(err)
+	}
+
+	sendErr := make(chan error, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		sendErr <- postJSONRaw(t, base.URL, api(session, "/send"), `{"text":"q2"}`)
+	}()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case err := <-sendErr:
+			if err != nil {
+				t.Fatalf("second send: %v", err)
+			}
+			continue
+		case <-deadline:
+			t.Fatal("no notice-empty status frame within 10s of the next Send")
+		default:
+		}
+		data, err := readLine()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f Frame
+		if err := json.Unmarshal([]byte(data), &f); err != nil {
+			t.Fatalf("frame: %v (%s)", err, data)
+		}
+		if f.Kind == "status" && f.Notice == "" {
+			break
+		}
+	}
+	// Drain any pending send result.
+	select {
+	case err := <-sendErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+	}
+	waitFor(t, 5*time.Second, func() bool { return !session.Running() })
+
+	// And /api/state agrees.
+	res2, err := http.Get(base.URL + api(session, "/state")) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st2 struct {
+		Notice string `json:"notice"`
+	}
+	_ = json.NewDecoder(res2.Body).Decode(&st2)
+	res2.Body.Close()
+	if st2.Notice != "" {
+		t.Fatalf("notice after the next Send = %q, want empty", st2.Notice)
+	}
+}

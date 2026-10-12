@@ -384,6 +384,13 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// The accepted user action supersedes every cached transient
+	// notice (a stale compaction failure or retry would otherwise sit
+	// on the status bar until the next manual compact). New notices
+	// from THIS run arrive as its events. (A retry racing this clear
+	// re-caches itself on its own event — the window is one provider
+	// call, and it self-heals.)
+	entry.hub.ClearNotices()
 	// The events channel is republished under the session lock inside
 	// Send; the wake is sent after Send returns, so the hub reattaches
 	// with zero latency (the channel is small — late attachment could

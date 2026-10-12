@@ -126,6 +126,21 @@ func (h *Hub) BroadcastStatus() {
 	h.mu.Unlock()
 }
 
+// ClearNotices drops the cached transient notices (compaction failure,
+// context pressure, provider retry) and pushes a status frame. The
+// rule is uniform: notices describe a PAST event; the user's next
+// accepted action supersedes them. Without this, one compaction
+// failure (or retry) stayed on the status bar and in /api/state until
+// the next manual compact — indefinitely misleading.
+func (h *Hub) ClearNotices() {
+	h.mu.Lock()
+	h.lastNotice = ""
+	h.lastPressure = ""
+	h.lastRetry = ""
+	h.broadcastStatusLocked()
+	h.mu.Unlock()
+}
+
 func (h *Hub) run(sub *agent.Subscription) {
 	// h.done is closed by Stop only — a return here (session closed)
 	// must not race a second close.
@@ -255,10 +270,21 @@ func (h *Hub) handleEvent(ev model.Event) {
 		h.lastRetry = formatRetry(e)
 		h.mu.Unlock()
 	case model.CompactionFailedEvent:
-		// A degraded soft compaction: cached as the notice so a page
-		// that reconnects later still sees it via /api/state.
+		// A degraded soft compaction: cached as the notice and pushed
+		// immediately so connected pages see it (a reconnecting page
+		// gets it via the snapshot). Cleared by the next user action
+		// (ClearNotices) or a successful compaction (below) — never
+		// stuck.
 		h.mu.Lock()
 		h.lastNotice = "compaction failed (soft pressure; run continues): " + e.Reason
+		h.broadcastStatusLocked()
+		h.mu.Unlock()
+	case model.CompactionCompletedEvent:
+		// A successful compaction supersedes any stale failure notice —
+		// pushed immediately, not at the run's settle.
+		h.mu.Lock()
+		h.lastNotice = ""
+		h.broadcastStatusLocked()
 		h.mu.Unlock()
 	}
 	if frame, ok := encodeEventFrame(ev); ok {
