@@ -290,9 +290,25 @@ const r4 = rec("assistant.message", { content: "a2" });
   assert(store.snap.tool && store.snap.tool.callID === "c9", "s12 snapshot sets the slot (tool without streaming)");
 }
 
+// ---- 13. events trailing their records are idempotent ----
+// The run commits completed/tool_result records BEFORE emitting their
+// events, so the wire may deliver the event after the record. The
+// client must no-op: no live resurrection, no state damage.
+{
+  const r = rec("assistant.message", { item: "trail-1", content: "done" });
+  await apply({ kind: "record", r });
+  await applyRecord(red, r);
+  const before = JSON.stringify({ live: store.snap.live, tool: store.snap.tool, n: store.snap.records.length });
+  await apply({ kind: "event", t: "assistant_message_completed", item: "trail-1" });
+  const trr = rec("tool.result", { tool_call_id: "c-trail", tool_name: "shell", content: "out" });
+  await apply({ kind: "event", t: "tool_result", call_id: "c-trail", name: "shell", text: "out" });
+  const after = JSON.stringify({ live: store.snap.live, tool: store.snap.tool, n: store.snap.records.length });
+  assert(before === after, "s13 trailing events changed state");
+}
+
 if (failures.length) {
   console.error("store_check: FAILED");
   for (const f of failures) console.error("  - " + f);
   process.exit(1);
 }
-console.log("store_check: OK (12 scenarios: mirror + burst + reorder guard + tool slot)");
+console.log("store_check: OK (13 scenarios: mirror + burst + reorder guard + tool slot + trailing idempotence)");

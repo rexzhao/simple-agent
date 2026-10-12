@@ -197,47 +197,57 @@ func TestEventRecordCausalOrder(t *testing.T) {
 		}
 	}
 
-	// For every completed event, its item's record must come AFTER it.
-	indexOf := func(kind, t, item string) int {
+	// For every item: its started event and all its deltas precede its
+	// assistant.message record. (completed is emitted AFTER the commit
+	// by design — no order constraint on it; the client is idempotent
+	// for events trailing their records, which store_check pins.)
+	indexOf := func(pred func(Frame) bool) int {
 		for i, f := range frames {
-			switch kind {
-			case "event":
-				if f.Kind == "event" && f.Type == t && f.Item == item {
-					return i
-				}
-			case "record":
-				if f.Kind == "record" && f.Record != nil {
-					var r struct {
-						Item string `json:"item"`
-						T    string `json:"t"`
-					}
-					_ = json.Unmarshal(f.Record, &r)
-					if r.T == "assistant.message" && r.Item == item {
-						return i
-					}
-				}
+			if pred(f) {
+				return i
 			}
 		}
 		return -1
 	}
-	checked := 0
-	for _, f := range frames {
-		if f.Kind == "event" && (f.Type == "assistant_message_completed" || f.Type == "assistant_message_failed") {
-			ev := indexOf("event", f.Type, f.Item)
-			rec := indexOf("record", "assistant.message", f.Item)
+	recordOf := func(item string) int {
+		return indexOf(func(f Frame) bool {
+			if f.Kind != "record" || f.Record == nil {
+				return false
+			}
+			var r struct {
+				Item string `json:"item"`
+				T    string `json:"t"`
+			}
+			_ = json.Unmarshal(f.Record, &r)
+			return r.T == "assistant.message" && r.Item == item
+		})
+	}
+	checkedStreams, checkedCompleted := 0, 0
+	for fi, f := range frames {
+		if f.Kind != "event" || f.Item == "" {
+			continue
+		}
+		switch f.Type {
+		case "assistant_message_started", "text_delta", "reasoning_delta":
+			rec := recordOf(f.Item)
 			if rec == -1 {
-				t.Fatalf("item %s: event seen but no record", f.Item)
+				continue // a live item that never completed (interrupted run)
 			}
-			if ev > rec {
-				t.Fatalf("item %s: record frame (%d) precedes its completed event (%d)", f.Item, rec, ev)
+			if fi > rec {
+				t.Fatalf("item %s: %s event (%d) trails its record (%d)", f.Item, f.Type, fi, rec)
 			}
-			checked++
+			checkedStreams++
+		case "assistant_message_completed", "assistant_message_failed":
+			if recordOf(f.Item) == -1 {
+				t.Fatalf("item %s: completed event seen but no record", f.Item)
+			}
+			checkedCompleted++
 		}
 	}
-	if checked == 0 {
+	if checkedStreams == 0 || checkedCompleted == 0 {
 		for i, f := range frames {
 			t.Logf("frame[%d] kind=%s type=%s item=%s", i, f.Kind, f.Type, f.Item)
 		}
-		t.Fatal("no completed events seen")
+		t.Fatalf("insufficient events: %d stream events, %d completed", checkedStreams, checkedCompleted)
 	}
 }

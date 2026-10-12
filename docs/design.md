@@ -233,6 +233,10 @@ WebUI 的桥（已落地，internal/web）：hub 把记录流与事件流按因�
 
 ## 12. 已知限制与已记录的未来需求
 
+**中断时正在执行的工具会留下一条取消结果（已记录的行为）**：Stop 中断 run
+时，工具批次里尚未开始的调用被跳过，但正在执行的那一个会提交一条错误结果
+（如 "shell command canceled"）——对用户可见"中断前进行到哪"有价值，保留。
+
 **内存随会话生命周期增长（已知限制）**：agent.Session.records、web Hub 的
 records/chain/index 都保留完整扁平记录流，压缩后不裁剪——与"成本 ∝ 有效上下文"
 的目标相悖。冷却是唯一回头扫的点（softCooldownElapsed 只需回溯到最后一条

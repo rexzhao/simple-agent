@@ -513,21 +513,26 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		errCh := make(chan error, 1)
 		go func() { errCh <- session.Compact() }()
-		// Keep the transient state visible: status frames while the
-		// compaction holds the slot. A client that assumes idle
-		// mid-compact is exactly what routed sends into the steer path
-		// (the panic of the compact/steer bug). The final Notice
-		// broadcast carries the end state.
+		// Surface the slot the moment it is taken (a client assuming
+		// idle mid-compact is the steer-panic path), then keep periodic
+		// frames until the final Notice broadcast carries the end state.
+		// Compacting() is a light accessor — Snapshot would deep-copy
+		// the whole folded context per poll.
+		for !session.Compacting() {
+			select {
+			case err := <-errCh:
+				notifyCompactResult(hub, err)
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		hub.BroadcastStatus()
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
 			case err := <-errCh:
-				if err != nil && !errors.Is(err, agent.ErrNothingToCompact) {
-					hub.Notice("compact failed: " + err.Error())
-					return
-				}
-				hub.Notice("")
+				notifyCompactResult(hub, err)
 				return
 			case <-ticker.C:
 				hub.BroadcastStatus()
@@ -535,6 +540,14 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+}
+
+func notifyCompactResult(hub *Hub, err error) {
+	if err != nil && !errors.Is(err, agent.ErrNothingToCompact) {
+		hub.Notice("compact failed: " + err.Error())
+		return
+	}
+	hub.Notice("")
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {

@@ -138,12 +138,18 @@ func (h *Hub) run(sub *agent.Subscription) {
 	for {
 		select {
 		case rec := <-sub.Records():
-			// Causal order: the run emits an item's events BEFORE committing
-			// its record, and the events channel is buffered — so by the
-			// time a record is readable here, its preceding events are
-			// already queued. The select picks randomly, so without this
-			// drain a record could precede its own completed event and a
-			// client would re-create a live item the record already closed.
+			// Streaming-order guarantee: the run emits an item's STREAMING
+			// events (started, deltas) before committing its record, and the
+			// events channel is buffered — so by the time a record is
+			// readable here, those events are already queued. The select
+			// picks randomly; without this drain a record could precede
+			// them and a client would re-create a live item the record
+			// already closed. Events produced AFTER the commit (completed,
+			// tool_result — emitted once the record is durable — or the next
+			// message's started) may also be pulled ahead of this record by
+			// the drain; that is harmless, every event is ItemID-addressed
+			// and the client is idempotent for events trailing their
+			// records.
 			// The wake that attaches the run's channel can itself lag the
 			// records (select randomness) — or h.events may still hold the
 			// PREVIOUS run's drained channel. Sync to the session's current
@@ -320,7 +326,7 @@ func (h *Hub) dropClientLocked(c *client) {
 // state. Callers hold h.mu.
 func (h *Hub) broadcastStatusLocked() {
 	running := h.session.Running()
-	compacting := h.session.Snapshot().Compacting != nil
+	compacting := h.session.Compacting()
 	frame := encodeFrame(Frame{
 		Kind:       "status",
 		Running:    &running,
@@ -367,7 +373,7 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 
 	snapshot := h.session.Snapshot()
 	running := h.session.Running()
-	compacting := snapshot.Compacting != nil
+	compacting := h.session.Compacting()
 	f := Frame{
 		Kind:       "snapshot",
 		Anchor:     h.chainAtLocked(start),

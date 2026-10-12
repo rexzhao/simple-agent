@@ -111,6 +111,15 @@ func (s *Session) Running() bool {
 	return s.running
 }
 
+// Compacting reports whether a compaction currently holds the run
+// slot. A light accessor for hot paths (status frames): Snapshot
+// deep-copies the whole folded context.
+func (s *Session) Compacting() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.Compacting != nil
+}
+
 // Events returns the transient event stream of the run: the active one,
 // or the previous run's closed channel (receiving drains any buffered
 // events, then returns false immediately).
