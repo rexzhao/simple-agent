@@ -527,14 +527,14 @@ func TestValidSessionIDStrictShape(t *testing.T) {
 	}
 	for _, bad := range []string{
 		"", ".", "..", "...", "CON", "blobs",
-		"s",                                              // too short
-		"s" + strings.Repeat("0", 25),                    // one short
-		"s" + strings.Repeat("0", 27),                    // one long
-		"u" + strings.Repeat("0", 26),                    // wrong kind
-		"s" + strings.Repeat("i", 26),                    // i not in the alphabet
-		"s" + strings.Repeat("0", 25) + " ",              // whitespace
-		strings.Repeat("0", 27),                          // no prefix
-		"s0000389560h59pb15q9vcfzpdw\x00",                // control byte
+		"s",                                 // too short
+		"s" + strings.Repeat("0", 25),       // one short
+		"s" + strings.Repeat("0", 27),       // one long
+		"u" + strings.Repeat("0", 26),       // wrong kind
+		"s" + strings.Repeat("i", 26),       // i not in the alphabet
+		"s" + strings.Repeat("0", 25) + " ", // whitespace
+		strings.Repeat("0", 27),             // no prefix
+		"s0000389560h59pb15q9vcfzpdw\x00",   // control byte
 	} {
 		if ValidSessionID(bad) {
 			t.Fatalf("accepted %q", bad)
