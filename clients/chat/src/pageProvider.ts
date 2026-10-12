@@ -332,8 +332,9 @@ export function allowedBrokerHost(url: string): boolean {
     return isPrivateIPv4(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
   }
   if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return isPrivateIPv4(host);
-  // IPv6 unique-local (fc00::/7).
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
   if (/^f[cd][0-9a-f:]*$/i.test(host)) return true;
+  if (/^fe[89ab][0-9a-f:]*$/i.test(host)) return true;
   return false;
 }
 

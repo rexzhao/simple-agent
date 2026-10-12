@@ -16,12 +16,19 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      # The JS fixture checks (chain/reducer/store mirrors) skip
-      # without node; without this step the entire value of those
-      # checks — drift cannot land silently — is absent from CI.
+      # The JS fixture checks (chain/reducer/store/convert/page-provider
+      # mirrors) skip without node, and the RENDER fixture skips without
+      # clients/chat/node_modules — without both steps the checks whose
+      # entire value is 'drift cannot land silently' are silently absent
+      # from CI itself.
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
+          cache-dependency-path: clients/chat/package-lock.json
+      - name: Install chat client dependencies
+        working-directory: clients/chat
+        run: npm ci
       - run: go test ./...
       - run: go vet ./...
       - name: Gofmt gate

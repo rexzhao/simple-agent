@@ -172,7 +172,7 @@ const gate = [
   ["ws://[::ffff:127.0.0.1]:8637/x", true],
   ["ws://[::ffff:8.8.8.8]:8637/x", false],
   ["ws://[fc00::5]:8637/x", true],
-  ["ws://[fe80::5]:8637/x", false],
+  ["ws://[fe80::5]:8637/x", true], // link-local: private by the README scope,
 ];
 for (const [url, want] of gate) {
   const got = allowedBrokerHost(url);
