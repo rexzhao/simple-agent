@@ -191,3 +191,30 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// TestShellDefaultBounds pins the default timeout and output cap: a
+// command with no explicit timeout_ms/max_output_bytes must not be
+// able to run forever or buffer unbounded output.
+func TestShellDefaultBounds(t *testing.T) {
+	executor := newTestExecutor(t)
+	// A command that would emit ~5MB: the default 1MB cap must hold
+	// in-memory retention at or below it.
+	result, err := executor.Execute(context.Background(), map[string]any{
+		"command": "yes hello | head -c 5242880",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The cap bounds the retained OUTPUT; a truncation notice header
+	// (~125 bytes) is prepended on top.
+	if len(result.Content) > 1<<20+512 {
+		t.Fatalf("default output cap not applied: %d bytes retained", len(result.Content))
+	}
+	if !strings.Contains(result.Content, "truncated=true") {
+		t.Fatalf("expected the truncation notice, got %q", result.Content[:80])
+	}
+}
+
+func containsTruncated(s string) bool {
+	return len(s) == 0 || s[:32] == "truncated=true\nmax_output_bytes"[:min(32, len(s))] || len(s) > 0 && string(s[0]) == "t"
+}

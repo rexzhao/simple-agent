@@ -5,7 +5,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,6 +21,18 @@ import (
 
 // BuiltinShell is the shell tool name.
 const BuiltinShell = "shell"
+
+// DefaultTimeoutMS bounds a shell command when the model does not pass
+// timeout_ms: a hung command otherwise pins the run (and its
+// single-flight slot) forever. Ten minutes — generous for builds and
+// test suites, finite for `yes`.
+const DefaultTimeoutMS = 10 * 60 * 1000
+
+// DefaultMaxOutputBytes bounds in-memory output buffering when the
+// model does not pass max_output_bytes. The final tool result is
+// truncated further (50KB) on the way to the provider; this cap is
+// about not exhausting process memory before that.
+const DefaultMaxOutputBytes = 1 << 20
 
 // Executor executes one tool call. It is the interface the agent loop's
 // ToolExecutor expects.
@@ -93,12 +104,13 @@ func newShellExecutor(rootDir string) Executor {
 			return model.ToolResult{}, err
 		}
 
-		commandCtx := ctx
-		if timeoutSet {
-			var cancel context.CancelFunc
-			commandCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
-			defer cancel()
+		// A default timeout: without one, a hung command pins the run
+		// (and its single-flight slot) forever.
+		if !timeoutSet {
+			timeoutMS = DefaultTimeoutMS
 		}
+		commandCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+		defer cancel()
 
 		cmd, err := newShellCommand(commandCtx, command)
 		if err != nil {
@@ -112,30 +124,22 @@ func newShellExecutor(rootDir string) Executor {
 		controller := newShellCommandController(cmd)
 		defer controller.Close()
 
-		var (
-			content         string
-			outputTruncated bool
-		)
-		if maxOutputSet {
-			// Do not use CombinedOutput here: it buffers the complete command
-			// output before we can truncate it. limitedOutput always reports a
-			// successful full write to os/exec so both pipes keep draining, while
-			// retaining at most maxOutputBytes in process memory.
-			output := newLimitedOutput(maxOutputBytes)
-			cmd.Stdout = output
-			cmd.Stderr = output
-			err = controller.Run(cmd)
-			content = output.String()
-			outputTruncated = output.Truncated()
-		} else {
-			// This matches exec.Cmd.CombinedOutput while allowing the platform
-			// controller to attach process-group/process-tree cleanup after Start.
-			var output bytes.Buffer
-			cmd.Stdout = &output
-			cmd.Stderr = &output
-			err = controller.Run(cmd)
-			content = output.String()
+		// ALWAYS bounded output: an unbounded buffer meant `yes` or a
+		// large `cat` could exhaust process memory before the
+		// post-hoc 50KB tool-result truncation ever ran.
+		if !maxOutputSet {
+			maxOutputBytes = DefaultMaxOutputBytes
 		}
+		// Do not use CombinedOutput here: it buffers the complete command
+		// output before we can truncate it. limitedOutput always reports a
+		// successful full write to os/exec so both pipes keep draining, while
+		// retaining at most maxOutputBytes in process memory.
+		output := newLimitedOutput(maxOutputBytes)
+		cmd.Stdout = output
+		cmd.Stderr = output
+		err = controller.Run(cmd)
+		content := output.String()
+		outputTruncated := output.Truncated()
 		result := model.ToolResult{
 			Name:    BuiltinShell,
 			Content: content,
