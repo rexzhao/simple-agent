@@ -58,22 +58,18 @@ type Session struct {
 
 	mu    sync.RWMutex
 	state *storage.State
-	// records is the in-process flat record stream. After a compaction
-	// it is deliberately LONGER than the on-disk active segment: the
-	// softRetryAfterIndex anchors the soft-compaction retry cooldown:
-	// the record position at the moment of a failed or churned soft
-	// attempt (no record lands to anchor it). The retry needs two NEW
-	// user inputs PAST that point — the same cadence a successful
-	// compaction imposes through its record. softRetryArmed=false means
-	// no cooldown pending. (Anchoring matters: arming happens after the
-	// triggering input has already landed, so counting from the stream's
-	// end would pass after ONE new input.)
+	// softRetryArmed/softRetryAfterIndex anchor the soft-compaction
+	// retry cooldown (see design §14.4 for the milestone-A plan to move
+	// this to a state-layer counter that doesn't depend on the flat
+	// record stream).
 	softRetryArmed      bool
 	softRetryAfterIndex int
-	// pre-compaction records stay here (cooldown scans and the CLI's
-	// flat printed counter need them) while jsonl archives them. A
-	// consumer subscribing mid-session sees the flat stream; a fresh
+	// records is the in-process flat record stream. After a compaction
+	// it is deliberately LONGER than the on-disk active segment: the
+	// cooldown scans and the CLI's flat printed counter need them.
+	// A consumer subscribing mid-session sees the flat stream; a fresh
 	// Open sees only the active segment. Fold handles both.
+	// (Milestone A §14.4 will truncate this to the active segment.)
 	records []storage.Record
 	// pendingCreated is the session.created record of a fresh session,
 	// committed ahead of the first real record. Nil on reopened sessions.
