@@ -51,7 +51,7 @@ Options:
 
 An optional positional argument resumes a stored session. Slash commands:
 
-- `/clear` — start a new session (empty sessions are never written to disk)
+- `/new` — start a new session (empty sessions are never written to disk)
 - `/compact` — summarize the context and continue from the summary; the
   conversation before the compaction is replaced by it. Compaction also
   happens automatically when the request approaches the model's context

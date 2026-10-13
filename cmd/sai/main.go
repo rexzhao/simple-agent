@@ -126,7 +126,7 @@ func main() {
 		}
 	}()
 
-	fmt.Fprintln(os.Stderr, "sai: /clear /compact /resume <id> /stop /help /quit")
+	fmt.Fprintln(os.Stderr, "sai: /new /compact /resume <id> /stop /help /quit")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for {
@@ -337,7 +337,7 @@ func (c *cliApp) dispatch(text string) bool {
 	case text == "/quit" || text == "/exit":
 		c.closeSession()
 		return true
-	case text == "/clear":
+	case text == "/new":
 		if err := c.freshSession(); err != nil {
 			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		}
@@ -354,7 +354,7 @@ func (c *cliApp) dispatch(text string) bool {
 			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		}
 	case text == "/help":
-		fmt.Fprintln(os.Stderr, "sai: /clear new session · /compact summarize the context · /resume <id> reopen a session · /stop stop the run · /quit exit")
+		fmt.Fprintln(os.Stderr, "sai: /new new session · /compact summarize the context · /resume <id> reopen a session · /stop stop the run · /quit exit")
 	case strings.HasPrefix(text, "/resume"):
 		c.resumeCommand(strings.TrimSpace(strings.TrimPrefix(text, "/resume")))
 	default:

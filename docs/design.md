@@ -277,7 +277,8 @@ context.compacted），因此内存中的记录尾可以按冷却窗口截断；
 ## 13. 已记录的未来需求（未设计）
 
 - ~~**/clear 只重置 context window，不新开 session**~~——需求已取消：
-  /clear 保持现状（新开 session），上下文重置由 /compact 承担。
+  新建会话命令改名 /new（原 /clear，里程碑 A 后），上下文重置由
+  /compact 承担。
 
 ## 13. 上下文压缩（手动 + 自动）
 

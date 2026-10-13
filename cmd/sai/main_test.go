@@ -459,3 +459,62 @@ func TestSendReturnsAfterCompactionAndEviction(t *testing.T) {
 		t.Fatal("the compaction record never rendered — the catch-up's miss branch printed nothing")
 	}
 }
+
+// TestNewCommandSwitchesSession pins the /new rename: /new opens a
+// fresh session (records reset, ids differ) and /clear is no longer a
+// command (the unknown-command path).
+func TestNewCommandSwitchesSession(t *testing.T) {
+	ag, err := agent.New(agent.Options{
+		Provider:     &scriptedProvider{},
+		ProviderName: "test",
+		ModelID:      "model-test",
+		Storage:      memory.OpenStore(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := ag.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	printer := &spinnerPrinter{}
+	cli := &cliApp{agent: ag, printer: printer}
+	if err := cli.bind(session); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Send("first"); err != nil {
+		t.Fatal(err)
+	}
+	settleDeadline := time.Now().Add(30 * time.Second)
+	for session.Running() {
+		if time.Now().After(settleDeadline) {
+			t.Fatal("the run never settled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	before := session.ID()
+	beforeRecords := len(session.SnapshotStream().Records)
+
+	// /new: a fresh session — different id, no records (the old session's
+	// teardown is exercised by the closeSession paths, not asserted here).
+	if cli.dispatch("/new") {
+		t.Fatal("/new asked the REPL to exit")
+	}
+	if cli.session.ID() == before {
+		t.Fatal("/new kept the old session")
+	}
+	if got := len(cli.session.SnapshotStream().Records); got != 0 {
+		t.Fatalf("fresh session has %d records, want 0", got)
+	}
+	_ = beforeRecords
+
+	// /clear is gone: the unknown-command path (dispatch returns false,
+	// the session object unchanged).
+	afterNew := cli.session.ID()
+	if cli.dispatch("/clear") {
+		t.Fatal("/clear asked the REPL to exit")
+	}
+	if cli.session.ID() != afterNew {
+		t.Fatal("/clear was still routed to freshSession")
+	}
+}
