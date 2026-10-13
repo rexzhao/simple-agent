@@ -83,10 +83,7 @@ func TestSoftCompactFailureContinuesRun(t *testing.T) {
 	}
 	waitSettled(t, session)
 	// Cross the soft threshold: the summary fails, the run continues.
-	if err := session.Send(strings.Repeat("工", 75_000)); err != nil {
-		t.Fatal(err)
-	}
-	events := waitSettled(t, session)
+	events := sendCollectEvents(t, session, strings.Repeat("工", 75_000))
 
 	// The run COMPLETED: the last record is the assistant answer, not a
 	// failure.
@@ -286,8 +283,6 @@ func (p *blockSummaryProvider) Stream(ctx context.Context, request model.Request
 
 func compactedRecordsAll(t *testing.T, session *Session) []storage.Record {
 	t.Helper()
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	return records
 }

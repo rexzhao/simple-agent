@@ -112,7 +112,6 @@ func TestSteerDuringManualCompactNoPanic(t *testing.T) {
 		t.Fatalf("WithdrawSteer during compact: %v", err)
 	}
 	// The session stays responsive.
-	_ = session.Events()
 	_ = session.Snapshot()
 
 	close(release2)

@@ -149,28 +149,6 @@ func TestFirstStreamSeesHistory(t *testing.T) {
 	}
 }
 
-// A web-only session has no CLI attached: nobody consumes the run's
-// per-run event channel (the CLI's transition path, deleted in step 4),
-// whose sends BLOCK when full. Before the hub migrated to the stream it
-// drained that channel implicitly; the migration must keep the run
-// unblocked — a turn emitting more than the channel buffer (256)
-// transient events must complete on its own.
-func TestWebOnlyRunDrainsLegacyEvents(t *testing.T) {
-	deltas := make([]model.Event, 0, 301)
-	for i := 0; i < 300; i++ {
-		deltas = append(deltas, model.TextDeltaEvent{Text: "x"})
-	}
-	deltas = append(deltas, model.MessageDoneEvent{})
-	provider := &webFakeProvider{turns: [][]model.Event{deltas}}
-	session, _, _ := newTestManagerServer(t, provider)
-
-	if err := session.Send("hi"); err != nil {
-		t.Fatal(err)
-	}
-	// Nobody drains: the run must still settle by itself.
-	waitFor(t, 5*time.Second, func() bool { return !session.Running() })
-}
-
 // TestHubEvictionResubscribesAndReissues pins the Lost-recovery path
 // (milestone A step 3): when the hub's stream subscription is evicted
 // (buffer overflow on non-droppable events), the hub must re-subscribe,

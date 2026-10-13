@@ -317,47 +317,14 @@ func (p *spinnerPrinter) write(text string) {
 
 // cliApp holds the active session.
 type cliApp struct {
-	agent       *agent.Agent
-	session     *agent.Session
-	printer     *spinnerPrinter
-	unwatch     func()
-	watcherDone chan struct{} // closed when the record watcher goroutine exited
-
-	// liveMu guards liveShown and parked: assistant messages rendered
-	// live by the event drain (their committed records must not print
-	// twice) and records parked pending that decision.
-	liveMu    sync.Mutex
-	liveShown map[string]struct{}
-	parked    []storage.Record
-
-	// printedMu guards printed: how many records the watcher (and the
-	// synchronous history print) has processed. waitForRecords blocks
-	// until it catches up with the session's committed count.
-	printedMu sync.Mutex
-	printed   int
-}
-
-// countPrinted records one processed record.
-func (c *cliApp) countPrinted() {
-	c.printedMu.Lock()
-	c.printed++
-	c.printedMu.Unlock()
-}
-
-// waitForRecords blocks until the record printer has processed every
-// committed record, so the next prompt never appears before pending
-// output. A bounded timeout keeps a stuck printer from wedging the REPL.
-func (c *cliApp) waitForRecords() {
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		c.printedMu.Lock()
-		printed := c.printed
-		c.printedMu.Unlock()
-		if printed >= c.session.RecordCount() {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+	agent   *agent.Agent
+	session *agent.Session
+	printer *spinnerPrinter
+	// rendered counts the records this app has accounted for (printed,
+	// live-rendered, or omitted from the history tail): the eviction
+	// catch-up resumes the snapshot's records from here. Single-threaded
+	// by construction — the REPL renders one run at a time.
+	rendered int
 }
 
 // dispatch handles one input line. It returns true when the REPL should
@@ -373,14 +340,12 @@ func (c *cliApp) dispatch(text string) bool {
 		}
 	case text == "/stop":
 		fmt.Fprintln(os.Stderr, "sai: stopping run")
-		c.session.Stop()
-		// Wait for the run to settle and its records to print, so the
-		// prompt never interleaves the settling output.
-		deadline := time.Now().Add(5 * time.Second)
-		for c.session.Running() && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
+		if r := c.session.CurrentRun(); r != nil {
+			r.Stop()
+			// Join: the run's teardown (terminal status on the stream,
+			// record commits) completes before the prompt returns.
+			<-r.Done()
 		}
-		c.waitForRecords()
 	case text == "/compact":
 		if err := c.compact(); err != nil {
 			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
@@ -403,147 +368,126 @@ func (c *cliApp) dispatch(text string) bool {
 
 // send runs one agent turn. The reply streams character by character via
 // the live writer; the dot spinner marks only the quiet phases (waiting
-// for the first token, running tools). Records print as they are
-// committed, except assistant messages already rendered live.
+// for the first token, running tools). Everything renders from the
+// session's single ordered stream in one loop — records print as they
+// are committed (assistant messages the live writer already rendered
+// are skipped), transient events stream or land on stderr as notices.
+// The loop ends at the run's terminal Status{Running:false} — its LAST
+// stream event — so when send returns, every output byte of the run is
+// already on the terminal and the next prompt cannot precede it.
 func (c *cliApp) send(text string) error {
-	if err := c.session.Send(text); err != nil {
+	sub := c.session.Stream()
+	defer sub.Stop()
+	if _, err := c.session.Start(context.Background(), text); err != nil {
 		return err
 	}
-
-	// The drain goroutine renders the run's transient events; each
-	// message's start event marks its ItemID before the record can commit,
-	// so the watcher's record print is filtered by identity.
-	live := &liveWriter{printer: c.printer}
-	events := c.session.Events()
-	drained := make(chan struct{})
-	go func() {
-		defer close(drained)
-		for event := range events {
-			if started, ok := event.(model.AssistantMessageStartedEvent); ok {
-				c.markLiveShown(started.ItemID)
-			}
-			// Budget notices are control messages, like every other
-			// 'sai:' notice: stderr, not the rendered record stream.
-			if pressure, ok := event.(model.ContextPressureEvent); ok {
-				fmt.Fprintf(os.Stderr, "sai: context exceeds the estimated budget (%d ≥ %d tokens); no compaction possible, sending anyway\n",
-					pressure.EstimatedTokens, pressure.HardInputLimit)
-				continue
-			}
-			// Retry notices land on stderr for the same reason — a silent
-			// retry between streaming chunks looks like a hang.
-			if retry, ok := event.(model.ProviderRetryEvent); ok {
-				fmt.Fprintf(os.Stderr, "sai: retrying model request (attempt %d/%d, %s)\n",
-					retry.Attempt, retry.MaxAttempts, retry.Reason)
-				continue
-			}
-			// A degraded soft compaction: the run continues with the
-			// original request; the user should still know it happened.
-			if failed, ok := event.(model.CompactionFailedEvent); ok {
-				fmt.Fprintf(os.Stderr, "sai: compaction failed (soft pressure; run continues): %s\n", failed.Reason)
-				continue
-			}
-			live.handle(event)
-		}
-		live.settle()
-	}()
-
-	frame := 0
-	for c.session.Running() {
-		time.Sleep(spinnerInterval)
-		if live.inMessage.Load() && live.sawOutput.Load() {
-			// Text is flowing: the output itself is the progress.
-			c.printer.clear()
-		} else {
-			c.printer.frame(spinnerFrames[frame%len(spinnerFrames)])
-			frame++
-		}
-	}
-	c.printer.clear()
-	<-drained
-	// The skip set is final now: any assistant record parked mid-run
-	// (its start event not yet processed when the record arrived) prints
-	// here unless it was live-rendered after all.
-	c.reconcileParked()
-	// The next prompt must not appear before the watcher printed the
-	// run's records.
-	c.waitForRecords()
+	c.runLoop(sub)
 	return nil
 }
 
-// markLiveShown records an assistant message the live writer will
-// render; its committed record would duplicate it.
-func (c *cliApp) markLiveShown(itemID string) {
-	c.liveMu.Lock()
-	if c.liveShown == nil {
-		c.liveShown = make(map[string]struct{})
-	}
-	c.liveShown[itemID] = struct{}{}
-	c.liveMu.Unlock()
-}
-
-// liveShownHas reports whether the item was marked, consuming the mark.
-func (c *cliApp) liveShownHas(itemID string) bool {
-	c.liveMu.Lock()
-	defer c.liveMu.Unlock()
-	_, shown := c.liveShown[itemID]
-	delete(c.liveShown, itemID)
-	return shown
-}
-
-// reconcileParked prints assistant records that were parked mid-run and
-// turn out not to have been live-rendered once the event drain finished
-// (the skip set is final by then). Normally nothing is parked: the drain
-// processes each message's start event long before its record commits.
-func (c *cliApp) reconcileParked() {
-	c.liveMu.Lock()
-	parked := c.parked
-	c.parked = nil
-	c.liveMu.Unlock()
-	for _, record := range parked {
-		// Parked records were already counted when they were parked.
-		if !c.liveShownHas(record.ItemID) {
-			c.printer.line(formatRecord(record))
-		}
-	}
-}
-
-// compact summarizes the session context. The spinner runs while the
-// summary generates; the committed record prints through the watcher.
-func (c *cliApp) compact() error {
-	done := make(chan error, 1)
-	go func() { done <- c.session.Compact() }()
+// runLoop renders one run's stream until its terminal status: records
+// print as committed, transient events render live or land on stderr,
+// and the spinner marks the quiet phases between events. The terminal
+// Status{Running:false} is the run's guaranteed last stream event
+// (enqueued in settle, before the run's done closes) — returning after
+// it, not merely after Run.Done (which can fire while trailing events
+// are still buffered), is what keeps the next prompt after the run's
+// last output byte.
+func (c *cliApp) runLoop(sub *agent.StreamSubscription) {
+	live := &liveWriter{printer: c.printer}
 	frame := 0
+	// One reused timer (not time.After per iteration): dense deltas
+	// would otherwise allocate and discard a timer per event.
+	timer := time.NewTimer(spinnerInterval)
+	defer timer.Stop()
 	for {
 		select {
-		case err := <-done:
-			c.printer.clear()
-			// The compaction record prints through the watcher; do not let
-			// the next prompt overtake it.
-			c.waitForRecords()
-			return err
-		case <-time.After(spinnerInterval):
-			c.printer.frame(spinnerFrames[frame%len(spinnerFrames)])
-			frame++
+		case ev := <-sub.Events():
+			if !timer.Stop() {
+				<-timer.C // drain the already-fired tick before Reset
+			}
+			timer.Reset(spinnerInterval)
+			if c.renderEvent(ev, live) {
+				live.settle()
+				c.printer.clear()
+				return
+			}
+		case <-sub.Lost():
+			// The render fell too far behind (a blocked terminal): the
+			// dispatcher evicted this subscription. §14.2: re-Stream.
+			// The fresh snapshot's records carry the catch-up (the ones
+			// committed during the gap); live delta rendering stays off
+			// for the rest of the run — the in-flight item's started
+			// event is below the fresh startSeq, so later deltas cannot
+			// be attributed; the record (non-droppable, re-delivered
+			// fresh) prints the full content instead. If the run already
+			// settled, the snapshot itself is the terminal state: return
+			// without waiting for a terminal status that was lost with
+			// the eviction — the loop must never hang.
+			fmt.Fprintln(os.Stderr, "\rsai: stream subscription evicted (rendering fell behind); re-syncing from records")
+			sub.Stop()
+			sub = c.session.Stream()
+			snap := sub.Initial()
+			live = &liveWriter{printer: c.printer} // no item context: records print in full
+			for _, record := range snap.Records[c.rendered:] {
+				c.printRecord(record, live)
+				c.rendered++
+			}
+			if !snap.StatusRunning {
+				c.printer.clear()
+				return
+			}
+		case <-timer.C:
+			timer.Reset(spinnerInterval)
+			if live.inMessage.Load() && live.sawOutput.Load() {
+				// Text is flowing: the output itself is the progress.
+				c.printer.clear()
+			} else {
+				c.printer.frame(spinnerFrames[frame%len(spinnerFrames)])
+				frame++
+			}
 		}
 	}
 }
 
-// printRecord renders one committed record. A user input opens a new run:
-// the blank line keeps runs visually separated. An assistant message
-// rendered live by the event drain is skipped; one arriving mid-run
-// before its start event was processed is parked and decided at
-// reconcileParked.
-func (c *cliApp) printRecord(record storage.Record) {
-	if record.Type == storage.TypeAssistantMessage {
-		if c.liveShownHas(record.ItemID) {
-			return
+// renderEvent maps one stream event onto the terminal. It returns true
+// for the run's terminal status — the caller's signal that the run and
+// its rendering are complete.
+func (c *cliApp) renderEvent(ev agent.SessionEvent, live *liveWriter) bool {
+	switch e := ev.(type) {
+	case agent.RecordCommitted:
+		c.printRecord(e.Record, live)
+		c.rendered++ // printed or live-rendered: accounted either way
+	case agent.Transient:
+		// Control notices are 'sai:' messages on stderr, not rendered
+		// record stream content.
+		switch event := e.Event.(type) {
+		case model.ContextPressureEvent:
+			fmt.Fprintf(os.Stderr, "sai: context exceeds the estimated budget (%d ≥ %d tokens); no compaction possible, sending anyway\n",
+				event.EstimatedTokens, event.HardInputLimit)
+		case model.ProviderRetryEvent:
+			fmt.Fprintf(os.Stderr, "sai: retrying model request (attempt %d/%d, %s)\n",
+				event.Attempt, event.MaxAttempts, event.Reason)
+		case model.CompactionFailedEvent:
+			fmt.Fprintf(os.Stderr, "sai: compaction failed (soft pressure; run continues): %s\n", event.Reason)
+		default:
+			live.handle(e.Event)
 		}
-		if c.session.Running() {
-			c.liveMu.Lock()
-			c.parked = append(c.parked, record)
-			c.liveMu.Unlock()
-			return
-		}
+	case agent.Status:
+		return !e.Running
+	}
+	return false
+}
+
+// printRecord renders one committed record. A user input opens a new
+// run: the blank line keeps runs visually separated. An assistant
+// message the live writer is streaming is skipped: its content is
+// already on the terminal, and the stream's order (started → deltas →
+// record → completed) makes the check race-free — the writer is still
+// inside that item when its record arrives.
+func (c *cliApp) printRecord(record storage.Record, live *liveWriter) {
+	if record.Type == storage.TypeAssistantMessage && record.ItemID == live.currentItem() {
+		return
 	}
 	if record.Type == storage.TypeUserInput {
 		c.printer.line("")
@@ -551,35 +495,30 @@ func (c *cliApp) printRecord(record storage.Record) {
 	c.printer.line(formatRecord(record))
 }
 
-// stopWatcher stops the record-printing watcher without closing the
-// session — serve mode hands terminal output over to the web UI (/tail
-// re-enables it on demand).
-func (c *cliApp) stopWatcher() {
-	if c.unwatch != nil {
-		c.unwatch()
-		c.unwatch = nil
+// compact summarizes the session context. The spinner runs while the
+// summary generates (runLoop's quiet phase); the context.compacted
+// record and the compaction lifecycle events render from the stream,
+// and the loop's terminal-status exit means the next prompt follows the
+// committed summary record.
+func (c *cliApp) compact() error {
+	sub := c.session.Stream()
+	defer sub.Stop()
+	r, err := c.session.StartCompact(context.Background())
+	if err != nil {
+		return err
 	}
-	if c.watcherDone != nil {
-		<-c.watcherDone
-		c.watcherDone = nil
-	}
+	c.runLoop(sub)
+	// r.err is written before settle enqueues the terminal status — but
+	// reading it before close(done) is still a data race (the loop exits
+	// at the terminal status, which precedes the close). Join Done.
+	<-r.Done()
+	return r.Err()
 }
 
-// closeSession stops the watcher and closes the session.
+// closeSession closes the session. With the stream-based rendering
+// there is no watcher goroutine to join: every run's loop ends at its
+// terminal status, so no render is in flight while the REPL is idle.
 func (c *cliApp) closeSession() {
-	if c.unwatch != nil {
-		c.unwatch()
-		c.unwatch = nil
-	}
-	// Join the watcher goroutine before returning: after Stop it may
-	// still process buffered records, and those must not leak past the
-	// counter reset in bind (a late countPrinted would inflate the new
-	// session's printed; a late printRecord would render old-session
-	// records into the new one).
-	if c.watcherDone != nil {
-		<-c.watcherDone
-		c.watcherDone = nil
-	}
 	c.session.Close()
 }
 
@@ -612,9 +551,10 @@ func (c *cliApp) resumeCommand(arg string) {
 	}
 }
 
-// bind switches to a session: existing records print first, then every
-// later commit prints as it happens. The session id prints immediately —
-// it exists from creation, before anything is written to disk.
+// bind switches to a session: existing records print as history; every
+// later record prints from its run's stream loop (send/compact). The
+// session id prints immediately — it exists from creation, before
+// anything is written to disk.
 func (c *cliApp) bind(session *agent.Session) error {
 	if c.session != nil {
 		if c.session.Running() {
@@ -622,52 +562,21 @@ func (c *cliApp) bind(session *agent.Session) error {
 		}
 		c.closeSession()
 	}
-	// Reset the cross-session bookkeeping: printed counts toward the new
-	// session's records (a stale counter would make waitForRecords a
-	// permanent no-op), and the live-render markers of the old session
-	// are meaningless here.
-	c.liveMu.Lock()
-	c.liveShown = nil
-	c.parked = nil
-	c.liveMu.Unlock()
-	c.printedMu.Lock()
-	c.printed = 0
-	c.printedMu.Unlock()
 	c.session = session
-	sub := session.Subscribe()
-	c.unwatch = sub.Stop
-	watcherDone := make(chan struct{})
-	c.watcherDone = watcherDone
-	go func() {
-		defer close(watcherDone)
-		for {
-			select {
-			case record := <-sub.Records():
-				c.printRecord(record)
-				c.countPrinted()
-			case <-sub.Done():
-				return
-			}
-		}
-	}()
 	fmt.Fprintf(os.Stderr, "sai: session %s\n", session.ID())
 	// History shows only the tail: the full log stays in the file; a
 	// resumed session needs the recent context, not a wall of scroll-back.
-	// The omitted records count as processed — waitForRecords compares
-	// against the session's full committed count, and every omitted record
-	// would otherwise be waited for until the timeout.
-	initial := sub.Initial()
+	// The omitted head counts as rendered — the eviction catch-up must
+	// never replay it.
+	initial := session.SnapshotStream().Records
+	c.rendered = len(initial)
 	if len(initial) > resumeTailRecords {
-		omitted := len(initial) - resumeTailRecords
 		c.printer.line(fmt.Sprintf("[… showing last %d of %d records]", resumeTailRecords, len(initial)))
 		initial = initial[len(initial)-resumeTailRecords:]
-		c.printedMu.Lock()
-		c.printed += omitted
-		c.printedMu.Unlock()
 	}
+	live := &liveWriter{printer: c.printer} // currentItem "" — history records all print
 	for _, record := range initial {
-		c.printRecord(record)
-		c.countPrinted()
+		c.printRecord(record, live)
 	}
 	return nil
 }

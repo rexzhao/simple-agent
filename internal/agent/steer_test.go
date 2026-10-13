@@ -188,10 +188,8 @@ func TestSteerLeftoverDeliveredByNextRun(t *testing.T) {
 
 func sessionRecords(t *testing.T, session *Session) []recordView {
 	t.Helper()
-	sub := session.Subscribe()
-	defer sub.Stop()
 	var out []recordView
-	for _, r := range sub.Initial() {
+	for _, r := range session.SnapshotStream().Records {
 		out = append(out, recordView{ItemID: r.ItemID, Type: r.Type, Content: r.Content})
 	}
 	return out

@@ -224,11 +224,12 @@ loop:
 	}
 }
 
-// TestStreamDualPathConsistency pins B1: the stream and the legacy
-// subscription deliver the SAME set of records for the same run. If
-// the stream misses a record (e.g. Start's user.input, or
+// TestStreamSeesEveryWritePath pins completeness: the stream's record
+// set must equal the committed history after every write path (header
+// flush, Start's user.input, run commits, tool results, compaction).
+// If the stream misses a record (e.g. Start's user.input, or
 // commitLocked returning two records), this test catches it.
-func TestStreamDualPathConsistency(t *testing.T) {
+func TestStreamSeesEveryWritePath(t *testing.T) {
 	toolDone := make(chan struct{})
 	close(toolDone) // non-blocking tool
 	executor := &blockingToolExecutor{done: toolDone}
@@ -247,13 +248,10 @@ func TestStreamDualPathConsistency(t *testing.T) {
 		o.Tools = []model.Tool{{Name: "check"}}
 	})
 
-	// Subscribe to BOTH paths BEFORE any write — then MaterializeHeader
-	// exercises the third write path (the session header flush) through
-	// both subscriptions equally.
+	// Subscribe BEFORE any write — then MaterializeHeader exercises the
+	// third write path (the session header flush) on the stream too.
 	streamSub := session.Stream()
 	defer streamSub.Stop()
-	legacySub := session.Subscribe()
-	defer legacySub.Stop()
 
 	if err := session.MaterializeHeader(); err != nil {
 		t.Fatal(err)
@@ -302,40 +300,29 @@ loop:
 		}
 	}
 
-	// Collect all records from the legacy subscription.
-	var legacyRecords []string
-	for {
-		select {
-		case r := <-legacySub.Records():
-			legacyRecords = append(legacyRecords, r.ItemID)
-		default:
-			goto compare
-		}
-	}
-compare:
 	// The stream's Initial already contains the pre-subscription
 	// records; merge them with the stream events.
 	for _, r := range streamSub.Initial().Records {
 		streamRecords = append(streamRecords, r.ItemID)
 	}
 
-	if len(streamRecords) != len(legacyRecords) {
-		t.Fatalf("record count mismatch: stream=%d legacy=%d\nstream: %v\nlegacy: %v",
-			len(streamRecords), len(legacyRecords), streamRecords, legacyRecords)
+	// The baseline is the session's committed history: every write path
+	// (MaterializeHeader, Start's user.input, run commits, compaction)
+	// must be visible on the stream exactly once.
+	committed := session.SnapshotStream().Records
+	if len(streamRecords) != len(committed) {
+		t.Fatalf("record count mismatch: stream=%d committed=%d\nstream: %v\ncommitted: %v",
+			len(streamRecords), len(committed), streamRecords, committed)
 	}
 	for i := range streamRecords {
-		if streamRecords[i] != legacyRecords[i] {
-			t.Fatalf("record %d mismatch: stream=%s legacy=%s", i, streamRecords[i], legacyRecords[i])
+		if streamRecords[i] != committed[i].ItemID {
+			t.Fatalf("record %d mismatch: stream=%s committed=%s", i, streamRecords[i], committed[i].ItemID)
 		}
 	}
 
 	// Compare transient events: the critical tool lifecycle event must
-	// appear in the stream's Transient lane. Compaction events
-	// (started/completed) are only emitted by AUTO-compaction
-	// (maybeAutoCompact); manual compact doesn't emit them yet — that's
-	// the N3 gap closed in step 3. For the behavioral coverage here,
-	// the tool event is the one that catches an executeToolCall
-	// bypassing the stream.
+	// appear in the stream's Transient lane — the one that catches an
+	// executeToolCall bypassing the stream (S2).
 	for _, want := range []string{"tool_started"} {
 		found := false
 		for _, typ := range streamTransientTypes {
@@ -398,38 +385,40 @@ loop:
 	}
 }
 
-// TestSendEventOnlyFromExitFunction is a structural guard (S2): the
-// free function sendEvent must only be called from emitTransient (the
-// single exit point). A direct sendEvent call bypasses the stream —
-// exactly the ToolStartedEvent bug this round fixed. This test scans
-// the source to enforce the discipline.
-func TestSendEventOnlyFromExitFunction(t *testing.T) {
-	// The allowed call sites: sendEvent's own definition, and inside
-	// emitTransient (the exit function).
-	allowed := map[string]bool{
-		"func sendEvent":                  true,
-		"func (s *Session) emitTransient": true,
+// TestNoPerRunEventChannel is the step-4 structural guard: the per-run
+// event channel and everything that fed it are deleted — transient
+// events ride the session stream exclusively. A reintroduction (e.g. a
+// "temporary" buffer for one consumer) is exactly the wedge class
+// step 4 removed: blocking sends with no consumer stalled runs forever.
+func TestNoPerRunEventChannel(t *testing.T) {
+	// Patterns banned in every file.
+	banned := []string{
+		"sendEvent(",                   // the blocking per-run send
+		"func (s *Session) Events()",   // the per-run channel accessor
+		"func (s *Session) Subscribe(", // the legacy record subscription
 	}
-	src, err := os.ReadFile("session.go")
-	if err != nil {
-		t.Skip("source not available in test binary")
+	// Event channels are additionally banned outside agent.go: the
+	// provider interface legitimately streams model.Event channels as
+	// its INPUT contract (agent.go); nothing else may hold one.
+	files := []string{"session.go", "stream.go", "budget.go", "tool_output.go"}
+	for _, name := range files {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			// Not skippable: the test runs in the package directory, so
+			// an unreadable source is an environment fault — a silent
+			// skip would leave the guard off exactly where it matters.
+			t.Fatalf("read %s: %v", name, err)
+		}
+		patterns := banned
+		if name != "agent.go" {
+			patterns = append(patterns, "chan model.Event")
+		}
+		for _, pattern := range patterns {
+			if strings.Contains(string(src), pattern) {
+				t.Fatalf("%s contains %q — the per-run event path must stay deleted (transient events ride the session stream)", name, pattern)
+			}
+		}
 	}
-	for _, line := range strings.Split(string(src), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.Contains(trimmed, "sendEvent(") {
-			continue
-		}
-		// Allow the definition and the call inside emitTransient.
-		if strings.HasPrefix(trimmed, "func sendEvent") {
-			continue
-		}
-		// The call inside emitTransient is "sendEvent(ctx, out, event)".
-		if trimmed == "sendEvent(ctx, out, event)" {
-			continue
-		}
-		t.Fatalf("sendEvent called outside the exit function: %q — use s.emitTransient instead", trimmed)
-	}
-	_ = allowed
 }
 
 // TestStreamEvictionRecovery pins S4 deterministically: a subscriber

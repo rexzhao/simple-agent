@@ -27,7 +27,7 @@ const (
 // terminal: the assistant message appears character by character as the
 // model generates it, reasoning lines marked like in the committed record
 // rendering. The committed assistant.message record is then skipped by the
-// record watcher — its content was already shown.
+// render loop — its content was already shown.
 type liveWriter struct {
 	printer terminal
 	// inMessage is set between AssistantMessageStarted and
@@ -38,10 +38,20 @@ type liveWriter struct {
 	inMessage atomic.Bool
 	sawOutput atomic.Bool
 
+	// item is the ItemID of the message being streamed: the render loop
+	// uses it to skip the record of a live-rendered message. The stream's
+	// order (started → deltas → record → completed) keeps the check
+	// race-free: the record of the streaming item arrives while item is
+	// still set (completed clears it after).
+	item string
+
 	lineStart     bool // at the start of a body line (drives the indent)
 	lastKind      int  // delta kind of the last chunk (drives the phase break)
 	headerPending bool // the message header is not yet on the terminal
 }
+
+// currentItem reports the item being streamed ("" between messages).
+func (w *liveWriter) currentItem() string { return w.item }
 
 // handle consumes one transient event.
 func (w *liveWriter) handle(event model.Event) {
@@ -51,9 +61,11 @@ func (w *liveWriter) handle(event model.Event) {
 		w.sawOutput.Store(false)
 		w.lineStart = true
 		w.lastKind = deltaNone
+		w.item = event.ItemID
 		// The header is pending, not printed: it must not overtake the
-		// watcher's user-input record. It goes out with the first actual
-		// output — a full provider roundtrip after the input committed.
+		// user-input record. It goes out with the first actual output — a
+		// full provider roundtrip after the input committed (the stream's
+		// seq order guarantees the input record is already printed).
 		w.headerPending = true
 	case model.ReasoningDeltaEvent:
 		w.writeChunk(event.Text, true)
@@ -78,12 +90,14 @@ func (w *liveWriter) handle(event model.Event) {
 			}
 		}
 		w.inMessage.Store(false)
+		w.item = ""
 	case model.AssistantMessageFailedEvent:
 		// A failed message may leave a pending header (nothing was shown)
 		// or a half-streamed body; both end here.
 		w.headerPending = false
 		w.endMessage()
 		w.inMessage.Store(false)
+		w.item = ""
 	}
 }
 
@@ -111,11 +125,13 @@ func (w *liveWriter) endMessage() {
 	}
 }
 
-// settle is called when the run's event stream closed: an interrupted
-// message may have ended mid-line.
+// settle closes any interrupted message: an interrupted run ends
+// mid-message with no completed event, so runLoop calls this at the
+// terminal status.
 func (w *liveWriter) settle() {
 	w.endMessage()
 	w.inMessage.Store(false)
+	w.item = ""
 }
 
 // writeChunk streams one delta chunk into the body. The pending header

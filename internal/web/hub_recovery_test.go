@@ -1,7 +1,6 @@
 package web
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,9 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/storage/memory"
 )
 
 // stagedProvider routes turns by the user input's content, so tests
@@ -102,164 +99,6 @@ func sseGet(t *testing.T, url string) (*http.Response, context.CancelFunc) {
 		t.Fatal(err)
 	}
 	return res, cancel
-}
-
-// TestEvictedHubDrainsRunStartedWhileEvicted is the END-TO-END pin of
-// H1 漏洞 b: a run that starts while the hub's stream subscription is
-// evicted never delivers its Status{Running:true}, and the fresh
-// subscription skips it too (S1) — the resubscribe-time snapshot is the
-// reliable drain trigger (stale backlog statuses may incidentally drain
-// as well; see the unit test below for the isolated mechanism, and
-// TestResubscribeSnapshotDrainsActiveRun pins that path specifically).
-//
-// The eviction is forced deterministically: the hub loop is frozen
-// (h.mu held by the test) while flood turns overflow the subscription
-// buffer, and the evicted subscription's backlog is drained before the
-// unfreeze so the loop takes Lost immediately (no stale Status is ever
-// processed — the recovery rides on the snapshot alone).
-func TestEvictedHubDrainsRunStartedWhileEvicted(t *testing.T) {
-	gate1, gate2 := make(chan struct{}), make(chan struct{})
-	entered1, entered2 := make(chan struct{}), make(chan struct{})
-	provider := &stagedProvider{byName: map[string]stagedTurn{
-		"t0":    {gate: gate1, entered: entered1, post: 50},            // drainer-free backlog head
-		"m":     {pre: 1},                                              // flood turns
-		"wedge": {pre: 200, gate: gate2, entered: entered2, post: 300}, // the wedge-run
-	}}
-	session, srv, base := newTestManagerServer(t, provider)
-	hub := srv.manager.sessions[session.ID()].hub
-
-	// An SSE client watches throughout; the window reissue after the
-	// resubscribe is the observable signal that recovery completed.
-	res, cancel := sseGet(t, base.URL+api(session, "/stream"))
-	defer cancel()
-	defer res.Body.Close()
-	frames := make(chan Frame, 4096)
-	go func() {
-		br := bufio.NewReader(res.Body)
-		for {
-			line, err := br.ReadString('\n')
-			if err != nil {
-				close(frames)
-				return
-			}
-			if !strings.HasPrefix(line, "data: ") {
-				continue
-			}
-			var f Frame
-			if err := json.Unmarshal([]byte(strings.TrimRight(line[6:], "\n")), &f); err != nil {
-				close(frames)
-				return
-			}
-			frames <- f
-		}
-	}()
-	// The connect snapshot arrives first.
-	select {
-	case f, ok := <-frames:
-		if !ok || f.Kind != "snapshot" {
-			t.Fatalf("first frame is not a snapshot: %+v", f)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("no connect snapshot")
-	}
-
-	// Turn 0 starts; wait until the hub has PROCESSED its run-start
-	// status (mirror running) — its drain spawns now, on turn 0's own
-	// channel, keeping the frozen-period deltas flowing.
-	if err := session.Send("t0"); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, 5*time.Second, func() bool {
-		hub.mu.Lock()
-		defer hub.mu.Unlock()
-		return hub.running
-	})
-
-	// Freeze the loop, then release turn 0: its 50 deltas become the
-	// backlog head (no Status{Running:true} anywhere near it).
-	hub.mu.Lock()
-	close(gate1)
-	waitSettled(t, session)
-
-	// Flood until the subscription is evicted (buffer 1024 overflows
-	// on non-droppable events: 4 per flood turn).
-	evicted := false
-	for batch := 0; batch < 12 && !evicted; batch++ {
-		for i := 0; i < 20; i++ {
-			if err := session.Send("m"); err != nil {
-				hub.mu.Unlock()
-				t.Fatalf("flood send: %v", err)
-			}
-			waitSettled(t, session)
-		}
-		select {
-		case <-hub.stream.Lost():
-			evicted = true
-		default:
-		}
-	}
-	if !evicted {
-		hub.mu.Unlock()
-		t.Fatal("hub subscription was not evicted by the flood")
-	}
-
-	// Still frozen: start the wedge-run. Its run-start status is
-	// enqueued with no subscriber (evicted) and will be BELOW the fresh
-	// subscription's startSeq — the resubscribe snapshot is its only
-	// chance to get a drain.
-	if err := session.Send("wedge"); err != nil {
-		hub.mu.Unlock()
-		t.Fatal(err)
-	}
-	select {
-	case <-entered2:
-	case <-time.After(10 * time.Second):
-		hub.mu.Unlock()
-		t.Fatal("wedge-run never reached its gate")
-	}
-
-	// Drain the evicted subscription's buffered backlog: at the
-	// unfreeze the loop must take Lost IMMEDIATELY (Events empty), so
-	// no stale Status frame is ever processed — without this, the
-	// random Events/Lost select could process old run-start statuses
-	// that incidentally drain the wedge-run, and the test would not
-	// pin the resubscribe-snapshot path.
-	for drained := 0; ; {
-		select {
-		case <-hub.stream.Events():
-			drained++
-		default:
-			if drained == 0 {
-				hub.mu.Unlock()
-				t.Fatal("evicted subscription has no backlog — eviction path changed")
-			}
-			goto unfreeze
-		}
-	}
-unfreeze:
-	hub.mu.Unlock()
-
-	// The loop takes Lost immediately, resubscribes (the snapshot shows
-	// the run active → drain starts), and reissues the window snapshot.
-	sawReissue := false
-	deadline := time.After(10 * time.Second)
-	for !sawReissue {
-		select {
-		case f, ok := <-frames:
-			if !ok {
-				t.Fatal("SSE connection closed during recovery")
-			}
-			if f.Kind == "snapshot" {
-				sawReissue = true
-			}
-		case <-deadline:
-			t.Fatal("no window reissue after eviction")
-		}
-	}
-
-	// Release the wedge-run: 300 more deltas flow through the drain.
-	close(gate2)
-	waitFor(t, 15*time.Second, func() bool { return !session.Running() })
 }
 
 // TestOutofBandStatusReadsMirror pins H2: out-of-band status frames
@@ -587,81 +426,4 @@ func TestNoticeFrameReachesFreshClient(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("notice frame never reached the fresh client")
 	}
-}
-
-// TestResubscribeSnapshotDrainsActiveRun pins H1 漏洞 b at the unit
-// level: a run that started while the hub could not see its run-start
-// Status (here: the hub loop never runs — the status sits forever in
-// the unprocessed subscription buffer) is protected ONLY by
-// resubscribe's snapshot check. The hub is assembled without its loop
-// goroutine so no other drain path can exist; the wedge-run completing
-// after the gate release proves the resubscribe drain fired.
-func TestResubscribeSnapshotDrainsActiveRun(t *testing.T) {
-	gate := make(chan struct{})
-	entered := make(chan struct{})
-	provider := &stagedProvider{byName: map[string]stagedTurn{
-		// pre+post > 256: without a drain the run wedges on its full
-		// per-run channel forever.
-		"wedge": {pre: 100, gate: gate, entered: entered, post: 300},
-	}}
-	// A bare session with NO manager hub (a manager-created session
-	// would carry a live hub whose loop drains the run normally — the
-	// exact interference this unit test must exclude).
-	ag, err := agent.New(agent.Options{
-		Provider:     provider,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := ag.NewSession()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = session.Close() })
-
-	// The hub under test is assembled WITHOUT its loop goroutine: no
-	// code path exists that could drain the run except the one under
-	// test (resubscribe's snapshot check).
-	hub := &Hub{
-		session: session,
-		done:    make(chan struct{}),
-		index:   make(map[string]int),
-		clients: make(map[*client]struct{}),
-		genesis: chainGenesis(session.ID()),
-	}
-	stream := session.Stream()
-	snap := stream.Initial()
-	hub.mu.Lock()
-	for _, r := range snap.Records {
-		hub.extendLocked(r)
-	}
-	hub.running = snap.StatusRunning
-	hub.compacting = snap.StatusCompacting
-	hub.processedSeq = snap.StartSeq
-	hub.mu.Unlock()
-	hub.stream = stream
-
-	// The wedge-run starts now: its run-start Status is delivered into
-	// the subscription buffer but never processed (no loop).
-	if err := session.Send("wedge"); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-entered:
-	case <-time.After(10 * time.Second):
-		t.Fatal("run never reached its gate")
-	}
-
-	// The recovery under test: resubscribe on a snapshot that shows the
-	// run active must start the legacy-channel drain.
-	hub.resubscribe()
-
-	// Release: 300 more deltas must flow through the drain and the run
-	// must complete. Without the resubscribe drain the per-run channel
-	// fills past 256 and the run never settles.
-	close(gate)
-	waitFor(t, 15*time.Second, func() bool { return !session.Running() })
 }

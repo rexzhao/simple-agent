@@ -17,32 +17,6 @@ import (
 	"github.com/rexzhao/simple-agent/internal/storage"
 )
 
-// subscribeBuffer bounds one subscriber's channel. Commits block when a
-// subscriber stalls: backpressure instead of dropped records. A stalled
-// subscriber is released by Stop closing its done channel.
-const subscribeBuffer = 1024
-
-// subscription is one registered record subscriber. The records channel is
-// never closed — closing it would race a commit's in-flight delivery —
-// instead Stop closes done, which ends the reader's loop and unblocks a
-// sender stuck on a full buffer.
-type subscription struct {
-	records chan storage.Record
-	done    chan struct{}
-}
-
-// deliver sends the stored records in order, giving up as soon as the
-// subscription is stopped.
-func (sub *subscription) deliver(stored []storage.Record) {
-	for _, record := range stored {
-		select {
-		case sub.records <- record:
-		case <-sub.done:
-			return
-		}
-	}
-}
-
 // providerRetryBackoff is the delay before retry attempt n (1-based).
 var providerRetryBackoff = func(attempt int) time.Duration {
 	return time.Duration(5*(1<<(attempt-1))) * time.Second
@@ -61,19 +35,18 @@ const (
 	RunCompact
 )
 
-// Run owns one execution's runtime resources: its cancel, its done
-// signal, and (until milestone A step 2 replaces them with the session
-// stream) its per-run event channel. The Session holds a pointer to
-// the current run; the run's teardown clears it under the session
-// lock before closing done — the C1 invariant: anyone who observes
-// the run as finished can immediately Start a new one or get ErrNoRun
-// from Steer.
+// Run owns one execution's runtime resources: its cancel and its done
+// signal. The Session holds a pointer to the current run; the run's
+// teardown clears it under the session lock before closing done — the
+// C1 invariant: anyone who observes the run as finished can immediately
+// Start a new one or get ErrNoRun from Steer. Transient events ride the
+// session stream (milestone A step 2/4); the run itself carries no
+// channels.
 type Run struct {
 	session *Session
 	ctx     context.Context
 	cancel  context.CancelFunc
 	done    chan struct{}
-	events  chan model.Event // buffered; closed by the run goroutine
 	err     error
 	kind    RunKind
 }
@@ -83,9 +56,9 @@ func (r *Run) Stop() { r.cancel() }
 
 // Done is closed once, by the run goroutine, after the session's
 // currentRun pointer has been cleared. It is a supplementary signal:
-// consumers that need to know the run's events are fully delivered
-// must drain the events channel (milestone A step 2's stream will
-// make this a non-issue with the in-stream terminal status).
+// consumers that need every event of the run must wait for the
+// stream's terminal Status{Running:false} (guaranteed to be the run's
+// last stream event, enqueued in settle before done closes).
 func (r *Run) Done() <-chan struct{} { return r.done }
 
 // Err returns the run's outcome. Only defined after Done is closed;
@@ -123,11 +96,9 @@ type Session struct {
 	// idle. Replaces the running/cancel/events/done field quartet —
 	// those resources belong to the Run (design §14.1).
 	currentRun *Run
-	// lastRun survives the current run's teardown: Events() and the
-	// test helpers drain buffered events off it after settle (the
-	// post-settle drain contract).
+	// lastRun survives the current run's teardown: test helpers read
+	// the finished run's outcome after settle.
 	lastRun *Run
-	subs    map[*subscription]struct{}
 
 	// --- session stream (milestone A step 2) ---
 	// streamSeq is the monotonic sequence counter, assigned under s.mu
@@ -163,15 +134,6 @@ func (s *Session) Persisted() bool {
 	return len(s.records) > 0
 }
 
-// RecordCount returns how many records the session has committed. The
-// CLI waits until its record printer has caught up with this count before
-// drawing the next prompt, so output never lands behind the prompt.
-func (s *Session) RecordCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.records)
-}
-
 // Snapshot returns a deep copy of the state, including the transient
 // streaming and running slots.
 func (s *Session) Snapshot() storage.State {
@@ -201,82 +163,6 @@ func (s *Session) Compacting() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.state.Compacting != nil
-}
-
-// Events returns the transient event stream of the run: the active
-// one, or the previous run's closed channel (receiving drains any
-// buffered events, then returns false immediately).
-func (s *Session) Events() <-chan model.Event {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.currentRun != nil {
-		return s.currentRun.events
-	}
-	if s.lastRun != nil {
-		return s.lastRun.events
-	}
-	return nil
-}
-
-// Subscription delivers committed records to one subscriber.
-type Subscription struct {
-	session *Session
-	sub     *subscription
-	initial []storage.Record
-}
-
-// Initial returns the records committed before the subscription was
-// registered. The caller must process Initial fully before consuming
-// Records: both streams are ordered on their own, and a record committed
-// after registration arrives on Records even while Initial is still
-// being processed. (The CLI is safe because it binds only while no run
-// is active; a future WebUI bridge must respect this ordering too.)
-func (s *Subscription) Initial() []storage.Record { return s.initial }
-
-// Records returns the delivery channel. It is never closed; stop reading
-// when Done is closed.
-func (s *Subscription) Records() <-chan storage.Record { return s.sub.records }
-
-// Done is closed by Stop. A reader selects on Records and Done:
-//
-//	for {
-//		select {
-//		case record := <-sub.Records():
-//			// render
-//		case <-sub.Done():
-//			return
-//		}
-//	}
-func (s *Subscription) Done() <-chan struct{} { return s.sub.done }
-
-// Stop ends delivery. It is idempotent and never blocks: a commit blocked
-// on this subscription's full buffer is released, not deadlocked.
-func (s *Subscription) Stop() {
-	s.session.mu.Lock()
-	if _, ok := s.session.subs[s.sub]; ok {
-		delete(s.session.subs, s.sub)
-		close(s.sub.done)
-	}
-	s.session.mu.Unlock()
-}
-
-// Subscribe atomically snapshots the committed records and registers a
-// subscription carrying every later commit. No record can be missed or
-// duplicated: the snapshot and the registration happen under one lock
-// section, and commits deliver only to registered subscriptions.
-func (s *Session) Subscribe() *Subscription {
-	sub := &subscription{
-		records: make(chan storage.Record, subscribeBuffer),
-		done:    make(chan struct{}),
-	}
-	s.mu.Lock()
-	records := append([]storage.Record(nil), s.records...)
-	if s.subs == nil {
-		s.subs = make(map[*subscription]struct{})
-	}
-	s.subs[sub] = struct{}{}
-	s.mu.Unlock()
-	return &Subscription{session: s, sub: sub, initial: records}
 }
 
 // Sentinel errors the transport layers map to stable wire codes.
@@ -326,7 +212,6 @@ func (s *Session) Start(ctx context.Context, input string) (*Run, error) {
 		ctx:     ctx2,
 		cancel:  cancel,
 		done:    make(chan struct{}),
-		events:  make(chan model.Event, 256),
 		kind:    RunTurn,
 	}
 
@@ -336,11 +221,10 @@ func (s *Session) Start(ctx context.Context, input string) (*Run, error) {
 		cancel()
 		return nil, ErrRunActive
 	}
-	stored, err := s.commitLocked(storage.Record{
+	if _, err := s.commitLocked(storage.Record{
 		ItemID: storage.NewUserInputID(), Type: storage.TypeUserInput,
 		RunID: runID, Content: input,
-	})
-	if err != nil {
+	}); err != nil {
 		s.mu.Unlock()
 		cancel()
 		return nil, err
@@ -350,22 +234,11 @@ func (s *Session) Start(ctx context.Context, input string) (*Run, error) {
 	// The run-start Status. Records were already enqueued by
 	// appendLocked (the single write path).
 	// The run-start Status rides the guaranteed path (§14.2):
-	// consumers key lifecycle machinery on it (the hub starts its
-	// legacy-channel drain here), so it must not be dropped — a full
-	// buffer evicts the subscriber instead, which is recoverable
-	// (re-Stream), unlike a silently dropped run-start.
+	// consumers key run lifecycle machinery on it, so it must not be
+	// dropped — a full buffer evicts the subscriber instead, which is
+	// recoverable (re-Stream), unlike a silently dropped run-start.
 	s.enqueueStreamLocked(Status{Running: true}, false)
-	var subs []*subscription
-	for sub := range s.subs {
-		subs = append(subs, sub)
-	}
 	s.mu.Unlock()
-
-	// Notify before launching the run goroutine, so subscribers see the
-	// user input ahead of anything the run commits.
-	for _, sub := range subs {
-		sub.deliver(stored)
-	}
 	go r.execute(runID, request)
 	return r, nil
 }
@@ -403,14 +276,9 @@ func (s *Session) Steer(text string) (string, error) {
 	// Snapshot. (A select with default does NOT protect a send on a
 	// closed channel — the send panics before default is consulted; the
 	// kind guard above is the real protection.)
-	// B2: enqueue into the stream FIRST (we're already under s.mu;
-	// emitTransient would re-acquire and deadlock). Then the best-effort
-	// per-run channel send.
+	// B2: enqueue into the stream (we're already under s.mu;
+	// emitTransient would re-acquire and deadlock).
 	s.enqueueStreamLocked(Transient{Event: model.SteerQueuedEvent{ItemID: itemID, Text: text}}, true)
-	select {
-	case s.currentRun.events <- model.SteerQueuedEvent{ItemID: itemID, Text: text}:
-	default:
-	}
 	return itemID, nil
 }
 
@@ -426,12 +294,6 @@ func (s *Session) UpdateSteer(itemID, text string) error {
 		if s.state.Steered[i].ItemID == itemID {
 			s.state.Steered[i].Text = text
 			s.enqueueStreamLocked(Transient{Event: model.SteerUpdatedEvent{ItemID: itemID, Text: text}}, true)
-			if s.currentRun != nil && s.currentRun.kind == RunTurn {
-				select {
-				case s.currentRun.events <- model.SteerUpdatedEvent{ItemID: itemID, Text: text}:
-				default:
-				}
-			}
 			return nil
 		}
 	}
@@ -446,12 +308,6 @@ func (s *Session) WithdrawSteer(itemID string) error {
 		if s.state.Steered[i].ItemID == itemID {
 			s.state.Steered = append(s.state.Steered[:i], s.state.Steered[i+1:]...)
 			s.enqueueStreamLocked(Transient{Event: model.SteerWithdrawnEvent{ItemID: itemID}}, true)
-			if s.currentRun != nil && s.currentRun.kind == RunTurn {
-				select {
-				case s.currentRun.events <- model.SteerWithdrawnEvent{ItemID: itemID}:
-				default:
-				}
-			}
 			return nil
 		}
 	}
@@ -537,26 +393,16 @@ func (s *Session) Close() error {
 // and Send notifies before launching the run goroutine.
 func (s *Session) commit(record storage.Record, clear func(*storage.State)) error {
 	s.mu.Lock()
-	stored, err := s.commitLocked(record)
+	_, err := s.commitLocked(record)
 	// clear runs even on error: it ends the transient slot's lifecycle
 	// (the run is aborting anyway), which is independent of whether this
 	// record reached the storage.
 	if clear != nil {
 		clear(s.state)
 	}
-	var subs []*subscription
-	for sub := range s.subs {
-		subs = append(subs, sub)
-	}
 	// Records were already enqueued by appendLocked.
 	s.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	for _, sub := range subs {
-		sub.deliver(stored)
-	}
-	return nil
+	return err
 }
 
 // MaterializeHeader commits the pending session.created record of a
@@ -578,20 +424,12 @@ func (s *Session) MaterializeHeader() error {
 		s.mu.Unlock()
 		return nil
 	}
-	stored, err := s.appendLocked(*s.pendingCreated)
-	if err != nil {
+	if _, err := s.appendLocked(*s.pendingCreated); err != nil {
 		s.mu.Unlock()
 		return err
 	}
 	s.pendingCreated = nil
-	var subs []*subscription
-	for sub := range s.subs {
-		subs = append(subs, sub)
-	}
 	s.mu.Unlock()
-	for _, sub := range subs {
-		sub.deliver([]storage.Record{stored})
-	}
 	return nil
 }
 
@@ -664,14 +502,13 @@ func (s *Session) applyStreaming(itemID string, apply func(m *model.Message)) {
 // seq above the snapshot's StartSeq — a client registering there
 // receives the same text twice (once in the snapshot, once replayed).
 // The per-run send stays outside the lock (it can block).
-func (s *Session) applyStreamingEmit(itemID string, apply func(m *model.Message), ctx context.Context, out chan<- model.Event, event model.Event) {
+func (s *Session) applyStreamingEmit(itemID string, apply func(m *model.Message), event model.Event) {
 	s.mu.Lock()
 	if item := s.state.Streaming; item != nil && item.ItemID == itemID {
 		apply(&item.Message)
 	}
 	s.enqueueStreamLocked(Transient{Event: event}, true) // droppable
 	s.mu.Unlock()
-	sendEvent(ctx, out, event)
 }
 
 // resetStreaming clears the accumulated content of the streaming message.
@@ -789,7 +626,6 @@ func (s *Session) StartCompact(ctx context.Context) (*Run, error) {
 		ctx:     ctx2,
 		cancel:  cancel,
 		done:    make(chan struct{}),
-		events:  make(chan model.Event, 256), // N3: compact runs also have events
 		kind:    RunCompact,
 	}
 
@@ -816,21 +652,17 @@ func (s *Session) StartCompact(ctx context.Context) (*Run, error) {
 		// make ctx.Err() always non-nil at normalization time, turning
 		// every successful compact into ErrInterrupted.
 		defer close(r.done)
-		defer close(r.events)
 		defer func() { s.settle(r) }()
 
-		// N3: manual compact now emits the same lifecycle events as
-		// auto-compaction — CompactionStarted/Completed go through the
-		// stream AND the per-run channel (the transition dual path).
-		// This is what lets handleCompact's polling be deleted in
-		// step 3: the hub sees Compacting Status and these events
-		// through the stream.
+		// N3: manual compact emits the same lifecycle events as
+		// auto-compaction — through the session stream, which is what
+		// let handleCompact's polling be deleted in step 3.
 		itemID := storage.NewContextCompactedID()
-		s.emitTransient(r.ctx, r.events, model.CompactionStartedEvent{ItemID: itemID})
+		s.emitTransient(model.CompactionStartedEvent{ItemID: itemID})
 
-		_, err := s.compactContext(r.ctx, itemID, pressureNone, 0, r.events)
+		_, err := s.compactContext(r.ctx, itemID, pressureNone, 0)
 		if err == nil {
-			s.emitTransient(r.ctx, r.events, model.CompactionCompletedEvent{ItemID: itemID})
+			s.emitTransient(model.CompactionCompletedEvent{ItemID: itemID})
 		}
 		r.err = compactOutcome(err, r.ctx.Err())
 		cancel() // cleanup: after the result is captured
@@ -845,7 +677,7 @@ func (s *Session) StartCompact(ctx context.Context) (*Run, error) {
 // Under soft pressure the compaction is dropped without committing when
 // the summary would not reclaim enough of the budget — churn, not
 // relief.
-func (s *Session) compactContext(ctx context.Context, itemID string, pressure compactionPressure, beforeTokens int, events chan model.Event) (bool, error) {
+func (s *Session) compactContext(ctx context.Context, itemID string, pressure compactionPressure, beforeTokens int) (bool, error) {
 	s.mu.Lock()
 	if len(s.state.Context) == 0 {
 		s.mu.Unlock()
@@ -861,7 +693,7 @@ func (s *Session) compactContext(ctx context.Context, itemID string, pressure co
 	}()
 
 	summary, err := s.agent.summarizeContext(ctx, request, func(retryErr error, attempt, maxAttempts int, delay time.Duration) {
-		s.emitTransient(ctx, events, model.ProviderRetryEvent{
+		s.emitTransient(model.ProviderRetryEvent{
 			Attempt: attempt + 1, MaxAttempts: maxAttempts, Delay: delay, Reason: model.RetryReason(retryErr),
 		})
 	})
@@ -890,7 +722,7 @@ func (s *Session) compactContext(ctx context.Context, itemID string, pressure co
 // compacts when the guards allow. It returns the request to continue
 // with and whether a compaction happened; the rebuilt request is
 // assembled from the compacted context.
-func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, events chan model.Event) (model.Request, bool, error) {
+func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request) (model.Request, bool, error) {
 	if !s.agent.autoCompact {
 		return request, false, nil
 	}
@@ -905,7 +737,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 		// there is no local preflight (the estimate is heuristic), so the
 		// request is sent and the provider decides.
 		if pressure == pressureHard {
-			s.emitTransient(ctx, events, model.ContextPressureEvent{
+			s.emitTransient(model.ContextPressureEvent{
 				EstimatedTokens: estimateRequestTokens(request), HardInputLimit: s.agent.budget.HardInputLimit,
 			})
 		}
@@ -918,8 +750,8 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 	}
 
 	itemID := storage.NewContextCompactedID()
-	s.emitTransient(ctx, events, model.CompactionStartedEvent{ItemID: itemID})
-	compacted, err := s.compactContext(ctx, itemID, pressure, estimateRequestTokens(request), events)
+	s.emitTransient(model.CompactionStartedEvent{ItemID: itemID})
+	compacted, err := s.compactContext(ctx, itemID, pressure, estimateRequestTokens(request))
 	if err != nil {
 		// An interruption is not a failure to downgrade: the run is
 		// being stopped, and the existing failure machinery skips the
@@ -935,7 +767,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 		// request cannot be sent safely.
 		if pressure == pressureSoft {
 			s.beginSoftCompactCooldown()
-			s.emitTransient(ctx, events, model.CompactionFailedEvent{ItemID: itemID, Reason: err.Error()})
+			s.emitTransient(model.CompactionFailedEvent{ItemID: itemID, Reason: err.Error()})
 			return request, false, nil
 		}
 		return request, false, err
@@ -948,7 +780,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 		}
 		return request, false, nil
 	}
-	s.emitTransient(ctx, events, model.CompactionCompletedEvent{ItemID: itemID})
+	s.emitTransient(model.CompactionCompletedEvent{ItemID: itemID})
 	s.clearSoftCompactCooldown()
 	// Note: under hard pressure the run may still fail right after this
 	// event — the summary was committed (it is a real, smaller context)
@@ -1044,7 +876,7 @@ func (s *Session) clearSoftCompactCooldown() {
 // tool calls, the iteration budget is exhausted, or the run is stopped.
 func (r *Run) execute(runID string, request model.Request) {
 	s := r.session
-	ctx, events, done := r.ctx, r.events, r.done
+	ctx, done := r.ctx, r.done
 
 	// Teardown order (C1): settle clears transient slots + retires the
 	// currentRun pointer in ONE lock section; close(events) and
@@ -1052,7 +884,6 @@ func (r *Run) execute(runID string, request model.Request) {
 	// chain: settle's lock-release < any observer's lock-acquire
 	// (sees currentRun==nil) < a new Start's lock-acquire.
 	defer close(done)
-	defer close(events)
 	defer func() { s.settle(r) }()
 	// A failure is recorded only when the run was not interrupted: an
 	// interruption leaves the user input unanswered, which is its own
@@ -1079,9 +910,9 @@ func (r *Run) execute(runID string, request model.Request) {
 
 	// Pre-turn pressure: the pending input is already in the context; a
 	// compaction absorbs it into the summary and the request is rebuilt.
-	if compactedRequest, compacted, err := s.maybeAutoCompact(ctx, request, events); err != nil {
+	if compactedRequest, compacted, err := s.maybeAutoCompact(ctx, request); err != nil {
 		failure = err.Error()
-		s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "auto compact"})
+		s.emitTransient(model.ErrorEvent{Err: err, Message: "auto compact"})
 		return
 	} else if compacted {
 		request = compactedRequest
@@ -1095,34 +926,34 @@ func (r *Run) execute(runID string, request model.Request) {
 		// were typed earlier but deliver at the next opportunity).
 		if _, err := s.drainSteered(&messages, runID); err != nil {
 			failure = err.Error()
-			s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "drain steered input"})
+			s.emitTransient(model.ErrorEvent{Err: err, Message: "drain steered input"})
 			return
 		}
 		request.Messages = messages
-		s.emitTransient(ctx, events, model.AgentIterationStartedEvent{Iteration: iteration})
+		s.emitTransient(model.AgentIterationStartedEvent{Iteration: iteration})
 
 		itemID := storage.NewAssistantMessageID()
 		s.beginAssistant(itemID)
-		s.emitTransient(ctx, events, model.AssistantMessageStartedEvent{ItemID: itemID, AgentIteration: iteration})
-		message, turnFailure, stopped := s.streamModelTurn(ctx, request, events, itemID, iteration)
+		s.emitTransient(model.AssistantMessageStartedEvent{ItemID: itemID, AgentIteration: iteration})
+		message, turnFailure, stopped := s.streamModelTurn(ctx, request, itemID, iteration)
 		if stopped {
 			failure = turnFailure
 			return
 		}
 
 		if isBlank(message) {
-			s.emitTransient(ctx, events, model.AssistantMessageFailedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
+			s.emitTransient(model.AssistantMessageFailedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
 			failure = "agent returned empty final response"
-			s.emitTransient(ctx, events, model.ErrorEvent{Err: errors.New(failure)})
+			s.emitTransient(model.ErrorEvent{Err: errors.New(failure)})
 			return
 		}
 		if err := s.commitAssistantMessage(itemID, runID, iteration, message); err != nil {
-			s.emitTransient(ctx, events, model.AssistantMessageFailedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
+			s.emitTransient(model.AssistantMessageFailedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
 			failure = fmt.Sprintf("persist assistant: %v", err)
-			s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "persist assistant"})
+			s.emitTransient(model.ErrorEvent{Err: err, Message: "persist assistant"})
 			return
 		}
-		s.emitTransient(ctx, events, model.AssistantMessageCompletedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
+		s.emitTransient(model.AssistantMessageCompletedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
 		messages = append(messages, message)
 		if len(message.ToolCalls) == 0 {
 			// A queued steer extends the run (followup): consume and request
@@ -1131,7 +962,7 @@ func (r *Run) execute(runID string, request model.Request) {
 			if iteration < maxIterations {
 				if n, err := s.drainSteered(&messages, runID); err != nil {
 					failure = err.Error()
-					s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "drain steered input"})
+					s.emitTransient(model.ErrorEvent{Err: err, Message: "drain steered input"})
 					return
 				} else if n > 0 {
 					continue
@@ -1151,13 +982,13 @@ func (r *Run) execute(runID string, request model.Request) {
 			}
 			resultItemID := storage.NewToolResultID()
 			s.beginTool(resultItemID, toolCall)
-			result := executeToolCall(ctx, s, s.agent.toolExecutor, enabledTools, toolCall, resultItemID, events)
+			result := executeToolCall(ctx, s, s.agent.toolExecutor, enabledTools, toolCall, resultItemID)
 			if err := s.commitToolResult(resultItemID, runID, iteration, result); err != nil {
 				failure = fmt.Sprintf("persist tool result: %v", err)
-				s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "persist tool result"})
+				s.emitTransient(model.ErrorEvent{Err: err, Message: "persist tool result"})
 				return
 			}
-			s.emitTransient(ctx, events, model.ToolResultEvent{Result: result})
+			s.emitTransient(model.ToolResultEvent{Result: result})
 			messages = append(messages, model.Message{
 				Role:       model.MessageRoleTool,
 				Content:    result.Content,
@@ -1168,16 +999,16 @@ func (r *Run) execute(runID string, request model.Request) {
 
 		if iteration == maxIterations {
 			failure = fmt.Sprintf("agent reached max iterations %d before the model returned a final response", maxIterations)
-			s.emitTransient(ctx, events, model.ErrorEvent{Err: errors.New(failure)})
+			s.emitTransient(model.ErrorEvent{Err: errors.New(failure)})
 			return
 		}
 
 		// Mid-turn pressure: this iteration's messages grew the context;
 		// compact before the next request.
 		request.Messages = messages
-		if compactedRequest, compacted, err := s.maybeAutoCompact(ctx, request, events); err != nil {
+		if compactedRequest, compacted, err := s.maybeAutoCompact(ctx, request); err != nil {
 			failure = err.Error()
-			s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "auto compact"})
+			s.emitTransient(model.ErrorEvent{Err: err, Message: "auto compact"})
 			return
 		} else if compacted {
 			request = compactedRequest
@@ -1196,10 +1027,10 @@ func (r *Run) execute(runID string, request model.Request) {
 // It returns the accumulated message. When stopped is true the run must
 // end and failure carries the reason (an interruption returns stopped
 // with a failure the caller's recorder discards).
-func (s *Session) streamModelTurn(ctx context.Context, request model.Request, out chan<- model.Event, assistantItemID string, agentIteration int) (model.Message, string, bool) {
+func (s *Session) streamModelTurn(ctx context.Context, request model.Request, assistantItemID string, agentIteration int) (model.Message, string, bool) {
 	var responseState *model.ResponseState
 	publishMessageFailure := func() {
-		s.emitTransient(ctx, out, model.AssistantMessageFailedEvent{
+		s.emitTransient(model.AssistantMessageFailedEvent{
 			ItemID: assistantItemID, AgentIteration: agentIteration,
 			Message: s.streamingSnapshot(assistantItemID, responseState),
 		})
@@ -1209,7 +1040,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 	failAfterPartialOutput := func(err error, message string) (model.Message, string, bool) {
 		publishMessageFailure()
 		failure := eventMessage(model.ErrorEvent{Err: err, Message: message})
-		s.emitTransient(ctx, out, model.ErrorEvent{Err: err, Message: message})
+		s.emitTransient(model.ErrorEvent{Err: err, Message: message})
 		return s.streamingSnapshot(assistantItemID, responseState), failure, true
 	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -1224,7 +1055,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 			// classification, budget, and context decide whether to retry.
 			if ctx.Err() == nil && attempt < maxAttempts && model.IsRetryableProviderError(err) {
 				delay := providerRetryBackoff(attempt)
-				s.emitTransient(ctx, out, model.ProviderRetryEvent{
+				s.emitTransient(model.ProviderRetryEvent{
 					Attempt: attempt + 1, MaxAttempts: maxAttempts,
 					Delay: delay, Reason: model.RetryReason(err),
 				})
@@ -1244,11 +1075,11 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 			switch event := event.(type) {
 			case model.TextDeltaEvent:
 				madeProgress = true
-				s.applyStreamingEmit(assistantItemID, func(m *model.Message) { m.Content += event.Text }, ctx, out, outputEvent)
+				s.applyStreamingEmit(assistantItemID, func(m *model.Message) { m.Content += event.Text }, outputEvent)
 				continue
 			case model.ReasoningDeltaEvent:
 				madeProgress = true
-				s.applyStreamingEmit(assistantItemID, func(m *model.Message) { m.ReasoningContent += event.Text }, ctx, out, outputEvent)
+				s.applyStreamingEmit(assistantItemID, func(m *model.Message) { m.ReasoningContent += event.Text }, outputEvent)
 				continue
 			case model.ToolCallDeltaEvent:
 				madeProgress = true
@@ -1265,7 +1096,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 					event.ToolCall = call
 					outputEvent = event
 				}
-				s.applyStreamingEmit(assistantItemID, func(m *model.Message) { m.ToolCalls = append(m.ToolCalls, call) }, ctx, out, outputEvent)
+				s.applyStreamingEmit(assistantItemID, func(m *model.Message) { m.ToolCalls = append(m.ToolCalls, call) }, outputEvent)
 				continue
 			case model.MessageDoneEvent, model.UsageEvent:
 				madeProgress = true
@@ -1281,7 +1112,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 						idleRetried = true
 					}
 					delay := providerRetryBackoff(attempt)
-					s.emitTransient(ctx, out, model.ProviderRetryEvent{
+					s.emitTransient(model.ProviderRetryEvent{
 						Attempt: attempt + 1, MaxAttempts: maxAttempts,
 						Delay: delay, Reason: model.RetryReason(event.Err),
 					})
@@ -1293,7 +1124,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 				}
 				return failAfterPartialOutput(event.Err, event.Message)
 			}
-			s.emitTransient(ctx, out, outputEvent)
+			s.emitTransient(outputEvent)
 		}
 		if retry {
 			continue
@@ -1306,29 +1137,14 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 	panic("unreachable")
 }
 
-// sendEvent delivers one transient event unless the run was stopped: a
-// stopped run's remaining events are dropped rather than blocking the run
-// goroutine on a full channel (the durable story of an interruption is
-// the unanswered user input).
-func sendEvent(ctx context.Context, out chan<- model.Event, event model.Event) {
-	if out == nil {
-		return
-	}
-	select {
-	case out <- event:
-	case <-ctx.Done():
-	}
-}
-
 // emitTransient enqueues a Transient event into the session stream AND
 // sends it on the per-run channel (transition: both paths exist until
 // step 3 migrates the hub; the stream is the canonical path for new
 // consumers). Called from the run path with the session's lock NOT held.
-func (s *Session) emitTransient(ctx context.Context, out chan<- model.Event, event model.Event) {
+func (s *Session) emitTransient(event model.Event) {
 	s.mu.Lock()
 	s.enqueueStreamLocked(Transient{Event: event}, true) // droppable
 	s.mu.Unlock()
-	sendEvent(ctx, out, event)
 }
 
 // waitForProviderRetry sleeps for the backoff delay unless the run is
@@ -1362,7 +1178,7 @@ func copyResponseState(state model.ResponseState) model.ResponseState {
 // events. Validation failures never emit ToolStartedEvent. resultItemID
 // is the identity of the tool.result this call will produce, carried on
 // the started event so in-flight observers can hold the slot.
-func executeToolCall(ctx context.Context, s *Session, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, resultItemID string, out chan<- model.Event) model.ToolResult {
+func executeToolCall(ctx context.Context, s *Session, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, resultItemID string) model.ToolResult {
 	arguments, err := parseToolArguments(toolCall.Arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "invalid tool arguments: %v", err)
@@ -1374,7 +1190,7 @@ func executeToolCall(ctx context.Context, s *Session, executor ToolExecutor, ena
 		return toolErrorResult(toolCall, "tool executor is not configured")
 	}
 
-	s.emitTransient(ctx, out, model.ToolStartedEvent{ToolCall: toolCall, ItemID: resultItemID})
+	s.emitTransient(model.ToolStartedEvent{ToolCall: toolCall, ItemID: resultItemID})
 	result, err := executor.Execute(ctx, toolCall.Name, arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "%v", err)

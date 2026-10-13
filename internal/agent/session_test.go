@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,8 +41,8 @@ func newTestAgent(t *testing.T, provider model.Provider, executor ToolExecutor, 
 	return ag, session
 }
 
-// waitSettled waits for the active run to end and drains its events.
-func waitSettled(t *testing.T, session *Session) []model.Event {
+// waitSettled waits for the active run to end.
+func waitSettled(t *testing.T, session *Session) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for session.Running() {
@@ -52,26 +51,37 @@ func waitSettled(t *testing.T, session *Session) []model.Event {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	var events []model.Event
-	timeout := time.After(5 * time.Second)
-	for event := range mustEvents(t, session) {
-		events = append(events, event)
-		select {
-		case <-timeout:
-			t.Fatal("timed out draining run events")
-		default:
-		}
-	}
-	return events
 }
 
-func mustEvents(t *testing.T, session *Session) <-chan model.Event {
+// sendCollectEvents sends one input and collects the run's Transient
+// events from the session stream until the terminal status — the
+// stream-era replacement for draining the per-run channel after
+// waitSettled (events of an unsubscribed run are gone; the subscription
+// must exist before the Send).
+func sendCollectEvents(t *testing.T, session *Session, text string) []model.Event {
 	t.Helper()
-	events := session.Events()
-	if events == nil {
-		t.Fatal("no active run events channel")
+	sub := session.Stream()
+	defer sub.Stop()
+	if err := session.Send(text); err != nil {
+		t.Fatalf("Send: %v", err)
 	}
-	return events
+	var events []model.Event
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case ev := <-sub.Events():
+			switch e := ev.(type) {
+			case Transient:
+				events = append(events, e.Event)
+			case Status:
+				if !e.Running {
+					return events
+				}
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for the terminal status")
+		}
+	}
 }
 
 func recordTypes(records []storage.Record) []string {
@@ -99,9 +109,7 @@ func TestSendPersistsInputAndFinalMessage(t *testing.T) {
 	}
 	waitSettled(t, session)
 
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	if want := []string{storage.TypeSessionCreated, storage.TypeUserInput, storage.TypeAssistantMessage}; !reflect.DeepEqual(recordTypes(records), want) {
 		t.Fatalf("records = %v, want %v", recordTypes(records), want)
 	}
@@ -137,14 +145,9 @@ func TestToolRoundTripCommitsRecords(t *testing.T) {
 	executor := &fakeToolExecutor{result: model.ToolResult{Content: "tool output"}}
 	_, session := newTestAgent(t, provider, executor)
 
-	if err := session.Send("use the tool"); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	events := waitSettled(t, session)
+	events := sendCollectEvents(t, session, "use the tool")
 
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	if want := []string{
 		storage.TypeSessionCreated, storage.TypeUserInput,
 		storage.TypeAssistantMessage, storage.TypeToolResult,
@@ -231,12 +234,10 @@ func TestStreamingSlotVisibleWhileGenerating(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	// Only the input is committed while the message is still generating.
-	sub := session.Subscribe()
-	committed := sub.Initial()
+	committed := session.SnapshotStream().Records
 	if len(committed) != 2 || committed[1].Type != storage.TypeUserInput {
 		t.Fatalf("committed records mid-stream = %v, want session.created + user.input only", recordTypes(committed))
 	}
-	sub.Stop()
 
 	close(provider.gate)
 	waitSettled(t, session)
@@ -254,9 +255,7 @@ func TestProviderErrorRecordsRunFailed(t *testing.T) {
 	}
 	waitSettled(t, session)
 
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	if want := []string{storage.TypeSessionCreated, storage.TypeUserInput, storage.TypeRunFailed}; !reflect.DeepEqual(recordTypes(records), want) {
 		t.Fatalf("records = %v, want %v", recordTypes(records), want)
 	}
@@ -285,10 +284,7 @@ func TestRetryBeforeProgressRecovers(t *testing.T) {
 	}}
 	_, session := newTestAgent(t, provider, nil)
 
-	if err := session.Send("hi"); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	events := waitSettled(t, session)
+	events := sendCollectEvents(t, session, "hi")
 	if len(provider.requests) != 2 {
 		t.Fatalf("provider requests = %d, want 2", len(provider.requests))
 	}
@@ -296,9 +292,7 @@ func TestRetryBeforeProgressRecovers(t *testing.T) {
 		t.Fatalf("text = %q, want recovered", collectText(events))
 	}
 
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	if want := []string{storage.TypeSessionCreated, storage.TypeUserInput, storage.TypeAssistantMessage}; !reflect.DeepEqual(recordTypes(records), want) {
 		t.Fatalf("records = %v, want %v", recordTypes(records), want)
 	}
@@ -326,9 +320,7 @@ func TestStopInterruptsRunAndClosesCleanly(t *testing.T) {
 	close(provider.gate)
 	waitSettled(t, session)
 
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	// An interruption leaves the input unanswered: no assistant message,
 	// no run.failed.
 	if want := []string{storage.TypeSessionCreated, storage.TypeUserInput}; !reflect.DeepEqual(recordTypes(records), want) {
@@ -376,9 +368,7 @@ func TestMaxIterationsRecordsFailure(t *testing.T) {
 	}
 	waitSettled(t, session)
 
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	want := []string{
 		storage.TypeSessionCreated, storage.TypeUserInput,
 		storage.TypeAssistantMessage, storage.TypeToolResult,
@@ -406,9 +396,7 @@ func TestMintsToolCallIDWhenProviderOmitsIt(t *testing.T) {
 	}
 	waitSettled(t, session)
 
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	assistant := records[2]
 	if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID == "" {
 		t.Fatalf("minted tool call id missing: %+v", assistant.ToolCalls)
@@ -562,43 +550,6 @@ func collectText(events []model.Event) string {
 	return text.String()
 }
 
-func TestUnsubscribeDuringCommitNotifyDoesNotPanic(t *testing.T) {
-	provider := &fakeProvider{turns: [][]model.Event{{model.TextDeltaEvent{Text: "x"}}}}
-	_, session := newTestAgent(t, provider, nil)
-
-	sub := session.Subscribe()
-	// Saturate the subscription's buffer from a background goroutine, so a
-	// commit's delivery is stuck in progress while Stop races it: the
-	// records channel must never be closed underneath a delivery.
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		for i := 0; i < subscribeBuffer+10; i++ {
-			_ = session.commit(storage.Record{
-				ItemID: storage.NewUserInputID(), Type: storage.TypeUserInput,
-				RunID: "run-test", Content: "fill",
-			}, nil)
-		}
-	}()
-	time.Sleep(20 * time.Millisecond)
-	// The delivery is stuck on the full buffer; Stop must release it —
-	// not panic (send on closed channel), not deadlock.
-	sub.Stop()
-	select {
-	case <-finished:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Stop did not release the blocked commit delivery")
-	}
-
-	// The session stays usable after the race.
-	if err := session.commit(storage.Record{
-		ItemID: storage.NewUserInputID(), Type: storage.TypeUserInput,
-		RunID: "run-test", Content: "after stop",
-	}, nil); err != nil {
-		t.Fatalf("commit after Stop: %v", err)
-	}
-}
-
 func TestCompactReplacesContextAndPersists(t *testing.T) {
 	provider := &fakeProvider{turns: [][]model.Event{
 		{model.TextDeltaEvent{Text: "first answer"}},
@@ -624,9 +575,7 @@ func TestCompactReplacesContextAndPersists(t *testing.T) {
 	}
 
 	// The record landed, between the input and nothing else pending.
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	found := false
 	for _, record := range records {
 		if record.Type == storage.TypeContextCompacted {
@@ -684,9 +633,7 @@ func TestCompactFailureLeavesContextUntouched(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "summary provider down") {
 		t.Fatalf("Compact error = %v, want the provider failure", err)
 	}
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	for _, record := range records {
 		if record.Type == storage.TypeContextCompacted {
 			t.Fatalf("failed compaction left a record: %+v", record)
@@ -1025,51 +972,5 @@ func TestSuccessfulTurnRunErrNil(t *testing.T) {
 	<-r.Done()
 	if r.Err() != nil {
 		t.Fatalf("successful turn run: Err() = %v, want nil (completed flag not set?)", r.Err())
-	}
-}
-
-// TestCompactRunClosesEventsChannel pins the Events() post-settle drain
-// contract for compact runs: after a manual compaction finishes, the
-// channel Events() returns must be CLOSED (a range consumer terminates,
-// a buffered-events drain completes). Review's overlay probe P1 covers
-// this; this is the permanent in-repo form.
-func TestCompactRunClosesEventsChannel(t *testing.T) {
-	provider := &failSummaryProvider{
-		fail: atomic.Bool{},
-		turns: [][]model.Event{
-			{model.TextDeltaEvent{Text: "answer one"}},
-			{model.TextDeltaEvent{Text: "summary ok " + strings.Repeat("word ", 10)},
-				model.MessageDoneEvent{}},
-		},
-	}
-	_, session := newTestAgent(t, provider, nil)
-	if err := session.Send("hello"); err != nil {
-		t.Fatal(err)
-	}
-	waitSettled(t, session)
-
-	r, err := session.StartCompact(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-r.Done()
-
-	// Events() must return a CLOSED channel after the compact run
-	// finishes — the post-settle drain contract.
-	ch := session.Events()
-	if ch == nil {
-		t.Fatal("Events() = nil after compact run — expected the closed channel")
-	}
-	// Drain with a bound: read until the channel reports closed.
-	timeout := time.After(5 * time.Second)
-	for {
-		select {
-		case _, ok := <-ch:
-			if !ok {
-				return // closed ✓
-			}
-		case <-timeout:
-			t.Fatal("Events() channel not closed after compact run finished")
-		}
 	}
 }

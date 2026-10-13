@@ -447,8 +447,8 @@ func TestSlowClientDoesNotStallRun(t *testing.T) {
 	}
 	// The run completed; the slow client's connection was closed by
 	// overflow or sits ignored — either way the agent proceeded.
-	if session.RecordCount() < 3 {
-		t.Fatalf("records stalled at %d", session.RecordCount())
+	if n := len(session.SnapshotStream().Records); n < 4 {
+		t.Fatalf("records stalled at %d", n)
 	}
 }
 
@@ -478,9 +478,8 @@ func TestChainCrossImplementation(t *testing.T) {
 
 	// An independent fold over the session's records — the same walk the
 	// page performs over its store.
-	sub := session.Subscribe()
 	head := chainGenesis(session.ID())
-	for _, r := range sub.Initial() {
+	for _, r := range session.SnapshotStream().Records {
 		head = chainStep(head, r)
 	}
 	if head != st.Digest {

@@ -156,14 +156,16 @@ type RunningTool struct {
 
 ## 7. 流式模型
 
-**（milestone A step 2 修订）**：两 channel（Subscribe 推记录 + Events 推事件）
+**（milestone A step 4 定稿）**：两 channel（Subscribe 推记录 + Events 推事件）
 已由**单一有序会话流**替代（`SessionEvent`：RecordCommitted / Transient /
-Status，seq 在 s.mu 内分配）。旧的 Subscribe/Events 在过渡期作为**双写**的
-薄适配保留（emitTransient 同时入流和发 per-run channel），step 3/4 迁移
-hub/CLI 后删除旧路径。快照接口 `Stream()` 返回 `StreamSnapshot`（records +
+Status，seq 在 s.mu 内分配）。hub（step 3）与 CLI（step 4）迁移完成后，
+旧 Subscribe/Events 路径与 per-run 事件通道**已整体删除**——瞬态事件只在
+会话流上存在，run 不携带任何通道；`TestNoPerRunEventChannel` 源码扫描钉死
+不复回归。快照接口 `Stream()` 返回 `StreamSnapshot`（records +
 瞬态槽 + steer 队列 + 状态，同一锁段原子拷贝）；不带订阅的等价快照
 `SnapshotStream()`（step 3：hub 的连接时 snapshot 帧由它构造，避免
-Snapshot()+Running()+Compacting() 多次取锁的拼接窗口）。
+Snapshot()+Running()+Compacting() 多次取锁的拼接窗口）与轻量变体
+`SnapshotStreamState()`（不拷 records，给每次请求的调用方）。
 
 - **单一累积点**：`session.AppendDelta` 写 `Streaming.Message`；
   `streamModelTurn` 的局部 builder 删除。Completed 时 commit 从 Streaming
@@ -225,9 +227,10 @@ session    会话：一个 log.jsonl
 
 ## 11. UI 更新模型
 
-**（milestone A step 2 修订）**：记录流与事件流已合并为单一有序会话流
-（§7 修订）。CLI 的 parked/reconcileParked 暂存裁决与 hub 的 Wake/drain
-补丁将在 step 3/4 迁移到 SessionEvent 流后删除（顺序由 seq 全序结构保证）。
+**（milestone A step 4 定稿）**：记录流与事件流已合并为单一有序会话流
+（§7 修订）。CLI 的 parked/reconcileParked/liveShown/waitForRecords 与
+hub 的 Wake/drain 补丁已随 step 3/4 迁移删除（顺序由 seq 全序结构保证，
+无需任何暂存裁决）。
 
 | 场景 | 通道 |
 |---|---|
@@ -235,10 +238,14 @@ session    会话：一个 log.jsonl
 | 重连 | StreamSnapshot 一次 + 继续事件流 |
 | 落盘 | RecordCommitted（对 UI 只是终态事件的等价副本） |
 
-CLI 的在场渲染（step 4 迁移中，当前仍在旧路径）：delta 逐字写终端（reasoning
-带 `·` 行标记），assistant 消息的身份在 started 事件时就已标记，落盘记录按
-ItemID 过滤不重复打印。step 4 后由流的 seq 全序替代暂存裁决。spinner 只标记
-静默阶段（等首 token、工具执行中）。
+CLI 的在场渲染（step 4 已迁移）：send/compact 各自订阅会话流，在**单个
+循环**里渲染 RecordCommitted（打印；live 渲染中的 assistant 消息按
+started 时记录的 ItemID 跳过——seq 全序使裁决无竞态）、Transient（delta
+逐字写终端，reasoning 带 `·` 行标记；压力/重试/压缩失败走 stderr）与
+Status（终态即循环终点）。循环在终态 Status——run 的**最后一条流内
+事件**——之后才返回，故下一个提示符必然在 run 全部输出之后（有字节级
+测试钉死）。spinner 只标记静默阶段（等首 token、工具执行中），事件间隙
+以 time.After 驱动，无轮询。/stop 经 CurrentRun+Done join，同样不忙等。
 
 WebUI 的桥（已落地，internal/web）：hub 把记录流与事件流按因果序经 SSE 转发
 （快照优先 + 摘要链断点续传，docs/webui.md），两个 UI 端（/log 零依赖页与

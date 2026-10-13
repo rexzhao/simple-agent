@@ -110,11 +110,6 @@ func NewHub(session *agent.Session) *Hub {
 	h.processedSeq = snap.StartSeq
 	h.mu.Unlock()
 	h.stream = stream
-	// A hub created mid-run (manager re-open) has already missed the
-	// run's Status{Running:true} event — the drain must start here too.
-	if snap.StatusRunning {
-		h.drainRunEvents()
-	}
 	go h.run()
 	return h
 }
@@ -192,38 +187,9 @@ func (h *Hub) handleStreamEvent(ev agent.SessionEvent) {
 		h.processedSeq = e.Seq
 		h.broadcastStatusLocked()
 		h.mu.Unlock()
-		if e.Running {
-			h.drainRunEvents()
-		}
 	}
 }
 
-// drainRunEvents null-drains the active run's per-run event channel.
-// That channel is the CLI's transition path (milestone A step 4
-// deletes it); its sends BLOCK when full, and a web-only session has
-// no other consumer — without this drain, a turn emitting more than
-// its buffer (256) transient events (a long streaming response)
-// wedges the run forever. The drain exits when the run's teardown
-// closes the channel; deleted together with the per-run channel.
-// Multiple drainers may share one channel (replayed run-start
-// statuses, resubscribe alongside a mid-run NewHub path): they just
-// split the reads — harmless for a null drain.
-func (h *Hub) drainRunEvents() {
-	ch := h.session.Events()
-	if ch == nil {
-		return
-	}
-	go func() {
-		for range ch {
-		}
-	}()
-}
-
-// resubscribe recovers from an evicted stream subscription: stop the
-// old one, start a fresh one, rebuild the mirror from the snapshot,
-// and reissue a window snapshot to every connected SSE client (they
-// converge to the current state; the resumed=false anchor means each
-// client does a clean rebuild).
 func (h *Hub) resubscribe() {
 	h.stream.Stop()
 	stream := h.session.Stream()
@@ -299,20 +265,6 @@ func (h *Hub) resubscribe() {
 	h.mu.Unlock()
 	h.stream = stream
 
-	// A run that started while the hub was evicted never delivered its
-	// Status{Running:true} — the fresh subscription skips events at or
-	// below its startSeq (S1), so the stream will not carry it either.
-	// The snapshot is the RELIABLE signal: if it shows a run active,
-	// the legacy-channel drain must start here (H1: without it, a run
-	// emitting more than the channel buffer (256) transient events
-	// wedges forever). Stale run-start statuses still buffered in the
-	// old subscription may ALSO incidentally spawn a drain when the
-	// loop drains them before taking Lost — an extra safety net, not
-	// a substitute: the backlog is abandoned on re-subscription and
-	// nothing guarantees those events are ever processed.
-	if snap.StatusRunning {
-		h.drainRunEvents()
-	}
 }
 
 // handleEvent fans one transient event out to the clients and refreshes

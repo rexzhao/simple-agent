@@ -108,9 +108,7 @@ func autoCompactAgent(t *testing.T, provider model.Provider, executor ToolExecut
 
 func compactedRecords(t *testing.T, session *Session) []storage.Record {
 	t.Helper()
-	sub := session.Subscribe()
-	records := sub.Initial()
-	sub.Stop()
+	records := session.SnapshotStream().Records
 	var compacted []storage.Record
 	for _, record := range records {
 		if record.Type == storage.TypeContextCompacted {
@@ -134,10 +132,7 @@ func TestAutoCompactTriggersOnSoftPressureBeforeTurn(t *testing.T) {
 	waitSettled(t, session)
 
 	// A huge CJK input (~75k estimated tokens) crosses the soft limit.
-	if err := session.Send(strings.Repeat("工", 75_000)); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	events := waitSettled(t, session)
+	events := sendCollectEvents(t, session, strings.Repeat("工", 75_000))
 
 	compacted := compactedRecords(t, session)
 	if len(compacted) != 1 {
@@ -230,9 +225,7 @@ func TestAutoCompactHardPressureFailsWhenSummaryCannotRelieve(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("hard compactions = %d, want 1 (committed despite the failure)", len(records))
 	}
-	sub := session.Subscribe()
-	all := sub.Initial()
-	sub.Stop()
+	all := session.SnapshotStream().Records
 	last := all[len(all)-1]
 	if last.Type != storage.TypeRunFailed || !strings.Contains(last.Error, "could not reclaim enough context") {
 		t.Fatalf("run outcome = %+v, want run.failed with the reclaim error", last)
@@ -334,10 +327,7 @@ func TestAutoCompactTriggersMidTurnAfterToolBatch(t *testing.T) {
 	// The user input (~60k estimated tokens) plus the tool result (~16k)
 	// crosses the soft limit only after the tool batch: the pre-turn
 	// check sees ~60k and stays quiet.
-	if err := session.Send(strings.Repeat("工", 60_000)); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	events := waitSettled(t, session)
+	events := sendCollectEvents(t, session, strings.Repeat("工", 60_000))
 
 	compacted := compactedRecords(t, session)
 	if len(compacted) != 1 || !strings.HasSuffix(compacted[0].Content, "mid-turn summary") {

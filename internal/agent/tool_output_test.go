@@ -72,18 +72,17 @@ func TestExecuteToolCallLimitsSuccessfulAndErrorOutputs(t *testing.T) {
 	_, session := newTestAgent(t, provider, nil)
 	toolCall := model.ToolCall{ID: "call-1", Name: "custom", Arguments: `{}`}
 	enabled := map[string]struct{}{"custom": {}}
-	out := make(chan model.Event, 2)
 
 	success := executeToolCall(context.Background(), session, staticToolExecutor{
 		result: model.ToolResult{Content: strings.Repeat("x", defaultToolOutputMaxBytes+1)},
-	}, enabled, toolCall, "t-test", out)
+	}, enabled, toolCall, "t-test")
 	if !strings.Contains(success.Content, "Tool output truncated") {
 		t.Fatalf("successful tool output was not limited: %d bytes", len(success.Content))
 	}
 
 	failure := executeToolCall(context.Background(), session, staticToolExecutor{
 		err: errors.New(strings.Repeat("y", defaultToolOutputMaxBytes+1)),
-	}, enabled, toolCall, "t-test", out)
+	}, enabled, toolCall, "t-test")
 	if !failure.IsError || !strings.Contains(failure.Content, "Tool output truncated") {
 		t.Fatalf("error tool output was not limited: %#v", failure)
 	}

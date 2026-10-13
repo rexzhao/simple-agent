@@ -59,13 +59,12 @@ v2 并入设计评审结论：两项前置工程（§0 会话锁、§3 CSRF）�
 
 | 需求 | 现有 API | 说明 |
 |---|---|---|
-| 恰好一次、有序的记录流 | `Session.Subscribe()` | 快照+注册在同一锁段内原子完成，`Initial()` 返回已提交记录，之后从 `Records()` 推送。CLI 的 printed 计数器已经依赖这个不变量 |
+| 恰好一次、有序的记录流与瞬态事件 | `Session.Stream()` | **单一有序会话流**（milestone A）：seq 在会话锁内分配，`Initial()` 原子快照，之后 RecordCommitted/Transient/Status 按全序推送（见 §4.3）。旧的 `Subscribe()`/`Events()` 双通道已在 step 3/4 删除 |
 | 输入提交 | `Session.Send(text)` | 检查、落盘、running 翻转在一个锁段；并发第二个提交被拒绝（天然 409 语义） |
-| 瞬态事件（delta/工具/压缩/压力/重试） | `Session.Events()` | 返回当前 run 的事件通道，run 结束时**关闭**；`sendEvent` 在满通道上阻塞（除非 run 被取消）——见 §4.3 |
-| 状态快照 | `Session.Snapshot()` | 深拷贝 State，**含瞬态 streaming 槽位和 running 位**——连接时刻的 in-flight item 内容直接可取 |
+| 状态快照 | `Session.SnapshotStream()` | records + 瞬态槽 + steer 队列 + 状态，同一锁段原子拷贝（`SnapshotStreamState()` 为不拷 records 的轻量变体）——连接时刻的 in-flight item 内容直接可取 |
 | 停止 | `Session.Stop()` | run 以中断收尾，无失败记录，user.input 保持未回答 |
 
-注意 `Subscribe().Initial()` 返回的是**进程内扁平流**（压缩后长于磁盘
+注意快照的 records 是**进程内扁平流**（压缩后长于磁盘
 活跃段，与 CLI 所见一致）。v1 的 log 视图就显示这个扁平流——与
 `sai -session X` resume 看到的完全相同。**已知用户可见差异**：重启后
 扁平流回到磁盘活跃段，历史显示变短——UI 显式画出压缩边界（"compaction
@@ -102,7 +101,7 @@ clients/chat/      独立构建的 assistant-ui 聊天客户端（React+Vite，
 /tail off                  # 关闭 viewer
 ```
 
-- **当前会话 = 完整实时**：viewer 自行 Subscribe（Initial 重放尾部
+- **当前会话 = 完整实时**：viewer 自行 Stream()（Initial 重放尾部
   20 条，同 resume 约定）+ 实时 Records，复用 cliApp 渲染栈
   （render.go + liveWriter，ItemID 去重/parked 同构）；delta 经
   **hub tap** 获得——hub 排干后拷贝给 tap，tap 有界缓冲溢出丢弃
@@ -232,12 +231,10 @@ hub 不再挂接 per-run 事件通道，而是**订阅会话的单一有序流**
 - **手动 /compact 的生命周期**：`StartCompact` 发
   CompactionStarted/Completed 瞬态事件 + Status{Compacting}，全部走
   流到达 hub——无需 handler 轮询或周期广播
-- **遗留 per-run 通道的排空**：`sendEvent` 满通道（256）阻塞 run
-  goroutine，而该通道是 CLI 的过渡路径（step 4 删除）；web-only
-  会话没有其它消费者，hub 在看到 Status{Running:true}（或建 hub /
-  重订阅时快照已 Running——run 开始的 Status 不丢弃，满则摘除
-  订阅，重订阅后由快照兜底）时起 null-drainer 排空，防止长流式
-  回复把 run 永久卡死
+- **run 开始的 Status 不丢弃**（§14.2）：它是消费者建立 run 生命
+  周期机件的锚点；满则摘除订阅者（可恢复），绝不静默丢弃。
+  （step 3 曾配有过渡性的 per-run 通道排空垫片，step 4 删除
+  per-run 通道后一并移除——瞬态事件只在会话流上存在）
 - **订阅被摘除（Lost）**：hub 的流订阅缓冲溢出时被 dispatcher 摘除；
   hub 重走 `Stream()`，从新快照重建镜像，并向所有 SSE 客户端
   **重发窗口快照**（resumed=false，客户端按规则 A 重新折叠），
@@ -261,7 +258,7 @@ viewer（§2.1，有损+可恢复），无一例外。
 
 ### 4.5 多标签页/多客户端
 
-同一会话可同时开 N 个 web UI，机制：**每个 SSE 连接独立 Subscribe()**
+同一会话可同时开 N 个 web UI，机制：**每个 SSE 连接向 hub 注册**
 （各自的 Initial + Records，恰好一次由同一原语各自保证）；**瞬态事件
 由 hub 单点消费会话流后扇出**（多标签页不是多个流订阅者——hub 是
 会话唯一的流消费者，页面向 hub 注册；共享会话状态
