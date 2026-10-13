@@ -577,7 +577,7 @@ func TestCompactionSegmentSwitch(t *testing.T) {
 	// A pre-compaction anchor is stale after the truncation: /history
 	// must refuse it (409) — serving a window from the NEW chain under
 	// the old anchor would fake drift on the client's strict fold.
-	histRes, err := http.Get(httpServer.URL + api(session, "/history?before=" + preState.Digest)) //nolint:noctx // test
+	histRes, err := http.Get(httpServer.URL + api(session, "/history?before="+preState.Digest)) //nolint:noctx // test
 	if err != nil {
 		t.Fatal(err)
 	}

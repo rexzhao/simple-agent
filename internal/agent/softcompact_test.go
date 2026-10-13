@@ -297,12 +297,12 @@ func TestSoftCooldownAfterSuccessfulCompact(t *testing.T) {
 	provider := &failSummaryProvider{
 		fail: atomic.Bool{},
 		turns: [][]model.Event{
-			{model.TextDeltaEvent{Text: "answer one"}},                                                          // run 1 model
-			{model.TextDeltaEvent{Text: "summary ok " + strings.Repeat("word ", 10)}, model.MessageDoneEvent{}}, // run 2: the soft-pressure summary (succeeds)
-			{model.TextDeltaEvent{Text: "answer two"}},                                                          // run 2 model
-			{model.TextDeltaEvent{Text: "answer three"}},                                                        // run 3 model (inside the cooldown: no summary)
+			{model.TextDeltaEvent{Text: "answer one"}},                                                             // run 1 model
+			{model.TextDeltaEvent{Text: "summary ok " + strings.Repeat("word ", 10)}, model.MessageDoneEvent{}},    // run 2: the soft-pressure summary (succeeds)
+			{model.TextDeltaEvent{Text: "answer two"}},                                                             // run 2 model
+			{model.TextDeltaEvent{Text: "answer three"}},                                                           // run 3 model (inside the cooldown: no summary)
 			{model.TextDeltaEvent{Text: "summary again " + strings.Repeat("word ", 10)}, model.MessageDoneEvent{}}, // run 4: the retry summary
-			{model.TextDeltaEvent{Text: "answer four"}},                                                         // run 4 model
+			{model.TextDeltaEvent{Text: "answer four"}},                                                            // run 4 model
 		},
 	}
 	_, session := autoCompactAgent(t, provider, nil, nil)
