@@ -30,7 +30,7 @@ opus ──分配──▶ worker ──开发完成──▶ review ──通�
    范围或验收标准不清就先问，不要靠猜开工。
 2. **开发（worker）**：实现 + 自测（门禁见 §3）。**此阶段先不要 commit**；
    要给 review 看的内容用工作树 + 变更清单说明（或说明有哪些未提交改动）。
-3. **送审（worker → review）**：消息必须包含
+3. **送审（worker → review）**：消息必须包含（另附待审文件的 `git hash-object <path>` 清单，供 §1 第 8 步机械比对）
    - 变更范围（文件/行为，逐条"做了什么"）
    - 自测证据（命令 + 真实输出，不接受"应该没问题"）
    - **请求重点审的点**（不确定之处、取舍理由、已知缺口）
@@ -43,6 +43,7 @@ opus ──分配──▶ worker ──开发完成──▶ review ──通�
    - 待提交的文件清单（`git status --short` 中属于本次的条目）与变更摘要
    - review "通过"那封邮件的 ID，及其"已核实"要点
    - 门禁全绿证据（§3）
+   - 待提交文件的 `git hash-object <path>` 清单，且与送审时的清单一致（不一致即说明通过后又改过，须重新送审）
    opus 审阅后给出 **批准提交** 或 **不批准（缺什么）**；不批准则回到第 2/5 步。
    **申请到批准之间不得改动待提交内容**；若必须改动，重新送审 review 后再申请。
 7. **commit（worker）**：**只有在 opus 明确"批准提交"之后**才 commit，只提交被批准的文件
@@ -51,7 +52,8 @@ opus ──分配──▶ worker ──开发完成──▶ review ──通�
    `review: <通过邮件 ID>` 与 `approved: <opus 批准邮件 ID>`。没有对应邮件就不能写这两行，
    也不能在 message 里声称"review 通过 / 已批准"。
 8. **通知与验收（worker → opus）**：commit hash + 变更摘要。
-   opus 核对：commit 内容与批准时的内容一致、引用的邮件存在且时间早于 commit；
+   opus 核对：commit 内容与批准时的内容一致（`git ls-tree <commit> <path>` 的 blob 与申请时的 hash-object 清单逐个相等）、
+   引用的邮件存在且时间早于 commit；
    然后对照验收标准与证据给出 **接受 / 不接受（缺什么）**。对不上的 commit 直接拒收。
 9. 若任务由用户或 review 直接提出（没有 opus 分配）：同样走 2–8，**提交仍须 opus 批准**。
 
@@ -74,8 +76,17 @@ sh scripts/build.sh                      # 需要产物时
 cd clients/chat && npx tsc --noEmit      # 动过前端时
 ```
 
-- **gofmt 按索引内容判定**：工作副本可能是 CRLF，会掩盖真实漂移。
-  逐文件 `git cat-file blob :<path> | gofmt -l <临时文件>` 全仓扫一遍才算数。
+- **gofmt 按"将要提交的内容"判定**：工作副本可能是 CRLF，会掩盖真实漂移；
+  `gofmt -l /dev/stdin` 在 Windows 上永远不报，**不能用**。唯一认可的做法是把内容写到临时文件再查：
+  ```sh
+  # 待提交（工作树）文件：去 CR 后写临时文件
+  for f in $(git status --short | awk '{print $2}' | grep '\.go$'); do
+    tr -d '\r' < "$f" > /tmp/fmt.go; [ -n "$(gofmt -l /tmp/fmt.go)" ] && echo "UNFMT $f"; done
+  # 已提交内容：git show HEAD:<path> > /tmp/fmt.go 后同样检查（全仓扫）
+  ```  
+  **不要用索引（`git cat-file blob :<path>` / `git show :<path>`）判定**
+  除非 `git status --porcelain` 已确认没有未暂存的改动：编辑尚未 `git add` 时，索引里是旧内容，会给出假绿（阶段 5 的漂移就是这样漏进提交的）。
+  声称 gofmt clean 时贴出所用命令；输出为空才算数。
 - 前端/脚本类改动要跑对应 fixture（`internal/web/testdata/*_check.mjs`，由 Go 测试驱动）。
 - 声称"全绿"必须能贴出对应输出。
 
