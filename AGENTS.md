@@ -83,8 +83,8 @@ cd clients/chat && npx tsc --noEmit      # 动过前端时
   for f in $(git status --short | awk '{print $2}' | grep '\.go$'); do
     tr -d '\r' < "$f" > /tmp/fmt.go; [ -n "$(gofmt -l /tmp/fmt.go)" ] && echo "UNFMT $f"; done
   # 已提交内容：git show HEAD:<path> > /tmp/fmt.go 后同样检查（全仓扫）
-  ```  
-  **不要用索引（`git cat-file blob :<path>` / `git show :<path>`）判定**
+  ```
+  **不要用索引（`git cat-file blob :<path>` / `git show :<path>`）判定**
   除非 `git status --porcelain` 已确认没有未暂存的改动：编辑尚未 `git add` 时，索引里是旧内容，会给出假绿（阶段 5 的漂移就是这样漏进提交的）。
   声称 gofmt clean 时贴出所用命令；输出为空才算数。
 - 前端/脚本类改动要跑对应 fixture（`internal/web/testdata/*_check.mjs`，由 Go 测试驱动）。
