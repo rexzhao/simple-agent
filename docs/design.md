@@ -648,3 +648,284 @@ status 帧。快照帧从 Initial 拼装；截断时的 snapshot 重发复用
 - Run 对象不泄漏 storage 细节——B 的 sessionhost 可以持有 *Run。
 - Stream 的快照语义与 B 的 Namespace 化正交。
 - seq 全序机制与 B 的 Hooks 正交（seq 分配在 Session 内部）。
+
+## 15. 里程碑 B1：Namespace、按会话配置模型、sessionhost
+
+三个互相咬合的重构：存储层去项目化（Namespace）、模型配置下沉到会话、
+会话池从 web.Manager 抽出为不依赖 HTTP 的 sessionhost。它们是里程碑 C
+（项目与会话管理）的直接前置。
+
+### 15.1 Namespace（项目离开核心层）
+
+**原则**：核心层（storage、agent）不知道"项目"。它只见一个**不透明的
+ns 字符串**；"项目 = 从 cwd 推导 ns"与"注册校验 = 只见已注册 ns 的
+会话"都是宿主语义，住在 projects 与 sessionhost。
+
+**Store 接口改造**（storage.Store）：
+
+```go
+type Store interface {
+    Create(ns string) (Session, error)      // ns：不透明分组键
+    Open(ns, id string) (Session, error)
+}
+// 可选能力：宿主用类型断言探测，核心接口不膨胀。
+type Lister  interface{ Store; ListSessions(ns string) ([]SessionInfo, error) }
+type Deleter interface{ Store; Delete(ns, id string) error }
+type Prober  interface{ Store; HasSession(ns, id string) bool }
+```
+
+- 目录布局不变：jsonl 的 `<root>/<ns>/<session>/log.jsonl`——ns 就是
+  当前的 project 目录名；`ValidProjectID` 更名 `ValidNamespace`（仍是
+  jsonl 的存储层契约：ns 必须是安全目录名），`ProjectID(dir)` 移到
+  projects 包（宿主的 cwd→ns 推导）。
+- **删除** `agent.Options.ProjectID` 与 `agent.OpenSessionIn`。Agent 的
+  `NewSession(ns, meta)` / `OpenSession(ns, id)` 把 ns 原样透传给
+  store——对 agent 而言 ns 无语义。
+- **CLI `-session <id>` / `/resume <id>`（产品决策 Q1=方案 B，用户可
+  见行为变更）**：只在当前目录对应项目的 ns 内查找；跨项目恢复返回
+  "找不到"。**不引入 `Locator` 能力**，storage 的跨项目扫描 `Open(id)`
+  一并删除（唯一调用方就是 CLI 恢复路径——`cmd/sai/main.go:539` 经
+  `agent.OpenSession`；web 早已按项目查找，grep 复核无其他调用方）。
+  memory store 的 `Open(ns, id)` 需校验 `projectOf` 归属（现 map 按
+  id 全局存，ns 不设防）。CLI 的错误提示写明**"会话只能在它所属的项
+  目目录下恢复"**而非裸 not found；README 同步。测试：项目 X 目录下
+  `-session` 项目 Y 的会话 → 找不到，且**不得触碰 Y 的会话锁**（不开
+  锁文件）。
+- **jsonl 的 stderr 直写**（log.go 两处 mid-file corruption 提示）改为
+  注入 `*slog.Logger`（`OpenStore` 增加 option；缺省 `slog.Discard`，
+  CLI/serve 注入自己的 logger）。
+
+### 15.2 按会话配置模型
+
+**记录**：`session.created` 新增 `reasoning_level`（字符串；空 = 该
+模型的默认推理强度。**不能叫 `reasoning`**——已被 assistant 推理内容
+占用）。现有 `provider`/`model` 字段沿用。**digest 链升 `sai/v2/`**
+（Go wire.go 与 JS chain.mjs 同步、chain_check fixture 跟进）：新可
+渲染字段按链版本规则进元组（wire.go 既有注释即此语义）；升级后老客户
+端的 head 一律 miss → 走已有的窗口重放安全回退（一次性全量 resync，
+机制现成）。不采用"排除在元组外"——那会留下永久性的"该字段不在防篡
+改覆盖内"特例。
+
+**升级注意事项**：chat 的 dist 是手工构建的，升 v2
+后不重建会持续显示 drift——README 的"dist 手工构建"段须提醒"链版本
+升级后必须重建"，release 流程若不自动构建也要说明；/log 页面由二进
+制内嵌，自动更新，无此问题。
+
+
+```go
+// storage 包：SessionMeta 就是 session.created 的载荷。
+type SessionMeta struct {
+    Provider, Model, ReasoningLevel string
+}
+```
+
+放 storage（记录载荷），agent 与 config 都不互依。旧会话（无
+`reasoning_level`）按空值打开 → 解析时取该模型默认（现有
+`ApplyReasoningLevel(…, "")` 行为，零迁移）。
+
+**组装分工**：
+
+- **Agent 只管项目**：tools、tool executor、system prompt 模板（未渲
+  染）、cwd、MaxIterations、AutoCompact。`Options` 删除
+  Provider/ProviderName/ModelID/Parameters/ContextWindow/MaxTokens/
+  DeveloperRole——全部来自会话的模型解析。
+- **ModelResolver**（注入 Agent；internal/config 提供 sai.yaml 实现）：
+
+```go
+type ModelResolver interface {
+    Resolve(meta SessionMeta) (Resolved, error) // ErrModelUnavailable
+    List() []ModelDescriptor                    // C 预留（见 15.5），B1 只留接口位
+}
+type Resolved struct {
+    Provider      model.Provider // 实例按 provider 名缓存，全会话共用
+    Parameters    map[string]any
+    ContextWindow int
+    OutputLimit   int
+    DeveloperRole model.MessageRole
+}
+```
+
+  provider 实例缓存于 resolver 内部（`map[providerName]model.Provider`，
+  互斥锁保护）——同一个 provider 只构造一次 HTTP client。**缓存键 =
+  provider 名**：安全前提是配置进程内不可变（sai.yaml 启动读一次、
+  运行期不重载——现状即如此）；若将来支持热重载，缓存键必须升为
+  "名 + baseURL/key 指纹"，否则不同配置互相污染。
+- **打开会话**：replay 后从 `session.created` 读 meta → Resolve →
+  `ErrModelUnavailable`（类型化；web 映射稳定错误码
+  `model_unavailable`，错误码表新增一行）→ **绝不悄悄换默认模型**。
+- **预算**：`resolveContextBudget` 改为按会话调用（open 时用该会话的
+  ContextWindow/OutputLimit 算出，挂在 Session 上）；压缩预算随之按
+  会话。
+- **system prompt 的 `{{time.now}}`**：Agent 持有未渲染模板；渲染点
+  收敛到**唯一的请求组装 helper**（`buildRequest` 的调用侧统一先渲
+  染）——`Start`/`StartCompact` 与 **run 中途的 `maybeAutoCompact →
+  compactContext`（它自己也组请求）**都走它，否则压缩请求会拿到未渲
+  染模板、逐 run 语义不一致。cwd/config_dir 项目内稳定，time.now
+  逐次组装刷新。
+
+### 15.3 sessionhost
+
+从 web.Manager 抽出会话生命周期，**不含 hub、不含 HTTP**：
+
+```go
+package sessionhost
+
+type Pool struct{ … }
+func New(opts Options) (*Pool, error)
+
+// Options: Store、Locate func(id) (ns, error)（注册门：由
+// projects+宿主实现，返回归属 ns 或 ErrNotFound/ErrConflict）、
+// AgentFor func(ns) (*agent.Agent, error)、EvictGuard
+// func(sessionID) bool（驱逐前的否决钩子：web 用它表达"还有 SSE
+// 订阅者"）、IdleWindow。
+
+func (p *Pool) Acquire(id string) (*Lease, error) // 懒打开 + 并发去重
+type Lease struct{ … }
+func (l *Lease) Release()                          // 引用归零 → 计入空闲时钟
+func (l *Lease) HostData() any                     // OnOpened 的返回值（web 放 hub）
+// Delete 的两个拒绝条件（与现状一致）：
+//   会话运行中 → ErrRunActive；引用 > 0（在途请求/Lease）或有订阅者
+//   → ErrInUse——订阅者在切分后不持 refs，"被观看"由 Options.
+//   InUseGuard 回调表达（web 读自己的订阅计数）。
+// 拒绝之外：置 closing、等在途打开排空、unlink、删存储。
+func (p *Pool) Delete(id string) error
+func (p *Pool) Close() error                       // 现有顺序：停清扫、排空、逐个关
+```
+
+**保留的全部语义**（逐条迁移，断言不变弱）：懒打开、同一 ID 并发打开
+去重（opening 占位 + `<-inFlight` 重入）、closing 状态（delete 期间拒
+绝打开、open 发布前复查）、空闲驱逐（清扫者 + EvictGuard）、
+DeleteSession 等在途打开排空、Close 顺序（停清扫 → 等 opening 清空 →
+逐个关闭）、**open 的 defer 占位清理**（panic 不楔死，P1 教训）。
+
+**hub 的通知钩子**（hub 留在 web，但 Pool 的三个拆除点必须通知宿主）：
+
+```go
+type Options struct {
+    …
+    // OnEvicted/OnClosed 在拆除路径上回调宿主（先从 Pool 的表里
+    // unlink，再回调 teardown——回调里的任何错误不影响拆除本身）。
+    // 驱逐：清扫者命中空闲 + EvictGuard 放行 → unlink → 回调 → 关
+    // Session。删除：排空在途打开 → unlink → 回调 → 删存储。
+    // Close：全部 unlink → 逐个回调 → 关。
+    // OnOpened 在 openSlow 里、会话发布之前同步调用（仍在 defer 占位
+    // 保护内）：宿主在这里建好自己的伴随对象（web 建 hub——hub 的镜像
+    // 播种必须先于任何客户端可见，阶段 A 的空白聊天视图 bug 正是播种
+    // 晚了）。返回值挂在 Lease.HostData() 上，OnEvicted/OnClosed 回调
+    // 时原样传回。返回错误：关闭会话、清占位、Acquire 返回该错误——
+    // 不留下半开的条目。并发去重由 Pool 保证：同一 ID 的并发 Acquire
+    // 只触发一次 OnOpened（占位机制天然覆盖——输家等赢家的结果而非
+    // 重开）。
+    OnOpened  func(sessionID string, sess *agent.Session) (hostData any, err error)
+    OnEvicted func(sessionID string, sess *agent.Session, hostData any)
+    OnClosed  func(sessionID string, sess *agent.Session, hostData any)
+    // InUseGuard 与 EvictGuard 同构的宿主判断：删除路径上问"该会话
+    // 是否被宿主持有"——web 用它表达"还有 SSE 订阅者"（切分后订阅者
+    // 不再持 Lease refs，这条删除拒绝条件由回调承载）。
+    InUseGuard func(sessionID string) bool
+}
+```
+
+web 在 OnOpened 里 `NewHub(sess)`（HostData=hub），在 OnEvicted/
+OnClosed 里 `hub.Stop()`（今天的四个触点 manager.go:191/541/729/
+delete 路径一一对应）。**顺序：先 unlink 再 teardown**——回调期间该
+id 已不在表内，新 Acquire 重新打开，不会与 teardown 竞争；closing
+窗口语义（`TestSweeperEvictsIdleSession` 考的：驱逐进入 closing 后
+拒绝新打开）保持。`Subscribers()` 的读取不需要进 Pool——web 自己就是
+订阅宿主，EvictGuard 闭包里直接读自己的 hub 表。
+
+**root lock（serve.lock）归 Pool**：`jsonl.AcquirePathLock` 的获取/
+释放随构造/Close 进出 Pool——"同一 root 单进程"的保证跟着会话池走
+（serve 的进程唯一性本质是会话池的唯一性）。CLI 不建 Pool，也就不占
+root lock（现状一致）。
+
+**错误类型化与稳定码逐条映射**（web 只做翻译；码表**新增三行**：
+session_conflict、model_unavailable，以及 unknown session 从纯文本
+升为码）：
+
+| 类型化错误 | HTTP | 稳定码 |
+|---|---|---|
+| ErrNotFound | 404 | unknown session（现状纯文本，升为码） |
+| ErrLocked（他进程持锁） | 409 | session_locked（现状即此） |
+| ErrClosing | 503 | session_closing（现状即此） |
+| ErrConflict（注册表多命中） | 409 | session_conflict（现状 409+纯文本，升为码） |
+| ErrModelUnavailable | 409 | model_unavailable（新） |
+| ErrRunActive（删除时运行中） | 409 | run_active（现状即此，码值不变） |
+| ErrInUse（删除时引用 > 0） | 409 | session_open（现状即此，码值不变） |
+
+**响应体格式变更（N3）**："unknown session"与"session_conflict"从纯
+文本升为码，会改变相应 404/409 响应体——`error` 字段由空变为有值、
+`message` 保留原文。chat 的 api.ts 与 /log 的 app.js 均以 `error`
+字段（非正文文本）判别错误（迁移时 grep 复核确认），不受影响；web 的
+fixture 在步 3 证明响应体兼容。
+
+**CLI 使用**：B1 不接（CLI 单会话直开 storage）；里程碑 C 的
+`/sessions`、`/resume` 列表/恢复会经 Pool（列表数据 = Lister + 宿主
+注册表过滤）。
+
+### 15.4 迁移步骤（每步独立送审 + commit）
+
+**能力 × 实现表**（web 测试大量用 memory store，能力面必须在迁移步 1
+对齐，否则相应路径测不到）：
+
+| 能力 | jsonl | memory |
+|---|---|---|
+| Lister（ListSessions） | ✓ | ✓ |
+| Deleter（Delete） | ✓ | ✓ |
+| Prober（HasSession） | ✓ | ✓ |
+
+**CLI 与注册表**：CLI 直开 storage、**不经注册门**（现状语义，保留——
+注册是 serve 的宿主概念）；web 的注册门由 `Locate` 回调（宿主用
+projects 注册表 + Prober 实现）承担，未注册 ns 的会话对 web 404。
+"多 ns 命中 → 409"的来源是 **web 的注册表探针**（对每个已注册项目
+`HasSession(ns, id)`，多处命中即冲突），经 Pool 的 `Options.Locate`
+回调浮出为类型化 `ErrConflict`——**jsonl 不含 `Locate`、不产生歧义
+错误**（Q1=B 后该能力已整体移除）；步 1 只保留 web 这条 409 回归。
+
+**SessionInfo 扩展**（C 的 /sessions 列表要显示模型，现在定字段避免
+改接口）：`SessionInfo` 增 `Meta SessionMeta`（describeSession 已读
+created 记录，加字段即得）。
+
+| 步 | 内容 | 回归保护 | 文档同步 |
+|---|---|---|---|
+| 1 | Namespace + slog：Store 接口改造、能力接口、agent 去 ProjectID/OpenSessionIn、**删跨项目扫描 Open(id)**、jsonl logger、CLI -session//resume 只查当前 ns（Q1=B） | 全部现有测试改调用点后不改断言；storage 的扫描/歧义测试删除并由"X 目录 -session Y 会话 → 找不到且不触碰 Y 锁"替代；web 的多 ns 命中 409 测试保留（注册表探针路径不变） | multi-session.md（ns 术语）、README（恢复行为变更说明） |
+| 2 | 按会话模型：session.created 增字段、链升 sai/v2/、SessionMeta/ModelResolver、agent.Options 瘦身、预算按会话、prompt 单点渲染、ErrModelUnavailable | **内联验收清单 a–g**（见下）；现有 provider 相关测试迁移 | design §5/§13（预算）、configuration.md、chain fixture、**webui.md（h₀ = SHA256("sai/v2/" + …) 链版本行同步）** |
+| 3 | sessionhost 抽取：Pool/Lease/类型化错误/通知钩子/root lock、Manager 瘦身 | **点名承重测试逐个迁移且断言不变弱**：`TestSweeperEvictsIdleSession`（closing 窗口）、`TestDuplicateSessionAcrossProjectsIs409`（→ErrConflict，409 语义不变）、`TestOpenDuringCloseDiscards`、`TestManagerCloseIdempotent`、`TestSlowOpenDoesNotBlockOtherSessions`、`TestConcurrentOpenOpensOnce`、`TestFailedOpenClearsPlaceholder`、`TestDeleteDuringInFlightOpen`、**删除拒绝两条件**（运行中 → run_active、引用 > 0 → session_open；含切分后唯一会静默变语义的一条：**已连接 SSE 订阅者 + 无 Lease refs → 仍 409 session_open**，经 InUseGuard 承载）、**D2 两条新测试**（并发 Acquire 同一 ID 只触发一次 OnOpened；OnOpened 返回错误不留下占位与锁）；web 全部 fixture 不改预期 | multi-session.md §3（架构图）、webui.md |
+| 4 | CLI /new 参数覆盖（`/new [-provider p] [-model m] [-reasoning lvl]`，默认继承启动参数；Q2=照办） | /new 无参数 = 现行为；参数覆盖落到 session.created；**非法参数（未知 provider/model、不支持的推理强度）报错且不新建会话** | README、design §15.2 |
+
+**步 2 的验收清单（a–g）**：
+
+- a) 两个会话使用不同模型，请求打到各自的 provider；
+- b) provider 实例被复用（同一个 provider 只构造一次）；
+- c) 记录里的模型从配置中删除后，打开返回 ErrModelUnavailable，
+  web 返回 model_unavailable；
+- d) 预算按会话的模型计算；
+- e) 跨越两次 run，system prompt 里的时间会刷新；
+- f) 旧会话（没有 reasoning_level）能按默认值打开；
+- g) chain_check 的 v2 用例：含 reasoning_level 的 session.created
+  元组，Go/JS 跨实现折叠一致。
+
+### 15.5 里程碑 C 的接口预留（只留位置，不实现）
+
+- **新建会话传 SessionMeta**：`Pool`（或其 Options 的工厂）在 C 里加
+  `Create(meta SessionMeta)`——sessionhost.Pool 的构造参数与 Lease 形
+  状按"未来有 Create"设计（AgentFor 已含全部项目装配，Create 只差
+  meta 的透传，不破坏现有接口）。
+- **列出模型**：`ModelResolver.List()` 的接口位（15.2 已列）；数据源
+  = sai.yaml 的 provider/model 表（含 reasoning 档位）。C 的
+  `GET /api/models` 直接消费它。
+- **归档**：storage 可选能力接口 `Archiver{ Archive(ns, id) error }`
+  （B1 只留接口位，**存储方式不预设**——移动目录到 archive/ 子树会改
+  变 `<root>/<ns>/<id>` 的路径不变量，ListSessions/Delete/HasSession
+  都要跟着动，留到 C 的设计阶段定）；宿主经类型断言探测并决定 UI 暴
+  露与否。**前置条件（写进接口注释）**：调用方必须持有 root lock 且
+  该会话无在途 Lease——归档与追加互斥。
+
+### 15.6 产品决策（已定，opus chk2ajpl1j）
+
+- **Q1 = 方案 B**：CLI 的 `-session`/`/resume` 只在当前目录对应项目
+  的 ns 内查找，跨项目返回"找不到"（提示写明会话只能在其所属项目
+  目录下恢复）。行为变更，README 与错误提示同步；Locator 能力与跨项目
+  扫描 Open(id) 不引入/删除；"cwd 不一致"子问题随之消失。
+- **Q2 = 照办**：`/new [-provider p] [-model m] [-reasoning lvl]` 三
+  参数皆可覆盖，未给沿用启动参数；非法参数报错、不新建会话。
