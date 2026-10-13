@@ -156,6 +156,13 @@ type RunningTool struct {
 
 ## 7. 流式模型
 
+**（milestone A step 2 修订）**：两 channel（Subscribe 推记录 + Events 推事件）
+已由**单一有序会话流**替代（`SessionEvent`：RecordCommitted / Transient /
+Status，seq 在 s.mu 内分配）。旧的 Subscribe/Events 在过渡期作为**双写**的
+薄适配保留（emitTransient 同时入流和发 per-run channel），step 3/4 迁移
+hub/CLI 后删除旧路径。快照接口 `Stream()` 返回 `StreamSnapshot`（records +
+瞬态槽 + steer 队列 + 状态，同一锁段原子拷贝）。
+
 - **单一累积点**：`session.AppendDelta` 写 `Streaming.Message`；
   `streamModelTurn` 的局部 builder 删除。Completed 时 commit 从 Streaming
   取内容拼记录。
@@ -165,7 +172,7 @@ type RunningTool struct {
 - **失败语义（接受的易失性）**：失败的半截内容只在失败事件里带给在场的
   UI；Snapshot 不保留，刷新即消失。中断的 run 就是 run.start 后无人应答，
   不需要收尾记录。
-- **重连**：Snapshot()（durable + transient）+ 继续事件流，无缝接上，零重拉。
+- **重连**：Stream() 的 StreamSnapshot + 继续事件流，无缝接上，零重拉。
 
 ## 8. tool call 生命周期
 
@@ -216,20 +223,25 @@ session    会话：一个 log.jsonl
 
 ## 11. UI 更新模型
 
+**（milestone A step 2 修订）**：记录流与事件流已合并为单一有序会话流
+（§7 修订）。CLI 的 parked/reconcileParked 暂存裁决与 hub 的 Wake/drain
+补丁将在 step 3/4 迁移到 SessionEvent 流后删除（顺序由 seq 全序结构保证）。
+
 | 场景 | 通道 |
 |---|---|
-| 在场 | 事件流（ItemID 寻址，幂等 upsert；delta/started/completed/tool 事件） |
-| 重连 | Snapshot 一次 + 继续事件流 |
-| 落盘 | 对 UI 只是终态事件的等价副本 |
+| 在场 | SessionEvent 流（seq 全序，ItemID 寻址，幂等 upsert） |
+| 重连 | StreamSnapshot 一次 + 继续事件流 |
+| 落盘 | RecordCommitted（对 UI 只是终态事件的等价副本） |
 
-CLI 的在场渲染：delta 逐字写终端（reasoning 带 `·` 行标记），assistant
-消息的身份在 started 事件时就已标记，落盘记录按 ItemID 过滤不重复打印
-（记录流与事件流分属两个 channel，无法证明顺序时的克录记录先暂存，
-事件排干后统一裁决）。spinner 只标记静默阶段（等首 token、工具执行中）。
+CLI 的在场渲染（step 4 迁移中，当前仍在旧路径）：delta 逐字写终端（reasoning
+带 `·` 行标记），assistant 消息的身份在 started 事件时就已标记，落盘记录按
+ItemID 过滤不重复打印。step 4 后由流的 seq 全序替代暂存裁决。spinner 只标记
+静默阶段（等首 token、工具执行中）。
 
 WebUI 的桥（已落地，internal/web）：hub 把记录流与事件流按因果序经 SSE 转发
 （快照优先 + 摘要链断点续传，docs/webui.md），两个 UI 端（/log 零依赖页与
-/chat 聊天客户端）按 ItemID upsert。CLI 直接消费同一事件流，零额外成本。
+/chat 聊天客户端）按 ItemID upsert。step 3 将 hub 迁到 SessionEvent 流，删除
+Wake/drainEvents/drainThenStatus。
 
 ## 12. 已知限制与已记录的未来需求
 
@@ -408,7 +420,7 @@ type StreamSubscription struct {
   发送 vs Close 关闭"的 send-on-closed 竞态（P0-1 同类）。
   Session.Close 按下文 R3 的五步顺序执行（取消 ctx → 等 run 排空 →
   通知 dispatcher 摘除全部订阅者 → 停 dispatcher → 关 storage）。
-  订阅 channel 本身不关。dispatcher 在 NewSession 和 Open 时都要启动。
+  订阅 channel 本身不关。dispatcher 在首次 Stream() 时懒启动（偏离 v5 设计的"NewSession/Open 时启动"：没有订阅方就没有消费方，入队只会让队列无限增长——enqueueStreamLocked 在 streamStop == nil 时直接丢弃。结果：首次 Stream() 之前的事件不入流、不分配 seq；新订阅方靠 StreamSnapshot 补齐状态）。
 - **事件生产方**（两个，都合法）：run goroutine 与 API goroutine（steer）。
 
 **全序规则**（B2 定案 + R3 边界）：
@@ -437,7 +449,7 @@ type StreamSubscription struct {
   ctx（`Stop()`）→ 2) 等 run 排空（< -done）→ 3) 通知 dispatcher 摘除
   全部订阅者（由 dispatcher 关闭各自的 Lost）→ 4) 停 dispatcher
   （关 stopDispatcher，等 dispatcherDone）→ 5) 关 storage。
-  dispatcher 在 NewSession 和 Open 时都要启动。
+  dispatcher 在首次 Stream() 时懒启动（理由见上）。
 - 这同时解掉"Status{Running:true} 在锁内发 vs 锁外发送纪律"的矛盾：
   **全部入队都在锁内**（与状态变更同锁段），**全部投递都在锁外**
   （dispatcher goroutine）。发送纪律的"锁外"指的是投递，不是入队。

@@ -128,6 +128,27 @@ type Session struct {
 	// post-settle drain contract).
 	lastRun *Run
 	subs    map[*subscription]struct{}
+
+	// --- session stream (milestone A step 2) ---
+	// streamSeq is the monotonic sequence counter, assigned under s.mu
+	// in the same critical section as the state change it describes.
+	streamSeq uint64
+	// streamQueue is the unbounded pending-delivery queue. Producers
+	// append under s.mu (never blocking); the dispatcher drains it
+	// outside the lock.
+	streamQueue []streamQueueItem
+	// streamSubs holds the registered stream subscribers.
+	streamSubs map[*streamSub]struct{}
+	// streamSignal wakes the dispatcher when new events are queued.
+	streamSignal chan struct{}
+	// streamStop closes the dispatcher; Close waits on streamDone.
+	streamStop chan struct{}
+	streamDone chan struct{}
+	streamOnce sync.Once
+	// streamClosed is set under s.mu by Close, so a post-close
+	// Stream() (even when the dispatcher was never started) returns
+	// an already-lost subscription instead of a dead one.
+	streamClosed bool
 }
 
 // ID returns the session ID, available before the first record.
@@ -326,6 +347,9 @@ func (s *Session) Start(ctx context.Context, input string) (*Run, error) {
 	}
 	request := s.agent.buildRequest(s.state.Context)
 	s.currentRun = r
+	// The run-start Status. Records were already enqueued by
+	// appendLocked (the single write path).
+	s.enqueueStreamLocked(Status{Running: true}, true) // non-terminal: droppable
 	var subs []*subscription
 	for sub := range s.subs {
 		subs = append(subs, sub)
@@ -374,6 +398,10 @@ func (s *Session) Steer(text string) (string, error) {
 	// Snapshot. (A select with default does NOT protect a send on a
 	// closed channel — the send panics before default is consulted; the
 	// kind guard above is the real protection.)
+	// B2: enqueue into the stream FIRST (we're already under s.mu;
+	// emitTransient would re-acquire and deadlock). Then the best-effort
+	// per-run channel send.
+	s.enqueueStreamLocked(Transient{Event: model.SteerQueuedEvent{ItemID: itemID, Text: text}}, true)
 	select {
 	case s.currentRun.events <- model.SteerQueuedEvent{ItemID: itemID, Text: text}:
 	default:
@@ -392,6 +420,7 @@ func (s *Session) UpdateSteer(itemID, text string) error {
 	for i := range s.state.Steered {
 		if s.state.Steered[i].ItemID == itemID {
 			s.state.Steered[i].Text = text
+			s.enqueueStreamLocked(Transient{Event: model.SteerUpdatedEvent{ItemID: itemID, Text: text}}, true)
 			if s.currentRun != nil && s.currentRun.kind == RunTurn {
 				select {
 				case s.currentRun.events <- model.SteerUpdatedEvent{ItemID: itemID, Text: text}:
@@ -411,6 +440,7 @@ func (s *Session) WithdrawSteer(itemID string) error {
 	for i := range s.state.Steered {
 		if s.state.Steered[i].ItemID == itemID {
 			s.state.Steered = append(s.state.Steered[:i], s.state.Steered[i+1:]...)
+			s.enqueueStreamLocked(Transient{Event: model.SteerWithdrawnEvent{ItemID: itemID}}, true)
 			if s.currentRun != nil && s.currentRun.kind == RunTurn {
 				select {
 				case s.currentRun.events <- model.SteerWithdrawnEvent{ItemID: itemID}:
@@ -483,6 +513,13 @@ func (s *Session) Close() error {
 	if r != nil {
 		<-r.done
 	}
+	// Mark the stream closed BEFORE stopping the dispatcher, so a
+	// racing Stream() sees the flag even when the dispatcher was
+	// never started.
+	s.mu.Lock()
+	s.streamClosed = true
+	s.mu.Unlock()
+	s.closeStream()
 	return s.storage.Close()
 }
 
@@ -506,6 +543,7 @@ func (s *Session) commit(record storage.Record, clear func(*storage.State)) erro
 	for sub := range s.subs {
 		subs = append(subs, sub)
 	}
+	// Records were already enqueued by appendLocked.
 	s.mu.Unlock()
 	if err != nil {
 		return err
@@ -583,6 +621,10 @@ func (s *Session) appendLocked(record storage.Record) (storage.Record, error) {
 	}
 	storage.Fold(s.state, stored)
 	s.records = append(s.records, stored)
+	// The stream enqueue lives HERE — the single write path — so every
+	// future write (MaterializeHeader, a hypothetical bulk import)
+	// cannot bypass the stream. Start/commit do NOT enqueue separately.
+	s.enqueueStreamLocked(RecordCommitted{Record: stored}, false)
 	return stored, nil
 }
 
@@ -688,6 +730,10 @@ func (s *Session) settle(r *Run) {
 		s.lastRun = r
 		s.currentRun = nil
 	}
+	// The terminal Status rides the stream on the guaranteed path
+	// (§14.2): not droppable, enqueued in the same lock section as the
+	// currentRun retirement.
+	s.enqueueStreamLocked(Status{Running: false}, false)
 	s.mu.Unlock()
 }
 
@@ -736,6 +782,7 @@ func (s *Session) StartCompact(ctx context.Context) (*Run, error) {
 		return nil, ErrNothingToCompact
 	}
 	s.currentRun = r
+	s.enqueueStreamLocked(Status{Running: true, Compacting: true}, true)
 	s.mu.Unlock()
 
 	go func() {
@@ -777,7 +824,7 @@ func (s *Session) compactContext(ctx context.Context, itemID string, pressure co
 	}()
 
 	summary, err := s.agent.summarizeContext(ctx, request, func(retryErr error, attempt, maxAttempts int, delay time.Duration) {
-		sendEvent(ctx, events, model.ProviderRetryEvent{
+		s.emitTransient(ctx, events, model.ProviderRetryEvent{
 			Attempt: attempt + 1, MaxAttempts: maxAttempts, Delay: delay, Reason: model.RetryReason(retryErr),
 		})
 	})
@@ -821,7 +868,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 		// there is no local preflight (the estimate is heuristic), so the
 		// request is sent and the provider decides.
 		if pressure == pressureHard {
-			sendEvent(ctx, events, model.ContextPressureEvent{
+			s.emitTransient(ctx, events, model.ContextPressureEvent{
 				EstimatedTokens: estimateRequestTokens(request), HardInputLimit: s.agent.budget.HardInputLimit,
 			})
 		}
@@ -834,7 +881,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 	}
 
 	itemID := storage.NewContextCompactedID()
-	sendEvent(ctx, events, model.CompactionStartedEvent{ItemID: itemID})
+	s.emitTransient(ctx, events, model.CompactionStartedEvent{ItemID: itemID})
 	compacted, err := s.compactContext(ctx, itemID, pressure, estimateRequestTokens(request), events)
 	if err != nil {
 		// An interruption is not a failure to downgrade: the run is
@@ -851,7 +898,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 		// request cannot be sent safely.
 		if pressure == pressureSoft {
 			s.beginSoftCompactCooldown()
-			sendEvent(ctx, events, model.CompactionFailedEvent{ItemID: itemID, Reason: err.Error()})
+			s.emitTransient(ctx, events, model.CompactionFailedEvent{ItemID: itemID, Reason: err.Error()})
 			return request, false, nil
 		}
 		return request, false, err
@@ -864,7 +911,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request, e
 		}
 		return request, false, nil
 	}
-	sendEvent(ctx, events, model.CompactionCompletedEvent{ItemID: itemID})
+	s.emitTransient(ctx, events, model.CompactionCompletedEvent{ItemID: itemID})
 	s.clearSoftCompactCooldown()
 	// Note: under hard pressure the run may still fail right after this
 	// event — the summary was committed (it is a real, smaller context)
@@ -997,7 +1044,7 @@ func (r *Run) execute(runID string, request model.Request) {
 	// compaction absorbs it into the summary and the request is rebuilt.
 	if compactedRequest, compacted, err := s.maybeAutoCompact(ctx, request, events); err != nil {
 		failure = err.Error()
-		sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "auto compact"})
+		s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "auto compact"})
 		return
 	} else if compacted {
 		request = compactedRequest
@@ -1011,15 +1058,15 @@ func (r *Run) execute(runID string, request model.Request) {
 		// were typed earlier but deliver at the next opportunity).
 		if _, err := s.drainSteered(&messages, runID); err != nil {
 			failure = err.Error()
-			sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "drain steered input"})
+			s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "drain steered input"})
 			return
 		}
 		request.Messages = messages
-		sendEvent(ctx, events, model.AgentIterationStartedEvent{Iteration: iteration})
+		s.emitTransient(ctx, events, model.AgentIterationStartedEvent{Iteration: iteration})
 
 		itemID := storage.NewAssistantMessageID()
 		s.beginAssistant(itemID)
-		sendEvent(ctx, events, model.AssistantMessageStartedEvent{ItemID: itemID, AgentIteration: iteration})
+		s.emitTransient(ctx, events, model.AssistantMessageStartedEvent{ItemID: itemID, AgentIteration: iteration})
 		message, turnFailure, stopped := s.streamModelTurn(ctx, request, events, itemID, iteration)
 		if stopped {
 			failure = turnFailure
@@ -1027,18 +1074,18 @@ func (r *Run) execute(runID string, request model.Request) {
 		}
 
 		if isBlank(message) {
-			sendEvent(ctx, events, model.AssistantMessageFailedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
+			s.emitTransient(ctx, events, model.AssistantMessageFailedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
 			failure = "agent returned empty final response"
-			sendEvent(ctx, events, model.ErrorEvent{Err: errors.New(failure)})
+			s.emitTransient(ctx, events, model.ErrorEvent{Err: errors.New(failure)})
 			return
 		}
 		if err := s.commitAssistantMessage(itemID, runID, iteration, message); err != nil {
-			sendEvent(ctx, events, model.AssistantMessageFailedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
+			s.emitTransient(ctx, events, model.AssistantMessageFailedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
 			failure = fmt.Sprintf("persist assistant: %v", err)
-			sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "persist assistant"})
+			s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "persist assistant"})
 			return
 		}
-		sendEvent(ctx, events, model.AssistantMessageCompletedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
+		s.emitTransient(ctx, events, model.AssistantMessageCompletedEvent{ItemID: itemID, AgentIteration: iteration, Message: message})
 		messages = append(messages, message)
 		if len(message.ToolCalls) == 0 {
 			// A queued steer extends the run (followup): consume and request
@@ -1047,7 +1094,7 @@ func (r *Run) execute(runID string, request model.Request) {
 			if iteration < maxIterations {
 				if n, err := s.drainSteered(&messages, runID); err != nil {
 					failure = err.Error()
-					sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "drain steered input"})
+					s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "drain steered input"})
 					return
 				} else if n > 0 {
 					continue
@@ -1067,13 +1114,13 @@ func (r *Run) execute(runID string, request model.Request) {
 			}
 			resultItemID := storage.NewToolResultID()
 			s.beginTool(resultItemID, toolCall)
-			result := executeToolCall(ctx, s.agent.toolExecutor, enabledTools, toolCall, resultItemID, events)
+			result := executeToolCall(ctx, s, s.agent.toolExecutor, enabledTools, toolCall, resultItemID, events)
 			if err := s.commitToolResult(resultItemID, runID, iteration, result); err != nil {
 				failure = fmt.Sprintf("persist tool result: %v", err)
-				sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "persist tool result"})
+				s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "persist tool result"})
 				return
 			}
-			sendEvent(ctx, events, model.ToolResultEvent{Result: result})
+			s.emitTransient(ctx, events, model.ToolResultEvent{Result: result})
 			messages = append(messages, model.Message{
 				Role:       model.MessageRoleTool,
 				Content:    result.Content,
@@ -1084,7 +1131,7 @@ func (r *Run) execute(runID string, request model.Request) {
 
 		if iteration == maxIterations {
 			failure = fmt.Sprintf("agent reached max iterations %d before the model returned a final response", maxIterations)
-			sendEvent(ctx, events, model.ErrorEvent{Err: errors.New(failure)})
+			s.emitTransient(ctx, events, model.ErrorEvent{Err: errors.New(failure)})
 			return
 		}
 
@@ -1093,7 +1140,7 @@ func (r *Run) execute(runID string, request model.Request) {
 		request.Messages = messages
 		if compactedRequest, compacted, err := s.maybeAutoCompact(ctx, request, events); err != nil {
 			failure = err.Error()
-			sendEvent(ctx, events, model.ErrorEvent{Err: err, Message: "auto compact"})
+			s.emitTransient(ctx, events, model.ErrorEvent{Err: err, Message: "auto compact"})
 			return
 		} else if compacted {
 			request = compactedRequest
@@ -1115,7 +1162,7 @@ func (r *Run) execute(runID string, request model.Request) {
 func (s *Session) streamModelTurn(ctx context.Context, request model.Request, out chan<- model.Event, assistantItemID string, agentIteration int) (model.Message, string, bool) {
 	var responseState *model.ResponseState
 	publishMessageFailure := func() {
-		sendEvent(ctx, out, model.AssistantMessageFailedEvent{
+		s.emitTransient(ctx, out, model.AssistantMessageFailedEvent{
 			ItemID: assistantItemID, AgentIteration: agentIteration,
 			Message: s.streamingSnapshot(assistantItemID, responseState),
 		})
@@ -1125,7 +1172,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 	failAfterPartialOutput := func(err error, message string) (model.Message, string, bool) {
 		publishMessageFailure()
 		failure := eventMessage(model.ErrorEvent{Err: err, Message: message})
-		sendEvent(ctx, out, model.ErrorEvent{Err: err, Message: message})
+		s.emitTransient(ctx, out, model.ErrorEvent{Err: err, Message: message})
 		return s.streamingSnapshot(assistantItemID, responseState), failure, true
 	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -1140,7 +1187,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 			// classification, budget, and context decide whether to retry.
 			if ctx.Err() == nil && attempt < maxAttempts && model.IsRetryableProviderError(err) {
 				delay := providerRetryBackoff(attempt)
-				sendEvent(ctx, out, model.ProviderRetryEvent{
+				s.emitTransient(ctx, out, model.ProviderRetryEvent{
 					Attempt: attempt + 1, MaxAttempts: maxAttempts,
 					Delay: delay, Reason: model.RetryReason(err),
 				})
@@ -1194,7 +1241,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 						idleRetried = true
 					}
 					delay := providerRetryBackoff(attempt)
-					sendEvent(ctx, out, model.ProviderRetryEvent{
+					s.emitTransient(ctx, out, model.ProviderRetryEvent{
 						Attempt: attempt + 1, MaxAttempts: maxAttempts,
 						Delay: delay, Reason: model.RetryReason(event.Err),
 					})
@@ -1206,7 +1253,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 				}
 				return failAfterPartialOutput(event.Err, event.Message)
 			}
-			sendEvent(ctx, out, outputEvent)
+			s.emitTransient(ctx, out, outputEvent)
 		}
 		if retry {
 			continue
@@ -1231,6 +1278,17 @@ func sendEvent(ctx context.Context, out chan<- model.Event, event model.Event) {
 	case out <- event:
 	case <-ctx.Done():
 	}
+}
+
+// emitTransient enqueues a Transient event into the session stream AND
+// sends it on the per-run channel (transition: both paths exist until
+// step 3 migrates the hub; the stream is the canonical path for new
+// consumers). Called from the run path with the session's lock NOT held.
+func (s *Session) emitTransient(ctx context.Context, out chan<- model.Event, event model.Event) {
+	s.mu.Lock()
+	s.enqueueStreamLocked(Transient{Event: event}, true) // droppable
+	s.mu.Unlock()
+	sendEvent(ctx, out, event)
 }
 
 // waitForProviderRetry sleeps for the backoff delay unless the run is
@@ -1264,7 +1322,7 @@ func copyResponseState(state model.ResponseState) model.ResponseState {
 // events. Validation failures never emit ToolStartedEvent. resultItemID
 // is the identity of the tool.result this call will produce, carried on
 // the started event so in-flight observers can hold the slot.
-func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, resultItemID string, out chan<- model.Event) model.ToolResult {
+func executeToolCall(ctx context.Context, s *Session, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, resultItemID string, out chan<- model.Event) model.ToolResult {
 	arguments, err := parseToolArguments(toolCall.Arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "invalid tool arguments: %v", err)
@@ -1276,7 +1334,7 @@ func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools ma
 		return toolErrorResult(toolCall, "tool executor is not configured")
 	}
 
-	sendEvent(ctx, out, model.ToolStartedEvent{ToolCall: toolCall, ItemID: resultItemID})
+	s.emitTransient(ctx, out, model.ToolStartedEvent{ToolCall: toolCall, ItemID: resultItemID})
 	result, err := executor.Execute(ctx, toolCall.Name, arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "%v", err)
