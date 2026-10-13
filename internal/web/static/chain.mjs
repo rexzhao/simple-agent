@@ -40,7 +40,16 @@ export function chainInput(r) {
 }
 
 export async function chainGenesis(sessionID) {
-  return sha256Hex(chainVersion + sessionID);
+  return chainGenesisAt(sessionID, "");
+}
+
+// The active segment's genesis (sai design §14.4): a segment beginning
+// after a compaction ([session.created, context.compacted, …]) seeds
+// from the compaction's ItemID — derivable at truncation time and at
+// fresh Open alike (it IS the segment's second record).
+export async function chainGenesisAt(sessionID, compactedItemID) {
+  const seed = compactedItemID ? sessionID + "/" + compactedItemID : sessionID;
+  return sha256Hex(chainVersion + seed);
 }
 
 export async function chainStep(prev, r) {

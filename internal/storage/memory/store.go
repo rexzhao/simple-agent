@@ -63,6 +63,19 @@ func (r *records) append(record storage.Record) (storage.Record, error) {
 	if err := record.Validate(); err != nil {
 		return storage.Record{}, err
 	}
+	if record.Type == storage.TypeContextCompacted {
+		// Segment switch (the jsonl store rolls a new log file; the
+		// memory store mirrors it): a context.compacted commit starts
+		// the next segment as [header copy?, compaction] — the header
+		// survives only when the current first record IS one (the jsonl
+		// switch skips the copy for headerless sessions too).
+		if len(r.entries) > 0 && r.entries[0].Type == storage.TypeSessionCreated {
+			r.entries = []storage.Record{r.entries[0], record}
+		} else {
+			r.entries = []storage.Record{record}
+		}
+		return record, nil
+	}
 	r.entries = append(r.entries, record)
 	return record, nil
 }

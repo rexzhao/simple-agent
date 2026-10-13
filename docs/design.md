@@ -307,10 +307,15 @@ InputSchema 的 JSON）。
 **触发点**：新轮次前（待处理输入已在 Context 内）与每个工具批次后。
 
 **守卫**：Context 无 assistant 回答不压（硬压时发 ContextPressureEvent
-告知用户超预算但无摘要可压、请求照发）；软压冷却——上次压缩后需 ≥2 条
-user.input；软压回收检查——摘要后估算缩减不足 max(2K, 前/20) 则丢弃
-不落盘；硬压压缩后仍超硬线 → run.failed（与旧版差异：记录先落盘再判
-定，下次 Send 会再压缩——窗口容不下任何摘要时本就无解）。
+告知用户超预算但无摘要可压、请求照发）；软压冷却（§14.4 双计数器）：
+`inputsSinceCompacted`（compacted commit 清零、user.input commit 递增、
+**Open 时从活跃段重建**——最后一条 compacted 之后的 user.input 数）与
+`inputsSinceSoftAttempt`（纯内存，重启即复位——过去软失败的持久故事是
+notice，不是楔子）；从未压缩过时 since-compacted 约束为空（首次软压
+即刻尝试，与旧扫描语义一致），否则两者都需 ≥2；软压回收检查——摘要后
+估算缩减不足 max(2K, 前/20) 则丢弃不落盘；硬压压缩后仍超硬线 →
+run.failed（与旧版差异：记录先落盘再判定，下次 Send 会再压缩——窗口
+容不下任何摘要时本就无解）。
 
 **与旧版的差异**：待处理输入被吸收进摘要（旧版保留原文；新架构下
 user.input 先落盘、compacted 后到，Fold 语义只能是整体替换）；无 usage
@@ -533,8 +538,11 @@ Session（状态层）持有。
 
 ### 14.4 内存（原 P1-7）：只保留活跃段
 
-**现状问题**：Session.records 保留完整扁平流（压缩后远大于活跃段）；
-hub 的 mirror/chain/index 同样。
+**（step 5 已实现）**：Session.records 在 context.compacted commit 时
+截断为 `[session.created, context.compacted]`（与 jsonl 段切换、
+memory store 的同语义截断对齐——内存中与 fresh Open 重放逐条一致）；
+hub 镜像同源截断 + 段 genesis 重置 + snapshot 重发（§14.5）。CLI 的
+摘除恢复按 ItemID（非下标）续渲染。
 
 **设计**：
 
@@ -558,9 +566,22 @@ hub 的 mirror/chain/index 同样。
   现有会话、两个客户端零改动。
 - **压缩后的段**：genesis = `H(chainVersion + sessionID + "/" +
   context.compacted 的 ItemID)`。该 ItemID 在截断时和 fresh Open
-  时都能拿到（就是活跃段的第二条记录），**不依赖任何额外存储**、
+  时都能拿到（就是活跃段的 compacted 记录），**不依赖任何额外存储**、
   不要求 storage 层知道 digest 链、不修改段头（§13 的“逐字副本”
-  不变）。
+  不变）。**段形态与判据**（截断与 fresh Open 调用同一个函数
+  `segmentGenesis`，重启一致性对每种形态成立）：
+  - `[session.created, context.compacted, …]`（有 header 的压缩后段）
+    → 种子取 records[1] 的 ItemID；
+  - `[context.compacted, …]`（**无 header 的压缩后段**——旧段首行
+    无效时 jsonl 段切换不拷贝 header，这是真实磁盘状态）→ 种子取
+    records[0] 的 ItemID；
+  - 其它（段 0，含无 header 的段 0——手工截断/手改首行）→ 段 0
+    genesis。
+  判据是纯数据推导，**不 panic**：畸形段退化为确定性的链（客户端
+  走 miss/窗口重放重同步），绝不能楔死 serve 进程（P1 教训：
+  panic 发生在 NewHub 持 h.mu 时，且 Manager.open 的 opening 占位
+  清理若无 defer，一个手改日志文件就能让该会话的所有请求永久
+  挂死——占位清理因此是 defer，防一切 panic，不只这一处）。
 - **重启一致性**：截断时 hub 的 genesis 基于活跃段的 compacted
   ItemID；重启后 fresh Open 读同一段、拿到同一 ItemID、算出同一
   genesis，fold 同一记录集 ⟹ **同一条链**（结构保证）。

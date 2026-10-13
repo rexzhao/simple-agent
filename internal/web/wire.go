@@ -32,10 +32,54 @@ import (
 
 const chainVersion = "sai/v1/"
 
-// chainGenesis returns h_0, the digest before any record.
+// chainGenesis returns h_0 of segment 0: the digest before any record
+// of a never-compacted session.
 func chainGenesis(sessionID string) string {
-	sum := sha256.Sum256([]byte(chainVersion + sessionID))
+	return chainGenesisAt(sessionID, "")
+}
+
+// chainGenesisAt is the active segment's genesis (§14.4): a segment
+// that begins after a compaction ([session.created, context.compacted,
+// …]) seeds from the compaction's ItemID — derivable both at truncation
+// time and at fresh Open (it IS the segment's second record), so the
+// per-segment chain needs no extra storage and no segment-header
+// changes. Restart consistency is structural: both sides read the same
+// segment and compute the same seed.
+func chainGenesisAt(sessionID, compactedItemID string) string {
+	seed := sessionID
+	if compactedItemID != "" {
+		seed = sessionID + "/" + compactedItemID
+	}
+	sum := sha256.Sum256([]byte(chainVersion + seed))
 	return hex.EncodeToString(sum[:])
+}
+
+// segmentGenesis derives the active segment's genesis from its record
+// shape (§14.4) — a PURE data derivation, no panics: headerless
+// segments are real disk states (a hand-edited or unreadable first
+// line means no session.created copy, and the jsonl segment switch
+// then starts the next segment with the compaction alone; a fresh
+// session's log can equally be headerless after manual truncation).
+// A malformed segment must degrade to a deterministic chain (clients
+// resync through the miss/window path), never wedge the serve.
+//
+//	[session.created, context.compacted, …] → seeded by records[1]
+//	[context.compacted, …] (no header copy)  → seeded by records[0]
+//	anything else (segment 0, headerless 0)  → segment-0 genesis
+//
+// Truncation and fresh Open read the same segment and run the same
+// rule, so restart consistency holds for every shape.
+func segmentGenesis(sessionID string, records []storage.Record) string {
+	switch {
+	case len(records) > 1 &&
+		records[0].Type == storage.TypeSessionCreated &&
+		records[1].Type == storage.TypeContextCompacted:
+		return chainGenesisAt(sessionID, records[1].ItemID)
+	case len(records) > 0 && records[0].Type == storage.TypeContextCompacted:
+		return chainGenesisAt(sessionID, records[0].ItemID)
+	default:
+		return chainGenesis(sessionID)
+	}
 }
 
 // chainStep folds one record onto the chain.

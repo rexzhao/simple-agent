@@ -320,11 +320,14 @@ type cliApp struct {
 	agent   *agent.Agent
 	session *agent.Session
 	printer *spinnerPrinter
-	// rendered counts the records this app has accounted for (printed,
-	// live-rendered, or omitted from the history tail): the eviction
-	// catch-up resumes the snapshot's records from here. Single-threaded
-	// by construction — the REPL renders one run at a time.
-	rendered int
+	// lastRenderedItem is the ItemID of the last record this app
+	// accounted for (printed or live-rendered): the eviction catch-up
+	// resumes the snapshot's records after it. Identity, not an index —
+	// a compaction truncates the record stream (§14.4), and a count
+	// would be out of range or misaligned against the truncated view.
+	// Single-threaded by construction — the REPL renders one run at a
+	// time.
+	lastRenderedItem string
 }
 
 // dispatch handles one input line. It returns true when the REPL should
@@ -429,9 +432,9 @@ func (c *cliApp) runLoop(sub *agent.StreamSubscription) {
 			sub = c.session.Stream()
 			snap := sub.Initial()
 			live = &liveWriter{printer: c.printer} // no item context: records print in full
-			for _, record := range snap.Records[c.rendered:] {
+			for _, record := range recordsAfter(snap.Records, c.lastRenderedItem) {
 				c.printRecord(record, live)
-				c.rendered++
+				c.lastRenderedItem = record.ItemID
 			}
 			if !snap.StatusRunning {
 				c.printer.clear()
@@ -457,7 +460,7 @@ func (c *cliApp) renderEvent(ev agent.SessionEvent, live *liveWriter) bool {
 	switch e := ev.(type) {
 	case agent.RecordCommitted:
 		c.printRecord(e.Record, live)
-		c.rendered++ // printed or live-rendered: accounted either way
+		c.lastRenderedItem = e.Record.ItemID // printed or live-rendered: accounted
 	case agent.Transient:
 		// Control notices are 'sai:' messages on stderr, not rendered
 		// record stream content.
@@ -569,7 +572,9 @@ func (c *cliApp) bind(session *agent.Session) error {
 	// The omitted head counts as rendered — the eviction catch-up must
 	// never replay it.
 	initial := session.SnapshotStream().Records
-	c.rendered = len(initial)
+	if len(initial) > 0 {
+		c.lastRenderedItem = initial[len(initial)-1].ItemID
+	}
 	if len(initial) > resumeTailRecords {
 		c.printer.line(fmt.Sprintf("[… showing last %d of %d records]", resumeTailRecords, len(initial)))
 		initial = initial[len(initial)-resumeTailRecords:]
@@ -620,3 +625,20 @@ var resolvedServerRoot string
 // Store exposes the shared storage (the serve-mode manager needs it for
 // listing and scoped opens).
 func (f *agentFactory) Store() *jsonl.Store { return f.store }
+
+// recordsAfter returns the records committed after the given item. A
+// missing marker (a compaction truncated the stream since it was
+// rendered — §14.4) falls back to the whole view: the catch-up would
+// rather re-print the small post-compaction segment than lose a record
+// it never saw.
+func recordsAfter(records []storage.Record, itemID string) []storage.Record {
+	if itemID == "" {
+		return records
+	}
+	for i, r := range records {
+		if r.ItemID == itemID {
+			return records[i+1:]
+		}
+	}
+	return records
+}

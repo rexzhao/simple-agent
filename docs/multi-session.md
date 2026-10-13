@@ -162,6 +162,20 @@ func agentFactory(serverRoot, providerName, modelName string)
 - `agents` 不驱逐：上限 = 注册项目数，有限
 - **模型选择按会话/项目**：本期不做（全局配置先行）
 
+### 3.1.1 记录截断（milestone A §14.4）
+
+context.compacted commit 时存储层切换段（jsonl 归档旧段开新段；
+memory store 同语义截断为 `[session.created, compaction]`），进程内
+Session.records 与 hub 镜像同源截断——内存占用 ∝ 活跃段而非会话
+lifetime，且与 fresh Open 的重放逐条一致。digest 链逐段独立：压缩后
+的段 genesis = H(chainVersion + sessionID + "/" + compacted ItemID)
+（ItemID 即活跃段第二条记录，零持久化），重启后两边读同一段算出同一条
+链。hub 对已连接客户端重发 snapshot（resumed:false + 新锚点）；旧
+锚点在 /history 上返回 stale_anchor（409），客户端重置后重试一次，
+仍失败即到活跃段开头。软压冷却为状态层双计数器
+（inputsSinceCompacted 在 Open 时从活跃段重建，
+inputsSinceSoftAttempt 纯内存），见 design §13。
+
 ### 3.2 hub 生命周期
 
 - hub 生命周期 = `活动 run OR 有订阅者`（run 可以在无人观看时继续跑，

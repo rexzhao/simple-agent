@@ -238,7 +238,10 @@ export class SessionStore {
           // A settled run has no tool in flight (the server's Running
           // slot exists only inside a run).
           tool: running ? this.snap.tool : null,
-          compacting: !!frame.compacting,
+          // Absent compacting = no change (same rule as running):
+          // notice-bearing frames omit positional fields on purpose,
+          // and !!undefined would clobber a live compacting=true.
+          compacting: frame.compacting ?? this.snap.compacting,
           notice: frame.notice || "",
           verified: frame.d ? frame.d === this.snap.head : this.snap.verified,
         });
@@ -337,12 +340,28 @@ export class SessionStore {
   async loadEarlier(): Promise<boolean> {
     const { session, prefixAnchor } = this.snap;
     if (!session || !prefixAnchor) return false;
-    const { getHistory } = await import("./api");
+    const { getHistory, APIError } = await import("./api");
     let data;
     try {
       data = await getHistory(session, prefixAnchor);
-    } catch {
-      return false;
+    } catch (e) {
+      // A compaction truncated the server's record view mid-flight:
+      // our prefix anchor belongs to the truncated-away chain. The
+      // reissued snapshot has (or will) reset the store's anchor —
+      // retry once with the fresh one; a second stale answer means we
+      // are at the head of the active segment.
+      if (!(e instanceof APIError) || e.status !== 409) return false;
+      const fresh = this.snap.prefixAnchor;
+      if (!fresh || fresh === prefixAnchor) {
+        this.commit({ more: false });
+        return false;
+      }
+      try {
+        data = await getHistory(session, fresh);
+      } catch {
+        this.commit({ more: false });
+        return false;
+      }
     }
     let h = data.anchor;
     for (const r of data.records) h = await chainStep(h, r);

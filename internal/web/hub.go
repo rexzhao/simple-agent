@@ -95,11 +95,16 @@ func NewHub(session *agent.Session) *Hub {
 		done:    make(chan struct{}),
 		index:   make(map[string]int),
 		clients: make(map[*client]struct{}),
-		genesis: chainGenesis(session.ID()),
 	}
 	stream := session.Stream()
 	snap := stream.Initial()
 	h.mu.Lock()
+	// The chain's genesis follows the segment (§14.4): a hub opened on
+	// a compacted session folds from the compaction-seeded genesis, the
+	// same one the pre-restart hub switched to at truncation time. It
+	// must be set BEFORE the seeding folds (chainHeadLocked reads it
+	// for the very first step).
+	h.genesis = segmentGenesis(session.ID(), snap.Records)
 	for _, r := range snap.Records {
 		h.extendLocked(r)
 	}
@@ -168,6 +173,37 @@ func (h *Hub) handleStreamEvent(ev agent.SessionEvent) {
 	switch e := ev.(type) {
 	case agent.RecordCommitted:
 		h.mu.Lock()
+		if e.Record.Type == storage.TypeContextCompacted && len(h.records) > 0 {
+			// Segment switch (§14.4): the session truncated its record
+			// stream to [session.created, compaction]; the mirror
+			// follows, the chain re-genesis from the compaction's
+			// ItemID, and every connected client gets a fresh snapshot
+			// (resumed=false — its old anchor belongs to the
+			// truncated-away chain). No record frame for this commit:
+			// folding it onto a client's old chain would be drift.
+			var head []storage.Record
+			if len(h.records) > 0 && h.records[0].Type == storage.TypeSessionCreated {
+				head = append(head, h.records[0])
+			}
+			segment := append(head, e.Record)
+			h.records = nil
+			h.chain = h.chain[:0]
+			for k := range h.index {
+				delete(h.index, k)
+			}
+			// The SAME derivation a fresh Open runs (§14.4): the
+			// truncation's segment shape and the reopened segment are
+			// identical by construction, so the genesis — and with it
+			// the whole chain — is restart-stable for every shape.
+			h.genesis = segmentGenesis(h.session.ID(), segment)
+			for _, r := range segment {
+				h.extendLocked(r)
+			}
+			h.processedSeq = e.Seq
+			h.fanoutLocked(h.snapshotFrameLocked(h.session.SnapshotStreamState()), 0, false)
+			h.mu.Unlock()
+			return
+		}
 		h.extendLocked(e.Record)
 		h.processedSeq = e.Seq
 		// Record frames bypass the seq filter: a client's snapshot
@@ -190,6 +226,55 @@ func (h *Hub) handleStreamEvent(ev agent.SessionEvent) {
 	}
 }
 
+// snapshotFrameLocked builds a full snapshot frame from the mirror
+// plus one atomic state snapshot: the trailing window of records, the
+// segment anchor, and the transient slots. Shared by the eviction
+// reissue and the compaction segment switch. Callers hold h.mu.
+func (h *Hub) snapshotFrameLocked(state agent.StreamSnapshot) []byte {
+	total := len(h.records)
+	start := total - DefaultWindow
+	if start < 0 {
+		start = 0
+	}
+	windowed := append([]storage.Record(nil), h.records[start:total]...)
+	encoded, _ := json.Marshal(windowed)
+	running := state.StatusRunning
+	compacting := state.StatusCompacting
+	f := Frame{
+		Kind:       "snapshot",
+		Anchor:     h.chainAtLocked(start),
+		Resumed:    false,
+		Total:      total,
+		More:       start > 0,
+		Records:    encoded,
+		Running:    &running,
+		Compacting: &compacting,
+		Digest:     h.chainHeadLocked(),
+	}
+	if state.Streaming != nil {
+		f.Streaming = &StreamingWire{
+			Item:      state.Streaming.ItemID,
+			Content:   state.Streaming.Message.Content,
+			Reasoning: state.Streaming.Message.ReasoningContent,
+		}
+	}
+	if state.Running != nil {
+		f.Tool = &ToolWire{
+			Item:   state.Running.ItemID,
+			CallID: state.Running.ToolCall.ID,
+			Name:   state.Running.ToolCall.Name,
+			Args:   state.Running.ToolCall.Arguments,
+		}
+	}
+	for _, entry := range state.Steered {
+		f.Steered = append(f.Steered, SteeredWire{Item: entry.ItemID, Text: entry.Text})
+	}
+	return encodeFrame(f)
+}
+
+// resubscribe recovers from an evicted stream subscription: stop the
+// old one, start a fresh one, rebuild the mirror from the snapshot,
+// and reissue a window snapshot to every connected SSE client.
 func (h *Hub) resubscribe() {
 	h.stream.Stop()
 	stream := h.session.Stream()
@@ -197,8 +282,10 @@ func (h *Hub) resubscribe() {
 
 	h.mu.Lock()
 	// Rebuild the mirror from the snapshot (the hub may have missed
-	// records while evicted). The rebuild is idempotent for the
-	// records the hub already holds.
+	// records while evicted). The genesis is re-derived from the
+	// segment (a compaction while evicted switched it) BEFORE the
+	// seeding folds.
+	h.genesis = segmentGenesis(h.session.ID(), snap.Records)
 	h.records = nil
 	h.chain = h.chain[:0]
 	for k := range h.index {
@@ -216,48 +303,7 @@ func (h *Hub) resubscribe() {
 	// Each client sees resumed=false + the new anchor and does a clean
 	// rebuild (the client's existing code handles this path — the same
 	// as a missed from= on reconnect).
-	total := len(h.records)
-	start := total - DefaultWindow
-	if start < 0 {
-		start = 0
-	}
-	windowed := append([]storage.Record(nil), h.records[start:total]...)
-	encoded, _ := json.Marshal(windowed)
-	running := snap.StatusRunning
-	compacting := snap.StatusCompacting
-	f := Frame{
-		Kind:       "snapshot",
-		Anchor:     h.chainAtLocked(start),
-		Resumed:    false,
-		Total:      total,
-		More:       start > 0,
-		Records:    encoded,
-		Running:    &running,
-		Compacting: &compacting,
-		Digest:     h.chainHeadLocked(),
-	}
-	if snap.Streaming != nil {
-		f.Streaming = &StreamingWire{
-			Item:      snap.Streaming.ItemID,
-			Content:   snap.Streaming.Message.Content,
-			Reasoning: snap.Streaming.Message.ReasoningContent,
-		}
-	}
-	if snap.Running != nil {
-		f.Tool = &ToolWire{
-			Item:   snap.Running.ItemID,
-			CallID: snap.Running.ToolCall.ID,
-			Name:   snap.Running.ToolCall.Name,
-			Args:   snap.Running.ToolCall.Arguments,
-		}
-	}
-	for _, entry := range snap.Steered {
-		f.Steered = append(f.Steered, SteeredWire{Item: entry.ItemID, Text: entry.Text})
-	}
-	// The reissue is a snapshot in its own right: delivered to every
-	// client unconditionally (a client's startSeq can only be older —
-	// everything the hub fans out after this has seq > snap.StartSeq).
-	h.fanoutLocked(encodeFrame(f), 0, false)
+	h.fanoutLocked(h.snapshotFrameLocked(snap), 0, false)
 	// A status frame alongside carries the cached notice (the snapshot
 	// frame does not); its running/compacting read the mirror just
 	// initialized from the same snapshot, so the two frames agree.

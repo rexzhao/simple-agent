@@ -1,17 +1,26 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
+	"github.com/rexzhao/simple-agent/internal/storage/memory"
 )
 
 // stagedProvider routes turns by the user input's content, so tests
@@ -33,9 +42,16 @@ type stagedProvider struct {
 }
 
 func (p *stagedProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
+	// Summary requests (the compaction prompt as the system message)
+	// route by name "summary"; conversational turns by the user input.
 	name := ""
 	if n := len(request.Messages); n > 0 {
-		name = request.Messages[n-1].Content
+		if request.Messages[0].Role == model.MessageRoleSystem &&
+			strings.Contains(request.Messages[0].Content, "Summarize the conversation so far") {
+			name = "summary"
+		} else {
+			name = request.Messages[n-1].Content
+		}
 	}
 	p.mu.Lock()
 	turn, ok := p.byName[name]
@@ -426,4 +442,508 @@ func TestNoticeFrameReachesFreshClient(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("notice frame never reached the fresh client")
 	}
+}
+
+// TestCompactionSegmentSwitch pins §14.5's truncation protocol end to
+// end: a committed compaction truncates the session's record view to
+// [session.created, compaction], the hub's mirror follows with a fresh
+// segment genesis, and every connected client receives a reissued
+// snapshot (resumed=false) whose wire-level invariant holds — folding
+// the frame's records from its anchor reproduces its digest. The chain
+// head is then compared across a restart: a hub over the reopened
+// session derives the same head from the same segment.
+func TestCompactionSegmentSwitch(t *testing.T) {
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	provider := &stagedProvider{byName: map[string]stagedTurn{
+		"hi":      {pre: 1, post: 1},
+		"summary": {pre: 2, post: 0},
+	}}
+	store := memory.OpenStore()
+	registry := &projects.Registry{Projects: []projects.Entry{
+		{Path: projectDir, Added: time.Now().UTC()},
+	}}
+	if err := registry.Save(projects.FilePath(root)); err != nil {
+		t.Fatal(err)
+	}
+	factory := func(projectCwd string) (*agent.Agent, error) {
+		return agent.New(agent.Options{
+			Provider:     provider,
+			ProviderName: "test",
+			ModelID:      "model-test",
+			Storage:      store,
+			ProjectID:    jsonl.ProjectID(projectCwd),
+			CWD:          projectCwd,
+		})
+	}
+	manager, err := NewManager(ManagerOptions{ServerRoot: root, Store: store, AgentFor: factory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.Close() })
+	ag, err := factory(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := ag.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.MaterializeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	session, err := manager.Session(created.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(manager)
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(httpServer.Close)
+
+	// A connected client sees the whole cycle live.
+	res, cancel := sseGet(t, httpServer.URL+api(session, "/stream"))
+	defer cancel()
+	defer res.Body.Close()
+	br := bufio.NewReader(res.Body)
+
+	if err := session.Send("hi"); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+	// Drain to the run's terminal status so the compaction's frames are
+	// the next ones read.
+	sawTerminal := false
+	for !sawTerminal {
+		f := nextFrame(t, br)
+		if f.Kind == "status" && f.Running != nil && !*f.Running {
+			sawTerminal = true
+		}
+	}
+
+	// The pre-compaction chain head (a client's held anchor).
+	stateRes, err := http.Get(httpServer.URL + api(session, "/state")) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preState state
+	if err := json.NewDecoder(stateRes.Body).Decode(&preState); err != nil {
+		t.Fatal(err)
+	}
+	stateRes.Body.Close()
+
+	// The compaction: the hub truncates its mirror and reissues the
+	// snapshot (no record frame for the compacted commit — folding it
+	// onto a client's old chain would be drift).
+	if err := session.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	var snap *Frame
+	for snap == nil {
+		f := nextFrame(t, br)
+		if f.Kind == "snapshot" {
+			snap = &f
+		}
+	}
+	if snap.Resumed {
+		t.Fatal("the reissued snapshot must be resumed=false — clients do a clean rebuild")
+	}
+	if snap.Total != 2 {
+		t.Fatalf("reissued snapshot total = %d, want 2 [session.created, compaction]", snap.Total)
+	}
+	var records []storage.Record
+	if err := json.Unmarshal(snap.Records, &records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 ||
+		records[0].Type != storage.TypeSessionCreated ||
+		records[1].Type != storage.TypeContextCompacted {
+		t.Fatalf("reissued records = %v, want [session.created, context.compacted]", records)
+	}
+	// The wire-level invariant (the same one the clients verify): fold
+	// the frame's records from its anchor and the result must equal the
+	// frame's digest.
+	head := snap.Anchor
+	for _, r := range records {
+		head = chainStep(head, r)
+	}
+	if head != snap.Digest {
+		t.Fatalf("fold(anchor, records) = %s, frame digest = %s — the reissued snapshot is not self-consistent", head, snap.Digest)
+	}
+	restartHead := snap.Digest
+
+	// A pre-compaction anchor is stale after the truncation: /history
+	// must refuse it (409) — serving a window from the NEW chain under
+	// the old anchor would fake drift on the client's strict fold.
+	histRes, err := http.Get(httpServer.URL + api(session, "/history?before=" + preState.Digest)) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer histRes.Body.Close()
+	if histRes.StatusCode != http.StatusConflict {
+		t.Fatalf("/history with a pre-compaction anchor = %d, want 409 stale_anchor", histRes.StatusCode)
+	}
+
+	// Restart consistency (§14.4): the reopened session replays the
+	// same active segment, and a hub over it derives the same chain
+	// head — the per-segment genesis is a function of the segment, not
+	// of process history.
+	id := session.ID()
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := ag.OpenSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	freshRecords := reopened.SnapshotStream().Records
+	if len(freshRecords) != 2 || freshRecords[0].ItemID != records[0].ItemID ||
+		freshRecords[1].ItemID != records[1].ItemID {
+		t.Fatalf("fresh Open records = %v, want the same [created, compaction] as the truncated view", freshRecords)
+	}
+	h2 := NewHub(reopened)
+	h2state := h2.state()
+	h2.Stop()
+	if h2state.Digest != restartHead {
+		t.Fatalf("restarted hub head %s != pre-restart head %s — the segment genesis is not restart-stable", h2state.Digest, restartHead)
+	}
+}
+
+// nextFrame reads one SSE data frame.
+func nextFrame(t *testing.T, br *bufio.Reader) Frame {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("no frame within the deadline")
+		}
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("stream read: %v", err)
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var f Frame
+		if err := json.Unmarshal([]byte(strings.TrimRight(line[6:], "\n")), &f); err != nil {
+			t.Fatalf("frame: %v (%s)", err, line)
+		}
+		return f
+	}
+}
+
+// writeSegment writes a session's log.jsonl by hand — the store's
+// on-disk shape is user data, and the P1 regression class is exactly
+// "disk states the writer never produces" (headerless segments from a
+// hand-edited first line or a failed header copy).
+func writeSegment(t *testing.T, store *jsonl.Store, projectDir, id string, records []storage.Record) {
+	t.Helper()
+	dir := filepath.Join(store.Root(), jsonl.ProjectID(projectDir), id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, r := range records {
+		data, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, string(data))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "log.jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHeaderlessSegmentsOpenAndStream pins the P1 regression: sessions
+// whose log has no session.created header (a hand-edited or truncated
+// first line — the store accepts them, ListSessions documents them as
+// "headerless stays untitled") must open through the manager and
+// stream, not panic in NewHub's genesis derivation. Both headerless
+// shapes: a segment-0 log starting at user.input, and a post-compaction
+// segment starting at the compaction itself (what the jsonl switch
+// writes when the old segment had no header to copy).
+func TestHeaderlessSegmentsOpenAndStream(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		records []storage.Record
+	}{
+		{
+			name: "headerless segment 0",
+			records: []storage.Record{
+				{ItemID: "u00000000000000000000000001", Type: storage.TypeUserInput, Time: "2026-01-01T00:00:00Z", RunID: "run-1", Content: "hi"},
+			},
+		},
+		{
+			name: "headerless post-compaction segment",
+			records: []storage.Record{
+				{ItemID: "x00000000000000000000000001", Type: storage.TypeContextCompacted, Time: "2026-01-01T00:00:00Z", Content: "summary"},
+				{ItemID: "u00000000000000000000000002", Type: storage.TypeUserInput, Time: "2026-01-01T00:01:00Z", RunID: "run-2", Content: "after"},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			projectDir := t.TempDir()
+			store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry := &projects.Registry{Projects: []projects.Entry{
+				{Path: projectDir, Added: time.Now().UTC()},
+			}}
+			if err := registry.Save(projects.FilePath(root)); err != nil {
+				t.Fatal(err)
+			}
+			id := storage.NewSessionID()
+			writeSegment(t, store, projectDir, id, tc.records)
+
+			manager, err := NewManager(ManagerOptions{ServerRoot: root, Store: store, AgentFor: func(string) (*agent.Agent, error) {
+				return agent.New(agent.Options{
+					Provider:     &stagedProvider{},
+					ProviderName: "test",
+					ModelID:      "model-test",
+					Storage:      store,
+					ProjectID:    jsonl.ProjectID(projectDir),
+					CWD:          projectDir,
+				})
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { manager.Close() })
+			server := New(manager)
+			httpServer := httptest.NewServer(server.Handler())
+			t.Cleanup(httpServer.Close)
+
+			// The stream opens and carries a snapshot — no panic, no
+			// wedge (the request has a deadline: a wedged open hangs
+			// here, which is the P1 failure mode).
+			res, cancel := sseGet(t, httpServer.URL+"/api/s/"+id+"/stream")
+			defer cancel()
+			defer res.Body.Close()
+			br := bufio.NewReader(res.Body)
+			f := nextFrame(t, br)
+			if f.Kind != "snapshot" {
+				t.Fatalf("first frame = %s, want a snapshot", f.Kind)
+			}
+			var got []storage.Record
+			if err := json.Unmarshal(f.Records, &got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(tc.records) {
+				t.Fatalf("snapshot records = %d, want %d (the full headerless segment)", len(got), len(tc.records))
+			}
+		})
+	}
+}
+
+// TestHeaderlessCompactedSegmentChainStable pins the genesis rule for
+// the headerless post-compaction shape: a segment starting at the
+// compaction seeds from ITS ItemID, and the chain head is stable
+// across a reopen (the same derivation runs at truncation time and at
+// fresh Open — §14.4).
+func TestHeaderlessCompactedSegmentChainStable(t *testing.T) {
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := storage.NewSessionID()
+	records := []storage.Record{
+		{ItemID: "x00000000000000000000000001", Type: storage.TypeContextCompacted, Time: "2026-01-01T00:00:00Z", Content: "summary"},
+		{ItemID: "u00000000000000000000000002", Type: storage.TypeUserInput, Time: "2026-01-01T00:01:00Z", RunID: "run-2", Content: "after"},
+	}
+	writeSegment(t, store, projectDir, id, records)
+
+	ag, err := agent.New(agent.Options{
+		Provider:     &stagedProvider{},
+		ProviderName: "test",
+		ModelID:      "model-test",
+		Storage:      store,
+		ProjectID:    jsonl.ProjectID(projectDir),
+		CWD:          projectDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := ag.OpenSessionIn(jsonl.ProjectID(projectDir), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h1 := NewHub(session)
+	head1 := h1.state().Digest
+	h1.Stop()
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen: same segment, same derivation, same chain.
+	reopened, err := ag.OpenSessionIn(jsonl.ProjectID(projectDir), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	h2 := NewHub(reopened)
+	head2 := h2.state().Digest
+	h2.Stop()
+	if head1 != head2 {
+		t.Fatalf("reopened chain head %s != original %s — the headerless segment genesis is not restart-stable", head2, head1)
+	}
+	// And the derivation matches the rule: seed from records[0].
+	want := chainGenesisAt(id, records[0].ItemID)
+	folded := want
+	for _, r := range records {
+		folded = chainStep(folded, r)
+	}
+	if head1 != folded {
+		t.Fatalf("chain head %s != rule-derived %s", head1, folded)
+	}
+}
+
+// TestManagerOpenPanicDoesNotWedge pins the defer guard in Manager.open:
+// a panic anywhere in the open path (injected through the agent factory
+// — any panic source is equivalent once it happens under the opening
+// placeholder) must not leave the placeholder behind. The NEXT request
+// for the same id must return — an error is fine, a hang is the P1
+// failure mode.
+func TestManagerOpenPanicDoesNotWedge(t *testing.T) {
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := &projects.Registry{Projects: []projects.Entry{
+		{Path: projectDir, Added: time.Now().UTC()},
+	}}
+	if err := registry.Save(projects.FilePath(root)); err != nil {
+		t.Fatal(err)
+	}
+	id := storage.NewSessionID()
+	writeSegment(t, store, projectDir, id, []storage.Record{
+		{ItemID: "u00000000000000000000000001", Type: storage.TypeUserInput, Time: "2026-01-01T00:00:00Z", RunID: "run-1", Content: "hi"},
+	})
+
+	manager, err := NewManager(ManagerOptions{ServerRoot: root, Store: store, AgentFor: func(string) (*agent.Agent, error) {
+		panic("injected: factory assembly exploded")
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The teardown is asynchronous ON PURPOSE: this test exists to fail
+	// under a regression (a leaked opening placeholder parks the handler
+	// forever), and a graceful httptest Close / Manager.Close would
+	// block on that parked handler — burying the test's assertion under
+	// a package-level timeout. Both closers run in goroutines so the
+	// failure surfaces as the assertion line; on the healthy path both
+	// complete immediately (everything here is test-local).
+	t.Cleanup(func() { go manager.Close() })
+	server := New(manager)
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(func() { go httpServer.Close() })
+
+	url := httpServer.URL + "/api/s/" + id + "/state"
+	for attempt := 1; attempt <= 2; attempt++ {
+		// The request must COMPLETE within the deadline: the first
+		// carries the panic (recovered by net/http → connection
+		// reset), the second proves the opening placeholder was
+		// cleaned — a leftover placeholder blocks on <-inFlight
+		// forever, the P1 wedge.
+		done := make(chan error, 1)
+		go func() {
+			res, err := http.Get(url) //nolint:noctx // test
+			if err == nil {
+				res.Body.Close()
+			}
+			done <- err
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("request %d never returned — the open panic wedged the session (opening placeholder leaked)", attempt)
+		}
+	}
+}
+
+// TestHeaderlessCompactTruncation pins the third truncation point on
+// the headerless shape: a session whose log starts at user.input (no
+// session.created header) compacts into a segment of [compacted] ALONE
+// — no fabricated header — and the in-process view equals what a fresh
+// Open replays, record by record.
+func TestHeaderlessCompactTruncation(t *testing.T) {
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := storage.NewSessionID()
+	writeSegment(t, store, projectDir, id, []storage.Record{
+		{ItemID: "u00000000000000000000000001", Type: storage.TypeUserInput, Time: "2026-01-01T00:00:00Z", RunID: "run-1", Content: "hi"},
+	})
+	provider := &stagedProvider{byName: map[string]stagedTurn{
+		"more":    {pre: 1, post: 1},
+		"summary": {pre: 1, post: 0},
+	}}
+	ag, err := agent.New(agent.Options{
+		Provider:     provider,
+		ProviderName: "test",
+		ModelID:      "model-test",
+		Storage:      store,
+		ProjectID:    jsonl.ProjectID(projectDir),
+		CWD:          projectDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := ag.OpenSessionIn(jsonl.ProjectID(projectDir), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Send("more"); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+	if err := session.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	inProc := session.SnapshotStream().Records
+	if len(inProc) != 1 || inProc[0].Type != storage.TypeContextCompacted {
+		t.Fatalf("in-process records after the headerless compact = %v, want [context.compacted] alone", recordTypesWeb(inProc))
+	}
+	for _, r := range inProc {
+		if r.Type == storage.TypeSessionCreated {
+			t.Fatal("the headerless truncation fabricated a session.created header")
+		}
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := ag.OpenSessionIn(jsonl.ProjectID(projectDir), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	fresh := reopened.SnapshotStream().Records
+	if len(fresh) != len(inProc) {
+		t.Fatalf("fresh Open records = %v, in-process = %v — the headerless truncation diverged from the replay", recordTypesWeb(fresh), recordTypesWeb(inProc))
+	}
+	for i := range fresh {
+		if fresh[i].ItemID != inProc[i].ItemID || fresh[i].Type != inProc[i].Type {
+			t.Fatalf("record %d: fresh %s/%s != in-process %s/%s", i, fresh[i].Type, fresh[i].ItemID, inProc[i].Type, inProc[i].ItemID)
+		}
+	}
+}
+
+func recordTypesWeb(records []storage.Record) []string {
+	types := make([]string, len(records))
+	for i, r := range records {
+		types[i] = r.Type
+	}
+	return types
 }

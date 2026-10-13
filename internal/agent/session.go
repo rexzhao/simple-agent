@@ -76,18 +76,23 @@ type Session struct {
 
 	mu    sync.RWMutex
 	state *storage.State
-	// softRetryArmed/softRetryAfterIndex anchor the soft-compaction
-	// retry cooldown (see design §14.4 for the milestone-A plan to move
-	// this to a state-layer counter that doesn't depend on the flat
-	// record stream).
-	softRetryArmed      bool
-	softRetryAfterIndex int
-	// records is the in-process flat record stream. After a compaction
-	// it is deliberately LONGER than the on-disk active segment: the
-	// cooldown scans and the CLI's flat printed counter need them.
-	// A consumer subscribing mid-session sees the flat stream; a fresh
-	// Open sees only the active segment. Fold handles both.
-	// (Milestone A §14.4 will truncate this to the active segment.)
+	// Soft-compaction retry cooldown as state-layer counters (§14.4):
+	// user.input commits increment both; a committed compaction resets
+	// inputsSinceCompacted; a failed/churning soft attempt arms the
+	// second. The cooldown passes when BOTH are ≥ 2 — the cadence a
+	// successful compaction imposes. inputsSinceCompacted is rebuilt
+	// from the active segment at Open; inputsSinceSoftAttempt is
+	// memory-only (a restart re-attempts immediately — the durable
+	// story of a past soft failure is the notice, never a wedge).
+	inputsSinceCompacted   int
+	hasCompacted           bool
+	softAttemptArmed       bool
+	inputsSinceSoftAttempt int
+	// records is the in-process record stream, truncated to the ACTIVE
+	// SEGMENT (§14.4): a context.compacted commit switches the storage
+	// segment and this slice becomes [session.created, compaction] —
+	// identical to what a fresh Open replays, and bounded no matter how
+	// many compactions happen.
 	records []storage.Record
 	// pendingCreated is the session.created record of a fresh session,
 	// committed ahead of the first real record. Nil on reopened sessions.
@@ -463,10 +468,39 @@ func (s *Session) appendLocked(record storage.Record) (storage.Record, error) {
 		return storage.Record{}, err
 	}
 	storage.Fold(s.state, stored)
-	s.records = append(s.records, stored)
+	// The soft-compaction cooldown counters (§14.4): user inputs count
+	// toward both; a committed compaction resets the since-compacted
+	// one (its segment switch also truncates the record stream below).
+	switch stored.Type {
+	case storage.TypeUserInput:
+		s.inputsSinceCompacted++
+		s.inputsSinceSoftAttempt++
+	case storage.TypeContextCompacted:
+		s.inputsSinceCompacted = 0
+		s.hasCompacted = true
+	}
+	// Truncation to the active segment (§14.4): a context.compacted
+	// commit switches the storage segment (the jsonl switch stages the
+	// next segment as [header copy?, compaction]) — the in-memory
+	// record stream mirrors it, keeping memory bounded and identical
+	// to what a fresh Open replays. The header copy survives only when
+	// it exists (a headerless session's segment starts at the
+	// compaction, matching the jsonl switch).
+	if stored.Type == storage.TypeContextCompacted {
+		if len(s.records) > 0 && s.records[0].Type == storage.TypeSessionCreated {
+			s.records = []storage.Record{s.records[0], stored}
+		} else {
+			s.records = []storage.Record{stored}
+		}
+	} else {
+		s.records = append(s.records, stored)
+	}
 	// The stream enqueue lives HERE — the single write path — so every
 	// future write (MaterializeHeader, a hypothetical bulk import)
 	// cannot bypass the stream. Start/commit do NOT enqueue separately.
+	// RecordCommitted carries the truncation implicitly: the hub (and
+	// any other record mirror) detects TypeContextCompacted and resets
+	// its own view.
 	s.enqueueStreamLocked(RecordCommitted{Record: stored}, false)
 	return stored, nil
 }
@@ -814,60 +848,38 @@ func (s *Session) hasCompactableAnswer() bool {
 	return false
 }
 
-// softCooldownElapsed reports whether at least two user inputs were
-// committed since the last compaction — and, after a failed or churned
-// soft attempt (which commits no marker record), since that attempt:
-// a failing summary must not be retried on every iteration.
+// softCooldownElapsed reports whether the soft-pressure retry gate is
+// open: at least two user inputs since the last committed compaction
+// AND, when a soft attempt armed the failure cooldown, at least two
+// inputs since that attempt. Both counters live in the state layer
+// (§14.4) — no record-stream scans.
 func (s *Session) softCooldownElapsed() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	inputs := 0
-	for i := len(s.records) - 1; i >= 0; i-- {
-		switch s.records[i].Type {
-		case storage.TypeContextCompacted:
-			return inputs >= 2 && s.softCooldownSatisfiedLocked()
-		case storage.TypeUserInput:
-			inputs++
-		}
+	if !s.hasCompacted {
+		// Never compacted: the since-compacted cadence is vacuous (a
+		// fresh session's first soft crossing attempts immediately) —
+		// the same semantics the old record-scan had when it found no
+		// compaction marker.
+		return !s.softAttemptArmed || s.inputsSinceSoftAttempt >= 2
 	}
-	return s.softCooldownSatisfiedLocked()
-}
-
-// softCooldownSatisfiedLocked: after a soft-attempt failure, the retry
-// waits for two NEW user inputs past the attempt's anchor — the same
-// cadence a successful compaction imposes through its record anchor.
-// Callers hold s.mu (RLock ok: the marker is written under the full
-// lock).
-func (s *Session) softCooldownSatisfiedLocked() bool {
-	if !s.softRetryArmed {
-		return true
-	}
-	inputs := 0
-	for i := s.softRetryAfterIndex; i < len(s.records); i++ {
-		if s.records[i].Type == storage.TypeUserInput {
-			inputs++
-			if inputs >= 2 {
-				return true
-			}
-		}
-	}
-	return false
+	return s.inputsSinceCompacted >= 2 && (!s.softAttemptArmed || s.inputsSinceSoftAttempt >= 2)
 }
 
 // beginSoftCompactCooldown arms the failure cooldown at the current
-// record position. A later success clears it (its own record is the
+// input count. A later success clears it (its own record is the
 // marker).
 func (s *Session) beginSoftCompactCooldown() {
 	s.mu.Lock()
-	s.softRetryArmed = true
-	s.softRetryAfterIndex = len(s.records)
+	s.softAttemptArmed = true
+	s.inputsSinceSoftAttempt = 0
 	s.mu.Unlock()
 }
 
 // clearSoftCompactCooldown drops the failure cooldown (on success).
 func (s *Session) clearSoftCompactCooldown() {
 	s.mu.Lock()
-	s.softRetryArmed = false
+	s.softAttemptArmed = false
 	s.mu.Unlock()
 }
 

@@ -974,3 +974,128 @@ func TestSuccessfulTurnRunErrNil(t *testing.T) {
 		t.Fatalf("successful turn run: Err() = %v, want nil (completed flag not set?)", r.Err())
 	}
 }
+
+// TestCooldownCountersRebuiltAtOpen pins §14.4's Open-time rebuild: the
+// since-compacted counter is derived from the active segment (the user
+// inputs after the last compaction), the has-compacted marker is set,
+// and the soft-attempt counter stays memory-only (a restart re-attempts
+// immediately).
+func TestCooldownCountersRebuiltAtOpen(t *testing.T) {
+	store := memory.OpenStore()
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "answer"}},
+		{model.TextDeltaEvent{Text: "the summary"}},
+		{model.TextDeltaEvent{Text: "more"}},
+	}}
+	ag, err := New(Options{
+		Provider:     provider,
+		ProviderName: "test",
+		ModelID:      "model-test",
+		Storage:      store,
+		ProjectID:    jsonl.ProjectID(t.TempDir()),
+		CWD:          "/w",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := ag.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range []string{"one", "two"} {
+		if err := session.Send(input); err != nil {
+			t.Fatal(err)
+		}
+		waitSettled(t, session)
+	}
+	if err := session.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Send("three"); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+
+	id := session.ID()
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := ag.OpenSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	reopened.mu.RLock()
+	sinceCompacted, hasCompacted, armed := reopened.inputsSinceCompacted, reopened.hasCompacted, reopened.softAttemptArmed
+	reopened.mu.RUnlock()
+	if sinceCompacted != 1 {
+		t.Fatalf("inputsSinceCompacted = %d, want 1 (the input after the compaction)", sinceCompacted)
+	}
+	if !hasCompacted {
+		t.Fatal("hasCompacted not rebuilt from the active segment")
+	}
+	if armed {
+		t.Fatal("the soft-attempt cooldown must be memory-only, not rebuilt at Open")
+	}
+}
+
+// TestCompactionBoundsRecordMemory pins §14.4's memory bound: the
+// in-process record stream is the ACTIVE SEGMENT, not the flat history
+// — after several compaction cycles with turns between, the records
+// stay at [session.created, compaction, <this segment's records>]
+// while the session has committed far more overall.
+func TestCompactionBoundsRecordMemory(t *testing.T) {
+	store := memory.OpenStore()
+	turns := make([][]model.Event, 0, 12)
+	for i := 0; i < 5; i++ {
+		turns = append(turns,
+			[]model.Event{model.TextDeltaEvent{Text: "answer"}},
+			[]model.Event{model.TextDeltaEvent{Text: "summary"}}, // the compaction summary
+		)
+	}
+	turns = append(turns, []model.Event{model.TextDeltaEvent{Text: "final"}})
+	provider := &fakeProvider{turns: turns}
+	ag, err := New(Options{
+		Provider:     provider,
+		ProviderName: "test",
+		ModelID:      "model-test",
+		Storage:      store,
+		ProjectID:    jsonl.ProjectID(t.TempDir()),
+		CWD:          "/w",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := ag.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	committed := 1 // session.created
+	for i := 0; i < 5; i++ {
+		if err := session.Send(fmt.Sprintf("turn %d", i)); err != nil {
+			t.Fatal(err)
+		}
+		waitSettled(t, session)
+		committed += 2
+		if err := session.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		committed++
+	}
+	if err := session.Send("after"); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+	committed += 2
+
+	records := session.SnapshotStream().Records
+	// The active segment: [created, compacted, user.input, assistant].
+	if len(records) != 4 {
+		t.Fatalf("records = %d (%v), want the 4-record active segment — memory is not bounded to it (committed ≈ %d)",
+			len(records), recordTypes(records), committed)
+	}
+	if records[1].Type != storage.TypeContextCompacted {
+		t.Fatalf("segment structure = %v, want [created, compacted, ...]", recordTypes(records))
+	}
+}

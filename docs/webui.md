@@ -230,7 +230,10 @@ hub 不再挂接 per-run 事件通道，而是**订阅会话的单一有序流**
   的状态变更与 seq 分配同锁段（§14.2），该不变量是结构保证
 - **手动 /compact 的生命周期**：`StartCompact` 发
   CompactionStarted/Completed 瞬态事件 + Status{Compacting}，全部走
-  流到达 hub——无需 handler 轮询或周期广播
+  流到达 hub——无需 handler 轮询或周期广播。**压缩 commit 本身不发
+  独立的 record 帧**（§14.5：截断走 snapshot 重发）——SSE 消费者只在
+  重发的 snapshot records 里看到 context.compacted，/log 页要到下一次
+  snapshot/重连才渲染该条
 - **run 开始的 Status 不丢弃**（§14.2）：它是消费者建立 run 生命
   周期机件的锚点；满则摘除订阅者（可恢复），绝不静默丢弃。
   （step 3 曾配有过渡性的 per-run 通道排空垫片，step 4 删除

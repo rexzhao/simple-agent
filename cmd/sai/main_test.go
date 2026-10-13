@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -243,14 +244,218 @@ func TestSendReturnsAfterEviction(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("cli.send never returned while its stream subscription was evicted — runLoop has no working Lost case")
 	}
-	// Every committed record is accounted for (printed, live-rendered,
-	// or caught up from the re-subscription snapshot).
-	if n := len(session.SnapshotStream().Records); cli.rendered != n {
-		t.Fatalf("rendered %d records, session committed %d — the eviction catch-up lost some", cli.rendered, n)
+	// Every committed record is accounted for: the last rendered item
+	// is the session's last committed record.
+	committed := session.SnapshotStream().Records
+	if last := committed[len(committed)-1]; cli.lastRenderedItem != last.ItemID {
+		t.Fatalf("last rendered item %q, session's last record %q — the eviction catch-up lost records", cli.lastRenderedItem, last.ItemID)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
 	os.Stdout, os.Stderr = oldOut, oldErr
 	<-drained
+}
+
+// compactingToolLoopProvider serves a tool loop, then a final answer,
+// then a compaction summary. gateAt parks the run mid-loop (after that
+// many rendered tool rounds) so a test can freeze the renderer with
+// records already behind it — the natural "old anchor truncated away"
+// state.
+type compactingToolLoopProvider struct {
+	rounds  int
+	gateAt  int
+	gate    chan struct{}
+	entered chan struct{}
+	turn    int
+}
+
+func (p *compactingToolLoopProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
+	p.turn++
+	events := make(chan model.Event, 4)
+	go func() {
+		defer close(events)
+		if p.turn == p.gateAt {
+			if p.entered != nil {
+				select {
+				case <-p.entered:
+				default:
+					close(p.entered)
+				}
+			}
+			select {
+			case <-p.gate:
+			case <-ctx.Done():
+				return
+			}
+		}
+		switch {
+		case p.turn <= p.rounds:
+			events <- model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "c", Name: "noop", Arguments: "{}"}}
+		case p.turn == p.rounds+1:
+			// The tool loop's final answer (the run ends here).
+			events <- model.TextDeltaEvent{Text: "the run is done"}
+		default:
+			// The compaction summary: its content lands verbatim in the
+			// context.compacted record the catch-up must re-render.
+			events <- model.TextDeltaEvent{Text: "the summary"}
+		}
+		events <- model.MessageDoneEvent{}
+	}()
+	return events, nil
+}
+
+// TestSendReturnsAfterCompactionAndEviction pins the §14.4 interaction
+// opus flagged: the CLI's catch-up must not depend on record indexes.
+// The run parks mid-loop after several RENDERED tool rounds (the
+// provider gates), the renderer freezes with a real pre-compaction
+// record as its last rendered item, the remaining tool rounds evict
+// the subscription, and a compaction then TRUNCATES the record stream —
+// the last rendered item no longer exists in the snapshot's view. The
+// catch-up's miss branch (re-render the whole post-compaction segment,
+// the compaction record included — its frame was lost with the
+// eviction, nothing else prints it) is the only path that can advance
+// the rendered item to the compaction; a count-based resume would
+// slice out of range here.
+func TestSendReturnsAfterCompactionAndEviction(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	ag, err := agent.New(agent.Options{
+		Provider: &compactingToolLoopProvider{
+			rounds: 700, gateAt: 50, gate: gate, entered: entered,
+		},
+		ProviderName:  "test",
+		ModelID:       "model-test",
+		Storage:       memory.OpenStore(),
+		Tools:         []model.Tool{{Name: "noop"}},
+		ToolExecutor:  noopExecutor{},
+		MaxIterations: 750,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := ag.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldOut, oldErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = w, w
+	defer func() {
+		os.Stdout, os.Stderr = oldOut, oldErr
+	}()
+	captured := make(chan string, 1)
+	var readBytes atomic.Int64
+	go func() {
+		buf := make([]byte, 64*1024)
+		var sb strings.Builder
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				readBytes.Add(int64(n))
+				sb.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+		captured <- sb.String()
+	}()
+
+	printer := &spinnerPrinter{}
+	cli := &cliApp{agent: ag, printer: printer}
+	if err := cli.bind(session); err != nil {
+		t.Fatal(err)
+	}
+	// The rendered-output baseline, taken BEFORE the run starts: past
+	// the bind output, record lines are the only traffic, so a rise
+	// proves records rendered (observed through the atomic read-side
+	// count — the rendered-item field belongs to the loop goroutine).
+	baseline := readBytes.Load()
+
+	// The run renders rounds 1..49 unhindered, then parks at round 50.
+	sent := make(chan error, 1)
+	go func() { sent <- cli.send("loop") }()
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the run never reached its mid-loop gate")
+	}
+	// With the run parked, let the renderer drain the committed rounds.
+	// The precondition is observed through the pipe's read-side byte
+	// count (atomic — the rendered-item field is written by the loop
+	// goroutine and must not be read from here): past the bind output,
+	// record lines are the only traffic.
+	renderDeadline := time.Now().Add(30 * time.Second)
+	for readBytes.Load() < baseline+500 {
+		if time.Now().After(renderDeadline) {
+			t.Fatal("precondition: nothing rendered before the freeze")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	printer.mu.Lock()
+	// Resume the flood: rounds 50..700 commit far past the 1024-slot
+	// buffer while the renderer is frozen — eviction.
+	close(gate)
+	deadline := time.Now().Add(30 * time.Second)
+	for len(session.SnapshotStream().Records) < 1100 {
+		if time.Now().After(deadline) {
+			printer.mu.Unlock()
+			t.Fatalf("the tool-loop run stalled at %d records", len(session.SnapshotStream().Records))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	settleDeadline := time.Now().Add(30 * time.Second)
+	for session.Running() {
+		if time.Now().After(settleDeadline) {
+			printer.mu.Unlock()
+			t.Fatal("the tool-loop run never settled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Compact ON THE SESSION directly (no second CLI loop: its
+	// rendering would satisfy the output assertions below regardless of
+	// the catch-up under test). The evicted subscription never sees the
+	// compacted record's frame.
+	if err := session.Compact(); err != nil {
+		printer.mu.Unlock()
+		t.Fatalf("compact while frozen: %v", err)
+	}
+	if n := len(session.SnapshotStream().Records); n != 2 {
+		printer.mu.Unlock()
+		t.Fatalf("post-compaction records = %d, want [created, compacted]", n)
+	}
+	printer.mu.Unlock()
+
+	select {
+	case err := <-sent:
+		if err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("cli.send never returned after compaction+eviction — the catch-up is index-based (§14.4 break)")
+	}
+	// Only the miss branch can reach the compaction from a truncated-
+	// away anchor: the whole segment re-rendered, rendered item
+	// advanced to the compaction.
+	committed := session.SnapshotStream().Records
+	if last := committed[len(committed)-1]; cli.lastRenderedItem != last.ItemID {
+		t.Fatalf("last rendered item %q, want the compaction %q — the catch-up's miss branch did not re-render the segment", cli.lastRenderedItem, last.ItemID)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout, os.Stderr = oldOut, oldErr
+	out := <-captured
+	// The catch-up actually re-rendered the frozen gap: the compaction
+	// record (lost with the eviction — no other loop printed it) must
+	// be on the terminal.
+	if !strings.Contains(out, "the summary") {
+		t.Fatal("the compaction record never rendered — the catch-up's miss branch printed nothing")
+	}
 }

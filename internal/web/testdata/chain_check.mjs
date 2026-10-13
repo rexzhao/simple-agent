@@ -3,7 +3,7 @@
 // module's chain encoding and folding match byte for byte. Run by
 // TestJSChainFixture via `node chain_check.mjs`; the chain code itself
 // lives in chain.mjs — the exact module the page imports.
-import { chainGenesis, chainStep, chainInput } from "../static/chain.mjs";
+import { chainGenesis, chainGenesisAt, chainStep, chainInput } from "../static/chain.mjs";
 
 const crypto = globalThis.crypto;
 if (!crypto || !crypto.subtle) {
@@ -22,7 +22,11 @@ for (const line of lines) {
   const fixture = JSON.parse(line);
   if (fixture.session) {
     sessionID = fixture.session;
-    genesis = await chainGenesis(sessionID);
+    // A segment line (§14.4): after a compaction the chain re-genesis
+    // from the compaction's ItemID; without one it is segment 0.
+    genesis = fixture.compacted
+      ? await chainGenesisAt(sessionID, fixture.compacted)
+      : await chainGenesis(sessionID);
     if (genesis !== fixture.genesis) {
       console.error(`genesis mismatch: js=${genesis} go=${fixture.genesis}`);
       process.exit(1);

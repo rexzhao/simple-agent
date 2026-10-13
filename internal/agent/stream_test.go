@@ -306,18 +306,38 @@ loop:
 		streamRecords = append(streamRecords, r.ItemID)
 	}
 
-	// The baseline is the session's committed history: every write path
-	// (MaterializeHeader, Start's user.input, run commits, compaction)
-	// must be visible on the stream exactly once.
+	// The baseline: every write path (MaterializeHeader, Start's
+	// user.input, run commits, tool results, compaction) is visible on
+	// the stream exactly once. The compaction at the end TRUNCATES the
+	// session's record view to the active segment (§14.4), so the
+	// stream's full sequence is a superset: it must cover the entire
+	// commit history (header + 3 turns + tool result + compaction = 8)
+	// while the session's snapshot collapses to [created, compacted].
 	committed := session.SnapshotStream().Records
-	if len(streamRecords) != len(committed) {
-		t.Fatalf("record count mismatch: stream=%d committed=%d\nstream: %v\ncommitted: %v",
-			len(streamRecords), len(committed), streamRecords, committed)
+	if len(committed) != 2 ||
+		committed[0].Type != storage.TypeSessionCreated ||
+		committed[1].Type != storage.TypeContextCompacted {
+		t.Fatalf("post-compaction snapshot = %v, want [session.created, context.compacted]", recordTypes(committed))
 	}
-	for i := range streamRecords {
-		if streamRecords[i] != committed[i].ItemID {
-			t.Fatalf("record %d mismatch: stream=%s committed=%s", i, streamRecords[i], committed[i].ItemID)
+	// The stream saw every record ever committed — including the ones
+	// the truncation removed from the session's view. The truncated
+	// view's [created, compacted] maps to the stream's FIRST and LAST
+	// record ids (the segment header copy is byte-identical).
+	if len(streamRecords) < 2 ||
+		streamRecords[0] != committed[0].ItemID ||
+		streamRecords[len(streamRecords)-1] != committed[1].ItemID {
+		t.Fatalf("the stream never saw the truncated view's records: %v", streamRecords)
+	}
+	if len(streamRecords) != 8 {
+		t.Fatalf("stream record count = %d (%v), want 8 — a write path bypassed the stream", len(streamRecords), streamRecords)
+	}
+	// Every record id is distinct: no duplicates from double enqueues.
+	seen := make(map[string]bool)
+	for _, id := range streamRecords {
+		if seen[id] {
+			t.Fatalf("record %s delivered twice on the stream", id)
 		}
+		seen[id] = true
 	}
 
 	// Compare transient events: the critical tool lifecycle event must

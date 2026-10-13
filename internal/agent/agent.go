@@ -160,7 +160,26 @@ func (a *Agent) openSession(open func(string) (storage.Session, error), id strin
 	for _, record := range records {
 		storage.Fold(state, record)
 	}
-	return &Session{agent: a, storage: stored, state: state, records: records}, nil
+	// Rebuild the since-compacted cooldown counter from the active
+	// segment (§14.4): the user inputs after the last context.compacted
+	// (all of them when the segment has none). The soft-attempt counter
+	// stays memory-only — a restart re-attempts immediately.
+	inputsSinceCompacted := 0
+	hasCompacted := false
+	for _, record := range records {
+		switch record.Type {
+		case storage.TypeUserInput:
+			inputsSinceCompacted++
+		case storage.TypeContextCompacted:
+			inputsSinceCompacted = 0
+			hasCompacted = true
+		}
+	}
+	return &Session{
+		agent: a, storage: stored, state: state, records: records,
+		inputsSinceCompacted: inputsSinceCompacted,
+		hasCompacted:         hasCompacted,
+	}, nil
 }
 
 // buildRequest assembles the model request from the folded context: system

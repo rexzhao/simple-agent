@@ -286,3 +286,61 @@ func compactedRecordsAll(t *testing.T, session *Session) []storage.Record {
 	records := session.SnapshotStream().Records
 	return records
 }
+
+// TestSoftCooldownAfterSuccessfulCompact pins the success-side reset:
+// a committed compaction clears inputsSinceCompacted, so the next soft
+// attempt waits for two NEW inputs — the same cadence the failure
+// cooldown imposes. The reset lives on one line in appendLocked; this
+// test is what makes its removal visible (without it the counter keeps
+// growing and every post-compaction soft crossing re-compacts).
+func TestSoftCooldownAfterSuccessfulCompact(t *testing.T) {
+	provider := &failSummaryProvider{
+		fail: atomic.Bool{},
+		turns: [][]model.Event{
+			{model.TextDeltaEvent{Text: "answer one"}},                                                          // run 1 model
+			{model.TextDeltaEvent{Text: "summary ok " + strings.Repeat("word ", 10)}, model.MessageDoneEvent{}}, // run 2: the soft-pressure summary (succeeds)
+			{model.TextDeltaEvent{Text: "answer two"}},                                                          // run 2 model
+			{model.TextDeltaEvent{Text: "answer three"}},                                                        // run 3 model (inside the cooldown: no summary)
+			{model.TextDeltaEvent{Text: "summary again " + strings.Repeat("word ", 10)}, model.MessageDoneEvent{}}, // run 4: the retry summary
+			{model.TextDeltaEvent{Text: "answer four"}},                                                         // run 4 model
+		},
+	}
+	_, session := autoCompactAgent(t, provider, nil, nil)
+
+	if err := session.Send("first"); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+	// Never compacted: the first soft crossing attempts immediately.
+	if err := session.Send(strings.Repeat("工", 75_000)); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+	if got := provider.summaries.Load(); got != 1 {
+		t.Fatalf("summary requests after the first soft crossing = %d, want 1 (never-compacted sessions attempt immediately)", got)
+	}
+	if len(compactedRecords(t, session)) != 1 {
+		t.Fatal("the soft compaction did not land")
+	}
+
+	// ONE new input since the compaction: the cooldown holds.
+	if err := session.Send(strings.Repeat("工", 75_000)); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+	if got := provider.summaries.Load(); got != 1 {
+		t.Fatalf("summary retried after ONE new input since the compaction: %d (inputsSinceCompacted reset missing?)", got)
+	}
+
+	// The SECOND new input releases it: exactly one more summary.
+	if err := session.Send(strings.Repeat("工", 75_000)); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+	if got := provider.summaries.Load(); got != 2 {
+		t.Fatalf("summary requests after two new inputs = %d, want 2 (the second compaction)", got)
+	}
+	if len(compactedRecords(t, session)) != 1 {
+		t.Fatalf("compactions = %d, want 1 in the truncated active segment", len(compactedRecords(t, session)))
+	}
+}

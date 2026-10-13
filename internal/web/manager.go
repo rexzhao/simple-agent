@@ -311,6 +311,16 @@ func (m *Manager) open(id string) (*sessionEntry, func(), int, error) {
 	opened := make(chan struct{})
 	m.opening[id] = opened
 	m.mu.Unlock()
+	// The placeholder is cleaned on EVERY exit path — panics included:
+	// openSlow reads disk data (segments a user can hand-edit), and a
+	// panic caught by net/http's recover must not leave this id
+	// permanently blocked on an unclosed channel.
+	defer func() {
+		m.mu.Lock()
+		delete(m.opening, id)
+		close(opened)
+		m.mu.Unlock()
+	}()
 
 	// ALL the IO runs lock-free (openSlow); the placeholder dedups
 	// concurrent opens of this id.
@@ -332,8 +342,6 @@ func (m *Manager) open(id string) (*sessionEntry, func(), int, error) {
 		entry.refs = 1
 		m.sessions[id] = entry
 	}
-	delete(m.opening, id)
-	close(opened)
 	m.mu.Unlock()
 	if !publish && entry != nil {
 		entry.hub.Stop()

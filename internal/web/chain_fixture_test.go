@@ -40,7 +40,7 @@ func TestJSChainFixture(t *testing.T) {
 	sessionID := "fixture-session"
 	head := chainGenesis(sessionID)
 	lines = append(lines, marshalLine(t, map[string]any{"session": sessionID, "genesis": head}))
-	for _, r := range records {
+	emit := func(r storage.Record) {
 		head = chainStep(head, r)
 		lines = append(lines, marshalLine(t, map[string]any{
 			"record": json.RawMessage(mustJSON(t, r)),
@@ -48,6 +48,21 @@ func TestJSChainFixture(t *testing.T) {
 			"digest": head,
 		}))
 	}
+	for _, r := range records {
+		emit(r)
+	}
+
+	// The post-compaction segment (§14.4): a context.compacted commit
+	// truncates the view to [session.created, compaction] and the chain
+	// re-genesis from the compaction's ItemID — the segment line pins
+	// that Go and JS derive the identical seed.
+	compacted := storage.Record{ItemID: "x1", Type: storage.TypeContextCompacted, Time: "t9", Content: "summary"}
+	head = chainGenesisAt(sessionID, compacted.ItemID)
+	lines = append(lines, marshalLine(t, map[string]any{
+		"session": sessionID, "compacted": compacted.ItemID, "genesis": head,
+	}))
+	emit(records[2]) // the session.created copy re-folds onto the new genesis
+	emit(compacted)
 
 	dir := t.TempDir()
 	fixturePath := filepath.Join(dir, "fixtures.jsonl")
