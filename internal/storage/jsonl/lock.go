@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // fileLock is an OS-level exclusive lock on one session directory. Two
@@ -55,16 +56,30 @@ func (l *fileLock) Release() {
 	l.file = nil
 }
 
+// readLockHolder reads the holder note for the loser's error message.
+// The winner writes the note immediately AFTER taking the lock, and a
+// loser can open inside that gap (or read a partially-written file
+// under concurrent IO on Windows) — a bounded retry closes the window.
+// The note is informational: a genuine absence (a winner deleted it on
+// release while still holding the lock) still degrades to the plain
+// message once the budget expires.
 func readLockHolder(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for {
+		if data, err := os.ReadFile(path); err == nil {
+			holder := string(data)
+			if len(holder) > 200 {
+				holder = holder[:200]
+			}
+			if holder != "" {
+				return holder
+			}
+		}
+		if time.Now().After(deadline) {
+			return ""
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
-	holder := string(data)
-	if len(holder) > 200 {
-		holder = holder[:200]
-	}
-	return holder
 }
 
 // LockHeldError reports a session (or path) lock held by another process.

@@ -3,6 +3,7 @@ package jsonl
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -129,4 +130,25 @@ func TestSessionLockReleaseOnClose(t *testing.T) {
 		t.Fatalf("Open after Close failed: %v", err)
 	}
 	reopened.Close()
+}
+
+// TestReadLockHolderRetriesThroughWriteGap pins the loser-side retry:
+// the winner writes the holder note microseconds AFTER taking the lock,
+// so a loser opening in that gap (or reading a partial file under
+// Windows concurrent IO) must retry briefly rather than report the lock
+// without holder info.
+func TestReadLockHolderRetriesThroughWriteGap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "holder")
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = os.WriteFile(path, []byte("pid 123\n"), 0o644)
+	}()
+	start := time.Now()
+	holder := readLockHolder(path)
+	if holder != "pid 123\n" {
+		t.Fatalf("holder = %q, want the late-written content", holder)
+	}
+	if elapsed := time.Since(start); elapsed < 15*time.Millisecond {
+		t.Fatalf("returned in %v without retrying through the write gap", elapsed)
+	}
 }
