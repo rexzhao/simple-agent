@@ -781,3 +781,72 @@ func (e *blockingToolExecutor) Execute(ctx context.Context, name string, argumen
 		return model.ToolResult{Content: "tool cancelled", IsError: true}, nil
 	}
 }
+
+// TestRunStartStatusNotDroppable pins H1a: the run-start Status rides
+// the guaranteed path (not droppable). Consumers key lifecycle
+// machinery on it — the hub starts its legacy-channel drain on
+// Status{Running:true} — so a drop over the watermark would silently
+// wedge a run with no recovery. Over-watermark subscribers must still
+// receive it, while droppable deltas are skipped as designed.
+func TestRunStartStatusNotDroppable(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "one"}, model.MessageDoneEvent{}},
+	}}
+	_, session := newTestAgent(t, provider, nil)
+
+	sub := session.Stream()
+	defer sub.Stop()
+	// Fill above the watermark but below capacity: droppable events
+	// are skipped for this subscriber from here on.
+	for i := 0; i < streamWatermark+16; i++ {
+		select {
+		case sub.sub.events <- Status{Seq: uint64(10000 + i)}:
+		default:
+			t.Fatalf("could not fill buffer at %d — unexpected", i)
+		}
+	}
+
+	if err := session.Send("hi"); err != nil {
+		t.Fatal(err)
+	}
+	// Do NOT read while the run is live: the watermark governs the
+	// CURRENT buffer length, and draining would drop it below the line
+	// (deltas would legitimately be delivered again). The buffer has
+	// headroom (watermark+16+4 < capacity), so no eviction either.
+	waitSettled(t, session)
+
+	// Drain everything and classify: the run-start Status{Running:true}
+	// must be there (non-droppable); the turn's deltas must not
+	// (droppable over the watermark).
+	sawRunStart, sawTerminal, sawDelta := false, false, false
+	for {
+		select {
+		case ev := <-sub.Events():
+			switch e := ev.(type) {
+			case Status:
+				if e.Seq < 10000 {
+					if e.Running {
+						sawRunStart = true
+					} else {
+						sawTerminal = true
+					}
+				}
+			case Transient:
+				if _, ok := e.Event.(model.TextDeltaEvent); ok {
+					sawDelta = true
+				}
+			}
+		default:
+			if !sawRunStart {
+				t.Fatal("run-start Status was dropped for the over-watermark subscriber (must be non-droppable)")
+			}
+			if !sawTerminal {
+				t.Fatal("terminal Status missing (also non-droppable)")
+			}
+			if sawDelta {
+				t.Fatal("droppable delta delivered over the watermark (watermark semantics broken)")
+			}
+			return
+		}
+	}
+}

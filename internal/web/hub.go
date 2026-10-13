@@ -14,21 +14,22 @@ import (
 // before scroll-back kicks in.
 const DefaultWindow = 200
 
-// clientBufferSize bounds one SSE client's frame backlog. Overflow closes
-// the connection; EventSource reconnects and replays. The agent is never
-// blocked: fan-out is non-blocking by implementation constraint (a
-// blocked hub would block the committer).
+// clientBufferSize bounds one SSE client frame backlog. Overflow closes
+// the connection; EventSource reconnects and replays.
 const clientBufferSize = 256
 
-// Hub is the single consumer of the session's record and event streams
-// and the fan-out point for every web client. It retains the flat record
-// stream (its own subscription view), the digest chain with an index for
-// cursor lookups, and the last status notices for /api/state.
+// Hub is the SSE bridge between one session's stream and the web
+// clients. It subscribes ONCE to the session's single ordered stream
+// (milestone A step 3): RecordCommitted → record frames, Transient →
+// event frames, Status → status frames. The ordering is the stream's
+// seq order — the hub needs no drain patches, no Wake, no per-run
+// channel attach. The digest chain is maintained by the hub (the
+// stream carries records, not digests).
 type Hub struct {
 	session *agent.Session
-	wake    chan struct{}
+	stream  *agent.StreamSubscription
 
-	// run is the hub's single loop goroutine.
+	// done is closed by Stop.
 	done chan struct{}
 
 	mu      sync.Mutex
@@ -38,15 +39,28 @@ type Hub struct {
 	clients map[*client]struct{}
 	genesis string
 
+	// The running/compacting MIRROR: what the hub has processed from
+	// the stream, not the live session state. Every status frame reads
+	// this (H2): the hub's digest/count trail the session by definition,
+	// so reading live running/compacting alongside mirror digests would
+	// emit frames that contradict the stream's order — e.g. an idle
+	// Notice frame racing ahead of the still-unprocessed final records.
+	// Initialized from the subscription snapshot (NewHub/resubscribe),
+	// updated ONLY by stream Status events.
+	running    bool
+	compacting bool
+	// processedSeq is the seq of the last SessionEvent the hub handled
+	// (the snapshot's StartSeq before any). Out-of-band frames carry it
+	// so the fan-out's seq filter treats them consistently with stream
+	// frames: a client whose snapshot is newer (startSeq >= processedSeq)
+	// skips them.
+	processedSeq uint64
+
 	// Status notices cached for /api/state (events are transient; the
 	// agent keeps no queryable history).
 	lastPressure string
 	lastRetry    string
 	lastNotice   string
-
-	// events is the currently attached run event channel (nil between
-	// runs). attachMu is not needed: only the loop goroutine touches it.
-	events <-chan model.Event
 
 	// onClients, when set, is called (outside h.mu) on every subscriber
 	// count transition — the manager's eviction clock restarts on both
@@ -60,56 +74,60 @@ type Hub struct {
 type client struct {
 	ch   chan []byte
 	done chan struct{}
+	// startSeq is the stream seq of the client's connect-time snapshot
+	// (real-time at registration). Stream-originated Transient/Status
+	// frames with seq <= startSeq are already reflected in that
+	// snapshot and are skipped for this client (H3: otherwise a client
+	// connecting while the hub trails the session would see the same
+	// deltas twice — once folded into the snapshot's Streaming content,
+	// once replayed from the hub's backlog). Record frames are exempt:
+	// the snapshot's records come from the hub's mirror, so record
+	// frames still carry records the snapshot lacks.
+	startSeq uint64
 }
 
-// NewHub starts the hub for the session. The record mirror is seeded
-// SYNCHRONOUSLY, before any client can register: the seeding used to
-// live inside the run goroutine, and a client registering in that
-// window received a snapshot with records:[] — the historical records
-// then landed in the mirror without ever being re-sent (records only
-// fan out on arrival), so the client rendered an empty thread until a
-// reconnect. Records arriving between Subscribe and the goroutine's
-// first consume are buffered by the subscription — nothing is lost.
+// NewHub starts the hub for the session. The mirror is seeded
+// SYNCHRONOUSLY from the stream's snapshot, before any client can
+// register. The stream subscription is the hub's single event source.
 func NewHub(session *agent.Session) *Hub {
 	h := &Hub{
 		session: session,
-		wake:    make(chan struct{}, 1),
 		done:    make(chan struct{}),
 		index:   make(map[string]int),
 		clients: make(map[*client]struct{}),
 		genesis: chainGenesis(session.ID()),
 	}
-	sub := session.Subscribe()
+	stream := session.Stream()
+	snap := stream.Initial()
 	h.mu.Lock()
-	for _, r := range sub.Initial() {
+	for _, r := range snap.Records {
 		h.extendLocked(r)
 	}
+	// The mirror starts at the subscription snapshot: running/compacting
+	// from its status flags, processedSeq at its StartSeq.
+	h.running = snap.StatusRunning
+	h.compacting = snap.StatusCompacting
+	h.processedSeq = snap.StartSeq
 	h.mu.Unlock()
-	go h.run(sub)
+	h.stream = stream
+	// A hub created mid-run (manager re-open) has already missed the
+	// run's Status{Running:true} event — the drain must start here too.
+	if snap.StatusRunning {
+		h.drainRunEvents()
+	}
+	go h.run()
 	return h
 }
 
-// Stop terminates the hub loop and releases its subscription: a
-// stopped hub must never sit as a dead subscriber whose full buffer
-// would block the committer on the next commit.
+// Stop terminates the hub loop and releases its stream subscription.
 func (h *Hub) Stop() {
 	h.stopOnce.Do(func() { close(h.done) })
 }
 
-// Wake reattaches the run event channel. The POST /api/send handler
-// calls it right after Send returns: Send publishes s.events under the
-// session lock, so the channel send/receive happens-before guarantees
-// the hub sees the new channel, with zero polling latency (the event
-// channel is small; late attachment could stall the run goroutine).
-func (h *Hub) Wake() {
-	select {
-	case h.wake <- struct{}{}:
-	default:
-	}
-}
-
 // Notice publishes an out-of-band status notice (e.g. an async compaction
-// failure) to every client and caches it for /api/state.
+// failure) to every client and caches it for /api/state. The frame's
+// running/compacting come from the hub mirror (H2) and carry the hub's
+// processed seq — clients whose snapshot is newer skip it (H3).
 func (h *Hub) Notice(text string) {
 	h.mu.Lock()
 	h.lastNotice = text
@@ -117,21 +135,9 @@ func (h *Hub) Notice(text string) {
 	h.mu.Unlock()
 }
 
-// BroadcastStatus pushes a status frame without touching the notice —
-// for state the server knows before any event could carry it (a
-// compaction taking the slot, for instance).
-func (h *Hub) BroadcastStatus() {
-	h.mu.Lock()
-	h.broadcastStatusLocked()
-	h.mu.Unlock()
-}
-
-// ClearNotices drops the cached transient notices (compaction failure,
-// context pressure, provider retry) and pushes a status frame. The
-// rule is uniform: notices describe a PAST event; the user's next
-// accepted action supersedes them. Without this, one compaction
-// failure (or retry) stayed on the status bar and in /api/state until
-// the next manual compact — indefinitely misleading.
+// ClearNotices drops the cached transient notices and pushes a status
+// frame. The rule is uniform: notices describe a PAST event; the
+// user's next accepted action supersedes them.
 func (h *Hub) ClearNotices() {
 	h.mu.Lock()
 	h.lastNotice = ""
@@ -141,155 +147,208 @@ func (h *Hub) ClearNotices() {
 	h.mu.Unlock()
 }
 
-func (h *Hub) run(sub *agent.Subscription) {
-	// h.done is closed by Stop only — a return here (session closed)
-	// must not race a second close.
-	//
-	// The subscription was created (and the mirror seeded) in NewHub.
-	// Whatever ends the loop, the subscription is released: a dead
-	// subscriber blocks the committer once its buffer fills.
-	defer sub.Stop()
-
+// run is the hub's single loop goroutine. It consumes SessionEvent
+// from the stream in seq order — the ordering guarantee is structural
+// (the stream assigns seq under the session lock in the same critical
+// section as the state change). Lost means the hub's subscription was
+// evicted (buffer overflow); the hub re-subscribes and reissues a
+// window snapshot to its SSE clients.
+func (h *Hub) run() {
 	for {
 		select {
-		case rec := <-sub.Records():
-			// Streaming-order guarantee: the run emits an item's STREAMING
-			// events (started, deltas) before committing its record, and the
-			// events channel is buffered — so by the time a record is
-			// readable here, those events are already queued. The select
-			// picks randomly; without this drain a record could precede
-			// them and a client would re-create a live item the record
-			// already closed. Events produced AFTER the commit (completed,
-			// tool_result — emitted once the record is durable — or the next
-			// message's started) may also be pulled ahead of this record by
-			// the drain; that is harmless, every event is ItemID-addressed
-			// and the client is idempotent for events trailing their
-			// records.
-			// The wake that attaches the run's channel can itself lag the
-			// records (select randomness) — or h.events may still hold the
-			// PREVIOUS run's drained channel. Sync to the session's current
-			// channel by identity before draining: attaching an
-			// already-drained closed channel is harmless (the settle path
-			// self-cleans it).
-			if ch := h.session.Events(); ch != nil && ch != h.events {
-				h.events = ch
-			}
-			h.drainEvents()
-			h.mu.Lock()
-			h.extendLocked(rec)
-			h.fanoutLocked(encodeRecordFrame(rec))
-			h.mu.Unlock()
-		case ev, ok := <-h.events:
-			if !ok {
-				// Run settled. The run's final commit precedes settle
-				// precedes the channel close, so any trailing record is
-				// already queued on the subscription.
-				h.events = nil
-				drainThenStatus(h, sub)
-				continue
-			}
-			h.handleEvent(ev)
-		case <-h.wake:
-			// Attach by channel identity: spurious and duplicate wakes
-			// are the norm (the previous run's channel may still be
-			// open when the next Send is accepted), and two drainers
-			// on one channel would silently split the events.
-			if ch := h.session.Events(); ch != nil && ch != h.events {
-				h.events = ch
-				// Drain events already buffered in the attached channel
-				// BEFORE any status frame: an instant run can settle before
-				// the wake arrives, and the channel (already closed) still
-				// holds the run's events — an idle status racing ahead of
-				// them reads as "the run never emitted anything".
-				h.drainEvents()
-				// The run may have settled before the wake arrived —
-				// the attached channel can already be closed — and the
-				// run's records are queued ahead of the status. A status
-				// frame must never overtake pending records either way.
-				drainThenStatus(h, sub)
-			}
-		case <-sub.Done():
-			return
+		case ev := <-h.stream.Events():
+			h.handleStreamEvent(ev)
+		case <-h.stream.Lost():
+			h.resubscribe()
 		case <-h.done:
+			h.stream.Stop()
 			return
 		}
 	}
 }
 
-// drainEvents delivers events already buffered in h.events, in
-// order, without letting the main select reorder them behind a record
-// or a status frame. A closed channel reads as instantly-ready
-// forever — the ok check is what stops the loop — and the close
-// itself is left for the main loop's settle path (a second
-// drainThenStatus is a harmless idempotent snapshot).
-func (h *Hub) drainEvents() {
-	for {
-		select {
-		case ev, ok := <-h.events:
-			if !ok {
-				return
-			}
-			h.handleEvent(ev)
-		default:
-			return
+// handleStreamEvent maps one SessionEvent onto SSE frames and the
+// hub's mirror. Runs on the hub loop goroutine.
+func (h *Hub) handleStreamEvent(ev agent.SessionEvent) {
+	switch e := ev.(type) {
+	case agent.RecordCommitted:
+		h.mu.Lock()
+		h.extendLocked(e.Record)
+		h.processedSeq = e.Seq
+		// Record frames bypass the seq filter: a client's snapshot
+		// carries the hub MIRROR's records, so record frames still
+		// deliver records the snapshot lacks (H3's exemption).
+		h.fanoutLocked(encodeRecordFrame(e.Record), e.Seq, false)
+		h.mu.Unlock()
+	case agent.Transient:
+		h.handleEvent(e.Event, e.Seq)
+	case agent.Status:
+		h.mu.Lock()
+		// The mirror IS the event's fields: update it, then broadcast
+		// from it — every status frame now reads state the hub has
+		// actually processed, in stream order (H2).
+		h.running = e.Running
+		h.compacting = e.Compacting
+		h.processedSeq = e.Seq
+		h.broadcastStatusLocked()
+		h.mu.Unlock()
+		if e.Running {
+			h.drainRunEvents()
 		}
 	}
 }
 
-// drainThenStatus forwards every record already queued on the
-// subscription, then broadcasts the current run state. A status frame
-// must never overtake pending records — "idle" racing ahead of the
-// final record reads as a lost answer. Runs on the hub loop goroutine.
-func drainThenStatus(h *Hub, sub *agent.Subscription) {
-	for {
-		select {
-		case rec := <-sub.Records():
-			h.mu.Lock()
-			h.extendLocked(rec)
-			h.fanoutLocked(encodeRecordFrame(rec))
-			h.mu.Unlock()
-		default:
-			h.mu.Lock()
-			h.broadcastStatusLocked()
-			h.mu.Unlock()
-			return
+// drainRunEvents null-drains the active run's per-run event channel.
+// That channel is the CLI's transition path (milestone A step 4
+// deletes it); its sends BLOCK when full, and a web-only session has
+// no other consumer — without this drain, a turn emitting more than
+// its buffer (256) transient events (a long streaming response)
+// wedges the run forever. The drain exits when the run's teardown
+// closes the channel; deleted together with the per-run channel.
+// Multiple drainers may share one channel (replayed run-start
+// statuses, resubscribe alongside a mid-run NewHub path): they just
+// split the reads — harmless for a null drain.
+func (h *Hub) drainRunEvents() {
+	ch := h.session.Events()
+	if ch == nil {
+		return
+	}
+	go func() {
+		for range ch {
 		}
+	}()
+}
+
+// resubscribe recovers from an evicted stream subscription: stop the
+// old one, start a fresh one, rebuild the mirror from the snapshot,
+// and reissue a window snapshot to every connected SSE client (they
+// converge to the current state; the resumed=false anchor means each
+// client does a clean rebuild).
+func (h *Hub) resubscribe() {
+	h.stream.Stop()
+	stream := h.session.Stream()
+	snap := stream.Initial()
+
+	h.mu.Lock()
+	// Rebuild the mirror from the snapshot (the hub may have missed
+	// records while evicted). The rebuild is idempotent for the
+	// records the hub already holds.
+	h.records = nil
+	h.chain = h.chain[:0]
+	for k := range h.index {
+		delete(h.index, k)
+	}
+	for _, r := range snap.Records {
+		h.extendLocked(r)
+	}
+	// The status mirror and processed position restart at the fresh
+	// snapshot (H2): everything up to its StartSeq is reflected in it.
+	h.running = snap.StatusRunning
+	h.compacting = snap.StatusCompacting
+	h.processedSeq = snap.StartSeq
+	// Window reissue: a fresh snapshot frame to every connected client.
+	// Each client sees resumed=false + the new anchor and does a clean
+	// rebuild (the client's existing code handles this path — the same
+	// as a missed from= on reconnect).
+	total := len(h.records)
+	start := total - DefaultWindow
+	if start < 0 {
+		start = 0
+	}
+	windowed := append([]storage.Record(nil), h.records[start:total]...)
+	encoded, _ := json.Marshal(windowed)
+	running := snap.StatusRunning
+	compacting := snap.StatusCompacting
+	f := Frame{
+		Kind:       "snapshot",
+		Anchor:     h.chainAtLocked(start),
+		Resumed:    false,
+		Total:      total,
+		More:       start > 0,
+		Records:    encoded,
+		Running:    &running,
+		Compacting: &compacting,
+		Digest:     h.chainHeadLocked(),
+	}
+	if snap.Streaming != nil {
+		f.Streaming = &StreamingWire{
+			Item:      snap.Streaming.ItemID,
+			Content:   snap.Streaming.Message.Content,
+			Reasoning: snap.Streaming.Message.ReasoningContent,
+		}
+	}
+	if snap.Running != nil {
+		f.Tool = &ToolWire{
+			Item:   snap.Running.ItemID,
+			CallID: snap.Running.ToolCall.ID,
+			Name:   snap.Running.ToolCall.Name,
+			Args:   snap.Running.ToolCall.Arguments,
+		}
+	}
+	for _, entry := range snap.Steered {
+		f.Steered = append(f.Steered, SteeredWire{Item: entry.ItemID, Text: entry.Text})
+	}
+	// The reissue is a snapshot in its own right: delivered to every
+	// client unconditionally (a client's startSeq can only be older —
+	// everything the hub fans out after this has seq > snap.StartSeq).
+	h.fanoutLocked(encodeFrame(f), 0, false)
+	// A status frame alongside carries the cached notice (the snapshot
+	// frame does not); its running/compacting read the mirror just
+	// initialized from the same snapshot, so the two frames agree.
+	h.broadcastStatusLocked()
+	h.mu.Unlock()
+	h.stream = stream
+
+	// A run that started while the hub was evicted never delivered its
+	// Status{Running:true} — the fresh subscription skips events at or
+	// below its startSeq (S1), so the stream will not carry it either.
+	// The snapshot is the RELIABLE signal: if it shows a run active,
+	// the legacy-channel drain must start here (H1: without it, a run
+	// emitting more than the channel buffer (256) transient events
+	// wedges forever). Stale run-start statuses still buffered in the
+	// old subscription may ALSO incidentally spawn a drain when the
+	// loop drains them before taking Lost — an extra safety net, not
+	// a substitute: the backlog is abandoned on re-subscription and
+	// nothing guarantees those events are ever processed.
+	if snap.StatusRunning {
+		h.drainRunEvents()
 	}
 }
 
 // handleEvent fans one transient event out to the clients and refreshes
 // the cached status notices. Runs on the hub loop goroutine.
-func (h *Hub) handleEvent(ev model.Event) {
+func (h *Hub) handleEvent(ev model.Event, seq uint64) {
 	switch e := ev.(type) {
 	case model.ContextPressureEvent:
 		h.mu.Lock()
 		h.lastPressure = formatPressure(e)
+		h.processedSeq = seq
 		h.mu.Unlock()
 	case model.ProviderRetryEvent:
 		h.mu.Lock()
 		h.lastRetry = formatRetry(e)
+		h.processedSeq = seq
 		h.mu.Unlock()
 	case model.CompactionFailedEvent:
-		// A degraded soft compaction: cached as the notice and pushed
-		// immediately so connected pages see it (a reconnecting page
-		// gets it via the snapshot). Cleared by the next user action
-		// (ClearNotices) or a successful compaction (below) — never
-		// stuck.
 		h.mu.Lock()
 		h.lastNotice = "compaction failed (soft pressure; run continues): " + e.Reason
+		h.processedSeq = seq
 		h.broadcastStatusLocked()
 		h.mu.Unlock()
 	case model.CompactionCompletedEvent:
-		// A successful compaction supersedes any stale failure notice —
-		// pushed immediately, not at the run's settle.
 		h.mu.Lock()
 		h.lastNotice = ""
+		h.processedSeq = seq
 		h.broadcastStatusLocked()
+		h.mu.Unlock()
+	default:
+		h.mu.Lock()
+		h.processedSeq = seq
 		h.mu.Unlock()
 	}
 	if frame, ok := encodeEventFrame(ev); ok {
 		h.mu.Lock()
-		h.fanoutLocked(encodeFrame(frame))
+		h.fanoutLocked(encodeFrame(frame), seq, true)
 		h.mu.Unlock()
 	}
 }
@@ -334,10 +393,20 @@ func (h *Hub) chainAtLocked(k int) string {
 
 // fanoutLocked delivers a pre-encoded frame to every client without ever
 // blocking: a full client buffer closes that connection (it reconnects
-// and replays); the hub — and behind it the committer — always proceeds.
-// Callers hold h.mu.
-func (h *Hub) fanoutLocked(frame []byte) {
+// and replays); the hub — and behind it the stream — always proceeds.
+// seq is the stream position the frame reflects; skipKnown filters
+// stream-originated Transient/Status frames for clients whose snapshot
+// already includes that position (seq <= client.startSeq — H3: the
+// snapshot's transient slots are real-time, so replaying those events
+// would duplicate deltas). Record frames pass skipKnown=false: the
+// snapshot's records come from the hub mirror, which may lag the
+// client's snapshot — record frames are how it catches up. Callers
+// hold h.mu.
+func (h *Hub) fanoutLocked(frame []byte, seq uint64, skipKnown bool) {
 	for c := range h.clients {
+		if skipKnown && seq <= c.startSeq {
+			continue // already reflected in this client's snapshot
+		}
 		select {
 		case c.ch <- frame:
 		default:
@@ -357,17 +426,33 @@ func (h *Hub) dropClientLocked(c *client) {
 // broadcastStatusLocked sends a status frame reflecting the current run
 // state. Callers hold h.mu.
 func (h *Hub) broadcastStatusLocked() {
-	running := h.session.Running()
-	compacting := h.session.Compacting()
+	// A notice is NEW information for every client — the snapshot
+	// frame carries no Notice field, so the seq filter must NOT skip
+	// notice-bearing frames for clients whose snapshot is at or past
+	// the hub's processed position. The positional fields are omitted
+	// on purpose: at notice time the hub's mirror may trail a fresh
+	// client's snapshot, and re-sending stale running/compacting/
+	// digest would regress it (its next positional truth is the next
+	// stream status frame, which the filter already orders). Both
+	// clients treat absent positional fields as "no change".
+	if h.lastNotice != "" {
+		h.fanoutLocked(encodeFrame(Frame{Kind: "status", Notice: h.lastNotice}), 0, false)
+		return
+	}
+	// Positional frame: reads the MIRROR (H2) — running/compacting as
+	// the hub has processed them, alongside the mirror's digest/count —
+	// and carries the hub's processed seq, so clients whose snapshot is
+	// newer skip it (H3) instead of being regressed.
+	running := h.running
+	compacting := h.compacting
 	frame := encodeFrame(Frame{
 		Kind:       "status",
 		Running:    &running,
 		Compacting: &compacting,
 		Digest:     h.chainHeadLocked(),
 		Count:      len(h.records),
-		Notice:     h.lastNotice,
 	})
-	h.fanoutLocked(frame)
+	h.fanoutLocked(frame, h.processedSeq, true)
 }
 
 // register connects one SSE client. The returned snapshot frame and the
@@ -382,8 +467,25 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 	h.mu.Lock()
 	// NOT deferred: the client-count observer must run outside h.mu
 	// (it takes the manager's lock).
+	c, f, err := h.registerLocked(from, window)
+	count := len(h.clients)
+	onClients := h.onClients
+	h.mu.Unlock()
+	if err != nil {
+		return nil, nil, err
+	}
+	if onClients != nil {
+		onClients(count)
+	}
+	return c, f, nil
+}
 
+// registerLocked is register's body; the caller holds h.mu. Split so
+// tests can register at a controlled stream position (the hub loop
+// frozen mid-backlog) — the (P, S] window the seq filter exists for.
+func (h *Hub) registerLocked(from string, window int) (*client, []byte, error) {
 	total := len(h.records)
+
 	start := total - window
 	if start < 0 {
 		start = 0
@@ -399,13 +501,19 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 	windowed = append(windowed, h.records[start:total]...)
 	encoded, err := json.Marshal(windowed)
 	if err != nil {
-		h.mu.Unlock()
 		return nil, nil, err
 	}
 
-	snapshot := h.session.Snapshot()
-	running := h.session.Running()
-	compacting := h.session.Compacting()
+	// Snapshot-frame state comes from ONE atomic snapshot — the light
+	// variant without the record copy (records are the hub mirror's,
+	// above): Snapshot()+Running()+Compacting() would be three separate
+	// lock acquisitions racing each other mid-transition. The snapshot
+	// is REAL-TIME by design: everything with seq <= its StartSeq is
+	// reflected in it, and the fan-out's seq filter keeps replayed
+	// transients from duplicating it (H3).
+	snapshot := h.session.SnapshotStreamState()
+	running := snapshot.StatusRunning
+	compacting := snapshot.StatusCompacting
 	f := Frame{
 		Kind:       "snapshot",
 		Anchor:     h.chainAtLocked(start),
@@ -436,14 +544,12 @@ func (h *Hub) register(from string, window int) (*client, []byte, error) {
 		f.Steered = append(f.Steered, SteeredWire{Item: entry.ItemID, Text: entry.Text})
 	}
 
-	c := &client{ch: make(chan []byte, clientBufferSize), done: make(chan struct{})}
-	h.clients[c] = struct{}{}
-	count := len(h.clients)
-	onClients := h.onClients
-	h.mu.Unlock()
-	if onClients != nil {
-		onClients(count)
+	c := &client{
+		ch:       make(chan []byte, clientBufferSize),
+		done:     make(chan struct{}),
+		startSeq: snapshot.StartSeq,
 	}
+	h.clients[c] = struct{}{}
 	return c, encodeFrame(f), nil
 }
 
@@ -512,21 +618,24 @@ type state struct {
 }
 
 func (h *Hub) state() state {
-	snapshot := h.session.Snapshot()
+	// One atomic snapshot for the transient slots — the same race
+	// argument as register, and the light variant (no record copy:
+	// /api/state is polled). running/compacting read the hub MIRROR
+	// (H2), keeping /api/state consistent with the frames the same
+	// clients see on the stream.
+	snapshot := h.session.SnapshotStreamState()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := state{
 		Session:    h.session.ID(),
-		Running:    h.session.Running(),
-		Compacting: snapshot.Compacting != nil,
+		Running:    h.running,
+		Compacting: h.compacting,
 		Count:      len(h.records),
 		Digest:     h.chainHeadLocked(),
 		Pressure:   h.lastPressure,
 		Retry:      h.lastRetry,
 		Notice:     h.lastNotice,
 	}
-	// The wire DTO, not the internal StreamingItem (untagged keys, the
-	// whole Message shape) — the same trap the snapshot frame fixed.
 	if snapshot.Streaming != nil {
 		s.Streaming = &StreamingWire{
 			Item:      snapshot.Streaming.ItemID,

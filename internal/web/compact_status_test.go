@@ -21,6 +21,13 @@ type blockSummaryProvider struct {
 	turns   int
 	freeAt  int // calls with index > freeAt block
 	release chan struct{}
+	// blocked, when non-nil, is closed once — the first time a call
+	// parks on release. Tests synchronize on it before closing release:
+	// the run-start Status precedes the provider call, so releasing on
+	// the Status alone races the capture of the release channel (a
+	// late capture parks on the replacement channel forever).
+	blockedOnce sync.Once
+	blocked     chan struct{}
 }
 
 func (p *blockSummaryProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
@@ -34,6 +41,9 @@ func (p *blockSummaryProvider) Stream(ctx context.Context, request model.Request
 		p.mu.Lock()
 		release := p.release
 		p.mu.Unlock()
+		if p.blocked != nil {
+			p.blockedOnce.Do(func() { close(p.blocked) })
+		}
 		go func() {
 			select {
 			case <-release:
@@ -52,21 +62,29 @@ func (p *blockSummaryProvider) Stream(ctx context.Context, request model.Request
 }
 
 // readFrames streams SSE frames until the condition is met or the
-// deadline passes, returning the frames seen.
+// deadline passes, returning the frames seen. The request carries a
+// context deadline: without it, a blocked read (condition never met,
+// hub idle) never returns, and the test's server cleanup hangs on the
+// open connection forever.
 func readFrames(t *testing.T, url string, cond func(Frame) bool) []Frame {
 	t.Helper()
-	res, err := http.Get(url) //nolint:noctx // test
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
 	br := bufio.NewReader(res.Body)
 	var frames []Frame
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("stream read after %d frames: %v", len(frames), err)
 		}
 		line = strings.TrimRight(line, "\n")
 		if !strings.HasPrefix(line, "data: ") {
@@ -80,9 +98,12 @@ func readFrames(t *testing.T, url string, cond func(Frame) bool) []Frame {
 		if cond(f) {
 			return frames
 		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("condition never met")
+		default:
+		}
 	}
-	t.Fatal("condition never met")
-	return nil
 }
 
 // TestCompactStatusBroadcast pins the compacting transient state on
@@ -91,7 +112,7 @@ func readFrames(t *testing.T, url string, cond func(Frame) bool) []Frame {
 // see the compaction assumes idle mid-compact — the exact assumption
 // that routed sends into the steer-panic path.
 func TestCompactStatusBroadcast(t *testing.T) {
-	provider := &blockSummaryProvider{freeAt: 1, release: make(chan struct{})}
+	provider := &blockSummaryProvider{freeAt: 1, release: make(chan struct{}), blocked: make(chan struct{})}
 	t.Cleanup(func() { close(provider.release) })
 	session, _, base := newTestManagerServer(t, provider)
 
@@ -101,36 +122,68 @@ func TestCompactStatusBroadcast(t *testing.T) {
 	}
 	waitFor(t, 5*time.Second, func() bool { return !session.Running() })
 
-	// A subscriber is watching before the compaction starts.
-	frames := make(chan []Frame, 1)
-	go func() {
-		fs := readFrames(t, base.URL+api(session, "/stream"), func(f Frame) bool {
-			return f.Kind == "status" && f.Compacting != nil && *f.Compacting
-		})
-		frames <- fs
-	}()
+	// Connect the subscriber FIRST, in the main goroutine: once
+	// http.Get returns, the hub has registered the client and flushed
+	// the connect snapshot (the response headers travel with the first
+	// write) — the compacting status broadcast cannot race the
+	// registration.
+	res, cancel := sseGet(t, base.URL+api(session, "/stream"))
+	defer cancel()
+	defer res.Body.Close()
+	br := bufio.NewReader(res.Body)
 
 	// Trigger the compaction; its summary blocks.
 	if err := postJSON(t, base.URL, api(session, "/compact"), map[string]string{}); err != nil {
 		t.Fatal(err)
 	}
 
-	select {
-	case fs := <-frames:
-		sawSnapshot := false
-		for _, f := range fs {
-			if f.Kind == "snapshot" {
-				sawSnapshot = true
+	// The compacting:true transition arrives as a live status frame
+	// (the client was registered before the compact started).
+	sawSnapshot := false
+	compactingSeen := false
+	deadline := time.Now().Add(10 * time.Second)
+	for !compactingSeen && time.Now().Before(deadline) {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("stream read: %v", err)
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var f Frame
+		if err := json.Unmarshal([]byte(strings.TrimRight(line[6:], "\n")), &f); err != nil {
+			t.Fatalf("frame: %v (%s)", err, line)
+		}
+		switch f.Kind {
+		case "snapshot":
+			// The subscriber connected while idle — its connect snapshot
+			// must NOT report compacting (the compact has not started).
+			sawSnapshot = true
+			if f.Compacting != nil && *f.Compacting {
+				t.Fatal("connect snapshot reported compacting before the compact started")
+			}
+		case "status":
+			if f.Compacting != nil && *f.Compacting {
+				compactingSeen = true
 			}
 		}
-		if !sawSnapshot {
-			t.Fatal("no snapshot frame before the compacting status")
-		}
-	case <-time.After(10 * time.Second):
+	}
+	if !compactingSeen {
 		t.Fatal("no compacting:true status frame within 10s")
 	}
+	if !sawSnapshot {
+		t.Fatal("no snapshot frame before the compacting status")
+	}
 
-	// Release and wait for the end-of-compact notice broadcast.
+	// Release and wait for the end-of-compact notice broadcast. The
+	// summary must have PARKED first: the compacting:true status
+	// precedes the provider call, and releasing before the call
+	// captures the channel would park it on the replacement forever.
+	select {
+	case <-provider.blocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the summary never parked on the release channel")
+	}
 	provider.mu.Lock()
 	release := provider.release
 	provider.release = make(chan struct{})
@@ -149,19 +202,24 @@ func TestCompactStatusBroadcast(t *testing.T) {
 // emits events before committing, but the hub's select chose channels
 // randomly — a record could overtake its own completed event, and a
 // client would re-create a live item the record already closed. The
-// hub now drains queued events before forwarding a record.
+// hub now consumes the single ordered stream, so the interleave is
+// structural (seq total order): the strengthened assertions below pin
+// the full frame sequence — user.input record → running:true status →
+// the run's events and records → terminal running:false status, with
+// nothing after the terminal. (Driven via session.Send, not POST
+// /send: handleSend's ClearNotices broadcasts an out-of-band status
+// frame whose position is legitimately racy — clients must tolerate
+// it, but this test pins the stream's own order.)
 func TestEventRecordCausalOrder(t *testing.T) {
 	session, _, base := newTestServer(t, [][]model.Event{{model.TextDeltaEvent{Text: "a1"}, model.MessageDoneEvent{}}})
 
-	res, err := http.Get(base.URL + api(session, "/stream")) //nolint:noctx // test
-	if err != nil {
-		t.Fatal(err)
-	}
+	res, cancel := sseGet(t, base.URL+api(session, "/stream"))
+	defer cancel()
 	defer res.Body.Close()
 
 	// Send while the subscriber is connected; read frames until the
 	// run settles with both assistant records delivered.
-	if err := postJSON(t, base.URL, api(session, "/send"), map[string]string{"text": "q"}); err != nil {
+	if err := session.Send("q"); err != nil {
 		t.Fatal(err)
 	}
 	br := bufio.NewReader(res.Body)
@@ -250,6 +308,61 @@ func TestEventRecordCausalOrder(t *testing.T) {
 		}
 		t.Fatalf("insufficient events: %d stream events, %d completed", checkedStreams, checkedCompleted)
 	}
+
+	// Strengthened (step 3): the stream's seq total order makes the
+	// frame interleave structural — pin the transitions, not just the
+	// per-item pairs.
+	idxFirstEvent, idxUserInput, idxRunningTrue, idxRunningFalse, idxLastAssistantRecord := -1, -1, -1, -1, -1
+	for fi, f := range frames {
+		switch {
+		case f.Kind == "record" && f.Record != nil:
+			var r struct {
+				Item string `json:"item"`
+				T    string `json:"t"`
+			}
+			_ = json.Unmarshal(f.Record, &r)
+			switch r.T {
+			case "user.input":
+				if idxUserInput == -1 {
+					idxUserInput = fi
+				}
+			case "assistant.message":
+				idxLastAssistantRecord = fi
+			}
+		case f.Kind == "event" && idxFirstEvent == -1:
+			idxFirstEvent = fi
+		case f.Kind == "status":
+			if f.Running != nil {
+				if *f.Running && idxRunningTrue == -1 {
+					idxRunningTrue = fi
+				}
+				if !*f.Running && idxRunningFalse == -1 {
+					idxRunningFalse = fi
+				}
+			}
+		}
+	}
+	if idxUserInput == -1 || idxRunningTrue == -1 || idxRunningFalse == -1 || idxLastAssistantRecord == -1 || idxFirstEvent == -1 {
+		t.Fatalf("missing frames: user.input=%d running:true@%d first-event@%d assistant-record=%d running:false@%d",
+			idxUserInput, idxRunningTrue, idxFirstEvent, idxLastAssistantRecord, idxRunningFalse)
+	}
+	if idxUserInput > idxRunningTrue {
+		t.Fatalf("user.input record (%d) must precede the running:true status (%d)", idxUserInput, idxRunningTrue)
+	}
+	if idxRunningTrue > idxFirstEvent {
+		t.Fatalf("running:true status (%d) must precede the run's events (%d)", idxRunningTrue, idxFirstEvent)
+	}
+	if idxRunningFalse < idxLastAssistantRecord {
+		t.Fatalf("terminal running:false status (%d) must follow the last assistant record (%d)", idxRunningFalse, idxLastAssistantRecord)
+	}
+	// The terminal status is the run's last word: no record or event
+	// frame may trail it.
+	for fi := idxRunningFalse + 1; fi < len(frames); fi++ {
+		f := frames[fi]
+		if f.Kind == "record" || f.Kind == "event" {
+			t.Fatalf("frame after terminal status: [%d] kind=%s type=%s item=%s", fi, f.Kind, f.Type, f.Item)
+		}
+	}
 }
 
 // TestCompactionFailedEventWireAndNotice pins the degraded soft
@@ -288,7 +401,7 @@ func TestCompactionFailedEventWireAndNotice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"})
+	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"}, 1)
 	release()
 
 	res2, err := http.Get(base.URL + api(session, "/state")) //nolint:noctx // test
@@ -325,7 +438,7 @@ func TestNoticeClearedByNextSend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"})
+	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"}, 1)
 	release()
 
 	// Visible on /api/state.
@@ -347,10 +460,8 @@ func TestNoticeClearedByNextSend(t *testing.T) {
 	// with a manual loop (readFrames' helper hides the per-line
 	// interleaving this needs): snapshot first, then the send, then
 	// frames until a status carrying an empty notice.
-	streamRes, err := http.Get(base.URL + api(session, "/stream")) //nolint:noctx // test
-	if err != nil {
-		t.Fatal(err)
-	}
+	streamRes, streamCancel := sseGet(t, base.URL+api(session, "/stream"))
+	defer streamCancel()
 	defer streamRes.Body.Close()
 	br := bufio.NewReader(streamRes.Body)
 	readLine := func() (string, error) {
@@ -480,7 +591,7 @@ func TestCompactionEventsBroadcastImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
-	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"})
+	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"}, 1)
 	f := nextFrame()
 	if f.Kind == "event" {
 		t.Fatal("the failure arrived as a bare event frame — the status broadcast is missing")
@@ -491,7 +602,7 @@ func TestCompactionEventsBroadcastImmediately(t *testing.T) {
 
 	// And the completion clears it — also immediately. (The failure's
 	// own event frame is still queued ahead; skip event frames.)
-	entry.hub.handleEvent(model.CompactionCompletedEvent{ItemID: "x1"})
+	entry.hub.handleEvent(model.CompactionCompletedEvent{ItemID: "x1"}, 1)
 	for {
 		f = nextFrame()
 		if f.Kind == "event" {
@@ -501,5 +612,65 @@ func TestCompactionEventsBroadcastImmediately(t *testing.T) {
 	}
 	if f.Kind != "status" || f.Notice != "" {
 		t.Fatalf("frame after the completion = kind %s notice %q, want a status frame with an empty notice", f.Kind, f.Notice)
+	}
+}
+
+// TestManualCompactLifecycleEvents pins N3: a manual /compact emits the
+// same CompactionStarted/Completed transient events as auto-compaction,
+// and they reach SSE clients as event frames through the session stream
+// (this is what let handleCompact's polling be deleted).
+func TestManualCompactLifecycleEvents(t *testing.T) {
+	// Turn 1: the context-building send; turn 2: the compaction summary.
+	provider := &webFakeProvider{turns: [][]model.Event{
+		{model.TextDeltaEvent{Text: "answer"}, model.MessageDoneEvent{}},
+		{model.TextDeltaEvent{Text: "summary"}, model.MessageDoneEvent{}},
+	}}
+	session, _, base := newTestManagerServer(t, provider)
+
+	if err := session.Send("hello"); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+
+	// Connect first (registration is complete once http.Get returns),
+	// then trigger — the lifecycle events cannot race the subscription.
+	res, cancel := sseGet(t, base.URL+api(session, "/stream"))
+	defer cancel()
+	defer res.Body.Close()
+
+	if err := postJSON(t, base.URL, api(session, "/compact"), map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+
+	br := bufio.NewReader(res.Body)
+	sawStarted, sawCompleted := false, false
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("stream read: %v", err)
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var f Frame
+		if err := json.Unmarshal([]byte(strings.TrimRight(line[6:], "\n")), &f); err != nil {
+			t.Fatalf("frame: %v (%s)", err, line)
+		}
+		if f.Kind != "event" {
+			continue
+		}
+		switch f.Type {
+		case "compaction_started":
+			sawStarted = true
+		case "compaction_completed":
+			sawCompleted = true
+		}
+		if sawCompleted {
+			break
+		}
+	}
+	if !sawStarted || !sawCompleted {
+		t.Fatalf("manual compact lifecycle events missing: started=%v completed=%v", sawStarted, sawCompleted)
 	}
 }

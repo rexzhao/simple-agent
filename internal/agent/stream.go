@@ -64,12 +64,13 @@ type streamSub struct {
 	startSeq uint64
 }
 
-// registerStreamLocked builds the snapshot, records the start seq, and
-// registers the subscriber — all under s.mu (the caller holds it).
-// Extracted so Stream() and deterministic tests share one code path.
-func (s *Session) registerStreamLocked(sub *streamSub) StreamSnapshot {
+// streamStateLocked captures the state half of a snapshot — transient
+// slots, steer queue, status flags, and the current stream seq — without
+// copying records. The caller holds s.mu. StartSeq is set here: the
+// state and the seq are captured in one lock section, so "everything
+// with seq <= StartSeq is reflected in this state" is structural.
+func (s *Session) streamStateLocked() StreamSnapshot {
 	var snap StreamSnapshot
-	snap.Records = append([]storage.Record(nil), s.records...)
 	if s.state.Streaming != nil {
 		st := *s.state.Streaming
 		snap.Streaming = &st
@@ -85,37 +86,86 @@ func (s *Session) registerStreamLocked(sub *streamSub) StreamSnapshot {
 	snap.Steered = append([]storage.SteeredItem(nil), s.state.Steered...)
 	snap.StatusRunning = s.currentRun != nil
 	snap.StatusCompacting = s.state.Compacting != nil
+	snap.StartSeq = s.streamSeq
+	return snap
+}
 
+// streamSnapshotLocked captures the full snapshot: the state half plus
+// a deep copy of the record history — the shared body of
+// registerStreamLocked and SnapshotStream. The caller holds s.mu.
+func (s *Session) streamSnapshotLocked() StreamSnapshot {
+	snap := s.streamStateLocked()
+	snap.Records = append([]storage.Record(nil), s.records...)
+	return snap
+}
+
+// registerStreamLocked builds the snapshot, records the start seq, and
+// registers the subscriber — all under s.mu (the caller holds it).
+// Extracted so Stream() and deterministic tests share one code path.
+func (s *Session) registerStreamLocked(sub *streamSub) StreamSnapshot {
+	snap := s.streamSnapshotLocked()
 	if s.streamSubs == nil {
 		s.streamSubs = make(map[*streamSub]struct{})
 	}
 	s.streamSubs[sub] = struct{}{}
 	// S1: the subscriber's seq starts AFTER everything already queued.
+	// (snap.StartSeq is already s.streamSeq — set by streamStateLocked.)
 	sub.startSeq = s.streamSeq
-	snap.StartSeq = s.streamSeq
 	return snap
 }
 
-// StreamSubscription is the public handle for one stream subscriber.
-// StreamSnapshot is the atomic state snapshot returned by Initial():
-// records + transient slots + steer queue + status, all copied under
-// one lock section (§14.2). The hub (step 3) uses this to construct
-// the SSE snapshot frame without a separate Snapshot() call that
-// could race the stream.
+// SnapshotStream returns an atomic state snapshot in the same shape as
+// StreamSubscription.Initial(), WITHOUT subscribing — for consumers
+// (the web hub seeding its mirror from a fresh subscription's
+// Initial()) that need the atomic copy including the record history.
+// It deep-copies every record: fine for hub creation and
+// re-subscription (rare), wrong for per-request callers — those want
+// SnapshotStreamState.
+func (s *Session) SnapshotStream() StreamSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streamSnapshotLocked()
+}
+
+// SnapshotStreamState is the per-request variant of SnapshotStream:
+// the same atomic lock section, but Records is left nil — the callers
+// (the hub's connect-time snapshot frame, /api/state) source records
+// from their own mirror and must not pay a full-history copy on every
+// request or poll.
+func (s *Session) SnapshotStreamState() StreamSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streamStateLocked()
+}
+
+// StreamSnapshot is an atomic state snapshot: records + transient
+// slots + steer queue + status + the stream position, all copied
+// under one lock section (§14.2). Stream() subscriptions return it
+// from Initial(); SnapshotStream/SnapshotStreamState return it
+// without subscribing. The structural guarantee: everything enqueued
+// with seq <= StartSeq is already reflected in the snapshot's state
+// (state change and seq assignment share one lock section), and
+// every event with seq > StartSeq arrives later on Events().
 type StreamSnapshot struct {
 	Records    []storage.Record
 	Streaming  *storage.StreamingItem
 	Running    *storage.RunningTool
 	Compacting *storage.CompactingItem
 	Steered    []storage.SteeredItem
-	// Status mirrors the transient control state at subscription time.
+	// Status mirrors the transient control state at snapshot time.
 	StatusRunning    bool
 	StatusCompacting bool
-	// StartSeq is the stream seq at registration (under s.mu):
-	// every event later delivered on Events() has seq > StartSeq.
+	// StartSeq is the stream seq at snapshot time (under s.mu): every
+	// event later delivered on Events() has seq > StartSeq. Also set
+	// by the non-subscribing SnapshotStreamState — the hub uses it as
+	// the client's startSeq so replayed transients can be filtered
+	// (S1's rule, applied one layer down at the SSE fan-out).
 	StartSeq uint64
 }
 
+// StreamSubscription is the public handle for one stream subscriber:
+// Initial() for the connect-time snapshot, Events()/Lost() for the
+// ordered delivery, Stop() to release the subscription.
 type StreamSubscription struct {
 	session  *Session
 	sub      *streamSub

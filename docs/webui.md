@@ -78,7 +78,7 @@ cmd/sai            -http <addr> 启动 serve 模式：web server + debug REPL
                    -http-static <dir> 在 /chat 托管独立构建的聊天客户端
 internal/web       server.go   HTTP mux + 生命周期 + 关停（Stop+Close，
                                flush 日志、不留 log.jsonl.next、释放会话锁）
-                   hub.go      记录/事件的单消费者 fan-out（全程非阻塞）
+                   hub.go      会话流的单消费者 fan-out（全程非阻塞，订阅单一有序流）
                    wire.go     model.Event → tagged JSON（事件无 json tag）
                    static/     index.html + app.js + style.css（go:embed，
                                托管在 /log）
@@ -149,7 +149,7 @@ hᵢ = SHA256(hᵢ₋₁ + "\n" + 输入串)
 
 **连接**：`GET /api/stream?from=<h>`：
 
-- hub 维护 `h → 位置` 映射（**启动时由 `Subscribe().Initial()`
+- hub 维护 `h → 位置` 映射（**启动时由 `Stream().Initial().Records`
   重建**）；为控内存可只保留最近 K 条前缀，旧 h miss → 窗口重放，
   这是有意降级非 bug
 - **命中** → 只补发 h 之后的记录，页面追加，链继续
@@ -188,35 +188,66 @@ h_{k−M}，客户端校验 `fold(h_{k−M}, 返回记录) == h_k`——严格�
 取代** delta 累积内容，行转为已持久化样式；run 结束无 streaming 残留。
 
 **中途连接**：Started 事件对"流已开始后才连上"的客户端已过去——
-SSE 建连的**第一帧是 `snapshot`**：一次 `Snapshot()`（含
-Streaming/Running 槽）+ 一次 `Subscribe()` 的 Initial。两者非同一次
-取锁、有重叠，但"record 取代同 ItemID streaming 行"的规则使重叠
-良性（同 ItemID 幂等覆盖）；此场景写进文档并有测试。
+SSE 建连的**第一帧是 `snapshot`**：一次原子的 `SnapshotStream()`
+（records 由 hub 镜像提供，Streaming/Running 槽、steer 队列与
+running/compacting 状态同一锁段拷贝，§4.3）。“record 取代同 ItemID
+streaming 行”的规则使任何重叠良性（同 ItemID 幂等覆盖）；此场景
+写进文档并有测试。
 
 **协议声明**：瞬态事件是 **best-effort**——任何时刻丢失只影响
 "正在打字"的观感，最终 record 会取代它。正确性只挂在记录流上。
 
-### 4.3 事件通道的挂接（真竞态与其边界）
+### 4.3 事件源：单一有序会话流（milestone A step 3）
 
-`Events()` 每 run 一通道；`sendEvent` 满通道（256）阻塞 run
-goroutine。挂接协议：
+hub 不再挂接 per-run 事件通道，而是**订阅会话的单一有序流**
+（`Session.Stream()`，见 design §14.2）：seq 在会话锁内分配，
+`RecordCommitted`/`Transient`/`Status` 三类事件按全序投递，hub 是
+唯一的流消费者，帧序即 seq 序——旧的 wake/挂接/排干补丁全部删除。
 
-- `POST /api/send` 在 `Send()` 返回后**立即唤醒 hub**（buffered
-  chan）；`Send` 持锁写 `s.events`，channel 的 happens-before 保证
-  hub 醒后读到的必然是新通道
-- **nil 通道**：首个 run 前 `s.events == nil`，对 nil channel 的
-  range 永久阻塞——hub 必须是
-  `select { case <-wake: ch := Events(); if ch == nil { continue } ... }`
-- **按通道身份挂接**：`run` 的 defer LIFO 使 settle 先于
-  close(events)，`running=false` 时旧通道还开着、新 Send 可能已被
-  接受——虚假/重复唤醒是常态。hub 以通道身份判重
-  （`if ch == attached { continue }`），**每个通道恰好一个 drainer**
-  （两个 drainer 静默拆走一半事件，是难查的 bug）
-- 挂接前 delta 已缓冲在通道里，不丢失
-
-**承认**：唤醒方案是单消费者补丁而非根因修复。P2 做 agent 层事件
-fan-out（Session 像 `subs` 一样广播 run 事件，每订阅者有界缓冲 +
-溢出丢弃），那时 REPL/web 共存与多标签页独立瞬态视图自然解决。
+- **帧映射**：`RecordCommitted` → record 帧（并折叠进摘要链）；
+  `Transient` → event 帧（pressure/retry/compact notice 同时缓存进
+  /api/state）；`Status` → status 帧
+- **所有 status 帧的 running/compacting 都来自流**：hub 维护一份
+  running/compacting 镜像（NewHub/resubscribe 时从订阅快照取初值，
+  之后只由流内 Status 事件更新），`broadcastStatusLocked` 只读镜像。
+  带外帧（Notice/ClearNotices）同样如此：hub 的 digest/count 天然
+  滞后于会话，若 running/compacting 读实时值，帧会与流序自相矛盾
+  （空闲帧抢在最后一条记录前面——正是当初 drainThenStatus 要防的）。
+  位置型帧携带 hub 已处理到的 seq，快照比它新的客户端会跳过。
+  **notice 帧例外**：带 notice 的帧对全部客户端无条件投递（快照帧
+  不携带 Notice，seq 过滤会把它静默吞掉），且**省略位置字段**
+  （running/compacting/digest/count）——发出 notice 时 hub 镜像可能
+  滞后于新鲜客户端的快照，重发过时位置字段会把它 regress；客户端
+  按缺席=no-change 处理（`compacting` 缺席时按 false——notice 只在
+  压缩失败路径出现，此时无进行中的压缩，恰好正确；这是一条
+  显式耦合，若未来 notice 出现在压缩进行中，需给帧补位置字段
+  或改客户端语义）
+- **重放过滤（seq 过滤）**：客户端连接时的快照是实时原子快照
+  （seq S）：一切 seq ≤ S 的事件都已反映在快照里。hub 落后时
+  （镜像 P < S），积压重放的 Transient/Status 帧（seq ≤ S）对该
+  客户端跳过，否则同一段 delta 会出现两次（一次折进快照的
+  Streaming 内容，一次重放）；record 帧豁免——快照的 records
+  来自 hub 镜像（P），(P, S] 间的记录靠 record 帧补齐。流式 delta
+  的状态变更与 seq 分配同锁段（§14.2），该不变量是结构保证
+- **手动 /compact 的生命周期**：`StartCompact` 发
+  CompactionStarted/Completed 瞬态事件 + Status{Compacting}，全部走
+  流到达 hub——无需 handler 轮询或周期广播
+- **遗留 per-run 通道的排空**：`sendEvent` 满通道（256）阻塞 run
+  goroutine，而该通道是 CLI 的过渡路径（step 4 删除）；web-only
+  会话没有其它消费者，hub 在看到 Status{Running:true}（或建 hub /
+  重订阅时快照已 Running——run 开始的 Status 不丢弃，满则摘除
+  订阅，重订阅后由快照兜底）时起 null-drainer 排空，防止长流式
+  回复把 run 永久卡死
+- **订阅被摘除（Lost）**：hub 的流订阅缓冲溢出时被 dispatcher 摘除；
+  hub 重走 `Stream()`，从新快照重建镜像，并向所有 SSE 客户端
+  **重发窗口快照**（resumed=false，客户端按规则 A 重新折叠），
+  之后继续正常扇出。SSE 客户端无需感知——重发的快照与普通断线
+  重连同路径
+- **快照帧的原子性**：连接时的 snapshot 帧的状态部分由一次
+  `SnapshotStreamState()`（瞬态槽 + steer 队列 + 状态，同一锁段拷贝，
+  不拷 records——记录来自 hub 镜像）构造，不再是
+  `Snapshot()` + `Running()` + `Compacting()` 三次取锁的拼接
+  （旧写法在转换窗口内可能自相矛盾）
 
 ### 4.4 慢客户端（实现约束，非建议）
 
@@ -232,8 +263,8 @@ viewer（§2.1，有损+可恢复），无一例外。
 
 同一会话可同时开 N 个 web UI，机制：**每个 SSE 连接独立 Subscribe()**
 （各自的 Initial + Records，恰好一次由同一原语各自保证）；**瞬态事件
-由 hub 单点排干后扇出**（多标签页不是多个 drainer——那会踩中“两个
- drainer 静默拆走一半事件”，hub 的存在正是为了避免）；共享会话状态
+由 hub 单点消费会话流后扇出**（多标签页不是多个流订阅者——hub 是
+会话唯一的流消费者，页面向 hub 注册；共享会话状态
 无页间私有副本，唯一真相源是会话本身（记录流 + status 广播）。两个
 标签页同时 POST /api/send：锁段保证恰一个成功，另一个 409，UI 在
 RUNNING 时禁用输入并在 409 时就地提示；一个标签页停止/压缩，效果
@@ -277,7 +308,7 @@ tag（内部类型不加），`wire.go` 做判别编码：
 | `/api/history` | GET | `?before=<h>&limit=M` 滚动回加载：窗口前 M 条 + 新前缀锚点，可后向验证 |
 | `/api/state` | GET | 摘要：session id、running、`RecordCount()`（进程内扁平口径）、in-flight item、**Compacting 槽**（`Snapshot()` 已含）、hub 缓存的最近 pressure/retry/**compact notice**（事件是瞬态的，agent 无可查历史，hub 自己缓存） |
 | `/api/send` | POST | `{"text":"..."}`，强制 application/json + Origin/Host 校验；run 活跃 409 `run_active` |
-| `/api/compact` | POST | **异步：handler 起 goroutine 立即返 202**（`Compact()` 持单飞槽直到摘要完成可能数十秒，同步会占住连接且前端无状态可显）。同步前置校验：run 活跃 409 `run_active`、`Snapshot().Context` 为空 409 `nothing_to_compact`（可同步判定，不进 goroutine）。**前置校验是 TOCTOU，异步失败的唯一归宿是带外通道**：goroutine 在 `Compact()` 返回非 nil 时把错误交给 hub，由 hub 以 status 帧广播 `{"kind":"status","compacting":false,"notice":"compact failed: …"}`；`/api/state` 摘要携带最近一次 notice，断线期间打开的页面也能读到。异步 202 若无带外错误通道，语义就是"接受且不告知结果"，比同步阻塞更差 |
+| `/api/compact` | POST | **异步：handler 起 goroutine 立即返 202**（`Compact()` 持单飞槽直到摘要完成可能数十秒，同步会占住连接且前端无状态可显）。同步前置校验：run 活跃 409 `run_active`、`Snapshot().Context` 为空 409 `nothing_to_compact`（可同步判定，不进 goroutine）。**压缩生命周期（compacting:true/false、CompactionStarted/Completed）全部经会话流到达 hub**（§4.3），无轮询无周期广播。**前置校验是 TOCTOU，异步失败的唯一归宿是带外通道**：goroutine 在 `Compact()` 返回非 nil 时把错误交给 hub，由 hub 以 status 帧广播 `{"kind":"status","compacting":false,"notice":"compact failed: …"}`；`/api/state` 摘要携带最近一次 notice，断线期间打开的页面也能读到。异步 202 若无带外错误通道，语义就是"接受且不告知结果"，比同步阻塞更差 |
 | `/api/stop` | POST | `Stop()`；**无 run 时幂等成功** |
 
 v1 不做：会话列表、认证。默认 `127.0.0.1:7420`，仅 `-http` 显式启用。

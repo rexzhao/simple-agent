@@ -375,12 +375,11 @@ func TestReconnectResumeAndFallback(t *testing.T) {
 // snapshot frame.
 func TestMidstreamConnectSeesStreaming(t *testing.T) {
 	gated := &gatedStream{gate: make(chan struct{})}
-	session, server, httpServer := newTestManagerServer(t, gated)
+	session, _, httpServer := newTestManagerServer(t, gated)
 
 	if err := session.Send("hi"); err != nil {
 		t.Fatal(err)
 	}
-	server.manager.sessions[session.ID()].hub.Wake()
 	// Let the streaming slot populate.
 	time.Sleep(100 * time.Millisecond)
 

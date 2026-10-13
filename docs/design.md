@@ -161,7 +161,9 @@ type RunningTool struct {
 Status，seq 在 s.mu 内分配）。旧的 Subscribe/Events 在过渡期作为**双写**的
 薄适配保留（emitTransient 同时入流和发 per-run channel），step 3/4 迁移
 hub/CLI 后删除旧路径。快照接口 `Stream()` 返回 `StreamSnapshot`（records +
-瞬态槽 + steer 队列 + 状态，同一锁段原子拷贝）。
+瞬态槽 + steer 队列 + 状态，同一锁段原子拷贝）；不带订阅的等价快照
+`SnapshotStream()`（step 3：hub 的连接时 snapshot 帧由它构造，避免
+Snapshot()+Running()+Compacting() 多次取锁的拼接窗口）。
 
 - **单一累积点**：`session.AppendDelta` 写 `Streaming.Message`；
   `streamModelTurn` 的局部 builder 删除。Completed 时 commit 从 Streaming
@@ -472,11 +474,20 @@ type StreamSubscription struct {
 **背压与摘除**（B3 修订）：
 - channel 缓冲 `streamBuffer = 1024`。
 - **水位线**：delta（Transient）在缓冲超过 **3/4** 时开始丢弃，
-  给 RecordCommitted 和终态 Status 预留 1/4 空间——降低摘除频率。
+  给 RecordCommitted 和 Status 预留 1/4 空间——降低摘除频率。
+  **所有 Status（含 run 开始的）都不可丢弃**：消费者靠 run-start
+  建立生命周期机制（hub 的遗留通道排空以此触发），静默丢弃会让
+  run 永久卡死且无恢复路径；满则摘除订阅者，重订阅后由快照
+  兑底（step 3 修订：早期实现把 run-start 标为可丢弃，与本文冲突）。
 - **RecordCommitted / Status**：缓冲满即**摘除该订阅者**——
   close(Lost) + 从 fan-out 列表移除。订阅方收到 Lost 后重新
   `Stream()`（从 Initial 重建，hub 侧触发 window reissue 给它的
   SSE 客户端）。
+- **流式状态变更与 seq 同锁段**（step 3 修订）：Streaming 内容
+  的累积（delta 追加、tool call 追加）与对应 Transient 的入队
+  必须在**同一锁段**（applyStreamingEmit）。分两个锁段时，快照
+  可能落在中间——内容已折进 Streaming 但事件 seq 还未分配，
+  客户端会把同一段文本收两次（一次在快照里，一次重放）。
 - **终态 Status 的保证路径**：终态入队后，即使所有订阅者都满了，
   dispatcher 也不阻塞——它投递到空列表（全部摘除后），然后 run
   goroutine 正常拆卸。权威收敛（running/compacting 是 Session 的

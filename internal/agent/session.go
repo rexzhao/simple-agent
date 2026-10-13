@@ -349,7 +349,12 @@ func (s *Session) Start(ctx context.Context, input string) (*Run, error) {
 	s.currentRun = r
 	// The run-start Status. Records were already enqueued by
 	// appendLocked (the single write path).
-	s.enqueueStreamLocked(Status{Running: true}, true) // non-terminal: droppable
+	// The run-start Status rides the guaranteed path (§14.2):
+	// consumers key lifecycle machinery on it (the hub starts its
+	// legacy-channel drain here), so it must not be dropped — a full
+	// buffer evicts the subscriber instead, which is recoverable
+	// (re-Stream), unlike a silently dropped run-start.
+	s.enqueueStreamLocked(Status{Running: true}, false)
 	var subs []*subscription
 	for sub := range s.subs {
 		subs = append(subs, sub)
@@ -651,6 +656,24 @@ func (s *Session) applyStreaming(itemID string, apply func(m *model.Message)) {
 	s.mu.Unlock()
 }
 
+// applyStreamingEmit is applyStreaming and the stream enqueue in ONE
+// lock section. The state change and its seq must be atomic (the
+// "state-change order = stream-event order" guarantee, §14.2):
+// with two sections, a snapshot taken between them sees the delta
+// already folded into Streaming.Content while its event carries a
+// seq above the snapshot's StartSeq — a client registering there
+// receives the same text twice (once in the snapshot, once replayed).
+// The per-run send stays outside the lock (it can block).
+func (s *Session) applyStreamingEmit(itemID string, apply func(m *model.Message), ctx context.Context, out chan<- model.Event, event model.Event) {
+	s.mu.Lock()
+	if item := s.state.Streaming; item != nil && item.ItemID == itemID {
+		apply(&item.Message)
+	}
+	s.enqueueStreamLocked(Transient{Event: event}, true) // droppable
+	s.mu.Unlock()
+	sendEvent(ctx, out, event)
+}
+
 // resetStreaming clears the accumulated content of the streaming message.
 // Retries only happen after no provider progress, so this is defensive.
 func (s *Session) resetStreaming(itemID string) {
@@ -782,7 +805,9 @@ func (s *Session) StartCompact(ctx context.Context) (*Run, error) {
 		return nil, ErrNothingToCompact
 	}
 	s.currentRun = r
-	s.enqueueStreamLocked(Status{Running: true, Compacting: true}, true)
+	// Run-start, on the guaranteed path for the same reason as
+	// Start's (see there): the hub's drain depends on it.
+	s.enqueueStreamLocked(Status{Running: true, Compacting: true}, false)
 	s.mu.Unlock()
 
 	go func() {
@@ -794,7 +819,19 @@ func (s *Session) StartCompact(ctx context.Context) (*Run, error) {
 		defer close(r.events)
 		defer func() { s.settle(r) }()
 
-		_, err := s.compactContext(r.ctx, storage.NewContextCompactedID(), pressureNone, 0, r.events)
+		// N3: manual compact now emits the same lifecycle events as
+		// auto-compaction — CompactionStarted/Completed go through the
+		// stream AND the per-run channel (the transition dual path).
+		// This is what lets handleCompact's polling be deleted in
+		// step 3: the hub sees Compacting Status and these events
+		// through the stream.
+		itemID := storage.NewContextCompactedID()
+		s.emitTransient(r.ctx, r.events, model.CompactionStartedEvent{ItemID: itemID})
+
+		_, err := s.compactContext(r.ctx, itemID, pressureNone, 0, r.events)
+		if err == nil {
+			s.emitTransient(r.ctx, r.events, model.CompactionCompletedEvent{ItemID: itemID})
+		}
 		r.err = compactOutcome(err, r.ctx.Err())
 		cancel() // cleanup: after the result is captured
 	}()
@@ -1207,10 +1244,12 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 			switch event := event.(type) {
 			case model.TextDeltaEvent:
 				madeProgress = true
-				s.applyStreaming(assistantItemID, func(m *model.Message) { m.Content += event.Text })
+				s.applyStreamingEmit(assistantItemID, func(m *model.Message) { m.Content += event.Text }, ctx, out, outputEvent)
+				continue
 			case model.ReasoningDeltaEvent:
 				madeProgress = true
-				s.applyStreaming(assistantItemID, func(m *model.Message) { m.ReasoningContent += event.Text })
+				s.applyStreamingEmit(assistantItemID, func(m *model.Message) { m.ReasoningContent += event.Text }, ctx, out, outputEvent)
+				continue
 			case model.ToolCallDeltaEvent:
 				madeProgress = true
 			case model.ToolCallDoneEvent:
@@ -1226,7 +1265,8 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, ou
 					event.ToolCall = call
 					outputEvent = event
 				}
-				s.applyStreaming(assistantItemID, func(m *model.Message) { m.ToolCalls = append(m.ToolCalls, call) })
+				s.applyStreamingEmit(assistantItemID, func(m *model.Message) { m.ToolCalls = append(m.ToolCalls, call) }, ctx, out, outputEvent)
+				continue
 			case model.MessageDoneEvent, model.UsageEvent:
 				madeProgress = true
 			case model.ResponseStateEvent:

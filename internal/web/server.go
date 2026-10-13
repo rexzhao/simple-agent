@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 )
@@ -391,11 +390,9 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	// re-caches itself on its own event — the window is one provider
 	// call, and it self-heals.)
 	entry.hub.ClearNotices()
-	// The events channel is republished under the session lock inside
-	// Send; the wake is sent after Send returns, so the hub reattaches
-	// with zero latency (the channel is small — late attachment could
-	// stall the run goroutine).
-	entry.hub.Wake()
+	// The hub subscribes to the session stream (milestone A step 3):
+	// no Wake needed — the stream is session-level and always
+	// connected; the run's events flow through it in seq order.
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -516,35 +513,15 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	hub, session := entry.hub, entry.session
 	// Compact holds the single-flight slot for the whole summary (tens
-	// of seconds); the response must not.
+	// of seconds); the response must not. The lifecycle events
+	// (CompactionStarted/Completed, Status{Compacting}) now go through
+	// the session stream (N3) — the hub sees them directly, no polling.
 	go func() {
-		errCh := make(chan error, 1)
-		go func() { errCh <- session.Compact() }()
-		// Surface the slot the moment it is taken (a client assuming
-		// idle mid-compact is the steer-panic path), then keep periodic
-		// frames until the final Notice broadcast carries the end state.
-		// Compacting() is a light accessor — Snapshot would deep-copy
-		// the whole folded context per poll.
-		for !session.Compacting() {
-			select {
-			case err := <-errCh:
-				notifyCompactResult(hub, err)
-				return
-			case <-time.After(5 * time.Millisecond):
-			}
+		if err := session.Compact(); err != nil {
+			notifyCompactResult(hub, err)
+			return
 		}
-		hub.BroadcastStatus()
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case err := <-errCh:
-				notifyCompactResult(hub, err)
-				return
-			case <-ticker.C:
-				hub.BroadcastStatus()
-			}
-		}
+		notifyCompactResult(hub, nil)
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }

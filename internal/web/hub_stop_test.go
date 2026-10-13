@@ -2,6 +2,7 @@ package web
 
 import (
 	"bufio"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -145,5 +146,154 @@ func TestFirstStreamSeesHistory(t *testing.T) {
 	}
 	if !strings.Contains(snapshot, `"t":"user.input"`) || !strings.Contains(snapshot, `"t":"assistant.message"`) {
 		t.Fatalf("first stream missed history records: %s", snapshot[:min(300, len(snapshot))])
+	}
+}
+
+// A web-only session has no CLI attached: nobody consumes the run's
+// per-run event channel (the CLI's transition path, deleted in step 4),
+// whose sends BLOCK when full. Before the hub migrated to the stream it
+// drained that channel implicitly; the migration must keep the run
+// unblocked — a turn emitting more than the channel buffer (256)
+// transient events must complete on its own.
+func TestWebOnlyRunDrainsLegacyEvents(t *testing.T) {
+	deltas := make([]model.Event, 0, 301)
+	for i := 0; i < 300; i++ {
+		deltas = append(deltas, model.TextDeltaEvent{Text: "x"})
+	}
+	deltas = append(deltas, model.MessageDoneEvent{})
+	provider := &webFakeProvider{turns: [][]model.Event{deltas}}
+	session, _, _ := newTestManagerServer(t, provider)
+
+	if err := session.Send("hi"); err != nil {
+		t.Fatal(err)
+	}
+	// Nobody drains: the run must still settle by itself.
+	waitFor(t, 5*time.Second, func() bool { return !session.Running() })
+}
+
+// TestHubEvictionResubscribesAndReissues pins the Lost-recovery path
+// (milestone A step 3): when the hub's stream subscription is evicted
+// (buffer overflow on non-droppable events), the hub must re-subscribe,
+// rebuild its mirror from the fresh snapshot, and reissue a window
+// snapshot to its connected SSE clients — which then continue receiving
+// live frames. The eviction is forced deterministically: the hub's loop
+// is frozen (h.mu held by the test) while enough turns overflow the
+// subscription's 1024-slot buffer.
+func TestHubEvictionResubscribesAndReissues(t *testing.T) {
+	turns := make([][]model.Event, 500)
+	for i := range turns {
+		turns[i] = []model.Event{model.TextDeltaEvent{Text: "x"}, model.MessageDoneEvent{}}
+	}
+	provider := &webFakeProvider{turns: turns}
+	session, srv, base := newTestManagerServer(t, provider)
+
+	// One SSE client, connected before the flood: a background reader
+	// keeps the connection drained (the client buffer is 256; the
+	// reissued snapshot must reach it after recovery).
+	res, cancel := sseGet(t, base.URL+api(session, "/stream"))
+	defer cancel()
+	defer res.Body.Close()
+	frames := make(chan Frame, 8192)
+	go func() {
+		br := bufio.NewReader(res.Body)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				close(frames)
+				return
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var f Frame
+			if err := json.Unmarshal([]byte(strings.TrimRight(line[6:], "\n")), &f); err != nil {
+				close(frames)
+				return
+			}
+			frames <- f
+		}
+	}()
+
+	// The connect snapshot arrives first.
+	select {
+	case f, ok := <-frames:
+		if !ok || f.Kind != "snapshot" {
+			t.Fatalf("first frame is not a snapshot: %+v", f)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no connect snapshot")
+	}
+
+	hub := srv.manager.sessions[session.ID()].hub
+
+	// Freeze the hub loop, then flood: each turn commits 2 records +
+	// 1 terminal status (3 non-droppables); ~342 turns overflow the
+	// 1024-slot subscription buffer and the next record evicts.
+	hub.mu.Lock()
+	for i := 0; i < 450; i++ {
+		if err := session.Send("m"); err != nil {
+			hub.mu.Unlock()
+			t.Fatalf("send %d: %v", i, err)
+		}
+		waitSettled(t, session)
+	}
+	select {
+	case <-hub.stream.Lost():
+	case <-time.After(10 * time.Second):
+		hub.mu.Unlock()
+		t.Fatal("hub subscription was not evicted")
+	}
+	hub.mu.Unlock()
+
+	// Recovery: the hub loop consumes its backlog, takes Lost,
+	// re-subscribes, and reissues a window snapshot (resumed=false,
+	// the full trailing window) to the connected client.
+	sawReissue := false
+	deadline := time.After(10 * time.Second)
+	for !sawReissue {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				t.Fatal("SSE connection closed during recovery")
+			}
+			if f.Kind == "snapshot" && !f.Resumed && f.Total >= 900 {
+				// 450 turns × 2 records = 900; the mirror was rebuilt
+				// from the fresh snapshot, not the stale one.
+				if !f.More {
+					t.Fatalf("reissued snapshot must mark scroll-back: total=%d", f.Total)
+				}
+				sawReissue = true
+			}
+		case <-deadline:
+			t.Fatal("no window reissue after eviction")
+		}
+	}
+
+	// The re-subscribed hub keeps serving live frames: a fresh turn's
+	// records reach the same SSE connection.
+	if err := session.Send("after"); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled(t, session)
+	sawRecord := false
+	deadline = time.After(10 * time.Second)
+	for !sawRecord {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				t.Fatal("SSE connection closed before the post-recovery record")
+			}
+			if f.Kind == "record" && f.Record != nil {
+				var r struct {
+					T string `json:"t"`
+				}
+				_ = json.Unmarshal(f.Record, &r)
+				if r.T == "user.input" {
+					sawRecord = true
+				}
+			}
+		case <-deadline:
+			t.Fatal("no live record frame after recovery")
+		}
 	}
 }
