@@ -306,9 +306,52 @@ const r4 = rec("assistant.message", { content: "a2" });
   assert(before === after, "s13 trailing events changed state");
 }
 
+// ---- 14. a genuine sai/v1/ head degrades to the window rebuild ----
+// The v2 upgrade path (§15.2): a client that still holds v1 digests
+// reconnects; every v1 digest differs from every v2 one (the prefix
+// changed — pinned Go-side by TestV1HeadMissesUnderV2), so the resume
+// anchor is unknown to the server and the client takes the same safe
+// window-rebuild path as s9. The v1 digest below is computed with the
+// frozen v1 rules, not a placeholder.
+{
+  const v1Genesis = "sai/v1/";
+  const sha256HexV1 = async text => {
+    const data = new TextEncoder().encode(text);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+  };
+  // A v1 head over some records of a session the client had open
+  // before the upgrade.
+  const v1Session = "upgrade-session";
+  const v1Head = await sha256HexV1(v1Genesis + v1Session);
+
+  const rUp = rec("user.input", { content: "after upgrade" });
+  const frame = {
+    kind: "snapshot",
+    anchor: v1Head,
+    resumed: true,
+    more: false,
+    records: [rUp],
+    running: false,
+    d: await fold(v1Head, [rUp]),
+  };
+  await applySnapshot(red, frame);
+  await apply(frame);
+  agree("s14 v1 anchor resync");
+  assert(store.snap.records.length === 1 && store.snap.records[0].item === rUp.item, "s14 rebuilt from the v1 anchor");
+  assert(store.snap.prefixAnchor === v1Head, "s14 cursor moved to the v1 anchor (full resync, no false hit)");
+
+  // The success marker lives INSIDE the block and references v1Head
+  // (block-scoped): deleting the block takes the marker with it
+  // (K4b), and the surgical delete-the-body-keep-the-marker attack
+  // dies on the undefined reference instead of printing (K4d) — the
+  // marker can only exist if the block actually ran.
+  console.log("store_check: s14 v1-anchor resync ok; anchor=" + v1Head.slice(0, 8));
+}
+
 if (failures.length) {
   console.error("store_check: FAILED");
   for (const f of failures) console.error("  - " + f);
   process.exit(1);
 }
-console.log("store_check: OK (13 scenarios: mirror + burst + reorder guard + tool slot + trailing idempotence)");
+console.log("store_check: OK (14 scenarios: mirror + burst + reorder guard + tool slot + trailing idempotence + v1-anchor resync)");

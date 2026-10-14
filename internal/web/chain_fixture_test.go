@@ -34,6 +34,11 @@ func TestJSChainFixture(t *testing.T) {
 		{ItemID: "i3", Type: storage.TypeToolResult, Time: "t3", ToolCallID: "c1", ToolName: "shell", IsError: true, Content: "exit 1"},
 		{ItemID: "i4", Type: storage.TypeAssistantMessage, Time: "t4", Content: "done",
 			ToolCalls: []storage.WireToolCall{{ID: "c1", Name: "shell", Arguments: `{"cmd":"ls"}`}}},
+		// v2 tuple members (§15.2): reasoning_level rides the digest.
+		// A session.created WITH a level and its twin WITHOUT must fold
+		// differently — the level is inside the tamper-proof tuple.
+		{ItemID: "h2", Type: storage.TypeSessionCreated, Time: "t5", Provider: "p", Model: "m", ReasoningLevel: "high"},
+		{ItemID: "h3", Type: storage.TypeSessionCreated, Time: "t5", Provider: "p", Model: "m"},
 	}
 
 	var lines []string

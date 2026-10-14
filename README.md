@@ -151,7 +151,12 @@ The build cross-compiles:
 - `dist/sai-darwin-arm64`
 
 Pushing a `v*` tag runs the release workflow: it validates the backend, builds
-all three binaries, and publishes them with a `SHA256SUMS` manifest.
+all three binaries, and publishes them with a `SHA256SUMS` manifest. The
+workflow does NOT build the chat client's `dist/` (see
+`clients/chat/README.md`): if you serve a released binary with `-http-static
+<chat dist>`, rebuild the dist first — especially after a digest-chain
+version bump (sai/v1/ → sai/v2/), where a stale dist keeps folding with the
+old prefix and permanently shows drift.
 
 Go validation:
 

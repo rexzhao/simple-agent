@@ -30,7 +30,7 @@ import (
 // tuple — a new renderable field means a version bump and a resync for
 // every client.
 
-const chainVersion = "sai/v1/"
+const chainVersion = "sai/v2/"
 
 // chainGenesis returns h_0 of segment 0: the digest before any record
 // of a never-compacted session.
@@ -120,6 +120,10 @@ func chainInput(r storage.Record) string {
 	field(r.Provider)
 	field(r.Model)
 	field(r.CWD)
+	// v2: reasoning_level joined the tuple (§15.2 — the sai/v2/ bump).
+	// New renderable fields append at the END, never between existing
+	// members, and always with a version bump.
+	field(r.ReasoningLevel)
 	return b.String()
 }
 

@@ -127,10 +127,16 @@ independently verified layers, each with its own fixture:
 | Layer | Check | What it pins |
 |---|---|---|
 | server snapshot | TestFirstStreamSeesHistory | the first-ever /stream carries the history (the hub seeding race) |
-| store state machine | store_check.mjs (TestChatStoreMirror) | mirror consistency with the log page's reducer, 9 scenarios |
+| store state machine | store_check.mjs (TestChatStoreMirror) | mirror consistency with the log page's reducer, 14 scenarios |
 | conversion | convert_check.mjs (TestConvertFixture) | every shape through the REAL runtime validator |
 | render | render_check.mjs (TestRenderFixture) | the SSR probe: real records -> real Thread HTML, and the ADAPTER SHAPE (`useExternalStoreRuntime(adapter)`, not `{adapter}` — written wrong twice) |
 
 Note: `dist/` is manually built and gitignored — after pulling server
 or client changes, `npm run build` before (re)starting serve, or the
-page may be an older bundle than the binary expects.
+page may be an older bundle than the binary expects. This is REQUIRED
+after a digest-chain version bump (e.g. sai/v1/ → sai/v2/): the chain
+module is bundled into dist, so an un-rebuilt dist keeps folding with
+the old prefix and permanently shows ❌ drift (every server digest
+misses its chain). The release workflow does not build the chat dist
+either — it ships server binaries only, so rebuild manually before
+serving a released binary with /chat.

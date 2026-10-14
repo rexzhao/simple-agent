@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1066,13 +1068,14 @@ func (p *recordingProvider) Stream(ctx context.Context, request model.Request) (
 	return events, nil
 }
 
-// TestRecordFrameOmitsEmptyReasoningLevel pins the 2a wire invariant:
+// TestRecordFrameReasoningLevelWireAndTuple pins the 2b wire invariants:
 // a session.created with an empty reasoning_level serializes to the
-// same JSON as before the field existed (omitempty drops it), so the
-// record frames and the digest chain are byte-identical to v1. The
-// digest's chainInput never includes ReasoningLevel (that lands in 2b
-// with the sai/v2/ bump).
-func TestRecordFrameOmitsEmptyReasoningLevel(t *testing.T) {
+// same JSON as before the field existed (omitempty drops it — old
+// records keep their exact bytes), a recorded level rides the wire,
+// and the v2 digest tuple COVERS the level (two records differing only
+// in reasoning_level must fold differently — §15.2: no field stays
+// outside the tamper-proof tuple).
+func TestRecordFrameReasoningLevelWireAndTuple(t *testing.T) {
 	empty := storage.Record{ItemID: "h1", Type: storage.TypeSessionCreated, Provider: "p", Model: "m"}
 	withLevel := storage.Record{ItemID: "h1", Type: storage.TypeSessionCreated, Provider: "p", Model: "m", ReasoningLevel: "high"}
 
@@ -1090,11 +1093,46 @@ func TestRecordFrameOmitsEmptyReasoningLevel(t *testing.T) {
 	if !bytes.Contains(withJSON, []byte("reasoning_level")) {
 		t.Fatalf("recorded level missing from the wire: %s", withJSON)
 	}
-	// The digest tuple is v1: ReasoningLevel is not part of chainInput.
+	// The digest tuple is v2: ReasoningLevel IS part of chainInput.
 	if chainInput(withLevel) == chainInput(empty) {
-		// same tuple (level not folded) — expected
-	} else {
-		t.Fatal("chainInput includes ReasoningLevel — the v1 digest would change")
+		t.Fatal("chainInput ignores ReasoningLevel — the field would sit outside the tamper-proof tuple")
+	}
+}
+
+// TestV1HeadMissesUnderV2 pins the upgrade contract (§15.2): every
+// digest a v1 client can hold — genesis, post-compaction genesis, and
+// record heads — differs under sai/v2/, so a v1 head is never a false
+// hit for a v2 server/client pair. A miss costs only the window
+// replay (the safe resync path the store already takes on unknown
+// anchors — pinned generically by store_check s9, and for a genuine
+// v1 digest by s14).
+func TestV1HeadMissesUnderV2(t *testing.T) {
+	const v1Genesis = "sai/v1/"
+	sha := func(s string) string {
+		sum := sha256.Sum256([]byte(s))
+		return hex.EncodeToString(sum[:])
+	}
+	sessionID := "s1"
+	compactedID := "x1"
+	r := storage.Record{ItemID: "i1", Type: storage.TypeUserInput, Time: "t1", Content: "hi"}
+
+	// v1 genesis / post-compaction genesis / first head, computed with
+	// the frozen v1 rules (the prefix; the v1 tuple is the v2 tuple
+	// minus the trailing reasoning_level field — for a record with an
+	// empty level the encodings coincide, which is exactly why the
+	// PREFIX is what a v2 bump must change).
+	v1Seg0 := sha(v1Genesis + sessionID)
+	v1SegN := sha(v1Genesis + sessionID + "/" + compactedID)
+	v1Head := sha(v1Seg0 + "\n" + chainInput(r))
+
+	if v1Seg0 == chainGenesis(sessionID) {
+		t.Fatal("v1 segment-0 genesis collides with v2 — upgrade would be silent")
+	}
+	if v1SegN == chainGenesisAt(sessionID, compactedID) {
+		t.Fatal("v1 post-compaction genesis collides with v2")
+	}
+	if v1Head == chainStep(chainGenesis(sessionID), r) {
+		t.Fatal("v1 record head collides with v2")
 	}
 }
 

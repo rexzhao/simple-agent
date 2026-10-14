@@ -577,6 +577,11 @@ hub 镜像同源截断 + 段 genesis 重置 + snapshot 重发（§14.5）。CLI 
   - `[context.compacted, …]`（**无 header 的压缩后段**——旧段首行
     无效时 jsonl 段切换不拷贝 header，这是真实磁盘状态）→ 种子取
     records[0] 的 ItemID；
+  - 注意：无 header 的**段形态**在链推导上仍成立（列表也容忍它们、
+    显示"无模型"），但整份日志折叠后**无任何 session.created** 的
+    会话在打开层被拒（§15.2：空 meta → ErrModelUnavailable）——
+    "列表可见、打开被拒"，两者不矛盾：列表展示磁盘事实，打开需要
+    可解析的模型身份；
   - 其它（段 0，含无 header 的段 0——手工截断/手改首行）→ 段 0
     genesis。
   判据是纯数据推导，**不 panic**：畸形段退化为确定性的链（客户端
@@ -700,12 +705,15 @@ type Prober  interface{ Store; HasSession(ns, id string) bool }
 
 **记录**：`session.created` 新增 `reasoning_level`（字符串；空 = 该
 模型的默认推理强度。**不能叫 `reasoning`**——已被 assistant 推理内容
-占用）。现有 `provider`/`model` 字段沿用。**digest 链升 `sai/v2/`**
-（Go wire.go 与 JS chain.mjs 同步、chain_check fixture 跟进）：新可
-渲染字段按链版本规则进元组（wire.go 既有注释即此语义）；升级后老客户
-端的 head 一律 miss → 走已有的窗口重放安全回退（一次性全量 resync，
-机制现成）。不采用"排除在元组外"——那会留下永久性的"该字段不在防篡
-改覆盖内"特例。
+占用）。现有 `provider`/`model` 字段沿用。**digest 链已升 `sai/v2/`**
+（2b 落地：Go wire.go 与 JS chain.mjs 同步、reasoning_level 追加进
+元组**末尾**、chain_check fixture 含 v2 用例）：新可渲染字段按链版本
+规则进元组（wire.go 既有注释即此语义）；升级后老客户端的 head 一律
+miss → 走已有的窗口重放安全回退（一次性全量 resync，机制现成，
+store_check s14 用真实 v1 摘要钉住该路径）。不采用"排除在元组外"——
+那会留下永久性的"该字段不在防篡改覆盖内"特例。旧会话的
+`reasoning_level` 空值在 wire 帧上被 omitempty 省略（字节不变），
+在 v2 元组中以空串折叠。
 
 **升级注意事项**：chat 的 dist 是手工构建的，升 v2
 后不重建会持续显示 drift——README 的"dist 手工构建"段须提醒"链版本
@@ -757,7 +765,9 @@ type Resolved struct {
   **空值同样拒绝**（Resolve 对空 provider/model 返回
   ErrModelUnavailable——ResolveModel 的默认值替换是创建时语义，
   解析期不做；两种退化情形：无头会话 = 无 created 记录 → 空 meta →
-  拒绝；有记录但 provider/model 为空 = 手改/外来日志 → 拒绝。生产
+  拒绝；有记录但 provider/model 为空 = 手改/外来日志 → 拒绝。**两类
+  会话在列表里仍然可见**（readSessionHead 容忍缺 header，显示"无
+  模型"）——列表可见、打开被拒，见 §14.4 的说明。生产
   写入路径不可能写出空值：CLI/serve 的 meta 一律来自已解析的
   ResolveModel 输出，空值在到达 agent 前就被配置校验拦下）。
 - **预算**：`resolveContextBudget` 改为按会话调用（open 时用该会话的

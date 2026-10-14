@@ -130,7 +130,12 @@ func TestChatStoreMirror(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store_check.mjs: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "store_check: OK") {
+	// Two independent existence signals for s14 (review K4): the
+	// hand-maintained summary (count + label) AND a marker logged
+	// from inside the block — deleting the block while forgetting the
+	// summary must still fail (K4b).
+	if !strings.Contains(string(out), "store_check: OK (14 scenarios") ||
+		!strings.Contains(string(out), "s14 v1-anchor resync ok") {
 		t.Fatalf("store_check.mjs: unexpected output\n%s", out)
 	}
 }

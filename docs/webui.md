@@ -133,10 +133,10 @@ clients/chat/      独立构建的 assistant-ui 聊天客户端（React+Vite，
 将来新增可渲染字段 = 升版本 = 所有客户端重同步）：
 
 ```
-h₀ = SHA256("sai/v1/" + sessionID)
+h₀ = SHA256("sai/v2/" + sessionID)
 输入串 = 每字段以十进制长度前缀拼接：
         itemID, type, ts, content, reasoning, is_error,
-        [tool: name, arguments, call_id]…, provider, model, cwd
+        [tool: name, arguments, call_id]…, provider, model, cwd, reasoning_level
 hᵢ = SHA256(hᵢ₋₁ + "\n" + 输入串)
 ```
 

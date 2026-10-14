@@ -2,7 +2,7 @@
 // check (node runs this exact module against Go-generated fixtures).
 // It must stay byte-for-byte identical to internal/web/wire.go.
 
-export const chainVersion = "sai/v1/";
+export const chainVersion = "sai/v2/";
 
 export async function sha256Hex(text) {
   const data = new TextEncoder().encode(text);
@@ -36,6 +36,10 @@ export function chainInput(r) {
   field(r.provider || "");
   field(r.model || "");
   field(r.cwd || "");
+  // v2: reasoning_level joined the tuple (§15.2 — the sai/v2/ bump).
+  // New renderable fields append at the END, never between existing
+  // members, and always with a version bump.
+  field(r.reasoning_level || "");
   return s;
 }
 
