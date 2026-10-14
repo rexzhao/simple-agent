@@ -925,8 +925,6 @@ func (r *Run) execute(runID string, request model.Request) {
 	}()
 
 	maxIterations := s.agent.maxIterations
-	enabledTools := enabledToolNames(request.Tools)
-
 	// Pre-turn pressure: the pending input is already in the context; a
 	// compaction absorbs it into the summary and the request is rebuilt.
 	if compactedRequest, compacted, err := s.maybeAutoCompact(ctx, request); err != nil {
@@ -1001,7 +999,7 @@ func (r *Run) execute(runID string, request model.Request) {
 			}
 			resultItemID := storage.NewToolResultID()
 			s.beginTool(resultItemID, toolCall)
-			result := executeToolCall(ctx, s, s.agent.toolExecutor, enabledTools, toolCall, resultItemID)
+			result := executeToolCall(ctx, s, s.agent.toolSet, toolCall, resultItemID)
 			if err := s.commitToolResult(resultItemID, runID, iteration, result); err != nil {
 				failure = fmt.Sprintf("persist tool result: %v", err)
 				s.emitTransient(model.ErrorEvent{Err: err, Message: "persist tool result"})
@@ -1197,20 +1195,18 @@ func copyResponseState(state model.ResponseState) model.ResponseState {
 // events. Validation failures never emit ToolStartedEvent. resultItemID
 // is the identity of the tool.result this call will produce, carried on
 // the started event so in-flight observers can hold the slot.
-func executeToolCall(ctx context.Context, s *Session, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, resultItemID string) model.ToolResult {
+func executeToolCall(ctx context.Context, s *Session, tools map[string]Tool, toolCall model.ToolCall, resultItemID string) model.ToolResult {
 	arguments, err := parseToolArguments(toolCall.Arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "invalid tool arguments: %v", err)
 	}
-	if _, ok := enabledTools[toolCall.Name]; !ok {
+	tool, ok := tools[toolCall.Name]
+	if !ok {
 		return toolErrorResult(toolCall, "tool %q is not enabled", toolCall.Name)
-	}
-	if executor == nil {
-		return toolErrorResult(toolCall, "tool executor is not configured")
 	}
 
 	s.emitTransient(model.ToolStartedEvent{ToolCall: toolCall, ItemID: resultItemID})
-	result, err := executor.Execute(ctx, toolCall.Name, arguments)
+	result, err := tool.Execute(ctx, arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "%v", err)
 	}

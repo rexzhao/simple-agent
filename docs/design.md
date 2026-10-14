@@ -1243,7 +1243,7 @@ Tool 接口相反）。
 | 1 | `model.Tool → model.ToolDefinition` 改名（纯 Go API，wire 零变化）**（已落地）** | 全仓 build/test；grep 旧名清零 | development.md 若提及 |
 | 2 | 包迁移·model（含 provider 子包）：git mv + 导入重写 + 收口注释**（已落地）** | 每步后全绿；旧路径 grep 为零；`go list ./...` 无 internal/model | README 包布局段 |
 | 3 | 包迁移·storage（jsonl/memory 同批）+ **doc.go 写明公开契约**：log.jsonl 记录格式、段切换（.next/归档/恢复规则）、sai/v2/ 摘要链——公开即契约，内部注释不够**（已落地）** | 同上 | storage 包文档、development.md 格式附录（若引用） |
-| 4 | 包迁移·tools + Tool 接口落地（接口在 `agent.Tool`（internal/agent，随步骤 5 公开）；`tools.Named` 适配、`Shell` 返回 `agent.Tool`、`agent.Options.Tools []agent.Tool`、namedExecutor 删除） | 既有 agent/web/CLI 测试不改断言；接口 kill（按名分发丢失→运行期错误测试红） | design §8 注记、README |
+| 4 | 包迁移·tools + Tool 接口落地（接口在 `agent.Tool`（internal/agent，随步骤 5 公开）；`tools.Named` 适配、`Shell` 返回 `agent.Tool`、`agent.Options.Tools []agent.Tool`、namedExecutor 删除）**（已落地）** | 既有 agent/web/CLI 测试不改断言；接口 kill（按名分发丢失→运行期错误测试红） | README；design §8 已核无需改动 |
 | 5 | 包迁移·agent（SessionEvent/Stream 随包公开；SessionMetaForTest 删除；NewStaticResolver 文档化） | 测试改字面量后全绿；公开 API 清单核对 | 同上 |
 | 6 | 包迁移·sessionhost（SweeperInterval/SessionIdleEvict 收为 Options，变量删除，测试改 Options） | 驱逐/清扫测试改注入后断言不变弱；可变变量 grep 清零 | multi-session.md §3 |
 | 7a | 审批状态机：`Ask` + agent 拥有的待审批态（`s.mu` 内事件+快照原子置位）+ `Session.ResolveApproval` + `ErrApprovalUnknown/Resolved` + `ToolApprovalPending/Resolved` 事件 + 快照 `AwaitingApproval` + web `ToolWire.awaiting_approval`（一个端点）+ fixture 两例 | kill：快照丢待审批态（重连看不到卡）、ResolveApproval 双答/未知不报错、事件与快照不同锁段（乱序）；取消走中断路径（sanitizeContext 修补，既有双测试） | webui.md 事件表 + 快照字段、multi-session.md §4 码表 +2 行（approval_unknown/approval_resolved） |

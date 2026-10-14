@@ -2,6 +2,9 @@ package tools
 
 import (
 	"context"
+
+	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/model"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,11 +15,21 @@ import (
 // newTestExecutor builds a shell executor over a temp directory.
 func newTestExecutor(t *testing.T) Executor {
 	t.Helper()
-	_, executor, err := Shell(t.TempDir())
+	tool, err := Shell(t.TempDir())
 	if err != nil {
 		t.Fatalf("Shell: %v", err)
 	}
-	return executor
+	return namedOnlyExecutor{tool: tool}
+}
+
+// namedOnlyExecutor keeps the Executor view of a shell tool for the
+// pre-interface test call sites.
+type namedOnlyExecutor struct {
+	tool agent.Tool
+}
+
+func (e namedOnlyExecutor) Execute(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
+	return e.tool.Execute(ctx, arguments)
 }
 
 func TestShellExecutorRunsCommandAndReturnsCombinedOutput(t *testing.T) {
@@ -170,11 +183,11 @@ func TestShellExecutorWorkingDirectory(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("ok"), 0o644); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
-	_, executor, err := Shell(root)
+	tool, err := Shell(root)
 	if err != nil {
 		t.Fatalf("Shell: %v", err)
 	}
-	result, err := executor.Execute(context.Background(), map[string]any{
+	result, err := tool.Execute(context.Background(), map[string]any{
 		"command": "test -f sai-cwd-marker.txt && echo in-root || echo elsewhere",
 	})
 	if err != nil {

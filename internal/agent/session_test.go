@@ -25,13 +25,46 @@ var testModel = storage.SessionMeta{Provider: "test", Model: "model-test"}
 // resolver: every session resolves to the given provider and the
 // default test budget. Tests that need per-session budgets use
 // newBudgetAgent.
-func newTestAgent(t *testing.T, provider model.Provider, executor ToolExecutor, options ...func(*Options)) (*Agent, *Session) {
+// nameDispatchExecutor is the pre-B2 shape the test fakes kept:
+// one executor handling every tool by name.
+type nameDispatchExecutor interface {
+	Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error)
+}
+
+// testTool adapts a name-dispatching executor to the Tool interface
+// for one definition.
+type testTool struct {
+	def  model.ToolDefinition
+	exec func(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error)
+}
+
+func (t testTool) Definition() model.ToolDefinition { return t.def }
+
+func (t testTool) Execute(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
+	return t.exec(ctx, t.def.Name, arguments)
+}
+
+// toolsFor wraps a name-dispatching executor as the tool set. A nil
+// executor yields no tools — the tests that pass nil never issue
+// tool calls (and taking a method value off a nil interface would
+// panic).
+func toolsFor(executor nameDispatchExecutor, defs ...model.ToolDefinition) []Tool {
+	out := make([]Tool, 0, len(defs))
+	if executor == nil {
+		return out
+	}
+	for _, def := range defs {
+		out = append(out, testTool{def: def, exec: executor.Execute})
+	}
+	return out
+}
+
+func newTestAgent(t *testing.T, provider model.Provider, executor nameDispatchExecutor, options ...func(*Options)) (*Agent, *Session) {
 	t.Helper()
 	optionsStruct := Options{
 		ModelResolver: NewStaticResolver(provider, nil, 0, 0, ""),
 		Storage:       memory.OpenStore(),
-		Tools:         []model.ToolDefinition{{Name: "echo"}},
-		ToolExecutor:  executor,
+		Tools:         toolsFor(executor, model.ToolDefinition{Name: "echo"}),
 	}
 	for _, apply := range options {
 		apply(&optionsStruct)

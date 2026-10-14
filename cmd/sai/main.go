@@ -28,10 +28,10 @@ import (
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/projects"
-	"github.com/rexzhao/simple-agent/internal/tools"
 	"github.com/rexzhao/simple-agent/model"
 	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/tools"
 )
 
 var version = "dev"
@@ -211,7 +211,7 @@ func providerNameOrModel(providerName, modelName string, cfg *config.Config) str
 
 // Agent assembles the agent for one project directory.
 func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
-	shell, executor, err := tools.Shell(projectCwd)
+	shell, err := tools.Shell(projectCwd)
 	if err != nil {
 		return nil, "", fmt.Errorf("register tools: %w", err)
 	}
@@ -222,8 +222,7 @@ func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
 	project := projects.ProjectID(projectCwd)
 	ag, err := agent.New(agent.Options{
 		Storage:       f.store,
-		Tools:         []model.ToolDefinition{shell},
-		ToolExecutor:  namedExecutor{exec: executor},
+		Tools:         []agent.Tool{shell},
 		SystemPrompt:  systemPrompt,
 		ModelResolver: f.resolver,
 		MaxIterations: f.cfg.Agent.MaxIterations,
@@ -275,19 +274,6 @@ func newMetaValidator(cfg *config.Config) func(storage.SessionMeta) error {
 		}
 		return nil
 	}
-}
-
-// namedExecutor adapts the single-tool executor to the agent loop's
-// name-dispatching ToolExecutor interface.
-type namedExecutor struct {
-	exec tools.Executor
-}
-
-func (n namedExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
-	if name != tools.BuiltinShell {
-		return model.ToolResult{}, fmt.Errorf("unknown tool %q", name)
-	}
-	return n.exec.Execute(ctx, arguments)
 }
 
 // spinnerPrinter interleaves the stderr spinner with stdout record lines:

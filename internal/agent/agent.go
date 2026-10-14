@@ -18,16 +18,43 @@ import (
 // DefaultMaxIterations bounds one run when Options.MaxIterations is unset.
 const DefaultMaxIterations = 8
 
-// ToolExecutor executes one tool call by name.
-type ToolExecutor interface {
-	Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error)
+// Tool is the consumer-side tool contract: the provider-facing
+// definition plus the execution. Defined here, at the consumer (Go
+// idiom) — the tools package provides implementations and adapters,
+// and third-party tools implement this interface without importing
+// the builtins.
+type Tool interface {
+	// Definition is the provider-facing shape: name, description,
+	// JSON schema. Returned by value; callers must not mutate maps.
+	Definition() model.ToolDefinition
+	// Execute runs one call. Contract:
+	//  - Arguments are self-validated: an invalid argument returns a
+	//    normal error (the agent loop turns it into a tool.result
+	//    is_error record — same as today's shell argument errors).
+	//  - ctx is the run's context: cancellation (user /stop, session
+	//    close) must unblock Execute promptly.
+	//  - Execute may block arbitrarily (network, subprocess); the
+	//    agent loop calls it synchronously in the iteration.
+	Execute(ctx context.Context, arguments map[string]any) (model.ToolResult, error)
+}
+
+// toolDefinitions extracts the provider-facing shapes from the tool
+// set (the request carries definitions; execution stays behind the
+// interface).
+func toolDefinitions(tools []Tool) []model.ToolDefinition {
+	defs := make([]model.ToolDefinition, len(tools))
+	for i, tool := range tools {
+		defs[i] = tool.Definition()
+	}
+	return defs
 }
 
 // Options configures Agent construction.
 type Options struct {
-	Storage      storage.Store
-	Tools        []model.ToolDefinition
-	ToolExecutor ToolExecutor
+	Storage storage.Store
+	// Tools is the enabled tool set; the agent dispatches by
+	// Definition().Name (duplicate names are a construction error).
+	Tools []Tool
 	// SystemPrompt is the UNRENDERED template: {{time.now}} and its
 	// siblings render at every request assembly, not here (§15.2).
 	SystemPrompt  string
@@ -48,9 +75,11 @@ type Options struct {
 // model itself lives on the SESSION: each session resolves its
 // recorded meta through the resolver (§15.2).
 type Agent struct {
-	store         storage.Store
-	tools         []model.ToolDefinition
-	toolExecutor  ToolExecutor
+	store storage.Store
+	tools []Tool
+	// toolSet indexes tools by Definition().Name for the loop's
+	// per-call dispatch; built once at construction.
+	toolSet       map[string]Tool
 	systemPrompt  string // unrendered template
 	resolver      ModelResolver
 	maxIterations int
@@ -73,10 +102,21 @@ func New(options Options) (*Agent, error) {
 	if maxIterations <= 0 {
 		maxIterations = DefaultMaxIterations
 	}
+	toolSet := make(map[string]Tool, len(options.Tools))
+	for _, tool := range options.Tools {
+		name := tool.Definition().Name
+		if name == "" {
+			return nil, fmt.Errorf("tool with an empty name is not addressable")
+		}
+		if _, dup := toolSet[name]; dup {
+			return nil, fmt.Errorf("duplicate tool name %q", name)
+		}
+		toolSet[name] = tool
+	}
 	return &Agent{
 		store:         options.Storage,
 		tools:         options.Tools,
-		toolExecutor:  options.ToolExecutor,
+		toolSet:       toolSet,
 		systemPrompt:  options.SystemPrompt,
 		resolver:      options.ModelResolver,
 		maxIterations: maxIterations,
@@ -221,7 +261,7 @@ func (s *Session) buildRequest(context []model.Message) model.Request {
 	return model.Request{
 		Model:         s.meta.Model,
 		Messages:      messages,
-		Tools:         a.tools,
+		Tools:         toolDefinitions(a.tools),
 		Parameters:    s.resolved.Parameters,
 		DeveloperRole: s.resolved.DeveloperRole,
 		MaxTokens:     s.resolved.OutputLimit,
@@ -357,16 +397,6 @@ func contextPressure(budget contextBudget, request model.Request) compactionPres
 		return pressureSoft
 	}
 	return pressureNone
-}
-
-// enabledToolNames indexes the request's tool schemas for the enabled-tool
-// check during execution.
-func enabledToolNames(toolSchemas []model.ToolDefinition) map[string]struct{} {
-	enabled := make(map[string]struct{}, len(toolSchemas))
-	for _, tool := range toolSchemas {
-		enabled[tool.Name] = struct{}{}
-	}
-	return enabled
 }
 
 func newRunID() string { return storage.NewRunID() }

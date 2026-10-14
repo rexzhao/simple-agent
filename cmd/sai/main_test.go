@@ -134,11 +134,15 @@ func TestPromptAfterRunOutputByteLevel(t *testing.T) {
 	}
 }
 
-// noopExecutor answers every tool call instantly — the tool loop's
-// record volume is what matters here, not the tool itself.
-type noopExecutor struct{}
+// noopTool answers every tool call instantly — the tool loop's
+// high-volume tests need a cheap executor.
+type noopTool struct{}
 
-func (noopExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
+func (noopTool) Definition() model.ToolDefinition {
+	return model.ToolDefinition{Name: "noop"}
+}
+
+func (noopTool) Execute(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 	return model.ToolResult{Content: "ok"}, nil
 }
 
@@ -176,8 +180,7 @@ func TestSendReturnsAfterEviction(t *testing.T) {
 	ag, err := agent.New(agent.Options{
 		ModelResolver: agent.NewStaticResolver(&toolLoopProvider{rounds: 700}, nil, 0, 0, ""),
 		Storage:       memory.OpenStore(),
-		Tools:         []model.ToolDefinition{{Name: "noop"}},
-		ToolExecutor:  noopExecutor{},
+		Tools:         []agent.Tool{noopTool{}},
 		// The default iteration cap (8) would end the run long before
 		// the 1024-slot buffer overflows; the eviction needs the full
 		// 700-round volume.
@@ -326,8 +329,7 @@ func TestSendReturnsAfterCompactionAndEviction(t *testing.T) {
 			rounds: 700, gateAt: 50, gate: gate, entered: entered,
 		}, nil, 0, 0, ""),
 		Storage:       memory.OpenStore(),
-		Tools:         []model.ToolDefinition{{Name: "noop"}},
-		ToolExecutor:  noopExecutor{},
+		Tools:         []agent.Tool{noopTool{}},
 		MaxIterations: 750,
 	})
 	if err != nil {

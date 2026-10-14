@@ -185,6 +185,6 @@ storage/            record schema + Fold + Store/Session interfaces — public (
   jsonl/             append-only JSONL file store (torn-tail recovery)
   memory/            in-memory store for tests and ephemeral sessions
 model/               provider adapters (OpenAI Chat/Responses, Anthropic) — public (B2, v0: no stability guarantees until v1)
-internal/tools       the shell tool (Bash on every platform, incl. Windows via Git Bash)
+tools/               the shell tool (Bash on every platform, incl. Windows via Git Bash) — public (B2, v0)
 internal/config      startup-time config parsing (cmd-only dependency)
 ```

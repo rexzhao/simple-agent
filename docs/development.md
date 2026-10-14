@@ -25,7 +25,7 @@ storage/            record schema + Fold() + Store/Session interfaces — public
   memory/            in-memory map for tests and ephemeral sessions
 model/               provider adapters: openai_chat, openai_responses,
                      anthropic_messages, httpstream — public (B2)
-internal/tools       the shell tool
+tools/               the shell tool — public (B2, v0)
 internal/config      startup-time config parsing (cmd-only dependency)
 internal/codexauth   Codex device login (used by cmd/sai provider assembly)
 ```

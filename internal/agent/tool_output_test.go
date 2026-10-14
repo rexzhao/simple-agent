@@ -71,18 +71,17 @@ func TestExecuteToolCallLimitsSuccessfulAndErrorOutputs(t *testing.T) {
 	provider := &fakeProvider{turns: nil}
 	_, session := newTestAgent(t, provider, nil)
 	toolCall := model.ToolCall{ID: "call-1", Name: "custom", Arguments: `{}`}
-	enabled := map[string]struct{}{"custom": {}}
+	executor := staticToolExecutor{result: model.ToolResult{Content: strings.Repeat("x", defaultToolOutputMaxBytes+1)}}
+	set := map[string]Tool{"custom": testTool{def: model.ToolDefinition{Name: "custom"}, exec: executor.Execute}}
 
-	success := executeToolCall(context.Background(), session, staticToolExecutor{
-		result: model.ToolResult{Content: strings.Repeat("x", defaultToolOutputMaxBytes+1)},
-	}, enabled, toolCall, "t-test")
+	success := executeToolCall(context.Background(), session, set, toolCall, "t-test")
 	if !strings.Contains(success.Content, "Tool output truncated") {
 		t.Fatalf("successful tool output was not limited: %d bytes", len(success.Content))
 	}
 
-	failure := executeToolCall(context.Background(), session, staticToolExecutor{
-		err: errors.New(strings.Repeat("y", defaultToolOutputMaxBytes+1)),
-	}, enabled, toolCall, "t-test")
+	failureExecutor := staticToolExecutor{err: errors.New(strings.Repeat("y", defaultToolOutputMaxBytes+1))}
+	failureSet := map[string]Tool{"custom": testTool{def: model.ToolDefinition{Name: "custom"}, exec: failureExecutor.Execute}}
+	failure := executeToolCall(context.Background(), session, failureSet, toolCall, "t-test")
 	if !failure.IsError || !strings.Contains(failure.Content, "Tool output truncated") {
 		t.Fatalf("error tool output was not limited: %#v", failure)
 	}

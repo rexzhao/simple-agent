@@ -1,7 +1,3 @@
-// Package tools provides the agent's shell tool: the single tool of the
-// minimal client. The agent reads, searches, and edits through Bash commands
-// (Git Bash on Windows, never PowerShell or cmd.exe), so one portable syntax
-// covers every platform.
 package tools
 
 import (
@@ -16,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/model"
 )
 
@@ -34,8 +31,9 @@ const DefaultTimeoutMS = 10 * 60 * 1000
 // about not exhausting process memory before that.
 const DefaultMaxOutputBytes = 1 << 20
 
-// Executor executes one tool call. It is the interface the agent loop's
-// ToolExecutor expects.
+// Executor executes one tool call. The pre-interface shape, kept as
+// the argument of Named (and for direct uses that predate the agent
+// loop's Tool dispatch).
 type Executor interface {
 	Execute(ctx context.Context, arguments map[string]any) (model.ToolResult, error)
 }
@@ -47,18 +45,37 @@ func (f ExecutorFunc) Execute(ctx context.Context, arguments map[string]any) (mo
 	return f(ctx, arguments)
 }
 
-// Shell returns the shell tool: its provider-facing definition and the
-// executor. Every command runs with rootDir as its working directory; the
-// shell itself is never path confined.
-func Shell(rootDir string) (model.ToolDefinition, Executor, error) {
+// namedTool pairs a definition with its executor — the agent.Tool
+// implementation Named returns.
+type namedTool struct {
+	def  model.ToolDefinition
+	exec Executor
+}
+
+func (t namedTool) Definition() model.ToolDefinition { return t.def }
+
+func (t namedTool) Execute(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
+	return t.exec.Execute(ctx, arguments)
+}
+
+// Named pairs a provider-facing definition with an executor into an
+// agent.Tool — the migration path for pre-interface call sites that
+// built the definition and the execution separately.
+func Named(def model.ToolDefinition, exec Executor) agent.Tool {
+	return namedTool{def: def, exec: exec}
+}
+
+// Shell returns the shell tool. Every command runs with rootDir as
+// its working directory; the shell itself is never path confined.
+func Shell(rootDir string) (agent.Tool, error) {
 	if strings.TrimSpace(rootDir) == "" {
-		return model.ToolDefinition{}, nil, fmt.Errorf("rootDir must not be blank")
+		return nil, fmt.Errorf("rootDir must not be blank")
 	}
 	root, err := filepath.Abs(rootDir)
 	if err != nil {
-		return model.ToolDefinition{}, nil, fmt.Errorf("resolve rootDir: %w", err)
+		return nil, fmt.Errorf("resolve rootDir: %w", err)
 	}
-	return shellDefinition(), newShellExecutor(root), nil
+	return namedTool{def: shellDefinition(), exec: newShellExecutor(root)}, nil
 }
 
 func shellDefinition() model.ToolDefinition {
