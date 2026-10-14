@@ -975,8 +975,8 @@ created 记录，加字段即得）。
 的配对靠调用方自觉**：Tools 里列了名、ToolExecutor 按名找不到 →
 运行期错误；注册第二个工具需要重写分发器。
 
-**工具来源**：生产只有 `tools.Shell`（唯一内建）；web 的 page-provider
-不是工具来源——它是把**页面当 provider** 的调试通道（见 16.5）。
+**工具来源**：生产只有 `tools.Shell`（唯一内建）；原 page-provider
+调试通道已删除（见 16.5）。
 
 **tool call 生命周期**（§8 已述）：delta 累积在 Streaming 的
 ToolCalls → assistant.message 落盘（wire ID）→ ToolStarted（mint result
@@ -1209,16 +1209,12 @@ review 必须显式标注——它是对外隐藏的实现依赖。`clients/chat
 
 ### 16.5 页面工具提供者 / broker
 
-现状：page-provider 是"页面当 provider"的**调试通道**
-（`clients/chat/src/pageProvider.ts` + serve 侧零参与 + broker 为外部
-mcp-provider-broker），路由图已标注"准备移除的调试功能"。**B2 处置推
-荐：作为 B2 末尾的独立小步删除**（Tool 接口与审批 Hooks 落地后，"外
-部驱动页面→页面驱动 agent"的调试价值被正规机制取代；它还是一条
-unauthenticated LAN 攻击面——page_send 能触达 agent 的 shell）。删除
-= chat 的 pageProvider.ts + probe 入口 + page_provider_check.mjs
-fixture + 文档段。**若用户仍在用**（16.6c 未决）：保留现状不动，挪到
-C 前再议——绝不改造成 Tool 实现（它绕过 agent 的工具面，方向就与
-Tool 接口相反）。
+**已删除（B2 步骤 8）**。page-provider（"页面当 provider"的调试通道）
+整体移除：clients/chat 的 pageProvider.ts、App.tsx 的接线与横幅、
+page_provider_check fixture 与对应 Go 测试、README 的调试章节。理由：
+它是一条**未鉴权的 LAN 通路**且可经 page_send 触达 agent 的 shell 工具
+（安全面）；Tool 接口与审批 Hooks（§16.2/§16.3）取代了它的调试价值。
+如需恢复，revert 该提交即可。
 
 ### 16.6 待用户拍板的问题
 
@@ -1252,7 +1248,7 @@ Tool 接口相反）。
 | 6 | 包迁移·sessionhost（SweeperInterval/SessionIdleEvict 收为 Options，变量删除，测试改 Options）**（已落地）** | 驱逐/清扫测试改注入后断言不变弱；可变变量 grep 清零 | multi-session.md §3 |
 | 7a | 审批状态机（**已落地**）：`Ask` + agent 拥有的待审批态（`s.mu` 内事件+快照原子置位）+ `Session.ResolveApproval` + `ErrApprovalUnknown/Resolved` + `ToolApprovalPending/Resolved` 事件 + 快照 `AwaitingApproval` + web `ToolWire.awaiting_approval`（一个端点）+ fixture 两例 | kill：快照丢待审批态（重连看不到卡）、ResolveApproval 双答/未知不报错、事件与快照不同锁段（乱序）；取消走中断路径（sanitizeContext 修补，既有双测试） | webui.md 事件表 + 快照字段、multi-session.md §4 码表 +2 行（approval_unknown/approval_resolved） |
 | 7b | 策略钩子：`agent.Hooks`（同步三态）+ deny-as-result + fail-closed + panic 防护 + AfterToolCall 边界（deny 跑、cancel 不跑、退出不跑） | **默认基线判据**：现有测试不改断言 + 无钩子事件序列 golden 测试（§16.3）；kill：deny 不落记录、钩子 panic 楔死、默认行为变 | 同上（码表不动） |
-| 8 | broker 处置（按 16.6c：删除 pageProvider + fixture + 文档段，或原样保留） | 若删：chat tsc + 剩余 fixture 全绿；grep page_provider 清零 | webui.md、chat README |
+| 8 | broker 处置（按 16.6c：删除 pageProvider + fixture + 文档段，或原样保留）**（已落地：删除）** | 若删：chat tsc + 剩余 fixture 全绿；grep page_provider 清零 | webui.md、chat README |
 
 步骤 2-6 每步一包是 review 粒度考量；若 review 负担可承受，2+3、
 4 紧邻步骤可合并送审（commit 仍分开）。

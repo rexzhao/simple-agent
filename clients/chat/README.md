@@ -75,49 +75,12 @@ instead of the current silent empty view).
 Also known: a deep link to an UNKNOWN session id (or one this serve
 cannot open) selects it, fails to connect, and stays an empty view
 with a disabled composer — no explanation, no bounce to the list.
-And `execute_provider_tool` calls that land in the page provider's
-session-switch/reconnect window answer "provider connection closed"
-(the page cannot answer after its socket closes; the broker could
-queue or retry across provider reconnects).
-
 ## Sizes
 
 Measured after the official-style switch: JS 1,073,593 B (333,255 B
 gzipped), dist total 1,244,142 B including five Geist woff2 subsets —
 React + assistant-ui + Tailwind + fonts. The Go binary serves it as
 static files; nothing is embedded.
-
-## Page provider (agent-operated debugging)
-
-The page can register itself as an mcp-provider-broker PROVIDER over
-WebSocket (`ws://<broker>/hub/provider`) — the agent's MCP debug flow
-discovers it and operates the page. Identity is the addressing
-contract: `sai-chat-<session>` (the agent in session X drives the page
-showing X; switching sessions re-registers). Duplicate-id semantics
-(verified live): an active registration is not displaced; the id
-carries no credential — the broker's unauthenticated LAN trust class
-applies.
-
-Three doors, in order of user intent:
-
-- `sai.pageProvider(ws://host:port/hub/provider, {send: true})` —
-  explicit DevTools action; the only path that persists (auto-connects
-  on later loads). The URL is required — no baked-in default.
-- `?page-provider=<ws-url>` — NOT persisted, NOT auto-connecting: the
-  page shows a confirmation banner; confirming connects for this
-  session only. A crafted link can never silently wire the page to a
-  foreign broker.
-- `sai.pageProviderOff()` — stop and clear.
-
-Only loopback/private-network ws targets are accepted. The status bar
-shows an active connection (`provider: <host>` + one-click disconnect).
-`page_send` is opt-in separately — it drives the REAL composer (native
-setter + input event + send click, with a bounded cleared-input
-confirmation), which reaches the agent's shell tools; the tool
-description states it is dispatched, not confirmed.
-
-Other console tools: `sai.list()`, `sai.snap()`, `sai.messages()`,
-`sai.select(id)` — live state inspection from DevTools.
 
 ## The blank-view evidence chain
 
