@@ -1262,3 +1262,273 @@ page_provider_check fixture 与对应 Go 测试、README 的调试章节。理�
   （internal/projects 的宿主概念）、归档——纯 B1 基础即可做。
 - B2 不动 web 的会话面（新建/删除/列表 API 属 C），只动 Tool/Hooks
   与包路径；web 留 internal 正是给 C 留重塑空间。
+
+## 17. 里程碑 C：项目与会话管理
+
+**消歧**：本章是路线图的第三里程碑（A=会话流重构、B1=Namespace/
+按会话模型/sessionhost、B2=Tool 接口/审批/公共包）。C 围绕**项目与
+会话的管理面**：新建、列表、归档、注册、删除的补全。
+
+### 17.1 现状盘点
+
+| 能力 | 现状 | 缺口 |
+|---|---|---|
+| 新建会话 | CLI `/new`（B1 步 4）；web 无 | web 端点 + 对话框 |
+| 模型列表 | `ModelResolver.List()` 接口位 + `ModelDescriptor{Provider, Model, ReasoningLevels}`（agent/resolver.go:46）；config resolver 的 List 已实现（`reasoningLevelNames`） | 无消费方；无测试；无默认标记 |
+| 会话列表 | `Store.ListSessions(ns)`（jsonl 按 mtime 排序；`readSessionHead` 从**最早段**取 title/created/meta）| web /api/projects 已消费；CLI 无 |
+| 归档 | 无（§15.5 只留 `Archiver` 接口位 + 前置条件） | 存储方式未定；CLI/web 全缺 |
+| 删除 | web DELETE /api/s/{id}（B1）；chat onDelete 未接 | chat 二次确认 |
+| 项目注册 | CLI `sai project add`；web 只读 projects.json（stat-gated 缓存，Manager.registryEntries） | web 注册/注销端点；注册表并发写 |
+| 标题 | `readSessionHead`：最早段 records[0]=session.created 且 records[1]≠compacted 时扫首条 user.input | **压缩后标题变空**：records[1] 是 compacted 即放弃——但设计意图就是从最早段读，最早的 archive 段在，标题应该在 |
+| /resume | `strings.HasPrefix(text, "/resume")`（B2 待办：/resumefoo 误匹配） | 精确匹配收紧 |
+
+**标题问题（设计点 6，实测基线 + 规则冲突）**：用户报告"压缩后标题
+变空"。这**不是单纯的 bug，而是用户报告与既有书面规则的冲突**——
+multi-session.md（§ Title 规则）明文规定"若最早段前两行是
+created+compacted → Title 留空；**绝不取中途输入当标题——标题撒谎
+比留空更糟**"。
+
+**实测基线**（review 用真实 Append 路径的 overlay 探针，三种状态）：
+- **A. 正常压缩**（created→input→compact→input）：归档段
+  `[created, input]`，活跃段 `[created, compacted, input]`——
+  **标题非空**（"FIRST"）✓；`records[1]==compacted` 的提前返回
+  **不可达**（最早段是归档，不含尾随 compacted）。
+- **B. 全部压缩前归档不在磁盘**（带外删除/清理）：活跃段
+  `[created, compacted, input]`——标题空（**既有规则的预期行为**）；
+  此时放宽扫描得到的"later"**不是会话最早输入**——正是规则说的
+  "撒谎"。
+- **C. 最早归档第二行 torn**：`[created, <坏行>]`——标题静默空
+  （jsonl 从首坏行截断的既有语义）；与 `records[1]==compacted`
+  无关，**放宽扫描修不了**。
+
+仓库内**无任何清理归档的代码**（grep prune/Remove 零命中）⟹ B/C
+只能来自人工/外部工具/旧版本遗留。**chat 的标题必然来自
+SessionInfo.Title**（两处 `s.title || "untitled"`，源是服务端快照）
+——客户端路径假设已否决。
+
+**C1 的纪律**：第一项是**经真实压缩路径的复现测试**（A 形态）——
+若绿（实测预期绿），则需拿到用户那条会话的真实磁盘形态（目录里的
+log-*.jsonl 清单）：归档齐全 → 报告另有来源（旧版本段布局，未验
+证）；归档缺失 → 命中 B 或 C。**B 是既有规则的行为**：要不要改规则
+（"撒谎比留空更糟"→"最早可读输入"）是产品决策，交用户；C 是截断
+语义的固有行为，修复方向另议（或接受）。**不按推测改扫描语义**。
+
+### 17.2 新建会话
+
+**服务端**：`sessionhost.Pool.Create(ns string, meta storage.SessionMeta) (*Lease, error)`（§15.5 预留落地）：
+- 校验 meta 经**共享校验函数**（`agent.ValidateSessionMeta(resolver, meta)`——B1 待办"level 校验下沉"在此落地）：provider/model 必须解析、reasoning_level 必须是该模型支持的档位（空=默认）。CLI `/new` 的 `newMetaValidator` 与 web 都调它，非法输入得到同一份错误。
+- 校验通过 → `agent.NewSession(ns, meta)`（惰性 header：磁盘无目录，首条 append 才落盘——现状不变）。
+- **发布进 Pool 表**：Create 走与 **Acquire 慢路径**同款的发布序列——openSlow（OnOpened 钩子：建 hub，宿主伴随对象先于任何客户端可见；失败 → 关会话 + 返回错误）→ `s.mu` 内置表（refs=1）→ defer 占位清理（不留半开条目）。之后 `GET /api/s/{id}/stream` 走表内**快路径**（不经 Locate——未落盘会话没有目录，`HasSession` 探针找不到它，Locate 必然 404；表内命中是它唯一的服务端入口）。
+- **ID 冲突**：NewSession mint 的新 ID 与表内/磁盘冲突概率为零（26 字符随机）；仍加一行守卫（表内已有该 id → 返回错误）——零概率一旦发生就是覆盖活条目，一行守卫比事后排查便宜。
+- **Pool 关闭**：`p.closed` 时 Create 返回 ErrClosing（与 Acquire 同款）。
+- **未落盘会话的生命周期**：表内条目受空闲驱逐管辖——refs 归零且无订阅者（EvictGuard）后，清扫者照常拆除：**拆除即永久丢失**（磁盘无目录，重启后同样不可恢复；`#s=<id>` 返回 unknown_session）。**刷新在空闲窗口内可回到**（表内快路径），**超时或重启后回不去**——这是惰性 header + 驱逐的真实代价，不是"只能靠 #s=<id>"那么温和。
+- **列表可见性**：惰性 header 意味着 `ListSessions` 看不见未落盘会话（jsonl 的 `listSession` 要求 hasSegment）。这是现状语义（CLI /new 的会话在首条消息前也不在 /api/projects 里），**保持**：对话框不含首条消息（用户拍板），新会话在侧栏显示靠**客户端本地状态**（创建返回的 ID 直接导航），服务端列表要等首条消息落盘。
+
+**端点**：`POST /api/projects/{pid}/sessions`
+- body（严格：未知字段 → 400 `unexpected_field`）：`{"provider": "p", "model": "m", "reasoning_level": ""}`；provider/model 必填（客户端默认填充后提交），reasoning_level 可选。
+- 201 + `{"id": "<sid>", "ns": "<pid>"}`；客户端用返回的 id 导航（`#s=<id>`）——**无服务端切换逻辑**（用户拍板）。
+- 错误码：`model_unavailable`（409，校验失败——理由：客户端只从 GET /api/models 选择，提交失配意味着**配置在选取与提交之间变了**；reasoning_level 不在该模型档位时同样返回此码）；`unknown_project`（404，**新码**——项目不在注册表）；`invalid_input`（400，字段缺失/类型错/未知字段）。
+
+**GET /api/models**：`[{"provider": "p", "model": "m", "reasoning_levels": ["low","high"], "default": bool}]`——`ModelDescriptor` 增 `Default bool`（config resolver 的 List 填充：default_provider+default_model 组合为 true）。`List()` 需测试（B1 待办）：pin 顺序稳定（按 provider 名、model 名排序）。
+
+### 17.3 归档
+
+**存储方案对比**：
+
+| 维度 | A：标记文件（`<id>/archived`） | B：目录移动（`<ns>/archive/<id>`） |
+|---|---|---|
+| 路径不变量 | **不变**——`<root>/<ns>/<id>` 寻址全保留 | 破坏：ListSessions/Delete/HasSession/Acquire 全部要识别两棵树 |
+| ListSessions | 每目录多一次 stat（标记存在性）——在已有的 ReadDir 循环里是同一次 IO 的附带查询 | 同一次 ReadDir（扫两个父目录） |
+| 崩溃一致性 | 两态（标记在/不在），`os.Create`+close 即可，无需原子重命名 | 两个目录的 rename 链，中断恢复复杂（复用段切换的模式但作用在目录级） |
+| 锁 | 会话锁路径不变（锁文件仍在 `<id>/` 内） | 锁文件跟着移动——移动期间锁语义中断 |
+| 外部工具（grep/备份） | 会话目录结构不变，直觉一致 | 归档会话"消失"到另一棵子树 |
+| 与段切换的交互 | 无（标记文件不参与段命名） | 归档目录里的段切换路径要重推 |
+
+**推荐 A（标记文件）**——与 opus 倾向一致，理由如上表；代价（列表多
+一次 stat）在 ReadDir 循环内可忽略。
+
+**接口**：`storage.Archiver`（§15.5 位置）：
+```go
+// Archiver is the optional archive capability. Archive/Unarchive
+// acquire the SESSION's own OS lock (the same one Open takes); no
+// root lock is required (the CLI never builds a Pool and cannot hold
+// it). The web host goes through Pool.Archive, which additionally
+// guarantees no in-flight Lease/subscribers before calling in; the
+// CLI calls the Store's Archiver directly.
+type Archiver interface {
+    Archive(ns, id string) error   // session lock held; creates the marker
+    Unarchive(ns, id string) error // session lock held; removes the marker
+    IsArchived(ns, id string) (bool, error)
+}
+```
+jsonl 与 memory 都实现。`SessionInfo` 增 `Archived bool`（ListSessions
+填充；默认过滤归档项，`ListSessionsOpts{IncludeArchived bool}` 或
+`ListSessionsAll`——接口形状实现期定）。
+
+**互斥**（设计点 4，修订：跨进程互斥靠**会话自己的 OS 锁**，不靠
+root lock——CLI 不建 Pool 不持 root lock，而 serve 可能正打开着同
+一会话）：
+- **Archiver 的实现**：Archive/Unarchive **获取该会话的 OS 锁**（与
+  Open 同一把锁：被其它进程持有 → LockHeldError → web 409
+  `session_locked`）。标记的写/删在锁内完成。
+- **打开与归档的 TOCTOU 消除**：标记检查放在**会话锁内**——
+  jsonl 的 `openDir` 在拿到锁后检查 `archived` 标记（存在 →
+  `storage.ErrArchived`，**新类型化错误**，agent 透传）。归档方
+  （持锁写标记）与打开方（持锁查标记）串行化在同一把锁上，窗口不
+  存在。memory 实现同语义（锁退化为进程内互斥）。
+- **Pool.Archive（web 宿主路径）与 Delete 同构**：运行中 →
+  ErrRunActive；refs>0 或有订阅者（InUseGuard）→ ErrInUse——**不
+  强制驱逐用户正在看的会话**；空闲 → 置 closing 占位（defer 清理，
+  与 Delete 同款）→ 池内 teardown → 获取会话锁 → 写标记 → 清占位。
+  占位期间 Acquire 得 ErrClosing。Unarchive 经 Pool 时同样过
+  InUseGuard（归档会话不在池里，通常直接锁内删标记）。
+- **CLI 路径**：`/archive` 直接经 Store 的 Archiver（获取会话锁 →
+  写标记）——CLI 与 serve 各自持锁串行，跨进程安全；serve 若已打
+  开该会话（持锁中）→ CLI 得 session_locked。
+- **归档会话的打开/resume**：**拒绝打开**（ErrArchived → web 409
+  `session_archived`，CLI 提示"先 /unarchive"）。追加同拒（追加
+  必经打开）。删除允许（归档≠保护，删除路径先删标记再删目录——
+  或直接删目录带标记）。驱逐不会遇到归档会话（打不开就不在池
+  里）。
+
+**CLI**：`/archive <序号|前缀>`、`/unarchive <同>`、`/sessions --all`。
+**web**：`POST /api/s/{id}/archive`、`DELETE /api/s/{id}/archive`、
+侧栏归档区（默认折叠，展开列出归档项 + 恢复按钮）。
+
+### 17.4 项目注册/注销
+
+**端点**：
+- `POST /api/projects` body `{"path": "..."}`——路径必须存在且为目录
+  （400 `invalid_path`）；**路径规范化用既有导出函数
+  `projects.Canonical(path)`**（Abs + Clean + windows/darwin 平台的
+  ToLower——与 ProjectID 的哈希前规范化完全一致；CLI 的 project add
+  与注册表判重已在用它，自造 Abs+Clean 会产生漂移）；已注册（同规范
+  路径）→ 幂等 200；注册表写失败 → 500。
+- `DELETE /api/projects/{pid}`——pid 必须在注册表（404
+  `unknown_project`）；**有已打开会话 → 409 `project_in_use`**。**与
+  打开的竞态**：顺序为①注册表锁下写入（移除该条目）→ ②之后的
+  Acquire 经 Locate（读注册表）自然拒绝新打开（unknown_session）；
+  ③已在途的打开：openSlow 的 Locate 在锁外读注册表——若读到旧表
+  （注销前快照），打开完成并进入池；**接受这个窗口**（已在途的打开
+  是合法的旧世界请求；该会话照常工作，驱逐后不可再开）——文档写明
+  而非消灭。判定来源：写注册表**前**问 Pool "该 ns 是否有打开会话"
+  （此刻快照 + Locate 门拒绝后来者 = 足够窄）。无会话但有归档/磁盘
+  目录 → **允许注销，数据不删**（用户拍板"不删除数据"）。
+
+**注册表文件锁**：**复用 jsonl.AcquirePathLock**（锁
+`<root>/projects.json.lock`）——同原语、同语义（进程级独占），写路径
+`读 → 修改 → 写临时文件 → rename → 释放锁`。CLI 的 `sai project add`
+同样走锁（现状是 CLI 独占运行所以无并发，加了锁两端对称）。
+**锁竞争**：AcquirePathLock 是非阻塞的（被持有即 LockHeldError）。
+两个并发 POST /api/projects：**短重试**（100ms/2ms 有界，与 readLockHolder 的重试同形——非复
+用那个函数）后仍被持 → 409 `registry_locked`（**新码**：
+注册表正被另一写操作持有，瞬时态、可重试）。CLI 同策略。
+
+**缓存失效**：Manager 的 stat-gated 缓存（mtime+size）在注册表被
+rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻辑**。极限
+情形（同尺寸写入落在同一 mtime tick）沿用 multi-session.md §3 的既有
+前提："下一次写即自愈"，满足"最迟下一次请求"。
+
+### 17.5 CLI /sessions 与 /resume
+
+**/sessions 输出**（当前项目范围，Q1=B）：
+```
+ 1  s0000389abc…  修复登录超时            fake/fake-reasoner  10-14 12:03
+ 2  s0000389def…  （无标题）              fake/fake-model     10-13 18:22
+ A  s0000389ghi…  旧会话                  fake/fake-model     09-30 09:00
+```
+- 序号 = **列表位置的 1-based 下标**（ListSessions 的 mtime 降序）；
+  **不稳定**（两次命令之间新增/归档会漂移）——**文档写明**，/resume
+  的序号匹配以"当次 /sessions 输出"为准；ID 前缀是稳定寻址。
+- 归档项：默认隐藏；`--all` 显示（标记 `A`）。
+- 模型列：SessionInfo.Meta（provider/model）。
+
+**/resume 匹配**：
+- 参数形态：纯数字 → 序号（取当次 ListSessions 的第 N 项，范围外报
+  错列出可用范围）；其它 → ID 前缀（唯一命中 → 打开；零命中 → "找
+  不到"；多命中 → 列出全部候选，要求补全长前缀）。
+- **命令匹配收紧**（B2 待办）：`text == "/resume"` 与
+  `strings.HasPrefix(text, "/resume ")`——`/resumefoo` 落 unknown
+  command（与 /new 同款 + stderr 断言测试）。
+
+### 17.6 chat 客户端
+
+- **新建对话框**：侧栏"+"按钮与输入框 `/new` 均打开；项目下拉（默认
+  当前）、模型下拉（GET /api/models，默认标记项）、推理强度（所选模
+  型 ReasoningLevels 非空才显示）；提交 → POST → 用返回 id 导航。
+- **归档区**：侧栏底部折叠区；归档/恢复按钮在会话项的上下文菜单。
+- **删除二次确认**：onDelete 已有事件，接浏览器 confirm。
+- **审批卡**（B2 待办）：消费 `tool_approval_pending/resolved` 事件
+  与快照 `awaiting_approval`（B2 7a 已落 wire）——渲染批准/拒绝按钮，
+  回答走 POST /api/s/{id}/approval。**推荐放进 C**（C 本就在改 chat
+  页面；7a 的 wire 已就绪只差 UI）。
+
+### 17.7 公开 API 收敛（B2 待办）
+
+**推荐：C 的最后一步做收敛**（C 的宿主代码——Create/Archive/List 的
+消费——写完后，近义项的实际用法可见，此时收敛有证据；另起小里程碑
+会把"用法定型"与"收敛"拆到两处，中间态更久）。范围：
+- `Send`/`Start`：看 C 的宿主代码用哪个（预计 Start 为主——web 需要
+  Run 控制；Send 可能内化为语法糖或删除）。
+- `SnapshotStream`/`SnapshotStreamState`：同上。
+- `DefaultContextWindowTokens`：若 C 无人用则内化。
+- `sessionhost.Coded`/`Options.Locate` 的宿主语义：看 Create/Archive
+  路径是否需要变更签名。
+
+### 17.8 待用户拍板的问题
+
+- **(a) 归档存储方式**：推荐 A（标记文件）——路径不变量不动、崩溃
+  一致性两态、锁语义连续（17.3 对比表）；B（目录移动）的收益只有
+  "列表天然分区"，代价是全部寻址路径重构。
+- **(b) 审批卡是否进 C**：推荐进（chat 页面本就在改；wire 就绪）。
+- **(c) /sessions 的序号语义**：推荐"当次列表位置，文档写明不稳
+  定"（备选：坚持 ID 前缀寻址、去掉序号——更稳定但可用性差）。
+- **(d) 注销项目时有磁盘会话但未打开**：推荐允许注销（数据保留，
+  重新注册即恢复可见）——用户拍板"不删除数据"的自然延伸；备选：
+  拒绝并要求先归档/迁移。
+- **(e) 惰性 header 的新会话在服务端列表的可见性**：推荐保持现状
+  （首条消息前不可见，客户端本地显示）。**真实代价**（D1 修订）：
+  刷新在空闲窗口内可回到（表内快路径），但**驱逐超时或进程重启后未
+  发首条消息的新会话永久消失**（磁盘无目录）——空会话本来就没有任
+  何内容，丢失的只是"导航占位"。备选：Create 后立即
+  MaterializeHeader（列表即时可见、刷新/重启后可恢复，但产生"空标
+  题会话"噪音且改变"空会话不落盘"的既有不变量）。两案的取舍交给
+  用户。
+
+### 17.9 迁移步骤（每步独立送审 + commit）
+
+| 步骤 | 内容 | 回归保护 | 硬依赖（弱序见下行说明） | doc-sync |
+|---|---|---|---|---|
+| C1 | 标题问题：**先复现**（A 形态：真实压缩路径断言标题非空——实测预期绿）；绿则取用户磁盘形态（log-*.jsonl 清单）分流 B/C；**B 是规则冲突**——改规则需用户裁定（"撒谎比留空更糟"→"最早可读输入"）；C 另议或接受 | A/B/C 三形态各有独立断言的测试；现有 list 测试全过 | 无 | **若改规则**：multi-session.md 的 Title 规则（"绝不取中途输入"段）+ storage/jsonl/store.go 的 readSessionHead 注释 + storage/storage.go 的 SessionInfo.Title 文档契约（"empty when the session start is no longer on disk"句）三处同步 |
+| C2 | 共享校验函数 `ValidateSessionMeta`（B1 下沉）+ CLI /new 切换 + resolver level 校验测试 | CLI /new 既有测试不改断言；校验 kill（level 不校验→红） | 无 | design §17.2 |
+| C3 | `ModelDescriptor.Default` + `List()` 测试 + `GET /api/models` | List 顺序/默认标记 pin；端点过 guardAPI | （建议）C2 | multi-session 码表+路由 |
+| C4 | `sessionhost.Pool.Create` + `POST /api/projects/{pid}/sessions` | Create 校验 kill（非法 meta→400 码）；端点测试（unknown_project/model_unavailable/严格字段） | C2、C3 | 同上 |
+| C5 | `Archiver`（标记文件）+ SessionInfo.Archived + ListSessions 过滤 + `Pool.Archive` 互斥 | 归档/取消/IsArchived round-trip；打开归档→ErrArchived；运行中归档→ErrRunActive；列表默认过滤+--all | （建议）C1 | storage doc.go 契约；multi-session.md §4 码表（session_archived 409）+ 归档路由；**§15.5 前置条件补指针**（"C 阶段 0 修订：互斥机制见 §17.3"） |
+| C5w | web 归档端点（POST/DELETE /api/s/{id}/archive）+ 409 session_archived 映射 | 端点测试：归档/取消 round-trip、打开归档→409 码、锁竞争→session_locked | C5 | 同 C5 |
+| C6a | chat 新建对话框 + 删除二次确认 | 对话框提交→POST→导航；tsc | C3、C4 | webui.md |
+| C6b | chat 侧栏归档区（归档/恢复按钮 + 折叠区） | UI 消费 SessionInfo.Archived；tsc | C5、C5w | webui.md |
+| C6c | chat **审批卡**（若 (b) 通过） | UI 消费 tool_approval_pending/resolved + 快照 awaiting_approval；回答走 /approval；tsc | 无（wire 已在 B2 落地） | webui.md |
+| C7 | CLI：/sessions、/archive、/unarchive、/resume 序号+前缀+精确匹配收紧 | /resumefoo stderr 断言（B2 待办）；序号/前缀/歧义用例 | C5 | README |
+| C8 | web 项目注册/注销端点 + 注册表文件锁 + CLI project add 走锁 | 并发注册/注销测试；注销有打开会话→409；缓存自动失效验证 | C4 | multi-session |
+| C9 | **公开 API 收敛**（17.7 清单，按 C 代码的实际用法） | 全部 C 测试不改断言通过 + 收敛项的调用方迁移 | C1–C8 | README API 面 |
+
+硬依赖只有：C4→C2、C3；C5w→C5；C6a→C3、C4；C6b→C5、C5w；C7→C5；
+C8→C4；C9→C1–C8。其余顺序（如 C1 在 C5 前）只是建议（避开同文件
+编辑冲突）。后端（C1–C5、C5w、C8）先于前端（C6a/b/c）；CLI（C7）
+与 web（C6*）在 C5 后可并行。C9 收尾。
+
+### 17.10 与既有设计的关系
+
+- §15.5 的三个接口预留（Create/List/Archiver）在本章落地，在预留
+  形状上**扩展**：Create 增 `ns`（宿主按项目 ns 建会话——预留的
+  `Create(meta)` 漏了宿主需要的寻址参数）；Archiver 增
+  Unarchive/IsArchived（取消归档与查询是 UI 必需）。**§15.5 的前置
+  条件（"持有 root lock 且零 Lease"）被 §17.3 修订**：跨进程互斥靠
+  会话自己的 OS 锁（CLI 不持 root lock）；接口注释按 §17.3 的机制
+  写。
+- §15.6 Q1=B 的项目范围语义贯穿（/sessions、/resume 均当前 ns）。
+- §16（B2）的审批 wire（事件+快照+端点）在 C6 消费，无新 wire 字段。
+- 需改的既有段落：§15.5 的 Archiver 前置条件原文（"调用方必须持
+  有 root lock 且该会话无在途 Lease"）**被 §17.3 修订**——落地时在
+  §15.5 补一句"（C 阶段 0 修订：互斥机制见 §17.3）"；其余既有段落
+  不改。
