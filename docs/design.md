@@ -1279,7 +1279,7 @@ page_provider_check fixture 与对应 Go 测试、README 的调试章节。理�
 | 归档 | 无（§15.5 只留 `Archiver` 接口位 + 前置条件） | 存储方式未定；CLI/web 全缺 |
 | 删除 | web DELETE /api/s/{id}（B1）；chat onDelete 未接 | chat 二次确认 |
 | 项目注册 | CLI `sai project add`；web 只读 projects.json（stat-gated 缓存，Manager.registryEntries） | web 注册/注销端点；注册表并发写 |
-| 标题 | `readSessionHead`：最早段 records[0]=session.created 且 records[1]≠compacted 时扫首条 user.input | **压缩后标题变空**：records[1] 是 compacted 即放弃——但设计意图就是从最早段读，最早的 archive 段在，标题应该在 |
+| 标题 | `readSessionHead`：最早段 records[0]=session.created 且 records[1]≠compacted 时扫首条 user.input | 用户报告"压缩后标题变空"——**规则冲突，非单纯 bug**（见下方实测基线：A 形态该分支不可达） |
 | /resume | `strings.HasPrefix(text, "/resume")`（B2 待办：/resumefoo 误匹配） | 精确匹配收紧 |
 
 **标题问题（设计点 6，实测基线 + 规则冲突）**：用户报告"压缩后标题
@@ -1304,7 +1304,9 @@ created+compacted → Title 留空；**绝不取中途输入当标题——标�
 仓库内**无任何清理归档的代码**（grep prune/Remove 零命中）⟹ B/C
 只能来自人工/外部工具/旧版本遗留。**chat 的标题必然来自
 SessionInfo.Title**（两处 `s.title || "untitled"`，源是服务端快照）
-——客户端路径假设已否决。
+——客户端路径假设已否决。**agent 层三条真实压缩路径均保留标题**
+（agent/title_compaction_test.go：手动 Compact、自动 pre-turn 压缩、
+压缩后重开追加——全部绿；K2 变异段切换不归档使手动路径红）。
 
 **C1 的纪律**：第一项是**经真实压缩路径的复现测试**（A 形态）——
 若绿（实测预期绿），则需拿到用户那条会话的真实磁盘形态（目录里的

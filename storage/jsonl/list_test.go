@@ -92,6 +92,15 @@ func TestListSessionsBasics(t *testing.T) {
 // The original first input stays in the immutable archive after a
 // compaction; the listing must keep reporting it (and the ORIGINAL
 // creation time, not the compaction time).
+//
+// This is also the C1 "A-form reproduction" (§17.1): the compaction
+// goes through the REAL segment-switch path (session.Append of
+// context.compacted triggers the jsonl archive+switch), so the
+// earliest segment is the archive holding [created, input] — and the
+// title survives. The records[1]==compacted early return is
+// UNREACHABLE in this shape (the active segment opens with a header
+// copy). Expected green; a red here means the segment switch or the
+// head scan regressed.
 func TestListSessionsAfterCompaction(t *testing.T) {
 	store, _ := testStore(t)
 	project := testNS(t)
