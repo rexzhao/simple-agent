@@ -90,6 +90,30 @@ cd clients/chat && npx tsc --noEmit      # 动过前端时
 - 前端/脚本类改动要跑对应 fixture（`internal/web/testdata/*_check.mjs`，由 Go 测试驱动）。
 - 声称"全绿"必须能贴出对应输出。
 
+### 3.1 门禁节奏（避免全套循环）
+
+迭代期只跑定向集合：单测试 `go test ./internal/<pkg>/ -run <Name>`、单包
+`go test ./internal/<pkg>/`。**迭代期不加 -count=1**，以利用测试缓存。
+
+正式门禁（-count=1 的完整 §3）在每个送审版本跑一次。review 通过后到
+申请提交之间，内容（hash）不变则不重跑，申请时引用送审时的输出与
+hash；内容变了必须重跑。
+
+禁止 `./...` 全套循环。flake 量化用 -run 锁定单测试再加大 -count
+（如 -count=3000），写明复现率。
+
+Windows 完整 race 门禁仍是 `go test -p 1 -race -count=1 ./internal/... ./cmd/...`，
+整仓串行以控制资源；迭代期的 -p 1 只对目标包使用。
+
+review/opus 的独立验证不受频次限制，但也应先定向、后全套一次。
+
+### 3.2 批量工具
+
+互不依赖的只读/机械操作（多文件 read、多路 grep、hash-object 清单、
+gofmt 临时文件检查、多个 -run）用一次 codemode 批量执行
+（Promise.allSettled）。会改文件的 edit/write，以及依赖前一步结果的
+步骤，按顺序执行；同一文件的多处改动合并为一次 edit。
+
 ## 4. review 的验证纪律
 
 - **不改动被审内容**：一次性实验用 overlay / 临时目录 + 副本进行；
@@ -111,6 +135,9 @@ cd clients/chat && npx tsc --noEmit      # 动过前端时
   `clients/chat/dist`、`.render-dist` 等已在 gitignore 内。
 - **不要 kill 不是自己启动的进程**（本机常有用户在跑的 `sai.exe` / `sai-dbg.exe`）。
   自己起的服务自己收；优先用**独立副本的 server root**，避免撞 root 锁影响他人。
+- **全套测试与 -race 属重负载**：开跑前用 `tasklist | grep -iE 'go.exe|\.test\.exe'`
+  之类的方法确认是否有其他会话在跑，能错开就错开、能缩小就缩小；
+  不得为此 kill 他人进程。
 - **不要 push**、不要改远端、不要动用户凭据，除非用户明确要求。
 
 ## 6. worker 送审清单
