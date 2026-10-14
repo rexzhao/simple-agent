@@ -14,8 +14,8 @@ import (
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessionhost"
-	"github.com/rexzhao/simple-agent/internal/storage"
-	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage"
+	"github.com/rexzhao/simple-agent/storage/jsonl"
 )
 
 // Manager is the web host: the HTTP adapter over the session pool,

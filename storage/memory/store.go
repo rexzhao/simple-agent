@@ -2,6 +2,8 @@
 // a map and die with the process. It exists for tests and ephemeral
 // sessions. Records outlive the handle: closing a session and reopening it
 // by id mirrors the jsonl behavior of reopening a file.
+//
+// Compatibility: v0 — no stability guarantees until v1.
 package memory
 
 import (
@@ -10,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 // Store manages sessions in memory.

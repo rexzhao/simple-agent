@@ -181,7 +181,7 @@ schema):
 ```
 cmd/sai              command-line interface (human-readable record blocks on stdout)
 internal/agent       state layer + agent loop (owns State, commit is the only write path)
-internal/storage     record schema + Fold + Store/Session interfaces
+storage/            record schema + Fold + Store/Session interfaces — public (B2, v0)
   jsonl/             append-only JSONL file store (torn-tail recovery)
   memory/            in-memory store for tests and ephemeral sessions
 model/               provider adapters (OpenAI Chat/Responses, Anthropic) — public (B2, v0: no stability guarantees until v1)

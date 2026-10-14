@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
-	"github.com/rexzhao/simple-agent/internal/storage/memory"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage/memory"
 )
 
 // A stopped hub must release its subscription: a dead subscriber whose

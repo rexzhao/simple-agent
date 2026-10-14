@@ -2,6 +2,9 @@
 // root laid out as <root>/<ns>/<session>/log.jsonl. The ns is an opaque
 // namespace the HOST derives (projects.ProjectID for the CLI and serve);
 // a session is a directory holding one append-only log.
+//
+// Compatibility: v0 — no stability guarantees until v1 (see the storage
+// package doc for the format contract).
 package jsonl
 
 import (
@@ -19,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 const (

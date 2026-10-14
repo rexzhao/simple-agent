@@ -1,8 +1,8 @@
 package agent
 
 import (
-	"github.com/rexzhao/simple-agent/internal/storage"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 // SessionEvent is one item on the session's single ordered stream. The

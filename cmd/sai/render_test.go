@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 func TestFormatRecordCommonHeaderAndBodies(t *testing.T) {

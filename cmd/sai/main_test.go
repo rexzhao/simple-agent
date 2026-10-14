@@ -15,9 +15,9 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
-	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
-	"github.com/rexzhao/simple-agent/internal/storage/memory"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/memory"
 )
 
 func TestAppNameFromArgv0(t *testing.T) {

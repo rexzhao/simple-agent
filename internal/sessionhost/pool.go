@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
-	"github.com/rexzhao/simple-agent/internal/storage"
-	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage"
+	"github.com/rexzhao/simple-agent/storage/jsonl"
 )
 
 // Typed errors. The HTTP layer maps each to a stable status + code

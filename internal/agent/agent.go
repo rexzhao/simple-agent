@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 // DefaultMaxIterations bounds one run when Options.MaxIterations is unset.

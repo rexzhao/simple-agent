@@ -6,8 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 // failSummaryProvider answers normal turns but fails every summary

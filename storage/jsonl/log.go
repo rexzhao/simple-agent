@@ -10,7 +10,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 // Log is the append-only JSONL file of one session. It owns the file and

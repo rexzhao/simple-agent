@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 // TestJSChainFixture closes the cross-language blind spot: the Go-side

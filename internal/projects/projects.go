@@ -250,7 +250,7 @@ func projectID(path string) string {
 // ProjectID derives the storage namespace for a project directory: the
 // cleaned absolute path (case-folded where the platform ignores it)
 // hashed into the "p"+16 base32 form the jsonl layout expects. Moved
-// from internal/storage/jsonl (§15.1): "project" is host semantics, the
+// from storage/jsonl (§15.1): "project" is host semantics, the
 // store sees only an opaque ns.
 func ProjectID(dir string) string {
 	abs, err := filepath.Abs(dir)

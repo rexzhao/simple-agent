@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
-	"github.com/rexzhao/simple-agent/internal/storage/memory"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage"
+	"github.com/rexzhao/simple-agent/storage/memory"
 )
 
 // recordingProvider captures the requests it serves, keyed by the model

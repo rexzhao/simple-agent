@@ -1,5 +1,5 @@
 // Wire types mirrored from the serve side (internal/web/wire.go,
-// internal/storage/record.go, internal/web/manager.go). The chat client
+// storage/record.go, internal/web/manager.go). The chat client
 // consumes the same contract as the log page — these are its shapes.
 
 export type WireToolCall = {

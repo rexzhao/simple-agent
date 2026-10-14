@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 // ErrModelUnavailable reports a session whose recorded model no longer

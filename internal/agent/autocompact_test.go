@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 func TestEstimateTextTokens(t *testing.T) {

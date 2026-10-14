@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 // TestSessionLockSecondOpenFails verifies the single-writer invariant: a

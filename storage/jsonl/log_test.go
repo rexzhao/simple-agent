@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 // TestCorruptionNoticeRidesInjectedLogger pins the §15.1 contract end to

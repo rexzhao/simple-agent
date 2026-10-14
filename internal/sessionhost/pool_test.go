@@ -16,8 +16,8 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
-	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage/jsonl"
 )
 
 // gatedProvider holds the stream open so the test can keep a run
