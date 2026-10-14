@@ -6,6 +6,13 @@
 
 ## 0. 术语
 
+**Namespace（ns，里程碑 B1 §15.1）**：存储层的会话分组键，一个不透明
+字符串（jsonl 的 `<root>/<ns>/<session>/` 目录布局）。"项目"是宿主语
+义：`projects.ProjectID(dir)` 从项目路径推导 ns，注册校验由宿主（web 的
+注册表探针）承担，核心层（storage/agent）只见 ns。CLI 的 `-session`/
+`/resume` 只在当前目录对应项目的 ns 内查找（Q1=B）。
+
+
 | 术语 | 定义 |
 |---|---|
 | **CLI 模式** | `sai` 无 `-http` 运行。单机命令行，进程宿主一个会话，**当前路径即项目路径**（`ProjectID(cwd)`），串行单会话 |

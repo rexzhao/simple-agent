@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,6 +15,8 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/internal/storage/memory"
 )
 
@@ -79,7 +84,7 @@ func TestPromptAfterRunOutputByteLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession("test-ns")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +190,7 @@ func TestSendReturnsAfterEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession("test-ns")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +339,7 @@ func TestSendReturnsAfterCompactionAndEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession("test-ns")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +478,7 @@ func TestNewCommandSwitchesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession("test-ns")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,5 +521,233 @@ func TestNewCommandSwitchesSession(t *testing.T) {
 	}
 	if cli.session.ID() != afterNew {
 		t.Fatal("/clear was still routed to freshSession")
+	}
+}
+
+// setupCLIFixture assembles a real jsonl-backed CLI world in temp
+// directories: two project namespaces under one root, a session
+// materialized in project A, and agents whose CWD points at one of
+// them. No real provider or user config is involved.
+func setupCLIFixture(t *testing.T, sessionIn string) (*agent.Agent, *agent.Agent, string) {
+	t.Helper()
+	root := t.TempDir()
+	projectA := t.TempDir()
+	projectB := t.TempDir()
+	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAgent := func(cwd string) *agent.Agent {
+		ag, err := agent.New(agent.Options{
+			Provider:     &scriptedProvider{},
+			ProviderName: "test",
+			ModelID:      "model-test",
+			Storage:      store,
+			CWD:          cwd,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ag
+	}
+	if sessionIn == "" {
+		return newAgent(projectA), newAgent(projectB), ""
+	}
+	// Create the session under project A's ns through A's agent.
+	agA := newAgent(projectA)
+	session, err := agA.NewSession(projects.ProjectID(projectA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.MaterializeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return agA, newAgent(projectB), session.ID()
+}
+
+// TestCLIResumeScopedToCurrentProject pins the Q1=B wiring end to end
+// through setupCLI (the same code main runs): a session resumes only
+// from its own project's directory, and the cross-project failure
+// carries the explaining message. Also pins /resume (the command) to
+// the same scope, and a wiring regression (ns derived as anything but
+// the current project) fails the same-project case.
+func TestCLIResumeScopedToCurrentProject(t *testing.T) {
+	agA, agB, id := setupCLIFixture(t, "session")
+
+	// Same project: the -session path resumes.
+	cli, err := setupCLI(agA, id)
+	if err != nil {
+		t.Fatalf("same-project resume: %v", err)
+	}
+	if cli.session == nil || cli.session.ID() != id {
+		t.Fatal("setupCLI returned without the resumed session")
+	}
+	cli.closeSession()
+
+	// Cross project: a clean not-found with the explaining message.
+	_, err = setupCLI(agB, id)
+	if err == nil {
+		t.Fatal("cross-project resume succeeded — Q1=B scoping is broken")
+	}
+	if !strings.Contains(err.Error(), "can only be resumed from the project directory they belong to") {
+		t.Fatalf("cross-project error lacks the hint: %v", err)
+	}
+
+	// The /resume command is scoped the same way: same project works.
+	cli, err = setupCLI(agA, "")
+	if err != nil {
+		t.Fatalf("fresh setup: %v", err)
+	}
+	defer cli.closeSession()
+	cli.resumeCommand(id)
+	if cli.session == nil || cli.session.ID() != id {
+		t.Fatal("/resume same-project did not switch sessions")
+	}
+	// Cross project through the command: the error goes to stderr and
+	// the app still holds its current session (the resumed one).
+	cli.resumeCommand("s0000000000000000000000000")
+	if cli.session == nil || cli.session.ID() != id {
+		t.Fatal("/resume of an unknown session dropped the current session")
+	}
+
+	// A fresh session (no resume id) lands in the CURRENT project's ns.
+	// The wiring mutant (ns derived from anything but CWD) makes the
+	// same-project resume above fail, so this is a positive control.
+	fresh, err := setupCLI(agA, "")
+	if err != nil {
+		t.Fatalf("fresh setup (positive control): %v", err)
+	}
+	if fresh.ns != projects.ProjectID(agA.CWD()) {
+		t.Fatalf("ns = %q, want the current project's namespace", fresh.ns)
+	}
+	fresh.closeSession()
+	_ = agB
+}
+
+// TestCLIEntrypointSessionScoping runs the REAL binary (built to a
+// temp path) with a fake provider config and temp root: the -session
+// and /resume paths are exercised through main itself — no in-process
+// shortcut can prove the wiring. A fake model is never called: resume
+// only opens the session, and the REPL is fed /quit.
+func TestCLIEntrypointSessionScoping(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess build is slow")
+	}
+	root := t.TempDir()
+	projectA := t.TempDir()
+	projectB := t.TempDir()
+	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nsA := projects.ProjectID(projectA)
+	session, err := store.Create(nsA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Materialize a header so the session exists on disk.
+	if err := os.MkdirAll(filepath.Join(root, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessDir := filepath.Join(store.Root(), nsA, session.ID())
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	header := `{"item":"h` + strings.Repeat("0", 26) + `","t":"session.created","ts":"2026-01-02T03:04:05Z","provider":"fake","model":"fake-model"}` + "\n"
+	if err := os.WriteFile(filepath.Join(sessDir, "log.jsonl"), []byte(header), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id := session.ID()
+
+	// A config with a fake provider pointing at a dead port: resume
+	// never contacts it, but assembly must succeed. The provider lives
+	// in provider_dir as its own YAML file (the loader's format).
+	cfg := `default_provider: fake
+default_model: fake-model
+`
+	if err := os.WriteFile(filepath.Join(root, "sai.yaml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	provider := `name: fake
+base_url: http://127.0.0.1:1
+api_key: test
+models:
+  fake-model:
+    id: fake-model
+    type: openai-chat
+`
+	if err := os.MkdirAll(filepath.Join(root, "providers"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "providers", "fake.yaml"), []byte(provider), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build the real binary once.
+	bin := filepath.Join(t.TempDir(), "sai-test.exe")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "."
+
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sai: %v\n%s", err, out)
+	}
+
+	run := func(dir string, stdin string, args ...string) (string, error) {
+		cmd := exec.Command(bin, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "SAI_SERVER_ROOT="+root)
+		cmd.Stdin = strings.NewReader(stdin)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		return stderr.String(), err
+	}
+
+	// -session from the owning project: exit 0, the resumed id named on
+	// the way out.
+	stderr, err := run(projectA, "", "--server-root", root, "-session", id)
+	if err != nil {
+		t.Fatalf("same-project -session: %v\nstderr: [%s]", err, stderr)
+	}
+	if !strings.Contains(stderr, "sai: session "+id+"\n") {
+		t.Fatalf("same-project exit output does not name the session: %s", stderr)
+	}
+
+	// -session from a foreign project: non-zero exit with the hint.
+	stderr, err = run(projectB, "", "--server-root", root, "-session", id)
+	if err == nil {
+		t.Fatalf("cross-project -session succeeded\nstderr: %s", stderr)
+	}
+	if !strings.Contains(stderr, "can only be resumed from the project directory they belong to") {
+		t.Fatalf("cross-project -session lacks the hint: %s", stderr)
+	}
+
+	// /resume (the command) from the owning project: switches to the
+	// session, names it on exit.
+	stderr, err = run(projectA, "/resume "+id+"\n/quit\n", "--server-root", root)
+	if err != nil {
+		t.Fatalf("/resume same-project: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(stderr, "sai: session "+id+"\n") {
+		t.Fatalf("/resume same-project did not end on the resumed session: %s", stderr)
+	}
+
+	// /resume a foreign id: the app keeps its fresh session (a
+	// different id on exit) and prints the hint.
+	stderr, err = run(projectB, "/resume "+id+"\n/quit\n", "--server-root", root)
+	if err != nil {
+		t.Fatalf("/resume cross-project: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(stderr, "can only be resumed from the project directory they belong to") {
+		t.Fatalf("/resume cross-project lacks the hint: %s", stderr)
+	}
+	// The foreign session was NOT adopted: the exit line that names the
+	// persisted session must not name it (the error message mentions
+	// the id, so pin the "sai: session <id>" exit-line form).
+	if strings.Contains(stderr, "sai: session "+id+"\n") {
+		t.Fatalf("/resume cross-project ended on the foreign session %s: %s", id, stderr)
 	}
 }

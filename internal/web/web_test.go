@@ -16,7 +16,6 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/storage"
-	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/internal/storage/memory"
 )
 
@@ -96,7 +95,6 @@ func newTestManagerServerInner(t *testing.T, provider model.Provider) (*agent.Se
 			ProviderName: "test",
 			ModelID:      "model-test",
 			Storage:      store,
-			ProjectID:    jsonl.ProjectID(projectCwd),
 			CWD:          projectCwd,
 		})
 	}
@@ -115,8 +113,9 @@ func newTestManagerServerInner(t *testing.T, provider model.Provider) (*agent.Se
 	// Create the session through the factory's agent (so the header
 	// content matches it), materialize the header, and reopen it
 	// THROUGH the manager — the returned object is the manager's, so
-	// direct sends notify the hub exactly like HTTP requests.
-	created, err := ag.NewSession()
+	// direct sends notify the hub exactly like HTTP requests. The ns is
+	// the manager's registry-derived one (memory store ownership check).
+	created, err := ag.NewSession(projects.ProjectID(projectDir))
 	if err != nil {
 		t.Fatal(err)
 	}

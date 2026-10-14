@@ -24,7 +24,7 @@ func TestSessionLockSecondOpenFails(t *testing.T) {
 		}
 		var session storage.Session
 		for attempt := 0; attempt < 500; attempt++ {
-			session, err = store.Open(os.Getenv("SAI_LOCK_SESSION"))
+			session, err = store.Open(os.Getenv("SAI_LOCK_NS"), os.Getenv("SAI_LOCK_SESSION"))
 			if err == nil {
 				break
 			}
@@ -54,6 +54,7 @@ func TestSessionLockSecondOpenFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := session.ID()
+	ns := "p" + strings.Repeat("0", 16)
 	// The parent must let go of the lock before the child can take it.
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
@@ -64,6 +65,7 @@ func TestSessionLockSecondOpenFails(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"SAI_LOCK_CHILD=1",
 		"SAI_LOCK_ROOT="+root,
+		"SAI_LOCK_NS="+ns,
 		"SAI_LOCK_SESSION="+id,
 	)
 	if err := cmd.Start(); err != nil {
@@ -74,14 +76,14 @@ func TestSessionLockSecondOpenFails(t *testing.T) {
 	// succeeds is closed immediately — a leaked open would hold the
 	// lock ourselves and defeat the whole point.
 	for i := 0; i < 500; i++ {
-		probe, err := store.Open(id)
+		probe, err := store.Open(ns, id)
 		if err != nil {
 			break
 		}
 		probe.Close()
 		time.Sleep(10 * time.Millisecond)
 	}
-	second, err := store.Open(id)
+	second, err := store.Open(ns, id)
 	if err == nil {
 		second.Close()
 		t.Fatal("second Open of a locked session succeeded")
@@ -99,7 +101,7 @@ func TestSessionLockSecondOpenFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = cmd.Wait()
-	reopened, err := store.Open(id)
+	reopened, err := store.Open(ns, id)
 	if err != nil {
 		t.Fatalf("Open after holder death failed: %v", err)
 	}
@@ -114,7 +116,8 @@ func TestSessionLockReleaseOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := store.Create("p" + strings.Repeat("0", 16))
+	ns := "p" + strings.Repeat("0", 16)
+	session, err := store.Create(ns)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +128,7 @@ func TestSessionLockReleaseOnClose(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := store.Open(id)
+	reopened, err := store.Open(ns, id)
 	if err != nil {
 		t.Fatalf("Open after Close failed: %v", err)
 	}

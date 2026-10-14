@@ -36,7 +36,6 @@ type Options struct {
 	Parameters    map[string]any
 	MaxTokens     int
 	MaxIterations int
-	ProjectID     string // jsonl directory grouping
 	CWD           string
 	// ContextWindow is the model's context window in tokens; 0 means a
 	// conservative default. With AutoCompact it bounds the request budget.
@@ -60,7 +59,6 @@ type Agent struct {
 	parameters    map[string]any
 	outputLimit   int
 	maxIterations int
-	projectID     string
 	cwd           string
 	budget        contextBudget
 	autoCompact   bool
@@ -94,7 +92,6 @@ func New(options Options) (*Agent, error) {
 		parameters:    options.Parameters,
 		outputLimit:   options.MaxTokens,
 		maxIterations: maxIterations,
-		projectID:     options.ProjectID,
 		cwd:           options.CWD,
 		budget:        resolveContextBudget(options.ContextWindow, options.MaxTokens),
 		autoCompact:   options.AutoCompact,
@@ -109,8 +106,8 @@ func (a *Agent) CWD() string { return a.cwd }
 // session.created record is prepared here and committed ahead of the
 // session's first real record — so an empty session never touches the
 // storage.
-func (a *Agent) NewSession() (*Session, error) {
-	stored, err := a.store.Create(a.projectID)
+func (a *Agent) NewSession(ns string) (*Session, error) {
+	stored, err := a.store.Create(ns)
 	if err != nil {
 		return nil, err
 	}
@@ -129,20 +126,12 @@ func (a *Agent) NewSession() (*Session, error) {
 	}, nil
 }
 
-// OpenSession reopens a stored session by ID, rebuilding its state by
-// folding the records.
-func (a *Agent) OpenSession(id string) (*Session, error) {
-	return a.openSession(a.store.Open, id)
-}
-
-// OpenSessionIn reopens a stored session scoped to one project: the id
-// resolves inside the project's storage namespace only. The serve-mode
-// registration gate is structural at this level — a session living under
-// an unregistered project is not found, even though the store can see
-// its directory.
-func (a *Agent) OpenSessionIn(projectID, id string) (*Session, error) {
+// OpenSession reopens a stored session by ID inside the namespace,
+// rebuilding its state by folding the records. The ns is opaque to the
+// agent (§15.1) — hosts derive it from their own project semantics.
+func (a *Agent) OpenSession(ns, id string) (*Session, error) {
 	return a.openSession(func(sessionID string) (storage.Session, error) {
-		return a.store.OpenIn(projectID, sessionID)
+		return a.store.Open(ns, sessionID)
 	}, id)
 }
 

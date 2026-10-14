@@ -8,6 +8,7 @@ package projects
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,8 +19,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 )
 
 // Entry is one registered project. Path is stored canonicalized (what
@@ -245,5 +244,45 @@ func (r *Registry) Deduped() []Entry {
 // so hand-entered relative or unclean paths hash identically to their
 // registered forms.
 func projectID(path string) string {
-	return jsonl.ProjectID(Canonical(path))
+	return ProjectID(Canonical(path))
+}
+
+// ProjectID derives the storage namespace for a project directory: the
+// cleaned absolute path (case-folded where the platform ignores it)
+// hashed into the "p"+16 base32 form the jsonl layout expects. Moved
+// from internal/storage/jsonl (§15.1): "project" is host semantics, the
+// store sees only an opaque ns.
+func ProjectID(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	abs = filepath.Clean(abs)
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		abs = strings.ToLower(abs)
+	}
+	digest := sha256.Sum256([]byte(abs))
+	return "p" + encodeBase32(digest[:10])
+}
+
+// base32Alphabet is the Crockford-style subset NewItemID namespaces use;
+// ProjectID's encoding shares it so every identifier reads uniformly.
+const base32Alphabet = "0123456789abcdefghjkmnpqrstvwxyz"
+
+func encodeBase32(data []byte) string {
+	var builder []byte
+	var buffer uint32
+	var bits uint
+	for _, b := range data {
+		buffer = buffer<<8 | uint32(b)
+		bits += 8
+		for bits >= 5 {
+			bits -= 5
+			builder = append(builder, base32Alphabet[(buffer>>bits)&0x1f])
+		}
+	}
+	if bits > 0 {
+		builder = append(builder, base32Alphabet[(buffer<<(5-bits))&0x1f])
+	}
+	return string(builder)
 }

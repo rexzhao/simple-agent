@@ -17,8 +17,8 @@ import (
 type Store struct {
 	mu       sync.Mutex
 	sessions map[string]*records
-	// projectOf mirrors the jsonl layout: which project each session
-	// belongs to. OpenIn's gate and ListSessions' scoping depend on it.
+	// projectOf mirrors the jsonl layout: which namespace each session
+	// belongs to. Open's ownership gate and ListSessions' scoping depend
 	projectOf map[string]string
 }
 
@@ -27,20 +27,26 @@ func OpenStore() *Store {
 	return &Store{sessions: make(map[string]*records), projectOf: make(map[string]string)}
 }
 
-// Create returns a new session inside the project.
-func (s *Store) Create(projectID string) (storage.Session, error) {
+// Create returns a new session inside the namespace.
+func (s *Store) Create(ns string) (storage.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session := &Session{id: storage.NewSessionID(), log: &records{}}
 	s.sessions[session.id] = session.log
-	s.projectOf[session.id] = projectID
+	s.projectOf[session.id] = ns
 	return session, nil
 }
 
-// Open returns a fresh handle over an existing session's records.
-func (s *Store) Open(id string) (storage.Session, error) {
+// Open returns a fresh handle over an existing session's records. The
+// session must belong to the namespace (§15.1): the memory store keeps
+// an ownership map for exactly this check — a wrong-ns open is a miss,
+// mirroring the jsonl directory scoping.
+func (s *Store) Open(ns, id string) (storage.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.projectOf[id] != ns {
+		return nil, fmt.Errorf("open session %q: %w", id, storage.ErrSessionNotFound)
+	}
 	log, ok := s.sessions[id]
 	if !ok {
 		return nil, fmt.Errorf("open session %q: %w", id, storage.ErrSessionNotFound)
@@ -127,21 +133,6 @@ func (s *Session) Close() error {
 	defer s.mu.Unlock()
 	s.closed = true
 	return nil
-}
-
-// OpenIn opens a session scoped to one project: a session living under a
-// different project is not found, mirroring the jsonl registration gate.
-func (s *Store) OpenIn(projectID, sessionID string) (storage.Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.projectOf[sessionID] != projectID {
-		return nil, fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
-	}
-	log, ok := s.sessions[sessionID]
-	if !ok {
-		return nil, fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
-	}
-	return &Session{id: sessionID, log: log}, nil
 }
 
 // ListSessions enumerates a project's sessions, newest activity first.

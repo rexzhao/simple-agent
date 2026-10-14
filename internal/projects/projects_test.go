@@ -8,8 +8,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 )
 
 func TestLoadMissingIsEmpty(t *testing.T) {
@@ -85,9 +83,9 @@ func TestDedupedMergesSameID(t *testing.T) {
 		t.Fatalf("entries = %d, want 2 (duplicate merged)", len(entries))
 	}
 	found := false
-	xID := jsonl.ProjectID(filepath.Join(base, "x"))
+	xID := ProjectID(filepath.Join(base, "x"))
 	for _, entry := range entries {
-		if jsonl.ProjectID(entry.Path) == xID {
+		if ProjectID(entry.Path) == xID {
 			found = true
 			if !entry.Added.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) {
 				t.Fatalf("merged Added = %v, want the earliest", entry.Added)
@@ -107,7 +105,7 @@ func TestCanonicalMatchesProjectIDNormalization(t *testing.T) {
 	variants := []string{dir, dir + string(filepath.Separator), filepath.Join(dir, ".")}
 	ids := make(map[string]bool)
 	for _, variant := range variants {
-		ids[jsonl.ProjectID(variant)] = true
+		ids[ProjectID(variant)] = true
 	}
 	if len(ids) != 1 {
 		t.Fatalf("path variants hash to %d ids, want 1: %v", len(ids), ids)
@@ -133,7 +131,7 @@ func TestDedupedKeepsEarliestAddedBothOrders(t *testing.T) {
 		t.Fatalf("ascending: entries = %d, want 2", len(entries))
 	}
 	for _, entry := range entries {
-		if jsonl.ProjectID(entry.Path) == jsonl.ProjectID(x) && !entry.Added.Equal(early) {
+		if ProjectID(entry.Path) == ProjectID(x) && !entry.Added.Equal(early) {
 			t.Fatalf("ascending: merged Added = %v, want the earliest %v", entry.Added, early)
 		}
 	}
@@ -148,7 +146,7 @@ func TestDedupedKeepsEarliestAddedBothOrders(t *testing.T) {
 		t.Fatalf("descending: entries = %d, want 2", len(entries))
 	}
 	for _, entry := range entries {
-		if jsonl.ProjectID(entry.Path) == jsonl.ProjectID(x) && !entry.Added.Equal(early) {
+		if ProjectID(entry.Path) == ProjectID(x) && !entry.Added.Equal(early) {
 			t.Fatalf("descending: merged Added = %v, want the earliest %v", entry.Added, early)
 		}
 	}

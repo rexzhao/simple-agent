@@ -1,19 +1,18 @@
 // Package jsonl is the file storage implementation: sessions under a data
-// root laid out as <root>/<project>/<session>/log.jsonl. A project is a
-// workspace directory identified by ProjectID; a session is a directory
-// holding one append-only log.
+// root laid out as <root>/<ns>/<session>/log.jsonl. The ns is an opaque
+// namespace the HOST derives (projects.ProjectID for the CLI and serve);
+// a session is a directory holding one append-only log.
 package jsonl
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,43 +31,38 @@ const (
 
 // Store manages sessions under a data root.
 type Store struct {
-	root string
+	root   string
+	logger *slog.Logger
 }
 
 // OpenStore opens (creating if needed) the data root directory.
 func OpenStore(root string) (*Store, error) {
+	return OpenStoreWithLogger(root, nil)
+}
+
+// OpenStoreWithLogger is OpenStore with an injected logger: the jsonl
+// layer's corruption notices go there instead of the process stderr
+// (§15.1). A nil logger discards them.
+func OpenStoreWithLogger(root string, logger *slog.Logger) (*Store, error) {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("data root is required")
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("create data root: %w", err)
 	}
-	return &Store{root: root}, nil
+	return &Store{root: root, logger: logger}, nil
 }
 
 // Root returns the data root directory.
 func (s *Store) Root() string { return s.root }
 
-// ProjectID returns the stable project identifier for a workspace
-// directory: "p" followed by base32 of the first ten bytes of the SHA-256
-// of the normalized absolute path. The same directory always maps to the
-// same project, with no registration step. Path case is folded on
-// case-insensitive platforms.
-func ProjectID(dir string) string {
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		abs = dir
-	}
-	abs = filepath.Clean(abs)
-	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
-		abs = strings.ToLower(abs)
-	}
-	digest := sha256.Sum256([]byte(abs))
-	return "p" + encodeBase32(digest[:10])
-}
-
-// ValidProjectID accepts the identifiers ProjectID generates.
-func ValidProjectID(id string) bool {
+// ValidNamespace accepts the identifiers a host derives for its
+// namespaces (the jsonl layout requires them to be safe single path
+// segments). Hosts derive them from project paths; the store never does.
+func ValidNamespace(id string) bool {
 	if len(id) != 17 || id[0] != 'p' {
 		return false
 	}
@@ -120,17 +114,17 @@ func encodeBase32(data []byte) string {
 	return string(builder)
 }
 
-// Create returns a new session inside the project. Creation is lazy:
+// Create returns a new session inside the namespace. Creation is lazy:
 // nothing touches the disk, so an empty session (one never committed to)
 // leaves no directory and no file. The first Append opens the log; the
 // state layer's session.created record is simply its first line.
-func (s *Store) Create(projectID string) (storage.Session, error) {
-	if !ValidProjectID(projectID) {
-		return nil, fmt.Errorf("invalid project id %q", projectID)
+func (s *Store) Create(ns string) (storage.Session, error) {
+	if !ValidNamespace(ns) {
+		return nil, fmt.Errorf("invalid namespace %q", ns)
 	}
 	return &Session{
 		id:      storage.NewSessionID(),
-		project: projectID,
+		project: ns,
 		store:   s,
 	}, nil
 }
@@ -235,37 +229,7 @@ func nextArchiveName(dir string) string {
 	return filepath.Join(dir, fmt.Sprintf("%s%04d%s", logArchivePrefix, number, logArchiveSuffix))
 }
 
-// sessionDir locates the directory of a session ID by scanning the project
-// directories of the data root. Session IDs are globally unique, so more
-// than one hit means directories were copied around by hand — refuse
-// instead of silently picking the first (the serve layer surfaces this as
-// 409).
-func (s *Store) sessionDir(id string) (string, error) {
-	projects, err := os.ReadDir(s.root)
-	if err != nil {
-		return "", fmt.Errorf("read data root: %w", err)
-	}
-	var hit string
-	for _, project := range projects {
-		if !project.IsDir() || !ValidProjectID(project.Name()) {
-			continue
-		}
-		dir := filepath.Join(s.root, project.Name(), id)
-		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			if hit != "" {
-				return "", fmt.Errorf("open session %q: multiple project directories hold this id: %s, %s", id, hit, dir)
-			}
-			hit = dir
-		}
-	}
-	if hit == "" {
-		return "", fmt.Errorf("open session %q: %w", id, storage.ErrSessionNotFound)
-	}
-	return hit, nil
-}
-
-// Open loads an existing session. The session ID is globally unique, so the
-// project directory it lives in is found by scanning the data root. A run
+// Open loads an existing session from its namespace directory. A run
 // which was interrupted by a crash needs no repair record: its user input
 // simply stays unanswered, and the agent patches any dangling tool calls
 // before the next request.
@@ -273,29 +237,14 @@ func (s *Store) sessionDir(id string) (string, error) {
 // A session's records live in segments: log.jsonl is the active segment,
 // log-NNNN.jsonl files are immutable archives of the history before each
 // compaction. An interrupted segment switch is recovered here.
-func (s *Store) Open(id string) (storage.Session, error) {
-	if !ValidSessionID(id) {
-		return nil, fmt.Errorf("invalid session id %q", id)
-	}
-	dir, err := s.sessionDir(id)
-	if err != nil {
-		return nil, err
-	}
-	return s.openDir(id, dir)
-}
-
-// OpenIn loads a session scoped to one project: the id resolves inside
-// <root>/<projectID>/ only. The serve-mode registration gate is structural
-// — an unregistered project's sessions cannot be opened even though the
-// store can see their directories.
-func (s *Store) OpenIn(projectID, sessionID string) (storage.Session, error) {
-	if !ValidProjectID(projectID) {
-		return nil, fmt.Errorf("invalid project id %q", projectID)
+func (s *Store) Open(ns, sessionID string) (storage.Session, error) {
+	if !ValidNamespace(ns) {
+		return nil, fmt.Errorf("invalid namespace %q", ns)
 	}
 	if !ValidSessionID(sessionID) {
 		return nil, fmt.Errorf("invalid session id %q", sessionID)
 	}
-	dir := filepath.Join(s.root, projectID, sessionID)
+	dir := filepath.Join(s.root, ns, sessionID)
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
 	}
@@ -303,7 +252,7 @@ func (s *Store) OpenIn(projectID, sessionID string) (storage.Session, error) {
 }
 
 // openDir takes the session lock, recovers an interrupted segment switch,
-// and opens the active log — the shared sequence behind Open and OpenIn.
+// and opens the active log — the shared path behind Open.
 func (s *Store) openDir(id, dir string) (storage.Session, error) {
 	// The lock precedes recovery and the log open: both touch files a
 	// concurrent writer could be mid-switch on.
@@ -315,7 +264,7 @@ func (s *Store) openDir(id, dir string) (storage.Session, error) {
 		lock.Release()
 		return nil, err
 	}
-	log, err := OpenLog(filepath.Join(dir, logFileName))
+	log, err := OpenLog(filepath.Join(dir, logFileName), s.logger)
 	if err != nil {
 		lock.Release()
 		return nil, err
@@ -366,7 +315,7 @@ func (s *Session) Append(record storage.Record) (storage.Record, error) {
 		if err != nil {
 			return storage.Record{}, err
 		}
-		log, err := OpenLog(filepath.Join(dir, logFileName))
+		log, err := OpenLog(filepath.Join(dir, logFileName), s.store.logger)
 		if err != nil {
 			lock.Release()
 			return storage.Record{}, err
@@ -396,7 +345,7 @@ func (s *Session) appendCompactionLocked(record storage.Record) (storage.Record,
 	if err := os.Remove(stagingPath); err != nil && !os.IsNotExist(err) {
 		return storage.Record{}, fmt.Errorf("clear stale segment staging: %w", err)
 	}
-	staging, err := OpenLog(stagingPath)
+	staging, err := OpenLog(stagingPath, s.store.logger)
 	if err != nil {
 		return storage.Record{}, err
 	}
@@ -447,7 +396,7 @@ func (s *Session) appendCompactionLocked(record storage.Record) (storage.Record,
 	if err := os.Rename(stagingPath, activePath); err != nil {
 		return storage.Record{}, fmt.Errorf("segment switch failed; reopen the session to continue: %w", err)
 	}
-	log, err := OpenLog(activePath)
+	log, err := OpenLog(activePath, s.store.logger)
 	if err != nil {
 		return storage.Record{}, fmt.Errorf("segment switch failed; reopen the session to continue: %w", err)
 	}
@@ -515,7 +464,7 @@ func (s *Session) Close() error {
 // right now), and sessions without a log file hold nothing and stay
 // unlisted.
 func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
-	if !ValidProjectID(projectID) {
+	if !ValidNamespace(projectID) {
 		return nil, fmt.Errorf("invalid project id %q", projectID)
 	}
 	entries, err := os.ReadDir(filepath.Join(s.root, projectID))
@@ -718,7 +667,7 @@ func parseRecordTime(value string) time.Time {
 // HasSession probes whether a session directory exists under a project
 // without taking its lock — the owning-project lookup for lazy opens.
 func (s *Store) HasSession(projectID, sessionID string) bool {
-	if !ValidProjectID(projectID) || !ValidSessionID(sessionID) {
+	if !ValidNamespace(projectID) || !ValidSessionID(sessionID) {
 		return false
 	}
 	info, err := os.Stat(filepath.Join(s.root, projectID, sessionID))
@@ -747,7 +696,7 @@ func (s *Store) HasSession(projectID, sessionID string) bool {
 // at the price of a marker whose failed removal permanently wedges
 // the session — not worth it until a real workload hits the window.
 func (s *Store) Delete(projectID, sessionID string) error {
-	if !ValidProjectID(projectID) {
+	if !ValidNamespace(projectID) {
 		return fmt.Errorf("invalid project id %q", projectID)
 	}
 	if !ValidSessionID(sessionID) {

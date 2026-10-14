@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/storage"
 	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/internal/storage/memory"
@@ -34,7 +35,7 @@ func newTestAgent(t *testing.T, provider model.Provider, executor ToolExecutor, 
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession("test-ns")
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -423,7 +424,7 @@ func TestOpenSessionRebuildsContextAndContinues(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	resumed, err := ag.OpenSession(id)
+	resumed, err := ag.OpenSession("test-ns", id)
 	if err != nil {
 		t.Fatalf("OpenSession: %v", err)
 	}
@@ -668,6 +669,7 @@ func TestCompactGuards(t *testing.T) {
 
 func TestCompactSegmentsAcrossReopenWithJSONL(t *testing.T) {
 	store, err := jsonl.OpenStore(filepath.Join(t.TempDir(), "data"))
+	ns := projects.ProjectID(t.TempDir())
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
@@ -680,13 +682,12 @@ func TestCompactSegmentsAcrossReopenWithJSONL(t *testing.T) {
 		ProviderName: "test",
 		ModelID:      "model-test",
 		Storage:      store,
-		ProjectID:    jsonl.ProjectID(t.TempDir()),
 		CWD:          "/w",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession(ns)
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -704,7 +705,7 @@ func TestCompactSegmentsAcrossReopenWithJSONL(t *testing.T) {
 
 	// The reopened session folds only the active segment: metadata and
 	// the summary, never the archived pre-compaction history.
-	resumed, err := ag.OpenSession(id)
+	resumed, err := ag.OpenSession(ns, id)
 	if err != nil {
 		t.Fatalf("OpenSession: %v", err)
 	}
@@ -992,13 +993,12 @@ func TestCooldownCountersRebuiltAtOpen(t *testing.T) {
 		ProviderName: "test",
 		ModelID:      "model-test",
 		Storage:      store,
-		ProjectID:    jsonl.ProjectID(t.TempDir()),
 		CWD:          "/w",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession("test-ns")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1020,7 +1020,7 @@ func TestCooldownCountersRebuiltAtOpen(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := ag.OpenSession(id)
+	reopened, err := ag.OpenSession("test-ns", id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1060,13 +1060,12 @@ func TestCompactionBoundsRecordMemory(t *testing.T) {
 		ProviderName: "test",
 		ModelID:      "model-test",
 		Storage:      store,
-		ProjectID:    jsonl.ProjectID(t.TempDir()),
 		CWD:          "/w",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession("test-ns")
 	if err != nil {
 		t.Fatal(err)
 	}

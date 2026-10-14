@@ -39,15 +39,35 @@ func (s *gateStore) HasSession(projectID, sessionID string) bool {
 		}
 		time.Sleep(s.slowDelay)
 	}
-	return s.Store.HasSession(projectID, sessionID)
+	p, ok := s.Store.(storage.Prober)
+	if !ok {
+		return false
+	}
+	return p.HasSession(projectID, sessionID)
 }
 
-func (s *gateStore) OpenIn(projectID, sessionID string) (storage.Session, error) {
+func (s *gateStore) Open(projectID, sessionID string) (storage.Session, error) {
 	s.openCalls.Add(1)
 	if s.failOpens.Load() {
 		return nil, fmt.Errorf("injected open failure")
 	}
-	return s.Store.OpenIn(projectID, sessionID)
+	return s.Store.Open(projectID, sessionID)
+}
+
+func (s *gateStore) ListSessions(ns string) ([]storage.SessionInfo, error) {
+	l, ok := s.Store.(storage.Lister)
+	if !ok {
+		return nil, fmt.Errorf("wrapped store cannot list")
+	}
+	return l.ListSessions(ns)
+}
+
+func (s *gateStore) Delete(ns, id string) error {
+	d, ok := s.Store.(storage.Deleter)
+	if !ok {
+		return fmt.Errorf("wrapped store cannot delete")
+	}
+	return d.Delete(ns, id)
 }
 
 // newOpenTestServer builds a manager over one registered project with
@@ -68,7 +88,6 @@ func newOpenTestServer(t *testing.T, store storage.Store) (*Manager, *httptest.S
 			ProviderName: "test",
 			ModelID:      "model-test",
 			Storage:      store,
-			ProjectID:    jsonl.ProjectID(projectCwd),
 			CWD:          projectCwd,
 		})
 	}
@@ -86,7 +105,7 @@ func newOpenTestServer(t *testing.T, store storage.Store) (*Manager, *httptest.S
 		if err != nil {
 			t.Fatal(err)
 		}
-		session, err := ag.NewSession()
+		session, err := ag.NewSession(projects.ProjectID(projectDir))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -349,8 +368,8 @@ func TestOpenDuringCloseDiscards(t *testing.T) {
 	// open through the store succeeds (it would conflict if the
 	// discard had leaked the session open).
 	entries, _ := manager.registryEntries()
-	projectID := jsonl.ProjectID(entries[0].Path)
-	entry, err := jsonlStore.OpenIn(projectID, ids[0])
+	projectID := projects.ProjectID(entries[0].Path)
+	entry, err := jsonlStore.Open(projectID, ids[0])
 	_ = entry
 	if err != nil {
 		t.Fatalf("independent reopen after discard: %v (OS lock leaked?)", err)

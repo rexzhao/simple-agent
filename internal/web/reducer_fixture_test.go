@@ -95,7 +95,7 @@ func createSecondSession(t *testing.T, s *Server) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := ag.NewSession()
+	created, err := ag.NewSession("test-ns")
 	if err != nil {
 		t.Fatal(err)
 	}

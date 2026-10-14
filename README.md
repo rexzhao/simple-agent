@@ -42,7 +42,8 @@ Options:
 
 ```text
 --server-root dir   configuration namespace root (default: user config dir/<app>)
---session id        resume a stored session by id (exit if not found)
+--session id        resume a stored session by id, searched in the
+                    current directory's project only (exit if not found)
 --provider name     override default_provider
 --model name        override default_model (model profile name)
 --http addr         serve the web UI instead of the interactive REPL
@@ -56,7 +57,8 @@ An optional positional argument resumes a stored session. Slash commands:
   conversation before the compaction is replaced by it. Compaction also
   happens automatically when the request approaches the model's context
   budget (`agent.auto_compact`, on by default)
-- `/resume <id>` — reopen a stored session (history prints as the last
+- `/resume <id>` — reopen a stored session (searched in the current
+  directory's project only; history prints as the last
   20 records; the full log stays in the file)
 - `/stop` — stop the active run (Ctrl+C does the same)
 - `/quit` — exit (a second Ctrl+C when idle also exits)

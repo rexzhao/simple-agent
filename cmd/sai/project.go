@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/projects"
-	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 )
 
 // projectCommand implements the `sai project` subcommands — the management
@@ -80,7 +79,7 @@ func projectAdd(path string) int {
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "sai: registered %s (%s)\n", canonical, jsonl.ProjectID(canonical))
+	fmt.Fprintf(os.Stderr, "sai: registered %s (%s)\n", canonical, projects.ProjectID(canonical))
 	return 0
 }
 
@@ -115,7 +114,7 @@ func projectList() int {
 		return 0
 	}
 	for _, entry := range entries {
-		fmt.Printf("%s  %s  added %s\n", jsonl.ProjectID(entry.Path), entry.Path, entry.Added.Format("2006-01-02"))
+		fmt.Printf("%s  %s  added %s\n", projects.ProjectID(entry.Path), entry.Path, entry.Added.Format("2006-01-02"))
 	}
 	return 0
 }

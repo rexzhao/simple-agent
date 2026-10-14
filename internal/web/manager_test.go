@@ -41,7 +41,6 @@ func newJSONLTestServer(t *testing.T, provider model.Provider) (*Manager, *Serve
 			ProviderName: "test",
 			ModelID:      "model-test",
 			Storage:      store,
-			ProjectID:    jsonl.ProjectID(projectCwd),
 			CWD:          projectCwd,
 		})
 	}
@@ -67,18 +66,18 @@ func newJSONLTestServer(t *testing.T, provider model.Provider) (*Manager, *Serve
 // closed: the manager opens its own).
 func createJSONLSession(t *testing.T, provider model.Provider, store *jsonl.Store, projectDir string) string {
 	t.Helper()
+	ns := projects.ProjectID(projectDir)
 	ag, err := agent.New(agent.Options{
 		Provider:     provider,
 		ProviderName: "test",
 		ModelID:      "model-test",
 		Storage:      store,
-		ProjectID:    jsonl.ProjectID(projectDir),
 		CWD:          projectDir,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession(ns)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +216,7 @@ func TestSweeperEvictsIdleSession(t *testing.T) {
 
 	// The lock is really released: another session open (a second agent
 	// holding the storage lock) succeeds now.
-	holder, err := store.OpenIn(jsonl.ProjectID(projectDir), id)
+	holder, err := store.Open(projects.ProjectID(projectDir), id)
 	if err != nil {
 		t.Fatalf("lock not released after eviction: %v", err)
 	}
@@ -350,7 +349,7 @@ func TestOpenLockedSessionIs409(t *testing.T) {
 	store := jsonlStoreOf(t, manager)
 
 	id := createJSONLSession(t, provider, store, projectDir)
-	holder, err := store.OpenIn(jsonl.ProjectID(projectDir), id)
+	holder, err := store.Open(projects.ProjectID(projectDir), id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +412,7 @@ func TestProjectsEndpoint(t *testing.T) {
 		t.Fatalf("projects = %d, want 1", len(body.Projects))
 	}
 	p := body.Projects[0]
-	if p.ID != jsonl.ProjectID(projectDir) || p.Path != projectDir {
+	if p.ID != projects.ProjectID(projectDir) || p.Path != projectDir {
 		t.Fatalf("project = %+v", p)
 	}
 	if len(p.Sessions) != 2 {
@@ -535,8 +534,8 @@ func TestDuplicateSessionAcrossProjectsIs409(t *testing.T) {
 	if err := registry.Save(projects.FilePath(manager.root)); err != nil {
 		t.Fatal(err)
 	}
-	if err := copyTree(t, filepath.Join(store.Root(), jsonl.ProjectID(projectDir), id),
-		filepath.Join(store.Root(), jsonl.ProjectID(secondDir), id)); err != nil {
+	if err := copyTree(t, filepath.Join(store.Root(), projects.ProjectID(projectDir), id),
+		filepath.Join(store.Root(), projects.ProjectID(secondDir), id)); err != nil {
 		t.Fatal(err)
 	}
 	manager.projectsMu.Lock()
@@ -612,7 +611,7 @@ func TestDeleteSession(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("idle delete: %d", resp.StatusCode)
 	}
-	if store.HasSession(jsonl.ProjectID(projectDir), victim) {
+	if store.HasSession(projects.ProjectID(projectDir), victim) {
 		t.Fatal("session still exists after delete")
 	}
 
@@ -650,7 +649,7 @@ func TestDeleteSession(t *testing.T) {
 
 	// Externally locked: session_locked.
 	locked := createJSONLSession(t, provider, store, projectDir)
-	holder, err := store.OpenIn(jsonl.ProjectID(projectDir), locked)
+	holder, err := store.Open(projects.ProjectID(projectDir), locked)
 	if err != nil {
 		t.Fatal(err)
 	}

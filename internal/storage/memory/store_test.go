@@ -8,7 +8,7 @@ import (
 
 func TestCreateAppendOpenRoundTrip(t *testing.T) {
 	store := OpenStore()
-	session, err := store.Create("")
+	session, err := store.Create("test-ns")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -26,7 +26,7 @@ func TestCreateAppendOpenRoundTrip(t *testing.T) {
 		t.Fatalf("records = %+v, want one stored user input", records)
 	}
 
-	reopened, err := store.Open(session.ID())
+	reopened, err := store.Open("test-ns", session.ID())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestCreateAppendOpenRoundTrip(t *testing.T) {
 
 func TestRecordsSurviveClosedHandle(t *testing.T) {
 	store := OpenStore()
-	session, _ := store.Create("")
+	session, _ := store.Create("test-ns")
 	if _, err := session.Append(storage.Record{ItemID: "u1", Type: storage.TypeUserInput, Content: "kept"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestRecordsSurviveClosedHandle(t *testing.T) {
 	if _, err := session.Append(storage.Record{ItemID: "u2", Type: storage.TypeUserInput}); err == nil {
 		t.Fatal("Append after Close accepted")
 	}
-	reopened, err := store.Open(session.ID())
+	reopened, err := store.Open("test-ns", session.ID())
 	if err != nil {
 		t.Fatalf("Open after Close: %v", err)
 	}
@@ -64,12 +64,12 @@ func TestRecordsSurviveClosedHandle(t *testing.T) {
 
 func TestOpenUnknownSessionFails(t *testing.T) {
 	store := OpenStore()
-	if _, err := store.Open("s-nope"); err == nil {
+	if _, err := store.Open("test-ns", "s-nope"); err == nil {
 		t.Fatal("Open of unknown session succeeded")
 	}
 }
 
-func TestListSessionsAndOpenIn(t *testing.T) {
+func TestListSessionsAndOpenScoping(t *testing.T) {
 	store := OpenStore()
 	project := "ptest0000000000001"
 	session, err := store.Create(project)
@@ -101,11 +101,12 @@ func TestListSessionsAndOpenIn(t *testing.T) {
 		t.Fatalf("list after empty create: %v %d", err, len(infos))
 	}
 
-	// OpenIn is scoped: a foreign project cannot see the session.
-	if _, err := store.OpenIn("ptest0000000000002", session.ID()); err == nil {
-		t.Fatal("foreign project opened the session")
+	// Open is namespace-scoped (§15.1): a foreign namespace cannot see
+	// the session.
+	if _, err := store.Open("ptest0000000000002", session.ID()); err == nil {
+		t.Fatal("foreign namespace opened the session")
 	}
-	opened, err := store.OpenIn(project, session.ID())
+	opened, err := store.Open(project, session.ID())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,9 +12,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,6 +27,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/storage"
 	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/internal/tools"
@@ -101,12 +104,8 @@ func main() {
 		resumeID = strings.TrimSpace(flag.Arg(0))
 	}
 
-	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}}
-	if resumeID != "" {
-		if err := cli.resume(resumeID); err != nil {
-			log.Fatalf("sai: %v", err)
-		}
-	} else if err := cli.freshSession(); err != nil {
+	cli, err := setupCLI(ag, resumeID)
+	if err != nil {
 		log.Fatalf("sai: %v", err)
 	}
 
@@ -189,7 +188,10 @@ func assembleFactory(serverRoot, providerName, modelName string) (*agentFactory,
 	if strings.TrimSpace(resolved.DeveloperRole) != "" {
 		developerRole = model.MessageRole(resolved.DeveloperRole)
 	}
-	store, err := jsonl.OpenStore(filepath.Join(serverRoot, "data"))
+	// The store's corruption notices (mid-file discard warnings) ride
+	// the process logger — the one place both the CLI and serve see
+	// (§15.1: the store never writes stderr directly).
+	store, err := jsonl.OpenStoreWithLogger(filepath.Join(serverRoot, "data"), slog.Default())
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +218,7 @@ func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	project := jsonl.ProjectID(projectCwd)
+	project := projects.ProjectID(projectCwd)
 	ag, err := agent.New(agent.Options{
 		Provider:      f.provider,
 		ProviderName:  f.providerName,
@@ -229,7 +231,6 @@ func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
 		Parameters:    f.parameters,
 		MaxTokens:     f.outputLimit,
 		MaxIterations: f.cfg.Agent.MaxIterations,
-		ProjectID:     project,
 		CWD:           projectCwd,
 		ContextWindow: f.contextWindow,
 		AutoCompact:   f.cfg.Agent.AutoCompact,
@@ -320,6 +321,9 @@ type cliApp struct {
 	agent   *agent.Agent
 	session *agent.Session
 	printer *spinnerPrinter
+	// ns is the storage namespace of the working directory's project —
+	// opaque to the agent, derived here by the host (§15.1).
+	ns string
 	// lastRenderedItem is the ItemID of the last record this app
 	// accounted for (printed or live-rendered): the eviction catch-up
 	// resumes the snapshot's records after it. Identity, not an index —
@@ -527,17 +531,22 @@ func (c *cliApp) closeSession() {
 
 // freshSession switches to a new empty session.
 func (c *cliApp) freshSession() error {
-	session, err := c.agent.NewSession()
+	session, err := c.agent.NewSession(c.ns)
 	if err != nil {
 		return err
 	}
 	return c.bind(session)
 }
 
-// resume reopens a stored session.
+// resume reopens a stored session. Q1=B (§15.1): the search is scoped
+// to the current directory's project namespace — a session belonging to
+// another project is not found here.
 func (c *cliApp) resume(id string) error {
-	session, err := c.agent.OpenSession(id)
+	session, err := c.agent.OpenSession(c.ns, id)
 	if err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) {
+			return fmt.Errorf("session %s not found in this project — sessions can only be resumed from the project directory they belong to", id)
+		}
 		return err
 	}
 	return c.bind(session)
@@ -641,4 +650,23 @@ func recordsAfter(records []storage.Record, itemID string) []storage.Record {
 		}
 	}
 	return records
+}
+
+// setupCLI assembles the interactive app and resolves the initial
+// session (resume or fresh). The namespace is derived HERE, from the
+// agent's project cwd — the single place host semantics enter the CLI
+// wiring (§15.1: Q1=B scopes -session and /resume to the current
+// project's ns), so a wiring regression is testable without invoking
+// main itself.
+func setupCLI(ag *agent.Agent, resumeID string) (*cliApp, error) {
+	ns := projects.ProjectID(ag.CWD())
+	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}, ns: ns}
+	if resumeID != "" {
+		if err := cli.resume(resumeID); err != nil {
+			return nil, err
+		}
+	} else if err := cli.freshSession(); err != nil {
+		return nil, err
+	}
+	return cli, nil
 }

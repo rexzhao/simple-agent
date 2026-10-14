@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"sync"
 
@@ -17,6 +18,9 @@ import (
 // through Records.
 type Log struct {
 	path string
+	// logger receives mid-file corruption notices (§15.1: the store must
+	// not write to the process's stderr directly — hosts inject theirs).
+	logger *slog.Logger
 
 	mu     sync.Mutex
 	file   *os.File
@@ -26,7 +30,10 @@ type Log struct {
 
 // OpenLog opens (creating if needed) the log at path, recovers a torn tail
 // left by a crash mid-append, and returns the log positioned for appends.
-func OpenLog(path string) (*Log, error) {
+func OpenLog(path string, logger *slog.Logger) (*Log, error) {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	if err := os.MkdirAll(dirOf(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create session directory: %w", err)
 	}
@@ -34,7 +41,7 @@ func OpenLog(path string) (*Log, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open session log: %w", err)
 	}
-	log := &Log{path: path, file: file, writer: bufio.NewWriter(file)}
+	log := &Log{path: path, logger: logger, file: file, writer: bufio.NewWriter(file)}
 	if err := log.recover(); err != nil {
 		file.Close()
 		return nil, err
@@ -103,11 +110,11 @@ func (l *Log) recover() error {
 		}
 		if info.Size()-offset > maxTornTailBytes {
 			if lastItemID != "" {
-				fmt.Fprintf(os.Stderr, "jsonl: %s: discarded %d bytes after item %s (type %s); mid-file corruption, not a torn tail\n",
-					l.path, info.Size()-offset, lastItemID, lastType)
+				l.logger.Warn("discarded bytes after item: mid-file corruption, not a torn tail",
+					"path", l.path, "bytes", info.Size()-offset, "after_item", lastItemID, "type", lastType)
 			} else {
-				fmt.Fprintf(os.Stderr, "jsonl: %s: discarded %d bytes before the first valid record; mid-file corruption, not a torn tail\n",
-					l.path, info.Size()-offset)
+				l.logger.Warn("discarded bytes before the first valid record: mid-file corruption, not a torn tail",
+					"path", l.path, "bytes", info.Size()-offset)
 			}
 		}
 	}

@@ -365,11 +365,12 @@ func (m *Manager) openSlow(id string) (*sessionEntry, int, error) {
 	// The same id under two REGISTERED projects means hand-copied
 	// directories: refuse instead of silently picking the first
 	// (design §4).
+	prober, canProbe := m.store.(storage.Prober)
 	entries, _ := m.registryEntries()
 	var ownerPath, ownerID string
 	for _, entry := range entries {
-		projectID := jsonl.ProjectID(entry.Path)
-		if !m.store.HasSession(projectID, id) {
+		projectID := projects.ProjectID(entry.Path)
+		if !canProbe || !prober.HasSession(projectID, id) {
 			continue
 		}
 		if ownerID != "" {
@@ -386,7 +387,7 @@ func (m *Manager) openSlow(id string) (*sessionEntry, int, error) {
 		return nil, http.StatusInternalServerError, &apiError{code: "project_unavailable", cause: err}
 	}
 
-	session, err := ag.OpenSessionIn(ownerID, id)
+	session, err := ag.OpenSession(ownerID, id)
 	if err != nil {
 		var held *jsonl.LockHeldError
 		if errors.As(err, &held) {
@@ -601,14 +602,18 @@ func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 	// leaves a project with no sessions rather than an empty shell
 	// with no id (which the page could neither render nor debug).
 	for i, entry := range entries {
-		body.Projects[i] = projectsProjectWire{ID: jsonl.ProjectID(entry.Path), Path: entry.Path}
+		body.Projects[i] = projectsProjectWire{ID: projects.ProjectID(entry.Path), Path: entry.Path}
 	}
+	lister, canList := m.store.(storage.Lister)
 	var wg sync.WaitGroup
 	for i, entry := range entries {
 		wg.Add(1)
 		go func(i int, projectID string) {
 			defer wg.Done()
-			infos, err := m.store.ListSessions(projectID)
+			if !canList {
+				return
+			}
+			infos, err := lister.ListSessions(projectID)
 			if err != nil {
 				log.Printf("sai: serve: list %s: %v", projectID, err)
 				return
@@ -621,7 +626,7 @@ func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 					Active:  openIDs[info.ID],
 				})
 			}
-		}(i, jsonl.ProjectID(entry.Path))
+		}(i, projects.ProjectID(entry.Path))
 	}
 	wg.Wait()
 
@@ -746,12 +751,14 @@ func (m *Manager) DeleteSession(w http.ResponseWriter, r *http.Request) {
 	// The owning project through the registration gate (a lock-free
 	// probe, mirroring open). Unregistered sessions are 404 even for
 	// deletion: the gate covers every surface.
+	prober, canProbe := m.store.(storage.Prober)
+	deleter, canDelete := m.store.(storage.Deleter)
 	entries, _ := m.registryEntries()
 	var ownerID string
 	var duplicate bool
 	for _, e := range entries {
-		projectID := jsonl.ProjectID(e.Path)
-		if m.store.HasSession(projectID, id) {
+		projectID := projects.ProjectID(e.Path)
+		if canProbe && prober.HasSession(projectID, id) {
 			if ownerID != "" {
 				duplicate = true
 				break
@@ -770,7 +777,12 @@ func (m *Manager) DeleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := m.store.Delete(ownerID, id); err != nil {
+	if !canDelete {
+		clearClosing()
+		writeAPIError(w, http.StatusInternalServerError, fmt.Errorf("store cannot delete sessions"))
+		return
+	}
+	if err := deleter.Delete(ownerID, id); err != nil {
 		clearClosing()
 		var held *jsonl.LockHeldError
 		switch {

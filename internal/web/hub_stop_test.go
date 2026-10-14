@@ -11,7 +11,6 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/internal/storage/memory"
 )
 
@@ -35,7 +34,7 @@ func TestStoppedHubDoesNotBlockCommitter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession()
+	session, err := ag.NewSession("test-ns")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +102,6 @@ func TestFirstStreamSeesHistory(t *testing.T) {
 			ProviderName: "test",
 			ModelID:      "model-test",
 			Storage:      store,
-			ProjectID:    jsonl.ProjectID(projectCwd),
 			CWD:          projectCwd,
 		})
 	}

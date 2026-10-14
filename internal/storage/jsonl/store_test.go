@@ -1,6 +1,7 @@
 package jsonl
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +21,7 @@ func newTestStore(t *testing.T) *Store {
 
 func TestLazyCreateTouchesNoDisk(t *testing.T) {
 	store := newTestStore(t)
-	session, err := store.Create(ProjectID(t.TempDir()))
+	session, err := store.Create(testNS(t))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -38,7 +39,7 @@ func TestLazyCreateTouchesNoDisk(t *testing.T) {
 
 func TestFirstAppendOpensLogInOrder(t *testing.T) {
 	store := newTestStore(t)
-	session, err := store.Create(ProjectID(t.TempDir()))
+	session, err := store.Create(testNS(t))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -73,7 +74,8 @@ func TestFirstAppendOpensLogInOrder(t *testing.T) {
 
 func TestOpenRebuildsRecordsAcrossProjects(t *testing.T) {
 	store := newTestStore(t)
-	session, err := store.Create(ProjectID(t.TempDir()))
+	ns := testNS(t)
+	session, err := store.Create(ns)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -85,7 +87,7 @@ func TestOpenRebuildsRecordsAcrossProjects(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	reopened, err := store.Open(id)
+	reopened, err := store.Open(ns, id)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -107,14 +109,15 @@ func TestOpenRebuildsRecordsAcrossProjects(t *testing.T) {
 
 func TestOpenUnknownSessionFails(t *testing.T) {
 	store := newTestStore(t)
-	if _, err := store.Open("s-does-not-exist"); err == nil {
+	if _, err := store.Open("p-nope", "s-does-not-exist"); err == nil {
 		t.Fatal("Open of unknown session succeeded")
 	}
 }
 
 func TestTornTailRecovery(t *testing.T) {
 	store := newTestStore(t)
-	session, err := store.Create(ProjectID(t.TempDir()))
+	ns := testNS(t)
+	session, err := store.Create(ns)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -137,7 +140,7 @@ func TestTornTailRecovery(t *testing.T) {
 	}
 	file.Close()
 
-	reopened, err := store.Open(id)
+	reopened, err := store.Open(ns, id)
 	if err != nil {
 		t.Fatalf("Open after torn tail: %v", err)
 	}
@@ -157,22 +160,14 @@ func TestTornTailRecovery(t *testing.T) {
 	}
 }
 
-func TestProjectIDDeterministicAndPathSafe(t *testing.T) {
-	// t.TempDir returns a fresh directory per call, so sample once.
-	workspace := t.TempDir()
-	first := ProjectID(workspace)
-	second := ProjectID(workspace)
-	if first != second {
-		t.Fatalf("ProjectID not deterministic: %s vs %s", first, second)
+func TestValidNamespace(t *testing.T) {
+	// Namespaces are the "p"+16 base32 form hosts derive (ProjectID's
+	// hash output) — anything else is foreign to the layout.
+	if !ValidNamespace("p9mv0f5v0257g98v0") {
+		t.Fatal("valid namespace rejected")
 	}
-	if !ValidProjectID(first) {
-		t.Fatalf("ProjectID %q rejected", first)
-	}
-	if ValidProjectID("nope") || ValidProjectID("") {
-		t.Fatal("malformed project ids accepted")
-	}
-	if strings.ContainsAny(first, `/\`) {
-		t.Fatalf("ProjectID %q is not path-safe", first)
+	if ValidNamespace("no/pe") || ValidNamespace("") || ValidNamespace("p9mv0f5v0257g98v") {
+		t.Fatal("malformed namespaces accepted")
 	}
 }
 
@@ -195,7 +190,8 @@ func TestRecoverDiscardWarningNamesLastValidItem(t *testing.T) {
 	t.Cleanup(func() { maxTornTailBytes = original })
 
 	store := newTestStore(t)
-	session, err := store.Create(ProjectID(t.TempDir()))
+	ns := testNS(t)
+	session, err := store.Create(ns)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -221,40 +217,22 @@ func TestRecoverDiscardWarningNamesLastValidItem(t *testing.T) {
 	file.Close()
 
 	var reopened storage.Session
-	stderr := captureStderr(t, func() {
-		reopened, err = store.Open(id)
-	})
+	var logged strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logged, nil))
+	loggedStore, err := OpenStoreWithLogger(store.Root(), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err = loggedStore.Open(ns, id)
 	if err != nil {
 		t.Fatalf("Open after garbage tail: %v", err)
 	}
-	if !strings.Contains(stderr, "after item u1 (type user.input)") {
-		t.Fatalf("discard warning = %q, want it to name the last valid item", stderr)
+	if !strings.Contains(logged.String(), "after_item=u1") || !strings.Contains(logged.String(), "type=user.input") {
+		t.Fatalf("discard warning = %q, want it to name the last valid item", logged.String())
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-}
-
-// captureStderr runs fn with os.Stderr redirected to a temp file and
-// returns what was written. The redirect (like the maxTornTailBytes
-// variable) is a package-global seam: this package's tests must not run
-// in parallel while it exists.
-func captureStderr(t *testing.T, fn func()) string {
-	t.Helper()
-	tmp, err := os.CreateTemp(t.TempDir(), "stderr")
-	if err != nil {
-		t.Fatalf("create stderr capture: %v", err)
-	}
-	original := os.Stderr
-	os.Stderr = tmp
-	defer func() { os.Stderr = original }()
-	fn()
-	tmp.Close()
-	data, err := os.ReadFile(tmp.Name())
-	if err != nil {
-		t.Fatalf("read captured stderr: %v", err)
-	}
-	return string(data)
 }
 
 func appendRecord(t *testing.T, session storage.Session, record storage.Record) storage.Record {
@@ -268,7 +246,7 @@ func appendRecord(t *testing.T, session storage.Session, record storage.Record) 
 
 func TestCompactionSwitchesSegments(t *testing.T) {
 	store := newTestStore(t)
-	session, err := store.Create(ProjectID(t.TempDir()))
+	session, err := store.Create(testNS(t))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -350,7 +328,8 @@ func TestCompactionSwitchesSegments(t *testing.T) {
 
 func TestResumeReadsActiveSegmentOnly(t *testing.T) {
 	store := newTestStore(t)
-	session, err := store.Create(ProjectID(t.TempDir()))
+	ns := testNS(t)
+	session, err := store.Create(ns)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -362,7 +341,7 @@ func TestResumeReadsActiveSegmentOnly(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	reopened, err := store.Open(id)
+	reopened, err := store.Open(ns, id)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -381,9 +360,10 @@ func TestResumeReadsActiveSegmentOnly(t *testing.T) {
 }
 
 func TestSegmentSwitchRecoveryWindows(t *testing.T) {
+	ns := testNS(t)
 	writeFixture := func(t *testing.T) (store *Store, session storage.Session, dir string) {
 		store = newTestStore(t)
-		session, err := store.Create(ProjectID(t.TempDir()))
+		session, err := store.Create(ns)
 		if err != nil {
 			t.Fatalf("Create: %v", err)
 		}
@@ -402,7 +382,7 @@ func TestSegmentSwitchRecoveryWindows(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, logSwitchStaging), []byte("{\"item\":\"x1\",\"t\":\"context.compacted\"}\n"), 0o644); err != nil {
 		t.Fatalf("write staging: %v", err)
 	}
-	reopened, err := store.Open(session.ID())
+	reopened, err := store.Open(ns, session.ID())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -429,7 +409,7 @@ func TestSegmentSwitchRecoveryWindows(t *testing.T) {
 	if err := os.Rename(filepath.Join(dir, logFileName), filepath.Join(dir, "log-0000.jsonl")); err != nil {
 		t.Fatalf("archive: %v", err)
 	}
-	reopened, err = store.Open(session.ID())
+	reopened, err = store.Open(ns, session.ID())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -450,7 +430,7 @@ func TestSegmentSwitchRecoveryWindows(t *testing.T) {
 	if err := os.Rename(filepath.Join(dir, logFileName), filepath.Join(dir, "log-0000.jsonl")); err != nil {
 		t.Fatalf("archive: %v", err)
 	}
-	reopened, err = store.Open(session.ID())
+	reopened, err = store.Open(ns, session.ID())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -485,7 +465,8 @@ func recordTypes(records []storage.Record) []string {
 // read back in the normalized form — in-memory and on-disk never diverge.
 func TestAppendNormalizesInvalidUTF8(t *testing.T) {
 	store := newTestStore(t)
-	session, err := store.Create(ProjectID(t.TempDir()))
+	ns := testNS(t)
+	session, err := store.Create(ns)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -503,7 +484,7 @@ func TestAppendNormalizesInvalidUTF8(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	reopened, err := store.Open(session.ID())
+	reopened, err := store.Open(ns, session.ID())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

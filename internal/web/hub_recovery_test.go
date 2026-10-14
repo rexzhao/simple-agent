@@ -472,7 +472,6 @@ func TestCompactionSegmentSwitch(t *testing.T) {
 			ProviderName: "test",
 			ModelID:      "model-test",
 			Storage:      store,
-			ProjectID:    jsonl.ProjectID(projectCwd),
 			CWD:          projectCwd,
 		})
 	}
@@ -485,7 +484,7 @@ func TestCompactionSegmentSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := ag.NewSession()
+	created, err := ag.NewSession(projects.ProjectID(projectDir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +593,7 @@ func TestCompactionSegmentSwitch(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := ag.OpenSession(id)
+	reopened, err := ag.OpenSession(projects.ProjectID(projectDir), id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +640,7 @@ func nextFrame(t *testing.T, br *bufio.Reader) Frame {
 // hand-edited first line or a failed header copy).
 func writeSegment(t *testing.T, store *jsonl.Store, projectDir, id string, records []storage.Record) {
 	t.Helper()
-	dir := filepath.Join(store.Root(), jsonl.ProjectID(projectDir), id)
+	dir := filepath.Join(store.Root(), projects.ProjectID(projectDir), id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -707,7 +706,6 @@ func TestHeaderlessSegmentsOpenAndStream(t *testing.T) {
 					ProviderName: "test",
 					ModelID:      "model-test",
 					Storage:      store,
-					ProjectID:    jsonl.ProjectID(projectDir),
 					CWD:          projectDir,
 				})
 			}})
@@ -765,13 +763,12 @@ func TestHeaderlessCompactedSegmentChainStable(t *testing.T) {
 		ProviderName: "test",
 		ModelID:      "model-test",
 		Storage:      store,
-		ProjectID:    jsonl.ProjectID(projectDir),
 		CWD:          projectDir,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.OpenSessionIn(jsonl.ProjectID(projectDir), id)
+	session, err := ag.OpenSession(projects.ProjectID(projectDir), id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,7 +780,7 @@ func TestHeaderlessCompactedSegmentChainStable(t *testing.T) {
 	}
 
 	// Reopen: same segment, same derivation, same chain.
-	reopened, err := ag.OpenSessionIn(jsonl.ProjectID(projectDir), id)
+	reopened, err := ag.OpenSession(projects.ProjectID(projectDir), id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -895,13 +892,12 @@ func TestHeaderlessCompactTruncation(t *testing.T) {
 		ProviderName: "test",
 		ModelID:      "model-test",
 		Storage:      store,
-		ProjectID:    jsonl.ProjectID(projectDir),
 		CWD:          projectDir,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.OpenSessionIn(jsonl.ProjectID(projectDir), id)
+	session, err := ag.OpenSession(projects.ProjectID(projectDir), id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -924,7 +920,7 @@ func TestHeaderlessCompactTruncation(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := ag.OpenSessionIn(jsonl.ProjectID(projectDir), id)
+	reopened, err := ag.OpenSession(projects.ProjectID(projectDir), id)
 	if err != nil {
 		t.Fatal(err)
 	}

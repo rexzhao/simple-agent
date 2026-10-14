@@ -42,37 +42,53 @@ type Session interface {
 
 // Store creates and opens sessions. The session.created record is not the
 // store's business: the state layer above commits it as its first record.
+//
+// The core is deliberately minimal (§15.1): ns is an OPAQUE grouping key
+// — "project" and registration gating are host semantics. Enumerating,
+// deleting, and probing are OPTIONAL capabilities the host discovers by
+// type assertion; the core interface stays implementable by anything that
+// can create and reopen append-only logs.
 type Store interface {
-	// Create returns a new, lazily persisted session inside the project.
-	// The project id groups sessions in the jsonl directory layout;
-	// in-memory implementations ignore it.
-	Create(projectID string) (Session, error)
-	Open(id string) (Session, error)
-	// OpenIn opens a session scoped to one project: the jsonl layout
-	// resolves the id inside <root>/<projectID>/ only — the serve-mode
-	// registration gate is structural (no scan across unregistered
-	// projects) and the id→dir resolution cannot cross it.
-	OpenIn(projectID, sessionID string) (Session, error)
-	// HasSession probes whether a session exists under a project
-	// WITHOUT taking its lock — the serve manager uses it to find the
-	// owning project before assembling the agent (assembly precedes
-	// the lock; a failed assembly must not leave a zombie lock).
-	HasSession(projectID, sessionID string) bool
-	// Delete removes a stored session and its records, permanently.
-	// The jsonl layer refuses an EXTERNAL lock holder (a CLI mid-write)
-	// instead of silently unlinking files under an active writer; a
-	// session held open by the CALLING process is the caller's business
-	// (the serve manager refuses its own open sessions before calling)
-	Delete(projectID, sessionID string) error
-	// ListSessions enumerates the stored sessions of one project,
-	// newest activity first (ID as the tiebreak). Sessions never
-	// materialized (no first record) are not listed: they hold nothing.
-	// The listing is a VIEW: it tolerates concurrent appends (a writer
-	// mid-line into a tail) by skipping unparseable lines, and a session
-	// directory whose segment cannot be read at all is skipped rather
-	// than failing the whole project — opening that session is where
-	// real corruption errors.
-	ListSessions(projectID string) ([]SessionInfo, error)
+	// Create returns a new, lazily persisted session inside the
+	// namespace. The ns groups sessions in the jsonl directory layout;
+	// in-memory implementations record it for ownership checks.
+	Create(ns string) (Session, error)
+	// Open reopens a stored session scoped to one namespace: the jsonl
+	// layout resolves the id inside <root>/<ns>/ only. There is no
+	// cross-namespace scan — a host that needs id→ns resolution keeps
+	// its own registry (the serve mode's projects table).
+	Open(ns, id string) (Session, error)
+}
+
+// Lister enumerates the stored sessions of one namespace, newest
+// activity first (ID as the tiebreak). Sessions never materialized (no
+// first record) are not listed: they hold nothing. The listing is a
+// VIEW: it tolerates concurrent appends (a writer mid-line into a tail)
+// by skipping unparseable lines, and a session directory whose segment
+// cannot be read at all is skipped rather than failing the whole
+// namespace — opening that session is where real corruption errors.
+type Lister interface {
+	Store
+	ListSessions(ns string) ([]SessionInfo, error)
+}
+
+// Deleter removes a stored session and its records, permanently. The
+// jsonl layer refuses an EXTERNAL lock holder (a CLI mid-write) instead
+// of silently unlinking files under an active writer; a session held
+// open by the CALLING process is the caller's business (the serve
+// manager refuses its own open sessions before calling).
+type Deleter interface {
+	Store
+	Delete(ns, id string) error
+}
+
+// Prober reports whether a session exists under a namespace WITHOUT
+// taking its lock — the serve host uses it to find the owning project
+// before assembling the agent (assembly precedes the lock; a failed
+// assembly must not leave a zombie lock).
+type Prober interface {
+	Store
+	HasSession(ns, id string) bool
 }
 
 // ErrSessionNotFound is the typed sentinel for opening a session that
