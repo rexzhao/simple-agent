@@ -190,6 +190,11 @@ type ToolWire struct {
 	CallID string `json:"call_id,omitempty"`
 	Name   string `json:"name,omitempty"`
 	Args   string `json:"args,omitempty"`
+	// AwaitingApproval marks the slot as blocked on the host's
+	// approval decision (§16.3): the client renders the approval card.
+	// The digest chain folds records only — wire fields never affect
+	// it, so sai/v2/ does not bump.
+	AwaitingApproval bool `json:"awaiting_approval,omitempty"`
 }
 
 // SteeredWire is one queued steer message: addressable by identity from

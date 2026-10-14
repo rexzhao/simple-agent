@@ -34,7 +34,7 @@ export type Snap = {
   // The single in-flight tool execution (the server has one Running
   // slot). It overlays the matching tool-call part of the last
   // assistant message with its executing state.
-  tool: { callID: string; name: string; args: string } | null;
+  tool: { callID: string; name: string; args: string; awaitingApproval: boolean } | null;
 };
 
 const initialSnap: Snap = {
@@ -209,7 +209,7 @@ export class SessionStore {
           more: !!frame.more,
           running: !!frame.running,
           live,
-          tool: frame.tool && frame.tool.call_id ? { callID: frame.tool.call_id, name: frame.tool.name || "", args: frame.tool.args || "" } : null,
+          tool: frame.tool && frame.tool.call_id ? { callID: frame.tool.call_id, name: frame.tool.name || "", args: frame.tool.args || "", awaitingApproval: !!frame.tool.awaiting_approval } : null,
           steered: frame.steered || [],
           connected: true,
           verified: frame.d ? frame.d === head : this.snap.verified,
@@ -280,7 +280,7 @@ export class SessionStore {
         // live item to hang them on.
         if (!frame.call_id) break;
         this.commit({
-          tool: { callID: frame.call_id, name: frame.name || "", args: frame.args || "" },
+          tool: { callID: frame.call_id, name: frame.name || "", args: frame.args || "", awaitingApproval: false },
         });
         const live = this.snap.live;
         if (live) {

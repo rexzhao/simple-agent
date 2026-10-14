@@ -150,6 +150,7 @@ func New(manager *Manager, opts ...ServerOption) *Server {
 	mux.HandleFunc("DELETE /api/s/{id}", manager.DeleteSession)
 	mux.HandleFunc("POST /api/s/{id}/compact", s.handleCompact)
 	mux.HandleFunc("POST /api/s/{id}/stop", s.handleStop)
+	mux.HandleFunc("POST /api/s/{id}/approval", s.handleApproval)
 	// Unmatched /api paths answer with a JSON 404, never the page
 	// redirect: API consumers must not be sent wandering (a 3xx on an
 	// unknown route reads as "route exists" to a naive client).
@@ -540,6 +541,47 @@ func notifyCompactResult(hub *Hub, err error) {
 		return
 	}
 	hub.Notice("")
+}
+
+// handleApproval answers a pending tool approval (§16.3): the host's
+// one endpoint for the Ask flow. Session-level codes come first (the
+// resolve path goes through the same session resolution as every
+// route); approval-level codes follow.
+func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
+	if !guardAPI(w, r, true) {
+		return
+	}
+	entry, release, ok := s.manager.resolve(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	var body struct {
+		Item   string `json:"item"`
+		Allow  bool   `json:"allow"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Item) == "" {
+		http.Error(w, "missing item", http.StatusBadRequest)
+		return
+	}
+	if err := entry.session.ResolveApproval(body.Item, body.Allow, body.Reason); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrApprovalUnknown):
+			writeAPIError(w, http.StatusNotFound, &apiError{code: "approval_unknown", cause: err})
+		case errors.Is(err, agent.ErrApprovalResolved):
+			writeAPIError(w, http.StatusConflict, &apiError{code: "approval_resolved", cause: err})
+		default:
+			writeAPIError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {

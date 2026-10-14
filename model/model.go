@@ -143,6 +143,8 @@ const (
 	EventTypeToolStarted               EventType = "tool_started"
 	EventTypeToolResult                EventType = "tool_result"
 	EventTypeCompactionStarted         EventType = "compaction_started"
+	EventTypeToolApprovalPending       EventType = "tool_approval_pending"
+	EventTypeToolApprovalResolved      EventType = "tool_approval_resolved"
 	EventTypeCompactionCompleted       EventType = "compaction_completed"
 	EventTypeCompactionFailed          EventType = "compaction_failed"
 	EventTypeContextPressure           EventType = "context_pressure"
@@ -285,6 +287,31 @@ type ToolResultEvent struct {
 
 func (ToolResultEvent) Type() EventType {
 	return EventTypeToolResult
+}
+
+// ToolApprovalPendingEvent announces that a tool call is awaiting the
+// host's approval decision (the policy hook returned Ask). ItemID is
+// the identity of the future tool.result.
+type ToolApprovalPendingEvent struct {
+	ItemID    string
+	Name      string
+	Arguments string
+}
+
+func (ToolApprovalPendingEvent) Type() EventType {
+	return EventTypeToolApprovalPending
+}
+
+// ToolApprovalResolvedEvent closes a pending approval: the host
+// approved or denied it, or the wait was cancelled (run stop, session
+// close).
+type ToolApprovalResolvedEvent struct {
+	ItemID  string
+	Outcome string // approved / denied / cancelled
+}
+
+func (ToolApprovalResolvedEvent) Type() EventType {
+	return EventTypeToolApprovalResolved
 }
 
 // CompactionStartedEvent opens an in-run context compaction. ItemID is

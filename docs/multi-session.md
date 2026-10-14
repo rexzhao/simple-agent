@@ -250,7 +250,8 @@ GET  /api/s/<id>/stream?from=<h>     POST /api/s/<id>/send
 GET  /api/s/<id>/state               POST /api/s/<id>/steer
 GET  /api/s/<id>/history             PUT  /api/s/<id>/steer
 POST /api/s/<id>/compact             DELETE /api/s/<id>/steer?item=
-POST /api/s/<id>/stop                DELETE /api/s/<id>   （删除会话）
+POST /api/s/<id>/stop                POST /api/s/<id>/approval （工具审批，§16.3）
+                                     DELETE /api/s/<id>   （删除会话）
 ```
 
 - **注册门在 Manager 层，逐路由**：`jsonl.Store.Open(id)` 扫整个 data
@@ -274,6 +275,8 @@ POST /api/s/<id>/stop                DELETE /api/s/<id>   （删除会话）
   | `session_locked` | 409 | 否 | 外部进程持锁（错误信息带 pid） |
   | `session_open` | 409 | 否 | 删除时：会话有在途请求（Lease refs）或被宿主持有（SSE 订阅者——步 3 后订阅者不持 refs，由 InUseGuard 承载） |
   | `run_active` | 409 | 否 | 单 run 槽占用 |
+  | `approval_unknown` | 404 | 否 | ResolveApproval 无此待审批项（可能已落地或从未存在）——先会话级码后审批级码 |
+  | `approval_resolved` | 409 | 否 | 待审批项已被回答 |
   | `no_run` | 409 | 否 | steer 要求运行中（回退 Send） |
   | `not_queued` | 404 | 否 | 编辑/撤回不存在的排队项 |
   | `stale_anchor` | 409 | 否 | `history?before=` 锚点未知（链重建）；重试同请求仍会 stale，正确动作是丢弃持有记录与链、按 Rule A 全量重放——链路协议的正常信号，页面 Rule A 的唯一触发码 |

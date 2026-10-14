@@ -290,6 +290,21 @@ const r4 = rec("assistant.message", { content: "a2" });
   assert(store.snap.tool && store.snap.tool.callID === "c9", "s12 snapshot sets the slot (tool without streaming)");
 }
 
+// ---- 12b. the approval flag rides the tool slot (§16.3) ----
+{
+  const frame = {
+    kind: "snapshot", anchor: store.snap.prefixAnchor, resumed: true,
+    records: [], running: true,
+    tool: { item: "i-appr", call_id: "c-appr", name: "shell", args: "{}", awaiting_approval: true },
+    d: store.snap.head,
+  };
+  await applySnapshot(red, frame);
+  await apply(frame);
+  agree("s12b awaiting_approval snapshot");
+  assert(store.snap.tool && store.snap.tool.awaitingApproval === true, "s12b the approval flag reached the store's tool slot");
+  assert(store.snap.tool && store.snap.tool.callID === "c-appr", "s12b the slot identity carried");
+}
+
 // ---- 13. events trailing their records are idempotent ----
 // The run commits completed/tool_result records BEFORE emitting their
 // events, so the wire may deliver the event after the record. The

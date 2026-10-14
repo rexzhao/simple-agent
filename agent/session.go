@@ -82,6 +82,9 @@ type Session struct {
 
 	mu    sync.RWMutex
 	state *storage.State
+	// pendingApproval is the awaiting tool call of the §16.3 Ask flow
+	// (nil when none); guarded by mu.
+	pendingApproval *pendingApproval
 	// Soft-compaction retry cooldown as state-layer counters (§14.4):
 	// user.input commits increment both; a committed compaction resets
 	// inputsSinceCompacted; a failed/churning soft attempt arms the

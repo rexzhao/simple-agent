@@ -65,6 +65,10 @@ type RunningTool struct {
 	ItemID    string
 	ToolCall  model.ToolCall
 	StartedAt time.Time
+	// AwaitingApproval marks the slot as blocked on the host's
+	// approval decision (the §16.3 Ask flow): the snapshot carries it
+	// so a reconnecting client can rebuild the approval card.
+	AwaitingApproval bool
 }
 
 // CompactingItem is the context compaction currently in flight. ItemID is

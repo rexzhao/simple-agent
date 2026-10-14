@@ -189,7 +189,10 @@ h_{k−M}，客户端校验 `fold(h_{k−M}, 返回记录) == h_k`——严格�
 **中途连接**：Started 事件对"流已开始后才连上"的客户端已过去——
 SSE 建连的**第一帧是 `snapshot`**：一次原子的 `SnapshotStream()`
 （records 由 hub 镜像提供，Streaming/Running 槽、steer 队列与
-running/compacting 状态同一锁段拷贝，§4.3）。“record 取代同 ItemID
+running/compacting 状态同一锁段拷贝，§4.3）。Running 槽携带
+`awaiting_approval`（§16.3：该工具调用正等待宿主审批决定——
+`tool_approval_pending`/`tool_approval_resolved` 瞬态事件与之
+同一临界区，重连客户端从快照重建审批卡）。“record 取代同 ItemID
 streaming 行”的规则使任何重叠良性（同 ItemID 幂等覆盖）；此场景
 写进文档并有测试。
 
@@ -310,6 +313,7 @@ tag（内部类型不加），`wire.go` 做判别编码：
 | `/api/send` | POST | `{"text":"..."}`，强制 application/json + Origin/Host 校验；run 活跃 409 `run_active` |
 | `/api/compact` | POST | **异步：handler 起 goroutine 立即返 202**（`Compact()` 持单飞槽直到摘要完成可能数十秒，同步会占住连接且前端无状态可显）。同步前置校验：run 活跃 409 `run_active`、`Snapshot().Context` 为空 409 `nothing_to_compact`（可同步判定，不进 goroutine）。**压缩生命周期（compacting:true/false、CompactionStarted/Completed）全部经会话流到达 hub**（§4.3），无轮询无周期广播。**前置校验是 TOCTOU，异步失败的唯一归宿是带外通道**：goroutine 在 `Compact()` 返回非 nil 时把错误交给 hub，由 hub 以 status 帧广播 `{"kind":"status","compacting":false,"notice":"compact failed: …"}`；`/api/state` 摘要携带最近一次 notice，断线期间打开的页面也能读到。异步 202 若无带外错误通道，语义就是"接受且不告知结果"，比同步阻塞更差 |
 | `/api/stop` | POST | `Stop()`；**无 run 时幂等成功** |
+| `/approval` | POST | `{"item","allow","reason"}`——回答待审批的工具调用（§16.3）；过 guardAPI + 会话解析（会话级码先行）；`approval_unknown` 404 / `approval_resolved` 409 |
 
 v1 不做：会话列表、认证。默认 `127.0.0.1:7420`，仅 `-http` 显式启用。
 

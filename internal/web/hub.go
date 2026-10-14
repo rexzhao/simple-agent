@@ -260,10 +260,11 @@ func (h *Hub) snapshotFrameLocked(state agent.StreamSnapshot) []byte {
 	}
 	if state.Running != nil {
 		f.Tool = &ToolWire{
-			Item:   state.Running.ItemID,
-			CallID: state.Running.ToolCall.ID,
-			Name:   state.Running.ToolCall.Name,
-			Args:   state.Running.ToolCall.Arguments,
+			Item:             state.Running.ItemID,
+			CallID:           state.Running.ToolCall.ID,
+			Name:             state.Running.ToolCall.Name,
+			Args:             state.Running.ToolCall.Arguments,
+			AwaitingApproval: state.Running.AwaitingApproval,
 		}
 	}
 	for _, entry := range state.Steered {
@@ -532,10 +533,11 @@ func (h *Hub) registerLocked(from string, window int) (*client, []byte, error) {
 	}
 	if snapshot.Running != nil {
 		f.Tool = &ToolWire{
-			Item:   snapshot.Running.ItemID,
-			CallID: snapshot.Running.ToolCall.ID,
-			Name:   snapshot.Running.ToolCall.Name,
-			Args:   snapshot.Running.ToolCall.Arguments,
+			Item:             snapshot.Running.ItemID,
+			CallID:           snapshot.Running.ToolCall.ID,
+			Name:             snapshot.Running.ToolCall.Name,
+			Args:             snapshot.Running.ToolCall.Arguments,
+			AwaitingApproval: snapshot.Running.AwaitingApproval,
 		}
 	}
 	for _, entry := range snapshot.Steered {

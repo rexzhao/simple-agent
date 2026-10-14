@@ -1126,7 +1126,7 @@ type ToolDecision struct {
   `AwaitingApproval`（连同 ToolCall 字段）重建审批卡，后续 Resolved
   事件收尾。web 的 `ToolWire` 增加 `awaiting_approval` 字段——**链版
   本不升**（digest 链只折叠**记录**，帧不参与哈希，sai/v2/ 不动）；
-  /log 与 chat 的 fixture 各加一例。
+  chat 的 store_check 加一例；/log 的 reducer 不渲染工具槽，不涉及。
 
 **取消时的记录形态（与中断规则的关系）**：审批等待被取消 = 一次中
 断，走**既有**中断语义（session.go 的工具循环在 ctx 取消时直接返
@@ -1249,7 +1249,7 @@ Tool 接口相反）。
 | 4 | 包迁移·tools + Tool 接口落地（接口在 `agent.Tool`（internal/agent，随步骤 5 公开）；`tools.Named` 适配、`Shell` 返回 `agent.Tool`、`agent.Options.Tools []agent.Tool`、namedExecutor 删除）**（已落地）** | 既有 agent/web/CLI 测试不改断言；接口 kill（按名分发丢失→运行期错误测试红） | README；design §8 已核无需改动 |
 | 5 | 包迁移·agent（SessionEvent/Stream 随包公开；SessionMetaForTest 删除；NewStaticResolver 文档化）**（已落地）** | 测试改字面量后全绿；公开 API 清单核对 | 同上 |
 | 6 | 包迁移·sessionhost（SweeperInterval/SessionIdleEvict 收为 Options，变量删除，测试改 Options）**（已落地）** | 驱逐/清扫测试改注入后断言不变弱；可变变量 grep 清零 | multi-session.md §3 |
-| 7a | 审批状态机：`Ask` + agent 拥有的待审批态（`s.mu` 内事件+快照原子置位）+ `Session.ResolveApproval` + `ErrApprovalUnknown/Resolved` + `ToolApprovalPending/Resolved` 事件 + 快照 `AwaitingApproval` + web `ToolWire.awaiting_approval`（一个端点）+ fixture 两例 | kill：快照丢待审批态（重连看不到卡）、ResolveApproval 双答/未知不报错、事件与快照不同锁段（乱序）；取消走中断路径（sanitizeContext 修补，既有双测试） | webui.md 事件表 + 快照字段、multi-session.md §4 码表 +2 行（approval_unknown/approval_resolved） |
+| 7a | 审批状态机（**已落地**）：`Ask` + agent 拥有的待审批态（`s.mu` 内事件+快照原子置位）+ `Session.ResolveApproval` + `ErrApprovalUnknown/Resolved` + `ToolApprovalPending/Resolved` 事件 + 快照 `AwaitingApproval` + web `ToolWire.awaiting_approval`（一个端点）+ fixture 两例 | kill：快照丢待审批态（重连看不到卡）、ResolveApproval 双答/未知不报错、事件与快照不同锁段（乱序）；取消走中断路径（sanitizeContext 修补，既有双测试） | webui.md 事件表 + 快照字段、multi-session.md §4 码表 +2 行（approval_unknown/approval_resolved） |
 | 7b | 策略钩子：`agent.Hooks`（同步三态）+ deny-as-result + fail-closed + panic 防护 + AfterToolCall 边界（deny 跑、cancel 不跑、退出不跑） | **默认基线判据**：现有测试不改断言 + 无钩子事件序列 golden 测试（§16.3）；kill：deny 不落记录、钩子 panic 楔死、默认行为变 | 同上（码表不动） |
 | 8 | broker 处置（按 16.6c：删除 pageProvider + fixture + 文档段，或原样保留） | 若删：chat tsc + 剩余 fixture 全绿；grep page_provider 清零 | webui.md、chat README |
 
