@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -147,81 +149,6 @@ func TestStreamInitialSnapshot(t *testing.T) {
 	// "counter not advancing" case is caught by TestStreamSeqMonotonic
 	// (which asserts seq > 0 for delivered events).
 	_ = snapshot.StartSeq
-}
-
-// TestStreamSteerOrdering pins the B2 scenario: the steer_queued event
-// (from the API goroutine) must arrive BEFORE the RecordCommitted of
-// the user.input that consumes it (from the run goroutine) — both are
-// enqueued under s.mu with seq, so the ordering is structural.
-func TestStreamSteerOrdering(t *testing.T) {
-	provider := &fakeProvider{turns: [][]model.Event{
-		{model.TextDeltaEvent{Text: "answer"}, model.MessageDoneEvent{}},
-		{model.TextDeltaEvent{Text: "answer2"}, model.MessageDoneEvent{}},
-		{model.TextDeltaEvent{Text: "answer3"}, model.MessageDoneEvent{}},
-	}}
-	_, session := newTestAgent(t, provider, nil)
-
-	sub := session.Stream()
-	defer sub.Stop()
-
-	// Start a run.
-	if err := session.Send("start"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Steer mid-run: the steer_queued event should be enqueued before
-	// the consuming user.input RecordCommitted.
-	steerItem, err := session.Steer("mid-run input")
-	if err != nil {
-		t.Fatalf("Steer: %v", err)
-	}
-	_ = steerItem
-
-	waitSettled(t, session)
-
-	// Collect all events from the subscription.
-	var events []SessionEvent
-	deadline := time.After(10 * time.Second)
-loop:
-	for {
-		select {
-		case ev := <-sub.Events():
-			events = append(events, ev)
-			if st, ok := ev.(Status); ok && !st.Running {
-				break loop
-			}
-		case <-deadline:
-			t.Fatal("timed out")
-		case <-sub.Lost():
-			t.Fatal("unexpected eviction")
-		}
-	}
-
-	// Find the steer_queued event and the consuming user.input.
-	var steerQueuedIdx int = -1
-	var consumingInputIdx int = -1
-	for i, ev := range events {
-		switch e := ev.(type) {
-		case Transient:
-			if e.Event.Type() == model.EventTypeSteerQueued {
-				steerQueuedIdx = i
-			}
-		case RecordCommitted:
-			if e.Record.Type == storage.TypeUserInput && e.Record.Content == "mid-run input" {
-				consumingInputIdx = i
-			}
-		}
-	}
-
-	// Unconditional: the steer_queued event MUST be on the stream (B2
-	// fix), and it MUST precede the consuming user.input if the input
-	// was consumed in this run.
-	if steerQueuedIdx == -1 {
-		t.Fatal("no steer_queued Transient on the stream — B2 regression")
-	}
-	if consumingInputIdx != -1 && steerQueuedIdx > consumingInputIdx {
-		t.Fatalf("steer_queued (%d) after consuming user.input (%d) — B2 ordering violated", steerQueuedIdx, consumingInputIdx)
-	}
 }
 
 // TestStreamSeesEveryWritePath pins completeness: the stream's record
@@ -857,5 +784,160 @@ func TestRunStartStatusNotDroppable(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+// steerGateProvider holds the FIRST model request open until released,
+// letting the test Steer while the run is provably in-flight (the fake
+// provider's instant turns race Send's return against the run's
+// teardown). Later turns complete immediately — enough for the run to
+// consume the queued steer and finish. The entered channel signals the
+// first request is in-flight; all waits carry the request ctx so a
+// cancelled run frees the provider.
+type steerGateProvider struct {
+	turns [][]model.Event
+	mu    sync.Mutex
+	// requests counts model requests seen so far (guarded by mu; a
+	// provider may serve concurrent requests in principle).
+	requests int
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+// Stream serves the scripted turns; the first request parks until the
+// test releases it (or the run's ctx cancels — the failure-path exit
+// that keeps the helper leak-free). An unscripted request count is a
+// contract break and returns a readable error instead of a panic.
+func (p *steerGateProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
+	p.mu.Lock()
+	p.requests++
+	n := p.requests
+	p.mu.Unlock()
+	if n == 1 {
+		p.once.Do(func() { close(p.entered) })
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+		}
+	}
+	if n < 1 || n > len(p.turns) {
+		return nil, fmt.Errorf("unexpected model request %d (%d scripted)", n, len(p.turns))
+	}
+	turn := p.turns[n-1]
+	events := make(chan model.Event, len(turn))
+	go func() {
+		defer close(events)
+		for _, event := range turn {
+			select {
+			case events <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return events, nil
+}
+
+// TestStreamSteerOrderingDeterministic pins the B2 ordering contract
+// without racing Send's return against the run's teardown: the first
+// model request is held open until the Steer has been accepted, so the
+// run is PROVABLY active when the steer queues. The assertions are
+// unconditional and ItemID-bound: exactly one steer_queued for the
+// steered item, exactly one consuming user.input record, queued before
+// consumption.
+func TestStreamSteerOrderingDeterministic(t *testing.T) {
+	provider := &steerGateProvider{
+		turns: [][]model.Event{
+			{model.TextDeltaEvent{Text: "answer"}, model.MessageDoneEvent{}},
+			{model.TextDeltaEvent{Text: "answer2"}, model.MessageDoneEvent{}},
+		},
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	_, session := newTestAgent(t, provider, nil)
+
+	sub := session.Stream()
+	defer sub.Stop()
+
+	if err := session.Send("start"); err != nil {
+		t.Fatal(err)
+	}
+	// The run is provably in-flight: the first model request is open.
+	select {
+	case <-provider.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first model request never started")
+	}
+
+	// Steer mid-run — ErrNoRun is impossible now, and the assertion
+	// below treats it as a failure rather than tolerating it.
+	steerItem, err := session.Steer("mid-run input")
+	if err != nil {
+		t.Fatalf("Steer: %v", err)
+	}
+
+	// Let the run proceed: it drains the steer queue before the second
+	// model request and finishes.
+	close(provider.release)
+	waitSettled(t, session)
+
+	// Exactly two model requests: the gated first turn and the
+	// post-drain followup. A provider-contract change surfaces here as
+	// a readable failure.
+	provider.mu.Lock()
+	requests := provider.requests
+	provider.mu.Unlock()
+	if requests != 2 {
+		t.Fatalf("model requests = %d, want exactly 2 (first gated turn + post-drain followup)", requests)
+	}
+
+	// Collect the run's events through its terminal status.
+	var events []SessionEvent
+	deadline := time.After(10 * time.Second)
+loop:
+	for {
+		select {
+		case ev := <-sub.Events():
+			events = append(events, ev)
+			if st, ok := ev.(Status); ok && !st.Running {
+				break loop
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for the terminal status")
+		case <-sub.Lost():
+			t.Fatal("unexpected eviction")
+		}
+	}
+
+	// Both markers MUST be present, bound to the steered item's ID, and
+	// each exactly once — a foreign steer_queued cannot satisfy the
+	// assertion, and a missing consumption record means the steer was
+	// never drained (a real contract violation: the run cannot finish
+	// without draining the queue first).
+	steerQueuedIdx, consumingInputIdx := -1, -1
+	steerQueuedCount, consumingCount := 0, 0
+	for i, ev := range events {
+		switch e := ev.(type) {
+		case Transient:
+			if q, ok := e.Event.(model.SteerQueuedEvent); ok && q.ItemID == steerItem {
+				steerQueuedIdx = i
+				steerQueuedCount++
+			}
+		case RecordCommitted:
+			if e.Record.Type == storage.TypeUserInput && e.Record.ItemID == steerItem {
+				consumingInputIdx = i
+				consumingCount++
+			}
+		}
+	}
+	if steerQueuedCount != 1 {
+		t.Fatalf("steer_queued for item %s: %d occurrences, want exactly 1", steerItem, steerQueuedCount)
+	}
+	if consumingCount != 1 {
+		t.Fatalf("consuming user.input for item %s: %d occurrences, want exactly 1", steerItem, consumingCount)
+	}
+	if steerQueuedIdx > consumingInputIdx {
+		t.Fatalf("steer_queued (%d) after consuming user.input (%d) — B2 ordering violated", steerQueuedIdx, consumingInputIdx)
 	}
 }
