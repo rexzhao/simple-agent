@@ -956,8 +956,9 @@ created 记录，加字段即得）。
 
 ### 16.1 现状盘点
 
-（本表是设计时刻的快照；步骤 1 改名后文中的 `model.Tool` 均已为
-`model.ToolDefinition`，接口形状未变。）
+（本表是设计时刻的快照——**表内路径与拼写均为设计时刻**：步骤 1 后
+`model.Tool` 均为 `model.ToolDefinition`，步骤 2 后 `internal/model`
+已迁至顶层 `model/`；接口形状未变。）
 
 **接口三件套（分散三处，语义互不认识）**：
 

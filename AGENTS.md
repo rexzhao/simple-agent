@@ -75,7 +75,7 @@ opus ──分配──▶ worker ──开发完成──▶ review ──通�
 
 ```sh
 go build ./... && go vet ./... && go test ./...
-go test -race ./internal/...
+go test -race ./...
 sh scripts/build.sh                      # 需要产物时
 cd clients/chat && npx tsc --noEmit      # 动过前端时
 ```
@@ -106,8 +106,10 @@ hash；内容变了必须重跑。
 禁止 `./...` 全套循环。flake 量化用 -run 锁定单测试再加大 -count
 （如 -count=3000），写明复现率。
 
-Windows 完整 race 门禁仍是 `go test -p 1 -race -count=1 ./internal/... ./cmd/...`，
-整仓串行以控制资源；迭代期的 -p 1 只对目标包使用。
+Windows 完整 race 门禁仍是 `go test -p 1 -race -count=1 ./...`，
+整仓串行以控制资源；迭代期的 -p 1 只对目标包使用。（`./...` 而非
+`./internal/... ./cmd/...`：包移出 internal 后，限定 internal 会漏掉
+公开包。）
 
 review/opus 的独立验证不受频次限制，但也应先定向、后全套一次。
 - 送审与所有回复邮件里列出本次跑过的命令、`-count`/`-race` 与结论；接收方原则上不再重跑
