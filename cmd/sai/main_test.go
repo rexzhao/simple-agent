@@ -568,7 +568,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	agA, agB, id := setupCLIFixture(t, "session")
 
 	// Same project: the -session path resumes.
-	cli, err := setupCLI(agA, agent.SessionMetaForTest, id)
+	cli, err := setupCLI(agA, agent.SessionMetaForTest, nil, id)
 	if err != nil {
 		t.Fatalf("same-project resume: %v", err)
 	}
@@ -578,7 +578,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	cli.closeSession()
 
 	// Cross project: a clean not-found with the explaining message.
-	_, err = setupCLI(agB, agent.SessionMetaForTest, id)
+	_, err = setupCLI(agB, agent.SessionMetaForTest, nil, id)
 	if err == nil {
 		t.Fatal("cross-project resume succeeded — Q1=B scoping is broken")
 	}
@@ -587,7 +587,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	}
 
 	// The /resume command is scoped the same way: same project works.
-	cli, err = setupCLI(agA, agent.SessionMetaForTest, "")
+	cli, err = setupCLI(agA, agent.SessionMetaForTest, nil, "")
 	if err != nil {
 		t.Fatalf("fresh setup: %v", err)
 	}
@@ -606,7 +606,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	// A fresh session (no resume id) lands in the CURRENT project's ns.
 	// The wiring mutant (ns derived from anything but CWD) makes the
 	// same-project resume above fail, so this is a positive control.
-	fresh, err := setupCLI(agA, agent.SessionMetaForTest, "")
+	fresh, err := setupCLI(agA, agent.SessionMetaForTest, nil, "")
 	if err != nil {
 		t.Fatalf("fresh setup (positive control): %v", err)
 	}

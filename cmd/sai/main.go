@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"os"
@@ -88,7 +89,7 @@ func main() {
 		return
 	}
 
-	ag, project, defaultMeta, err := assembleCurrentDir(*serverRoot, *provider, *modelName)
+	ag, project, defaultMeta, validateMeta, err := assembleCurrentDir(*serverRoot, *provider, *modelName)
 	if err != nil {
 		log.Fatalf("sai: %v", err)
 	}
@@ -104,7 +105,7 @@ func main() {
 		resumeID = strings.TrimSpace(flag.Arg(0))
 	}
 
-	cli, err := setupCLI(ag, defaultMeta, resumeID)
+	cli, err := setupCLI(ag, defaultMeta, validateMeta, resumeID)
 	if err != nil {
 		log.Fatalf("sai: %v", err)
 	}
@@ -236,17 +237,44 @@ func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
 }
 
 // assembleCurrentDir is the CLI path: one agent for the process cwd.
-func assembleCurrentDir(serverRoot, providerName, modelName string) (*agent.Agent, string, storage.SessionMeta, error) {
+// The returned validator is the /new override check (§15.4 step 4):
+// provider/model must resolve in the live configuration and the
+// reasoning level must be one the chosen model supports.
+func assembleCurrentDir(serverRoot, providerName, modelName string) (*agent.Agent, string, storage.SessionMeta, func(storage.SessionMeta) error, error) {
 	cwd, err := filepath.Abs(".")
 	if err != nil {
-		return nil, "", storage.SessionMeta{}, fmt.Errorf("resolve working directory: %w", err)
+		return nil, "", storage.SessionMeta{}, nil, fmt.Errorf("resolve working directory: %w", err)
 	}
 	factory, err := assembleFactory(serverRoot, providerName, modelName)
 	if err != nil {
-		return nil, "", storage.SessionMeta{}, err
+		return nil, "", storage.SessionMeta{}, nil, err
 	}
 	ag, project, err := factory.Agent(cwd)
-	return ag, project, factory.defaultMeta, err
+	return ag, project, factory.defaultMeta, newMetaValidator(factory.cfg), err
+}
+
+// newMetaValidator builds the /new override check from the live
+// configuration. The user is CHOOSING a model here, so the messages
+// say which parameter is wrong and what the alternatives are (the
+// resolver's texts list them) — not the internal "not available"
+// phrasing of the open path.
+func newMetaValidator(cfg *config.Config) func(storage.SessionMeta) error {
+	return func(meta storage.SessionMeta) error {
+		resolved, err := cfg.ResolveModel(meta.Provider, meta.Model)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(meta.ReasoningLevel) == "" {
+			return nil
+		}
+		if len(resolved.ReasoningConfig.Levels) == 0 {
+			return fmt.Errorf("model %q takes no reasoning levels (drop -reasoning)", meta.Model)
+		}
+		if _, err := config.ApplyReasoningLevel(resolved.Parameters, resolved.ReasoningConfig, meta.ReasoningLevel); err != nil {
+			return fmt.Errorf("-reasoning: %v", err)
+		}
+		return nil
+	}
 }
 
 // namedExecutor adapts the single-tool executor to the agent loop's
@@ -317,8 +345,14 @@ type cliApp struct {
 	session *agent.Session
 	printer *spinnerPrinter
 	// defaultMeta is what /new records: the startup -provider/-model
-	// (step 4 adds per-command overrides).
+	// (per-command overrides merge over THIS, never over a previous
+	// /new's values — bare /new always returns to the startup default).
 	defaultMeta storage.SessionMeta
+	// validateMeta checks a /new override against the live
+	// configuration (unknown provider/model, unsupported reasoning
+	// level) BEFORE any session is created. Wired from the factory's
+	// config; nil in bare test harnesses (no /new args to validate).
+	validateMeta func(storage.SessionMeta) error
 	// ns is the storage namespace of the working directory's project —
 	// opaque to the agent, derived here by the host (§15.1).
 	ns string
@@ -340,7 +374,11 @@ func (c *cliApp) dispatch(text string) bool {
 		c.closeSession()
 		return true
 	case text == "/new":
-		if err := c.freshSession(); err != nil {
+		if err := c.freshSession(c.defaultMeta); err != nil {
+			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
+		}
+	case strings.HasPrefix(text, "/new "):
+		if err := c.newCommand(strings.TrimSpace(strings.TrimPrefix(text, "/new"))); err != nil {
 			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		}
 	case text == "/stop":
@@ -356,7 +394,7 @@ func (c *cliApp) dispatch(text string) bool {
 			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		}
 	case text == "/help":
-		fmt.Fprintln(os.Stderr, "sai: /new new session · /compact summarize the context · /resume <id> reopen a session · /stop stop the run · /quit exit")
+		fmt.Fprintln(os.Stderr, "sai: /new [-provider p] [-model m] [-reasoning lvl] new session (omitted items inherit the startup defaults) · /compact summarize the context · /resume <id> reopen a session · /stop stop the run · /quit exit")
 	case strings.HasPrefix(text, "/resume"):
 		c.resumeCommand(strings.TrimSpace(strings.TrimPrefix(text, "/resume")))
 	default:
@@ -527,13 +565,61 @@ func (c *cliApp) closeSession() {
 	c.session.Close()
 }
 
-// freshSession switches to a new empty session.
-func (c *cliApp) freshSession() error {
-	session, err := c.agent.NewSession(c.ns, c.defaultMeta)
+// freshSession switches to a new empty session recording the given
+// meta (the startup default, or a validated /new override).
+func (c *cliApp) freshSession(meta storage.SessionMeta) error {
+	session, err := c.agent.NewSession(c.ns, meta)
 	if err != nil {
 		return err
 	}
 	return c.bind(session)
+}
+
+// newCommand handles "/new <args>": parse the flags, merge the given
+// values over the STARTUP defaults (omitted items are the startup
+// values — never the previous /new's), validate against the live
+// configuration, and only then switch sessions. Any error leaves the
+// current session untouched.
+func (c *cliApp) newCommand(args string) error {
+	overrides, err := parseNewArgs(args)
+	if err != nil {
+		return err
+	}
+	meta := c.defaultMeta
+	if overrides.Provider != "" {
+		meta.Provider = overrides.Provider
+	}
+	if overrides.Model != "" {
+		meta.Model = overrides.Model
+	}
+	if overrides.ReasoningLevel != "" {
+		meta.ReasoningLevel = overrides.ReasoningLevel
+	}
+	if c.validateMeta != nil {
+		if err := c.validateMeta(meta); err != nil {
+			return fmt.Errorf("/new: %v", err)
+		}
+	}
+	return c.freshSession(meta)
+}
+
+// parseNewArgs parses the /new flag arguments. Errors are ours to
+// print (the FlagSet stays silent): unknown flags, missing values,
+// and stray positional arguments are all usage errors.
+func parseNewArgs(args string) (storage.SessionMeta, error) {
+	var meta storage.SessionMeta
+	fs := flag.NewFlagSet("/new", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&meta.Provider, "provider", "", "provider name (default: the startup provider)")
+	fs.StringVar(&meta.Model, "model", "", "model name (default: the startup model)")
+	fs.StringVar(&meta.ReasoningLevel, "reasoning", "", "reasoning level (default: the model's default)")
+	if err := fs.Parse(strings.Fields(args)); err != nil {
+		return storage.SessionMeta{}, fmt.Errorf("/new: %v (usage: /new [-provider p] [-model m] [-reasoning lvl])", err)
+	}
+	if fs.NArg() > 0 {
+		return storage.SessionMeta{}, fmt.Errorf("/new: unexpected argument %q (usage: /new [-provider p] [-model m] [-reasoning lvl])", fs.Arg(0))
+	}
+	return meta, nil
 }
 
 // resume reopens a stored session. Q1=B (§15.1): the search is scoped
@@ -656,14 +742,14 @@ func recordsAfter(records []storage.Record, itemID string) []storage.Record {
 // wiring (§15.1: Q1=B scopes -session and /resume to the current
 // project's ns), so a wiring regression is testable without invoking
 // main itself.
-func setupCLI(ag *agent.Agent, defaultMeta storage.SessionMeta, resumeID string) (*cliApp, error) {
+func setupCLI(ag *agent.Agent, defaultMeta storage.SessionMeta, validateMeta func(storage.SessionMeta) error, resumeID string) (*cliApp, error) {
 	ns := projects.ProjectID(ag.CWD())
-	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}, ns: ns, defaultMeta: defaultMeta}
+	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}, ns: ns, defaultMeta: defaultMeta, validateMeta: validateMeta}
 	if resumeID != "" {
 		if err := cli.resume(resumeID); err != nil {
 			return nil, err
 		}
-	} else if err := cli.freshSession(); err != nil {
+	} else if err := cli.freshSession(defaultMeta); err != nil {
 		return nil, err
 	}
 	return cli, nil

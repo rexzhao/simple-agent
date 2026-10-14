@@ -52,7 +52,15 @@ Options:
 
 An optional positional argument resumes a stored session. Slash commands:
 
-- `/new` — start a new session (empty sessions are never written to disk)
+- `/new [-provider p] [-model m] [-reasoning lvl]` — start a new session
+  with a per-session model override. Omitted items inherit the STARTUP
+  defaults (never the previous /new's values); bare `/new` always returns
+  to them. The override is recorded in the session, so reopening it uses
+  the same model. Invalid input (unknown flag or positional argument,
+  missing flag value, unknown provider or model, a reasoning level the
+  model does not support) prints an error naming the parameter and the
+  available choices — the current session is kept. Empty sessions are
+  never written to disk.
 - `/compact` — summarize the context and continue from the summary; the
   conversation before the compaction is replaced by it. Compaction also
   happens automatically when the request approaches the model's context
