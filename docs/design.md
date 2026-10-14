@@ -946,3 +946,315 @@ created 记录，加字段即得）。
   扫描 Open(id) 不引入/删除；"cwd 不一致"子问题随之消失。
 - **Q2 = 照办**：`/new [-provider p] [-model m] [-reasoning lvl]` 三
   参数皆可覆盖，未给沿用启动参数；非法参数报错、不新建会话。
+
+## 16. 里程碑 B2：Tool 接口、审批 Hooks、公共包
+
+**消歧**：§14.2 里出现的"B2 定案"是里程碑 A 评审问题的编号标签，与本章
+无关；本章全文用"里程碑 B2"指代本里程碑。B2 = B1 之后的"B 剩余"：
+统一 Tool 接口、工具审批 Hooks、公共包移出 `internal/`。排序依据（用户
+2026-10-14 决定）：C 的新代码直接落在最终包路径，免得二次搬运。
+
+### 16.1 现状盘点
+
+**接口三件套（分散三处，语义互不认识）**：
+
+| 位置 | 形状 | 角色 |
+|---|---|---|
+| `internal/model/model.go:88` | `model.Tool{Name, Description, InputSchema}` | provider 面向模型的**定义**（纯数据） |
+| `internal/tools/shell.go:39` | `tools.Executor{Execute(ctx, args) (ToolResult, error)}` | **执行**（不含名称/描述） |
+| `internal/agent/agent.go:22` | `agent.ToolExecutor{Execute(ctx, name, args)}` | agent 循环的**按名分发**口 |
+
+装配链（`cmd/sai/main.go`）：`tools.Shell(cwd)` 返回
+`(model.Tool, Executor)` 二元组 → CLI 用 `namedExecutor`（main.go:282，
+单工具适配器）把 Executor 包成 agent.ToolExecutor → `Options{Tools:
+[]model.Tool, ToolExecutor}` 两字段分别喂"定义"与"执行"。**定义与执行
+的配对靠调用方自觉**：Tools 里列了名、ToolExecutor 按名找不到 →
+运行期错误；注册第二个工具需要重写分发器。
+
+**工具来源**：生产只有 `tools.Shell`（唯一内建）；web 的 page-provider
+不是工具来源——它是把**页面当 provider** 的调试通道（见 16.5）。
+
+**tool call 生命周期**（§8 已述）：delta 累积在 Streaming 的
+ToolCalls → assistant.message 落盘（wire ID）→ ToolStarted（mint result
+ItemID、占 Running 槽）→ 执行 → ToolResult 落盘（同 ItemID upsert）。
+审批 Hooks 挂在"ToolStarted 之后、执行之前"与"执行之后"（16.3）。
+
+**输出截断（两层，归属不同）**：工具层——shell 的 `limitedOutput`
+（shell.go:164，执行期字节帽，防 OOM）；agent 层——
+`agent/tool_output.go` 的 `limitToolResultOutput`（落盘前 2000 行 /
+50KiB 预算，保尾）。两层都要留：前者是**工具自保**，后者是**记录预算**
+（宿主策略）。
+
+### 16.2 Tool 接口
+
+```go
+// internal/agent（迁移后 agent/）——接口定义在消费者侧（Go 惯例）：
+// 编排核心声明契约，内建包实现它。
+type Tool interface {
+    // Definition is the provider-facing shape: name, description,
+    // JSON schema. Returned by value; callers must not mutate maps.
+    // (model.ToolDefinition per the step-1 rename; 16.1's table keeps
+    // model.Tool where it describes the CURRENT code.)
+    Definition() model.ToolDefinition
+    // Execute runs one call. Contract:
+    //  - Arguments are self-validated: an invalid argument returns a
+    //    normal error (the agent loop turns it into a tool.result
+    //    is_error record — same as today's shell argument errors).
+    //  - ctx is the run's context: cancellation (user /stop, session
+    //    close) must unblock Execute promptly.
+    //  - Execute may block arbitrarily (network, subprocess); the
+    //    agent loop calls it synchronously in the iteration.
+    Execute(ctx context.Context, arguments map[string]any) (model.ToolResult, error)
+}
+```
+
+**接口归属与依赖方向**：接口定义在 **agent**（消费者侧，Go 惯例）；
+`tools` 是内建实现与适配器的**扩展包**，依赖方向 `tools → agent →
+(model, storage)`——agent 不 import tools（编排核心不依赖"内建工具
+集"这个叶子；第三方自定义工具只 import agent 即可实现接口，不必为
+一个接口拖进内建包）。
+
+**注册**：`agent.Options.Tools []agent.Tool` 取代
+`Tools []model.Tool + ToolExecutor` 两字段。agent 循环按
+`Definition().Name` 分发（等价于今天的 namedExecutor，内化为循环的一
+步；今天"定义与执行不配对"的失败形态本就是 tool.result + is_error
+（executeToolCall 的 toolErrorResult），与新接口的未知工具路径同形）。
+**迁移适配**：`tools.Named(def model.ToolDefinition, exec Executor)
+agent.Tool` 适配旧二元组（第三方按名拼接的工具一步迁移）；`Shell(cwd)`
+改为直接返回 `agent.Tool`（签名破坏性变更，v0 无稳定性承诺，16.4）。
+
+**参数校验归属**：**工具自校验**（Execute 内），不引入 schema 校验层。
+理由：内建零外部依赖纪律（JSON-schema 校验器是新依赖）；现状即自校验
+（shell.go 的 requiredStringArgument/optionalPositiveIntArgument）；
+schema 是给**模型**看的说明，不是运行期断言。契约写进接口注释。
+
+**并发与取消**：每次 tool call 同步执行（iteration 内顺序，现状）；
+ctx 语义如上；不引入工具级并发（多 tool_calls 并行执行留给将来，接口
+形状已兼容——Execute 独立无共享状态）。
+
+**截断归属**：agent 层 `limitToolResultOutput` **留在 agent**（记录预
+算是宿主/agent 策略，工具不该知道记录预算）；工具层的自我保护（如
+shell 的字节帽）是工具实现细节。接口不暴露截断参数。
+
+### 16.3 审批 Hooks
+
+**机制总览**：策略钩子**同步、不阻塞**（Allow / Deny / Ask 三态）；
+`Ask` 时**待审批状态由 agent 拥有**——在 `s.mu` 下与
+`ToolApprovalPending` 事件同一临界区置快照字段，宿主经会话方法
+`ResolveApproval` 给出决定，等待受 run ctx 约束。宿主不建审批状态机
+（没有 map+channel 要自造），web 只需一个 HTTP 端点。
+
+```go
+// internal/agent（迁移后 agent/）
+type Hooks struct {
+    // BeforeToolCall is a synchronous POLICY hook: it decides, never
+    // blocks. Returning Ask hands the decision to the session's
+    // approval flow (the run goroutine waits, bounded by run ctx).
+    // nil hook = Allow (the default: no behavior change).
+    // A panic is fail-closed: treated as Deny with the reason noted.
+    BeforeToolCall func(ctx context.Context, call ToolCallInfo) ToolDecision
+    // AfterToolCall observes the finished call (telemetry, audit).
+    // Boundaries: runs for executed calls AND for denials (the
+    // observer sees the same is_error result the model sees); does
+    // NOT run for cancelled calls (no result object exists); never
+    // runs at process exit. Errors and panics are logged and
+    // swallowed — it cannot affect the run.
+    AfterToolCall func(ctx context.Context, call ToolCallInfo, result model.ToolResult)
+}
+
+type ToolCallInfo struct {
+    SessionID string // 审批卡按会话路由（宿主一 agent 多会话）
+    RunID     string
+    ItemID    string // the tool RESULT item id (approval identity)
+    Name      string
+    Arguments map[string]any
+}
+
+type ToolDecision struct {
+    Action ToolAction // Allow / Deny / Ask
+    Reason string     // Deny: surfaces as the tool.result error content
+}
+```
+
+**挂点**：仅工具级（执行前策略 + 执行后观察）。**run 级挂点不提供**
+（B2）：run 生命周期已在会话流上（Status 事件），宿主经 `Stream()`
+已可观察；若将来 C 的宿主需要 run 级**干预**再议。
+
+**Rewrite 不进 B2**：参数改写被明确排除——落盘的 assistant.message
+记录携带的是**原始** tool_call 参数，改写后"实际执行了什么"在磁盘上
+无法还原，审计留痕需要新的记录/事件形状（事件带 original/effective
+或 tool.result 带实际参数摘要）。等有真实用例再连同留痕设计一起加，
+避免留一个实现者各自发明的未定义动作值。
+
+**deny 语义**（策略 deny 与人工 deny 同形）：**作为 tool.result 回给
+模型**（is_error + Reason 作 content），**不终止 run**。理由：模型
+看到"被拒绝及原因"可调整策略（换命令/放弃），这正是审批的产品语
+义；记录面零新形状（tool.result 记录照常、seq/RecordCommitted 流不
+变）；终止 run 是 /stop 与硬错误的职责，混入审批会把"用户拒绝一次
+操作"放大成"报废整轮"。策略钩子 panic → **fail-closed**：按 deny
+处理，Reason 注明 "approval hook panicked"（审批钩子失效时放行比拒
+绝危险）。
+
+**Ask：agent 拥有的待审批状态**：
+- **置位**：策略返回 Ask → run goroutine 在 `s.mu` 内发
+  `ToolApprovalPending{ItemID, Name, Arguments}` 并置快照工具槽的
+  `AwaitingApproval`（同一临界区——事件与快照原子一致），然后在内部
+  决定 channel 上等待。
+- **决定**：`Session.ResolveApproval(itemID string, allow bool,
+  reason string) error`——web 一个端点 `POST /api/s/{id}/approval`
+  打到它（与其它路由同样过 guardAPI：POST 的 CSRF/Origin/Host 守卫；
+  经既有会话解析取会话——会话已关/被驱逐/未知时先给出既有的
+  `session_closing`/`unknown_session` 码，客户端按"先会话级码、再审批
+  级码"判别）。类型化错误与码表归属（multi-session.md §4 错误码全集
+  +2 行）：`ErrApprovalUnknown` → 404 `approval_unknown`（无此待审批
+  项——可能已落地或从未存在）、`ErrApprovalResolved` → 409
+  `approval_resolved`（已被回答）。Deny 的 reason 走 tool.result（同
+  策略 deny）。
+- **解决事件**：`ToolApprovalResolved{ItemID, Outcome}`（approved /
+  denied / cancelled），在决定生效的同一临界区发出。
+- **ctx**：等待受 run ctx 约束——`/stop`、session Close 取消等待，
+  Outcome=cancelled；等待期间 run 占用单 run 槽（Running）。策略
+  Allow/Deny **不产生任何事件**（秒批不闪审批卡：只有 Ask 走事件与
+  快照位）。
+- **run 超时**：现状无 run 级超时；B2 不引入——等待审批的 run 可无
+ 限期挂起，由用户/宿主经 ctx 终结（审批等待本质是人的节奏）。
+- **快照恢复**（§14.2 快照字段规则）：重连客户端从快照工具槽的
+  `AwaitingApproval`（连同 ToolCall 字段）重建审批卡，后续 Resolved
+  事件收尾。web 的 `ToolWire` 增加 `awaiting_approval` 字段——**链版
+  本不升**（digest 链只折叠**记录**，帧不参与哈希，sai/v2/ 不动）；
+  /log 与 chat 的 fixture 各加一例。
+
+**取消时的记录形态（与中断规则的关系）**：审批等待被取消 = 一次中
+断，走**既有**中断语义（session.go 的工具循环在 ctx 取消时直接返
+回，语义为"中断不留收尾记录"）——不落 tool.result；落盘的是 assistant.message 里的 tool_calls
+（ToolStarted 是瞬态事件不落盘，占位是内存 Running 槽）。**未配对的
+tool_call 由 `sanitizeContext` 在下一次请求组装时修补**（agent.go:
+"every assistant tool call is followed by its tool result …
+synthesized as interrupted errors in call order"，有
+TestSanitizeContextPatchesDanglingToolCalls /
+TestSanitizeContextKeepsCompleteExchanges 双测试钉住）——今天
+/stop 打断执行中工具已是这条路，审批把窗口从毫秒拉长到分钟，机制不
+变。占位文案是否区分"审批等待被取消"与"执行被中断"（现在是统一的
+`[tool execution interrupted]`）留作实现期小决定，不改变契约。
+
+**默认行为与判据**：`Hooks{}` 零值（或 Options 不设）= 全部放行 =
+现状不变。**可执行判据**（步骤 7a 的回归保护）：现有 agent/web/CLI
+测试全部不改断言通过，**另加一条无钩子场景的事件序列 golden 测试**
+（同一脚本化场景，记录序列与事件序列的类型 + 关键字段逐条对比现
+状捕获的基线）——"不变"由测试证明，不靠声明。
+
+### 16.4 公共包移出 internal/
+
+**逐包裁定**：
+
+| 包 | 处置 | 理由 |
+|---|---|---|
+| `model`（+ 各 provider 子包） | **公开** | wire 类型与 provider 抽象是 SDK 的第一表面 |
+| `storage`（+ jsonl、memory） | **公开** | 会话存储格式（log.jsonl/段切换/链）是可复用契约 |
+| `tools` | **公开** | Tool 接口与内建 shell 是扩展点 |
+| `agent`（含 SessionEvent/Stream） | **公开** | Agent/Session/Run/Stream/Hooks 是编排核心。SessionEvent 留在 agent 随包公开（§14.8"一起搬"=同一时机）：sessionhost import agent，事件只有留在 agent 才不成环 |
+| `sessionhost` | **公开** | 宿主（CLI/serve/第三方）构建会话池的接口层 |
+| `config` | 留 internal | sai.yaml 是**应用**配置不是 SDK；宿主自带 resolver 即可（agent.ModelResolver 是接口） |
+| `projects` | 留 internal | serve 的注册表概念（宿主细节） |
+| `web` | 留 internal | serve 应用本体；C 会重塑（新建会话 UI），过早公开会冻结错误形状 |
+| `codexauth` | 留 internal | 特定 provider 的认证细节 |
+
+**目标路径**：**顶层** `github.com/rexzhao/simple-agent/<pkg>`（不用
+`pkg/` 目录）。理由：Go 社区主流（标准库、多数库优先）；`pkg/` 无编译
+语义、徒增一层；本仓库 `cmd/sai` 已是顶层惯例。
+
+**公开前必须收口**（阻塞项，随迁移各步完成）：
+- `agent.SessionMetaForTest`：删除，测试改用字面量（待办在案）。
+- `agent.NewStaticResolver`：**保留**——单模型宿主是合法用例，补文档
+  注释（"生产配置解析请自建 ModelResolver"）；当前零宿主使用，注明
+  "等第一个真实宿主出现再定形"。
+- `sessionhost.SweeperInterval`/`SessionIdleEvict` 包级可变变量：
+  收为 `Options.SweepInterval`/`IdleWindow`（已存在 IdleWindow），
+  变量删除——公开包的可变全局是数据竞争表面。测试改走 Options。
+- `web.Manager.agentFactory`（测试专用导出）：随 web 留 internal，待办
+  不变。
+- 命名收口：`agent.Tool`（接口）与 `model.Tool`（定义结构）跨包同名
+  在 Go 里合法，但编排代码里两者高频同文件出现，读混是真实的维护隐患
+  ——**`model.Tool` 改名 `model.ToolDefinition`**，让定义结构的角色
+  自描述（wire 不可见——它只进请求组装，不落盘不上面；改动是纯 Go
+  API 破坏，v0 可接受；opus 已裁定：做，公开前做代价最低）。
+
+**兼容承诺**：v0——**无任何稳定性保证**，破坏性变更不预告；README 与
+各公开包 doc.go 写明"v1 前随时变"。不设 `stable` 标记、不发 v1（用户
+明确后再议）。
+
+**迁移方式**：`git mv` 保历史；**一包一 commit**（依赖序：
+`model → storage(+jsonl,memory) → tools → agent → sessionhost`，每步
+全仓导入路径重写后 build+test 全绿才进下一步）。导入重写用**机械文本
+替换**（sed 或等价脚本——`gofmt -r` 作用于表达式模式，不是可靠的
+import 重写工具；具体手段在步骤 2 实测后固定）；验证 = build/vet/
+test 全绿 + 全仓 grep 旧路径为零。
+
+**公开包对 internal 的依赖**：Go 的 internal 规则允许**同模块内**的
+公开包 import internal 包（外部使用者无感——只是该依赖对他们不可替
+换）。现状盘点：五个将公开包之间只有相互依赖（model/storage/tools/
+agent/sessionhost），**无**指向 codexauth/config/projects/web 的边（**非测试**代码，已
+grep 核实；测试文件中的此类边合法且不影响发布）；若将来出现此类边（如某 provider 需要 codexauth），
+review 必须显式标注——它是对外隐藏的实现依赖。`clients/chat` 对 `internal/web/static/chain.mjs` 的相对导入不受
+影响（web 留 internal，同模块内合法）；`go:embed` 的
+`internal/web/static` 路径不变。
+
+### 16.5 页面工具提供者 / broker
+
+现状：page-provider 是"页面当 provider"的**调试通道**
+（`clients/chat/src/pageProvider.ts` + serve 侧零参与 + broker 为外部
+mcp-provider-broker），路由图已标注"准备移除的调试功能"。**B2 处置推
+荐：作为 B2 末尾的独立小步删除**（Tool 接口与审批 Hooks 落地后，"外
+部驱动页面→页面驱动 agent"的调试价值被正规机制取代；它还是一条
+unauthenticated LAN 攻击面——page_send 能触达 agent 的 shell）。删除
+= chat 的 pageProvider.ts + probe 入口 + page_provider_check.mjs
+fixture + 文档段。**若用户仍在用**（16.6c 未决）：保留现状不动，挪到
+C 前再议——绝不改造成 Tool 实现（它绕过 agent 的工具面，方向就与
+Tool 接口相反）。
+
+### 16.6 待用户拍板的问题
+
+- **(a) 审批交互 UI 的范围**：
+  - 选项 1：B2 交付策略钩子 + agent 侧审批状态机 + ResolveApproval
+    （web 侧只需一个 HTTP 端点即可接通，审批卡 UI 留 C 增量做）；CLI
+    确认提示同样留后续；
+  - 选项 2：Hooks + CLI 的 Y/n 提示（runLoop 中途读 stdin，渲染循环需
+    小改）；web 卡留 C；
+  - 选项 3：Hooks + CLI + web 审批卡全做。
+  - **推荐 1**：接口与事件语义是难且易错的部分（快照恢复、取消交
+    互、fail-closed），先把契约钉死；UI 是增量，且 web 审批卡与 C 的
+    页面工作天然同批。选项 2 的 CLI 提示可在 B2 内加做（工程量小、
+    独立送审）。
+- **(b) 公开范围与路径布局**：推荐 16.4 表（五个包公开：model/
+  storage/tools/agent/sessionhost；config/projects/web/codexauth 留
+  internal）+ 顶层布局。可收紧（只公开 agent+model）或放宽（加
+  config）——收紧的代价是 C 的宿主代码仍走 internal 路径。
+- **(c) broker/page-provider 处置**：推荐 B2 末尾删除（16.5）；若仍在
+  用则原样保留、C 前再议。
+
+### 16.7 迁移步骤（每步独立送审 + commit）
+
+| 步骤 | 内容 | 回归保护 | doc-sync |
+|---|---|---|---|
+| 1 | `model.Tool → model.ToolDefinition` 改名（纯 Go API，wire 零变化） | 全仓 build/test；grep 旧名清零 | development.md 若提及 |
+| 2 | 包迁移·model（含 provider 子包）：git mv + 导入重写 + 收口注释 | 每步后全绿；旧路径 grep 为零；`go list ./...` 无 internal/model | README 包布局段 |
+| 3 | 包迁移·storage（jsonl/memory 同批）+ **doc.go 写明公开契约**：log.jsonl 记录格式、段切换（.next/归档/恢复规则）、sai/v2/ 摘要链——公开即契约，内部注释不够 | 同上 | storage 包文档、development.md 格式附录（若引用） |
+| 4 | 包迁移·tools + Tool 接口落地（接口在 `agent.Tool`（internal/agent，随步骤 5 公开）；`tools.Named` 适配、`Shell` 返回 `agent.Tool`、`agent.Options.Tools []agent.Tool`、namedExecutor 删除） | 既有 agent/web/CLI 测试不改断言；接口 kill（按名分发丢失→运行期错误测试红） | design §8 注记、README |
+| 5 | 包迁移·agent（SessionEvent/Stream 随包公开；SessionMetaForTest 删除；NewStaticResolver 文档化） | 测试改字面量后全绿；公开 API 清单核对 | 同上 |
+| 6 | 包迁移·sessionhost（SweeperInterval/SessionIdleEvict 收为 Options，变量删除，测试改 Options） | 驱逐/清扫测试改注入后断言不变弱；可变变量 grep 清零 | multi-session.md §3 |
+| 7a | 审批状态机：`Ask` + agent 拥有的待审批态（`s.mu` 内事件+快照原子置位）+ `Session.ResolveApproval` + `ErrApprovalUnknown/Resolved` + `ToolApprovalPending/Resolved` 事件 + 快照 `AwaitingApproval` + web `ToolWire.awaiting_approval`（一个端点）+ fixture 两例 | kill：快照丢待审批态（重连看不到卡）、ResolveApproval 双答/未知不报错、事件与快照不同锁段（乱序）；取消走中断路径（sanitizeContext 修补，既有双测试） | webui.md 事件表 + 快照字段、multi-session.md §4 码表 +2 行（approval_unknown/approval_resolved） |
+| 7b | 策略钩子：`agent.Hooks`（同步三态）+ deny-as-result + fail-closed + panic 防护 + AfterToolCall 边界（deny 跑、cancel 不跑、退出不跑） | **默认基线判据**：现有测试不改断言 + 无钩子事件序列 golden 测试（§16.3）；kill：deny 不落记录、钩子 panic 楔死、默认行为变 | 同上（码表不动） |
+| 8 | broker 处置（按 16.6c：删除 pageProvider + fixture + 文档段，或原样保留） | 若删：chat tsc + 剩余 fixture 全绿；grep page_provider 清零 | webui.md、chat README |
+
+步骤 2-6 每步一包是 review 粒度考量；若 review 负担可承受，2+3、
+4 紧邻步骤可合并送审（commit 仍分开）。
+
+### 16.8 与里程碑 C 的关系
+
+- **C 依赖 B2**：新代码落最终包路径（公开五包）；web 新建会话弹窗若
+  需要审批卡，消费步骤 7 的事件与快照字段；CLI `/sessions` 走公开的
+  sessionhost/agent API。
+- **C 不依赖 B2**：Archiver 能力（storage 可选接口）、项目注册管理
+  （internal/projects 的宿主概念）、归档——纯 B1 基础即可做。
+- B2 不动 web 的会话面（新建/删除/列表 API 属 C），只动 Tool/Hooks
+  与包路径；web 留 internal 正是给 C 留重塑空间。
