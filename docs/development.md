@@ -19,6 +19,7 @@ and design disagree, fix the design first, then the code.
 ```
 cmd/sai              startup: read config once → agent.New → REPL
 agent/               state layer + agent loop (merges the old chatapp) — public (B2, v0):
+sessionhost/         the serve-mode session pool — public (B2, v0)
                      session owns State, commit is the only write path
 storage/            record schema + Fold() + Store/Session interfaces — public (B2, v0)
   jsonl/             file layout, ProjectID, torn-tail recovery

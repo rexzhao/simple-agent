@@ -356,7 +356,7 @@ func TestOpenDuringCloseDiscards(t *testing.T) {
 
 	// No zombie state: nothing published (the placeholder's absence
 	// is pinned by the pool-level twin, TestOpenDuringCloseDiscards
-	// in internal/sessionhost).
+	// in sessionhost).
 	if got := len(manager.pool.OpenIDs()); got != 0 {
 		t.Fatalf("post-close state: %d open sessions, want 0", got)
 	}

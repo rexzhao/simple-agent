@@ -13,7 +13,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
-	"github.com/rexzhao/simple-agent/internal/sessionhost"
+	"github.com/rexzhao/simple-agent/sessionhost"
 	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
 )
@@ -21,7 +21,7 @@ import (
 // Manager is the web host: the HTTP adapter over the session pool,
 // the project registry, and one hub per open session. The session
 // lifecycle itself (lazy open, eviction, deletion, shutdown) lives in
-// internal/sessionhost; this file wires the web-specific pieces into
+// sessionhost; this file wires the web-specific pieces into
 // it and keeps what is purely HTTP (routes, /api/projects, error
 // bodies) — design: docs/multi-session.md §3, docs/design.md §15.3.
 //
@@ -79,6 +79,11 @@ type ManagerOptions struct {
 	// factory from the CLI assembly (provider config shared, tool
 	// executor and system prompt bound to the project cwd).
 	AgentFor func(projectCwd string) (*agent.Agent, error)
+	// IdleWindow / SweepInterval pass through to the session pool's
+	// eviction timing; zero keeps the pool defaults. Tests shrink both
+	// (the ticker captures the interval at construction).
+	IdleWindow    time.Duration
+	SweepInterval time.Duration
 }
 
 // NewManager builds the pool (which takes the serve-mode root lock —
@@ -92,15 +97,17 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 		hubs:         make(map[string]*Hub),
 	}
 	pool, err := sessionhost.New(sessionhost.Options{
-		Store:        options.Store,
-		RootLockPath: filepath.Join(options.ServerRoot, "serve.lock"),
-		Locate:       m.locate,
-		AgentFor:     options.AgentFor,
-		OnOpened:     m.onOpened,
-		OnEvicted:    m.onTeardown,
-		OnClosed:     m.onTeardown,
-		EvictGuard:   m.subscribed,
-		InUseGuard:   m.subscribed,
+		Store:         options.Store,
+		RootLockPath:  filepath.Join(options.ServerRoot, "serve.lock"),
+		IdleWindow:    options.IdleWindow,
+		SweepInterval: options.SweepInterval,
+		Locate:        m.locate,
+		AgentFor:      options.AgentFor,
+		OnOpened:      m.onOpened,
+		OnEvicted:     m.onTeardown,
+		OnClosed:      m.onTeardown,
+		EvictGuard:    m.subscribed,
+		InUseGuard:    m.subscribed,
 	})
 	if err != nil {
 		var held *jsonl.LockHeldError

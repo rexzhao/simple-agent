@@ -181,6 +181,7 @@ schema):
 ```
 cmd/sai              command-line interface (human-readable record blocks on stdout)
 agent/               state layer + agent loop (owns State, commit is the only write path) — public (B2, v0)
+sessionhost/         the serve-mode session pool (lazy open, eviction, delete) — public (B2, v0)
 storage/            record schema + Fold + Store/Session interfaces — public (B2, v0)
   jsonl/             append-only JSONL file store (torn-tail recovery)
   memory/            in-memory store for tests and ephemeral sessions

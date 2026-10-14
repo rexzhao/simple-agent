@@ -155,6 +155,13 @@ func newPlainEnv(t *testing.T) *testEnv {
 	return newTestEnv(t, nil, &gatedProvider{gate: make(chan struct{})})
 }
 
+// fastSweep shrinks the eviction timing through Options (the former
+// package vars): 50ms idle window, 20ms scan period.
+func fastSweep(o *Options) {
+	o.IdleWindow = 50 * time.Millisecond
+	o.SweepInterval = 20 * time.Millisecond
+}
+
 func TestPoolAcquireOpensAndReleases(t *testing.T) {
 	env := newPlainEnv(t)
 	lease, err := env.pool.Acquire(env.id)
@@ -184,10 +191,9 @@ func TestPoolAcquireOpensAndReleases(t *testing.T) {
 func TestSweeperEvictsIdleSession(t *testing.T) {
 	// Shrink the timing BEFORE the pool starts its sweeper: the
 	// ticker interval is captured at construction.
-	oldEvict, oldInterval := SessionIdleEvict, SweeperInterval
-	SessionIdleEvict, SweeperInterval = 50*time.Millisecond, 20*time.Millisecond
-	t.Cleanup(func() { SessionIdleEvict, SweeperInterval = oldEvict, oldInterval })
-	env := newPlainEnv(t)
+	// Shrink the timing through Options (the package vars are gone):
+	// the ticker captures the interval at construction.
+	env := newTestEnv(t, fastSweep, &gatedProvider{gate: make(chan struct{})})
 
 	lease, err := env.pool.Acquire(env.id)
 	if err != nil {
@@ -227,10 +233,7 @@ func TestSweeperEvictsIdleSession(t *testing.T) {
 func TestSweeperNeverEvictsActiveSession(t *testing.T) {
 	provider := &gatedProvider{gate: make(chan struct{})}
 	t.Cleanup(provider.release)
-	oldEvict, oldInterval := SessionIdleEvict, SweeperInterval
-	SessionIdleEvict, SweeperInterval = 50*time.Millisecond, 20*time.Millisecond
-	t.Cleanup(func() { SessionIdleEvict, SweeperInterval = oldEvict, oldInterval })
-	env := newTestEnv(t, nil, provider)
+	env := newTestEnv(t, fastSweep, provider)
 
 	// A gated run: Running stays true; several sweep ticks pass.
 	lease, err := env.pool.Acquire(env.id)
@@ -771,10 +774,9 @@ func TestRootLockRejectsSecondPool(t *testing.T) {
 // entry was evicted and the id reopened) must not decrement the NEW
 // entry's refs.
 func TestLeaseReleaseAfterReopenOnlyCountsItsEntry(t *testing.T) {
-	oldEvict, oldInterval := SessionIdleEvict, SweeperInterval
-	SessionIdleEvict, SweeperInterval = 50*time.Millisecond, 20*time.Millisecond
-	t.Cleanup(func() { SessionIdleEvict, SweeperInterval = oldEvict, oldInterval })
-	env := newPlainEnv(t)
+	// Shrink the timing through Options (the package vars are gone):
+	// the ticker captures the interval at construction.
+	env := newTestEnv(t, fastSweep, &gatedProvider{gate: make(chan struct{})})
 
 	stale, err := env.pool.Acquire(env.id)
 	if err != nil {

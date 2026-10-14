@@ -14,7 +14,6 @@ import (
 
 	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
-	"github.com/rexzhao/simple-agent/internal/sessionhost"
 	"github.com/rexzhao/simple-agent/model"
 	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
@@ -399,15 +398,53 @@ func fetchProjects(t *testing.T, base string) projectsBody {
 // viewer — a silent semantic change. Both sides are asserted: watched
 // survives many sweep periods; disconnected gets evicted (the store's
 // OS lock released proves the teardown was real, not a map quirk).
+// newFastEvictJSONLTestServer is newJSONLTestServer with the eviction
+// timing shrunk (50ms idle / 20ms sweep, through the manager's pass-
+// through — the pool's package vars are gone).
+func newFastEvictJSONLTestServer(t *testing.T, provider model.Provider) (*Manager, *Server, *httptest.Server, string) {
+	t.Helper()
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	registry := &projects.Registry{Projects: []projects.Entry{
+		{Path: projectDir, Added: time.Now().UTC()},
+	}}
+	if err := registry.Save(projects.FilePath(root)); err != nil {
+		t.Fatal(err)
+	}
+	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory := func(projectCwd string) (*agent.Agent, error) {
+		return agent.New(agent.Options{
+			ModelResolver: agent.NewStaticResolver(provider, nil, 0, 0, ""),
+			Storage:       store,
+			CWD:           projectCwd,
+		})
+	}
+	manager, err := NewManager(ManagerOptions{
+		ServerRoot:    root,
+		Store:         store,
+		AgentFor:      factory,
+		IdleWindow:    50 * time.Millisecond,
+		SweepInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(manager)
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(func() {
+		httpServer.Close()
+		server.Close()
+	})
+	return manager, server, httpServer, projectDir
+}
+
 func TestSubscriberBlocksEviction(t *testing.T) {
 	provider := &steerFlowProvider{gate: make(chan struct{})}
 	t.Cleanup(provider.release)
-	// Shrink BEFORE construction: the pool's ticker captures the
-	// interval at startup.
-	oldEvict, oldInterval := sessionhost.SessionIdleEvict, sessionhost.SweeperInterval
-	sessionhost.SessionIdleEvict, sessionhost.SweeperInterval = 50*time.Millisecond, 20*time.Millisecond
-	t.Cleanup(func() { sessionhost.SessionIdleEvict, sessionhost.SweeperInterval = oldEvict, oldInterval })
-	manager, _, base, projectDir := newJSONLTestServer(t, provider)
+	manager, _, base, projectDir := newFastEvictJSONLTestServer(t, provider)
 	store := jsonlStoreOf(t, manager)
 
 	id := createJSONLSession(t, provider, store, projectDir)

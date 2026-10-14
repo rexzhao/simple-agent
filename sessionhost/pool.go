@@ -1,7 +1,3 @@
-// Package sessionhost owns the serve-mode session lifecycle: lazy
-// opens with concurrent dedup, idle eviction, deletion, and shutdown.
-// It holds no HTTP and no hub — the host (internal/web) builds its
-// companion objects through the Options hooks (design §15.3).
 package sessionhost
 
 import (
@@ -74,8 +70,16 @@ type Options struct {
 	AgentFor func(projectPath string) (*agent.Agent, error)
 	// IdleWindow: how long a session survives with no request, no
 	// run, and no host-side holder. Zero means the package default
-	// (SessionIdleEvict).
+	// (defaultIdleWindow).
 	IdleWindow time.Duration
+	// SweepInterval is the eviction scan period; it also refreshes
+	// idleSince for active sessions, so measured idle time can exceed
+	// the true idle by at most one interval (the safe direction —
+	// eviction is only ever delayed by it). Zero means the package
+	// default (defaultSweepInterval). Host-level tests shrink both
+	// through these Options BEFORE constructing the pool (the ticker
+	// captures the interval at construction).
+	SweepInterval time.Duration
 
 	// OnOpened runs inside the open, BEFORE the session is published:
 	// the host builds its companion object here (web creates the hub —
@@ -102,17 +106,16 @@ type Options struct {
 	InUseGuard func(sessionID string) bool
 }
 
-// SessionIdleEvict is how long a session survives with no request, no
+// The eviction defaults: a session survives 30s with no request, no
 // subscriber, and no run before the sweeper closes it (releasing the
-// OS lock for a CLI process). A var: tests shrink it.
-var SessionIdleEvict = 30 * time.Second
-
-// SweeperInterval is the eviction scan period; it also refreshes
-// idleSince for active sessions, so measured idle time can exceed the
-// true idle by at most one interval (the safe direction — eviction is
-// only ever delayed by it). Exported like SessionIdleEvict: host-level
-// tests (web) shrink both BEFORE constructing the pool.
-var SweeperInterval = 10 * time.Second
+// OS lock for a CLI process); the scan runs every 10s. Hosts override
+// both through Options — package-level mutable globals were removed
+// with the public move (a public package's mutable global is a data
+// race surface).
+const (
+	defaultIdleWindow    = 30 * time.Second
+	defaultSweepInterval = 10 * time.Second
+)
 
 // Pool is the session lifecycle host. Locking: mu guards
 // agents/sessions/closing/opening — MEMORY state only; all disk IO
@@ -120,9 +123,10 @@ var SweeperInterval = 10 * time.Second
 // opening set dedups concurrent opens of one id (waiters block on a
 // channel, not on mu).
 type Pool struct {
-	opts  Options
-	store storage.Store
-	idle  time.Duration
+	opts          Options
+	store         storage.Store
+	idle          time.Duration
+	sweepInterval time.Duration
 
 	rootLock *jsonl.PathLock
 
@@ -164,19 +168,24 @@ func New(opts Options) (*Pool, error) {
 	}
 	idle := opts.IdleWindow
 	if idle <= 0 {
-		idle = SessionIdleEvict
+		idle = defaultIdleWindow
+	}
+	sweep := opts.SweepInterval
+	if sweep <= 0 {
+		sweep = defaultSweepInterval
 	}
 	p := &Pool{
-		opts:      opts,
-		store:     opts.Store,
-		idle:      idle,
-		rootLock:  lock,
-		agents:    make(map[string]*agent.Agent),
-		sessions:  make(map[string]*poolEntry),
-		closing:   make(map[string]struct{}),
-		opening:   make(map[string]chan struct{}),
-		sweepStop: make(chan struct{}),
-		sweepDone: make(chan struct{}),
+		opts:          opts,
+		store:         opts.Store,
+		idle:          idle,
+		sweepInterval: sweep,
+		rootLock:      lock,
+		agents:        make(map[string]*agent.Agent),
+		sessions:      make(map[string]*poolEntry),
+		closing:       make(map[string]struct{}),
+		opening:       make(map[string]chan struct{}),
+		sweepStop:     make(chan struct{}),
+		sweepDone:     make(chan struct{}),
 	}
 	go p.sweepLoop()
 	return p, nil
@@ -592,7 +601,7 @@ func (p *Pool) Close() {
 // a fresh open once teardown is done).
 func (p *Pool) sweepLoop() {
 	defer close(p.sweepDone)
-	ticker := time.NewTicker(SweeperInterval)
+	ticker := time.NewTicker(p.sweepInterval)
 	defer ticker.Stop()
 	for {
 		select {
