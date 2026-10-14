@@ -75,11 +75,15 @@ type sessionEntry struct {
 }
 ```
 
-驱逐条件（**全部在同一 `Manager.mu` 临界区内判定并执行摘除**）：
+驱逐条件（**全部在同一 Pool 临界区内判定并执行摘除**）：
 
 ```
-refs == 0 && hub.Subscribers() == 0 && !session.Running() && idle ≥ 30s
+refs == 0 && !Running() && !EvictGuard(id) && idle ≥ 30s
 ```
+
+（步 3 后驱逐判定在 sessionhost.Pool 内；"还有订阅者"由宿主经
+`EvictGuard` 回调表达——web 的实现读自己的 hub 订阅计数，
+`hub.Subscribers()` 是 web 侧细节，不再出现在池的判定里。）
 
 - **摘除先于 teardown**：判空闲 → 从 map 摘除 → （锁外）`hub.Stop()` +
   `session.Close()`。顺序不能反——先 Close 后摘除的话，opener 会拿到
@@ -125,15 +129,24 @@ refs == 0 && hub.Subscribers() == 0 && !session.Running() && idle ≥ 30s
 ## 3. 架构
 
 ```
-web.Manager（取代 web.New(session)）
-├── registry    按需读 projects.json（损坏语义见 §1）；stat 门控缓存
-│               （mtime+size，独立互斥）——未变更只花一次 os.Stat
+sessionhost.Pool（会话生命周期，B1 步 3 从 web.Manager 抽出）
 ├── agents      map[projectID]*agent.Agent   惰性，每项目一个（装配双重检查）
-├── sessions    map[sessionID]*sessionEntry  惰性，含 hub 与 refs
+├── sessions    map[sessionID]*poolEntry     惰性，含 OnOpened 的 hostData 与 refs
 ├── closing     map[string]struct{}          驱逐/删除竞态的错误来源判别
 ├── opening     map[sessionID]chan struct{}  打开中占位：同 id 并发打开
-│               只做一次 IO，等待者挂在 channel 上（不占 m.mu）
-└── sweeper     10s 周期，执行 §2.2 的驱逐
+│               只做一次 IO，等待者挂在 channel 上（不占 mu）
+├── sweeper     10s 周期，执行 §2.2 的驱逐
+└── root lock   serve.lock 随 Pool 构造/Close 进出
+    钩子：OnOpened（发布前建伴随对象）/ OnEvicted / OnClosed（先
+    unlink 再回调）；守卫：EvictGuard / InUseGuard（宿主表达
+    "还有订阅者"）；Locate = 宿主的注册门（ErrNotFound/ErrConflict）
+
+web.Manager（HTTP 适配层）
+├── registry    按需读 projects.json（损坏语义见 §1）；stat 门控缓存
+│               （mtime+size，独立互斥）——未变更只花一次 os.Stat
+├── hubs        map[sessionID]*Hub           OnOpened 建、teardown 钩子拆
+├── /api/projects + 错误码翻译（类型化错误 → 稳定码表 §4）
+└── pool        sessionhost.Pool（上述全部生命周期）
 ```
 
 **注册表缓存语义**：启动时文件**缺失**或损坏 → fail-fast 退出（§1）；
@@ -142,10 +155,10 @@ web.Manager（取代 web.New(session)）
 （mtime+size）漏检的极限情形是"同尺寸两次写落在同一 mtime tick"——
 下一次写即自愈，满足"最迟下一次请求"。
 
-**锁域（v3.4 修订）**：`m.mu` 只保护内存状态（agents/sessions/closing/
-opening）。打开一个会话的全部磁盘 IO——注册表读取、agent 装配、
-`OpenSessionIn` 的段重放——都在锁外执行（openSlow）：一个会话的慢打开
-不再阻塞其他会话的请求。同一 id 的并发打开由 opening 占位去重：先到者
+**锁域（v3.4 修订，B1 步 3 随 Pool 迁移）**：Pool 的 `mu` 只保护内存
+状态（agents/sessions/closing/opening）。打开一个会话的全部磁盘
+IO——注册表探针（Locate）、agent 装配、`OpenSession` 的段重放——都在
+锁外执行（openSlow）：一个会话的慢打开不再阻塞其他会话的请求。同一 id 的并发打开由 opening 占位去重：先到者
 做 IO，后到者在 channel 上等结果再走快路径；打开失败（锁冲突/404/损坏/
 装配失败）清除占位，下一次请求真实重试。**发布时复查 closing**：打开期
 间若删除已认领该 id，打开方丢弃刚打开的会话（close 掉）返回 503；
@@ -259,7 +272,7 @@ POST /api/s/<id>/stop                DELETE /api/s/<id>   （删除会话）
   |---|---|---|---|
   | `session_closing` | 503 | 是 | 本进程驱逐 teardown 进行中 |
   | `session_locked` | 409 | 否 | 外部进程持锁（错误信息带 pid） |
-  | `session_open` | 409 | 否 | 删除时：会话正被观看/有在途请求（SSE 订阅全程持 refs） |
+  | `session_open` | 409 | 否 | 删除时：会话有在途请求（Lease refs）或被宿主持有（SSE 订阅者——步 3 后订阅者不持 refs，由 InUseGuard 承载） |
   | `run_active` | 409 | 否 | 单 run 槽占用 |
   | `no_run` | 409 | 否 | steer 要求运行中（回退 Send） |
   | `not_queued` | 404 | 否 | 编辑/撤回不存在的排队项 |
@@ -267,9 +280,10 @@ POST /api/s/<id>/stop                DELETE /api/s/<id>   （删除会话）
   | `nothing_to_compact` | 409 | 否 | `compact`：上下文为空 |
   | `compacting` | 409 | 否 | `compact`：已有压缩在飞（单飞槽） |
   | `model_unavailable` | 409 | 否 | 会话记录的 provider/model/reasoning 不在当前配置中（含空值）——不回退默认模型，需恢复配置或迁移会话 |
+  | `session_conflict` | 409 | 否 | 同一 id 出现在多个注册项目（手拷目录）——拒绝而不静默挑一个（N3：error 字段有值，message 保留原文） |
   | `project_unavailable` | 500 | 否 | agent 装配失败（路径缺失等） |
   | `empty_input` | 400 | 否 | 空文本 |
-  | （无码） | 404 | 否 | 未知会话 / 未注册项目 / 非法 id |
+  | `unknown_session` | 404 | 否 | 未知会话 / 未注册项目 / 非法 id（N3：由纯文本升为码，message 保留原文 "unknown session"） |
 
   §2.3 的 CLI↔serve 互操作里"409 锁冲突"即 `session_locked`；CSRF
   守卫（guardAPI）全量适用，未过守卫的请求不进入上表。**边界**：守卫

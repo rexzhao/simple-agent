@@ -15,6 +15,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/sessionhost"
 	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 )
 
@@ -140,9 +141,16 @@ func TestRegistrationGatePerRoute(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// N3 (§15.3): the unknown session carries its code now —
+		// error has a value, the message keeps the original text.
+		body := map[string]string{}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("%s %s on unregistered session: %d, want 404", p.method, p.suffix, resp.StatusCode)
+		}
+		if body["error"] != "unknown_session" {
+			t.Fatalf("%s %s code: %q, want unknown_session", p.method, p.suffix, body["error"])
 		}
 	}
 
@@ -174,121 +182,10 @@ func TestRegistrationGatePerRoute(t *testing.T) {
 	}
 }
 
-// The sweeper evicts an idle session: the OS lock is released (a fresh
-// open succeeds), the entry is gone, and a later request reopens it
-// transparently.
-func TestSweeperEvictsIdleSession(t *testing.T) {
-	provider := &steerFlowProvider{gate: make(chan struct{})}
-	t.Cleanup(provider.release)
-	// Shrink the timing BEFORE the manager starts its sweeper: the
-	// ticker interval is captured at construction.
-	oldEvict, oldInterval := SessionIdleEvict, sweeperInterval
-	SessionIdleEvict, sweeperInterval = 50*time.Millisecond, 20*time.Millisecond
-	t.Cleanup(func() { SessionIdleEvict, sweeperInterval = oldEvict, oldInterval })
-	manager, _, base, projectDir := newJSONLTestServer(t, provider)
-	store := jsonlStoreOf(t, manager)
-
-	id := createJSONLSession(t, provider, store, projectDir)
-
-	// Open it through a request; then let it go idle. Unlinking from
-	// the map precedes teardown by design — wait for the CLOSING SET
-	// to clear instead: that is the point where the lock is released
-	// (waiting for the unlink alone races the closing window).
-	resp, err := http.Get(base.URL + "/api/s/" + id + "/state") //nolint:noctx // test
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("first state: %d", resp.StatusCode)
-	}
-	waitFor(t, 2*time.Second, func() bool {
-		manager.mu.Lock()
-		defer manager.mu.Unlock()
-		_, busy := manager.closing[id]
-		_, open := manager.sessions[id]
-		return !busy && !open
-	})
-
-	// The lock is really released: another session open (a second agent
-	// holding the storage lock) succeeds now.
-	holder, err := store.Open(projects.ProjectID(projectDir), id)
-	if err != nil {
-		t.Fatalf("lock not released after eviction: %v", err)
-	}
-	if err := holder.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// A later request transparently reopens.
-	resp, err = http.Get(base.URL + "/api/s/" + id + "/state") //nolint:noctx // test
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("reopen after eviction: %d", resp.StatusCode)
-	}
-}
-
-// The sweeper never evicts a session with an in-flight request (refs)
-// or an active run.
-func TestSweeperNeverEvictsActiveSession(t *testing.T) {
-	provider := &steerFlowProvider{gate: make(chan struct{})}
-	t.Cleanup(provider.release)
-	// Shrink the timing BEFORE the manager starts its sweeper: the
-	// ticker interval is captured at construction.
-	oldEvict, oldInterval := SessionIdleEvict, sweeperInterval
-	SessionIdleEvict, sweeperInterval = 50*time.Millisecond, 20*time.Millisecond
-	t.Cleanup(func() { SessionIdleEvict, sweeperInterval = oldEvict, oldInterval })
-	manager, _, base, projectDir := newJSONLTestServer(t, provider)
-	store := jsonlStoreOf(t, manager)
-
-	id := createJSONLSession(t, provider, store, projectDir)
-
-	// A gated run: Running stays true; several sweep ticks pass.
-	resp, err := http.Post(base.URL+"/api/s/"+id+"/send", "application/json", strings.NewReader(`{"text":"go"}`)) //nolint:noctx // test
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("send: %d", resp.StatusCode)
-	}
-	time.Sleep(300 * time.Millisecond)
-	manager.mu.Lock()
-	_, open := manager.sessions[id]
-	manager.mu.Unlock()
-	if !open {
-		t.Fatal("sweeper evicted a session with an active run")
-	}
-
-	// A held refs (in-flight request simulated through open+release
-	// omission — resolve and never release) blocks eviction too.
-	entry, release, _, err := manager.open(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = entry
-	time.Sleep(300 * time.Millisecond)
-	manager.mu.Lock()
-	_, open = manager.sessions[id]
-	manager.mu.Unlock()
-	if !open {
-		t.Fatal("sweeper evicted a session with in-flight refs")
-	}
-	release()
-	provider.release() // let the gated run settle: Running blocks eviction
-
-	// Now idle: eviction reclaims it (same closing-set condition).
-	waitFor(t, 2*time.Second, func() bool {
-		manager.mu.Lock()
-		defer manager.mu.Unlock()
-		_, busy := manager.closing[id]
-		_, open := manager.sessions[id]
-		return !busy && !open
-	})
-}
+// The sweeper tests (eviction of idle sessions, the run/refs/lease
+// refusals) migrated to internal/sessionhost with the lifecycle
+// itself: TestSweeperEvictsIdleSession and
+// TestSweeperNeverEvictsActiveSession live there now.
 
 // Concurrent first requests for the same session: every response is
 // 200 or (transiently) 503, and the session opens exactly once. This
@@ -325,13 +222,8 @@ func TestConcurrentFirstRequestOpensOnce(t *testing.T) {
 	}
 	wg.Wait()
 
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	for _, id := range ids {
-		if len(manager.sessions) != len(ids) {
-			t.Fatalf("sessions map = %d entries, want %d (double open?)", len(manager.sessions), len(ids))
-		}
-		_ = id
+	if got := len(manager.pool.OpenIDs()); got != len(ids) {
+		t.Fatalf("open sessions = %d, want %d (double open?)", got, len(ids))
 	}
 }
 
@@ -494,6 +386,65 @@ func fetchProjects(t *testing.T, base string) projectsBody {
 	return body
 }
 
+// TestSubscriberBlocksEviction pins the EVICTION side of the guard
+// wiring (§15.3): after the split an SSE subscriber holds no lease, so
+// "watched ⇒ not evicted" rides entirely on EvictGuard. Unwiring it
+// would let the sweeper tear the session (and its hub) down under the
+// viewer — a silent semantic change. Both sides are asserted: watched
+// survives many sweep periods; disconnected gets evicted (the store's
+// OS lock released proves the teardown was real, not a map quirk).
+func TestSubscriberBlocksEviction(t *testing.T) {
+	provider := &steerFlowProvider{gate: make(chan struct{})}
+	t.Cleanup(provider.release)
+	// Shrink BEFORE construction: the pool's ticker captures the
+	// interval at startup.
+	oldEvict, oldInterval := sessionhost.SessionIdleEvict, sessionhost.SweeperInterval
+	sessionhost.SessionIdleEvict, sessionhost.SweeperInterval = 50*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { sessionhost.SessionIdleEvict, sessionhost.SweeperInterval = oldEvict, oldInterval })
+	manager, _, base, projectDir := newJSONLTestServer(t, provider)
+	store := jsonlStoreOf(t, manager)
+
+	id := createJSONLSession(t, provider, store, projectDir)
+
+	// Watch it: an SSE subscriber, no lease, no run.
+	stream, err := http.Get(base.URL + "/api/s/" + id + "/stream") //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Body.Close()
+	waitFor(t, 2*time.Second, func() bool {
+		hub := manager.hubOf(id)
+		return hub != nil && hub.Subscribers() > 0
+	})
+
+	// Many sweep periods pass while watched (15 intervals ≥ 3× the
+	// idle window): the session must survive.
+	time.Sleep(300 * time.Millisecond)
+	if manager.hubOf(id) == nil {
+		t.Fatal("the sweeper evicted a watched session — EvictGuard is not wired")
+	}
+
+	// Disconnect: eviction reclaims it (waitFor — the teardown is
+	// asynchronous; hubOf turns nil only after the pool unlinked AND
+	// the teardown hook ran).
+	stream.Body.Close()
+	waitFor(t, 2*time.Second, func() bool { return manager.hubOf(id) == nil })
+
+	// The teardown was real: the OS lock is back. BOUNDED RETRY, not a
+	// single Open — the pool closes the session AFTER the teardown
+	// hook removed the hub (hubOf==nil is 2-4ms early on the reference
+	// machine); a single Open would flake under load. The pool-level
+	// twin observes the closing set instead (it can); the web test
+	// retries the observable it has.
+	waitFor(t, 2*time.Second, func() bool {
+		holder, err := store.Open(projects.ProjectID(projectDir), id)
+		if err != nil {
+			return false
+		}
+		return holder.Close() == nil
+	})
+}
+
 // Close is idempotent: the serve shutdown has two entry points (the
 // interrupt goroutine and the console loop) that can race.
 func TestManagerCloseIdempotent(t *testing.T) {
@@ -545,6 +496,18 @@ func TestDuplicateSessionAcrossProjectsIs409(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("duplicate session: %d, want 409", resp.StatusCode)
+	}
+	// N3 (§15.3): the refusal carries the session_conflict code with
+	// the original message — and nothing was opened on either side.
+	body := map[string]string{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["error"] != "session_conflict" {
+		t.Fatalf("duplicate session code: %q, want session_conflict", body["error"])
+	}
+	if want := "multiple registered projects hold session " + id; body["message"] != want {
+		t.Fatalf("duplicate session message: %q, want %q", body["message"], want)
 	}
 }
 
@@ -611,7 +574,8 @@ func TestDeleteSession(t *testing.T) {
 		t.Fatal("session still exists after delete")
 	}
 
-	// Watched (an SSE subscriber holds refs): session_open.
+	// Watched (an SSE subscriber — no lease refs after the split, the
+	// InUseGuard carries the refusal): session_open.
 	watched := createJSONLSession(t, provider, store, projectDir)
 	stream, err := http.Get(base.URL + "/api/s/" + watched + "/stream") //nolint:noctx // test
 	if err != nil {
@@ -619,10 +583,8 @@ func TestDeleteSession(t *testing.T) {
 	}
 	defer stream.Body.Close()
 	waitFor(t, 2*time.Second, func() bool {
-		manager.mu.Lock()
-		defer manager.mu.Unlock()
-		e := manager.sessions[watched]
-		return e != nil && e.refs > 0
+		hub := manager.hubOf(watched)
+		return hub != nil && hub.Subscribers() > 0
 	})
 	resp, body = deleteSession(watched)
 	if resp.StatusCode != http.StatusConflict || body["error"] != "session_open" {

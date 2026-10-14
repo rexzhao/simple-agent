@@ -92,7 +92,7 @@ func createSecondSession(t *testing.T, s *Server) string {
 	if len(entries) == 0 {
 		t.Fatal("no registered project for a second session")
 	}
-	ag, err := m.agentFor(entries[0].Path)
+	ag, err := m.agentFactory(entries[0].Path)
 	if err != nil {
 		t.Fatal(err)
 	}

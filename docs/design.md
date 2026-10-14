@@ -857,15 +857,15 @@ id 已不在表内，新 Acquire 重新打开，不会与 teardown 竞争；clos
 root lock（现状一致）。
 
 **错误类型化与稳定码逐条映射**（web 只做翻译；码表**新增三行**：
-session_conflict、model_unavailable，以及 unknown session 从纯文本
-升为码）：
+session_conflict、model_unavailable，以及 unknown_session 从纯文本
+升为码——码值用下划线风格，与既有码一致）：
 
 | 类型化错误 | HTTP | 稳定码 |
 |---|---|---|
-| ErrNotFound | 404 | unknown session（现状纯文本，升为码） |
+| ErrNotFound | 404 | `unknown_session`（现状纯文本，升为码；message 保留原文 "unknown session"） |
 | ErrLocked（他进程持锁） | 409 | session_locked（现状即此） |
 | ErrClosing | 503 | session_closing（现状即此） |
-| ErrConflict（注册表多命中） | 409 | session_conflict（现状 409+纯文本，升为码） |
+| ErrConflict（注册表多命中） | 409 | `session_conflict`（现状 409+纯文本，升为码；message 保留原文） |
 | ErrModelUnavailable | 409 | model_unavailable（新） |
 | ErrRunActive（删除时运行中） | 409 | run_active（现状即此，码值不变） |
 | ErrInUse（删除时引用 > 0） | 409 | session_open（现状即此，码值不变） |

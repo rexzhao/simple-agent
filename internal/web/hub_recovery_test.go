@@ -135,7 +135,7 @@ func TestOutofBandStatusReadsMirror(t *testing.T) {
 		"two": {pre: 1, gate: gate, entered: entered, post: 1}, // parks mid-stream
 	}}
 	session, srv, _ := newTestManagerServer(t, provider)
-	hub := srv.manager.sessions[session.ID()].hub
+	hub := srv.manager.hubOf(session.ID())
 
 	// Observe frames on a directly-registered client.
 	c, _, err := hub.register("", DefaultWindow)
@@ -226,7 +226,7 @@ drained:
 func TestSnapshotSeqFiltersReplayedFrames(t *testing.T) {
 	provider := &stagedProvider{byName: map[string]stagedTurn{"hi": {pre: 1, post: 1}}}
 	session, srv, _ := newTestManagerServer(t, provider)
-	hub := srv.manager.sessions[session.ID()].hub
+	hub := srv.manager.hubOf(session.ID())
 
 	// Freeze at P, run a full turn to completion (real-time S is past
 	// the terminal status), then register INSIDE the (P, S] window.
@@ -303,7 +303,7 @@ func TestSnapshotSeqFiltersReplayedDeltas(t *testing.T) {
 	}
 	provider := &stagedProvider{byName: byName}
 	session, srv, _ := newTestManagerServer(t, provider)
-	hub := srv.manager.sessions[session.ID()].hub
+	hub := srv.manager.hubOf(session.ID())
 
 	for i := 0; i < rounds; i++ {
 		// Freeze first: the run's events all land in the backlog. The
@@ -416,7 +416,7 @@ func TestNoticeFrameReachesFreshClient(t *testing.T) {
 		"one": {pre: 1, post: 1},
 	}}
 	session, srv, _ := newTestManagerServer(t, provider)
-	hub := srv.manager.sessions[session.ID()].hub
+	hub := srv.manager.hubOf(session.ID())
 
 	// A fresh client: its startSeq is the real-time position, which the
 	// hub can never be past — any frame carrying the hub's processedSeq

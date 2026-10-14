@@ -397,12 +397,12 @@ func TestCompactionFailedEventWireAndNotice(t *testing.T) {
 
 	// Feed the event the way the events channel would; /api/state must
 	// then carry it (pages that reconnect later still see it).
-	entry, release, _, err := srv.manager.open(session.ID())
+	lease, err := srv.manager.pool.Acquire(session.ID())
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"}, 1)
-	release()
+	srv.manager.hubOf(session.ID()).handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"}, 1)
+	lease.Release()
 
 	res2, err := http.Get(base.URL + api(session, "/state")) //nolint:noctx // test
 	if err != nil {
@@ -434,12 +434,12 @@ func TestNoticeClearedByNextSend(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return !session.Running() })
 
 	// Feed a compaction failure the way the events channel would.
-	entry, release, _, err := srv.manager.open(session.ID())
+	lease, err := srv.manager.pool.Acquire(session.ID())
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"}, 1)
-	release()
+	srv.manager.hubOf(session.ID()).handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"}, 1)
+	lease.Release()
 
 	// Visible on /api/state.
 	res, err := http.Get(base.URL + api(session, "/state")) //nolint:noctx // test
@@ -586,12 +586,12 @@ func TestCompactionEventsBroadcastImmediately(t *testing.T) {
 	// No run is active: feed the events the way the events channel
 	// would. The failure must arrive as a STATUS frame carrying the
 	// notice — not as a bare event frame.
-	entry, release, _, err := srv.manager.open(session.ID())
+	lease, err := srv.manager.pool.Acquire(session.ID())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer release()
-	entry.hub.handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"}, 1)
+	defer lease.Release()
+	srv.manager.hubOf(session.ID()).handleEvent(model.CompactionFailedEvent{ItemID: "x1", Reason: "summary was empty"}, 1)
 	f := nextFrame()
 	if f.Kind == "event" {
 		t.Fatal("the failure arrived as a bare event frame — the status broadcast is missing")
@@ -602,7 +602,7 @@ func TestCompactionEventsBroadcastImmediately(t *testing.T) {
 
 	// And the completion clears it — also immediately. (The failure's
 	// own event frame is still queued ahead; skip event frames.)
-	entry.hub.handleEvent(model.CompactionCompletedEvent{ItemID: "x1"}, 1)
+	srv.manager.hubOf(session.ID()).handleEvent(model.CompactionCompletedEvent{ItemID: "x1"}, 1)
 	for {
 		f = nextFrame()
 		if f.Kind == "event" {

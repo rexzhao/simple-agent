@@ -196,7 +196,7 @@ func TestHubEvictionResubscribesAndReissues(t *testing.T) {
 		t.Fatal("no connect snapshot")
 	}
 
-	hub := srv.manager.sessions[session.ID()].hub
+	hub := srv.manager.hubOf(session.ID())
 
 	// Freeze the hub loop, then flood: each turn commits 2 records +
 	// 1 terminal status (3 non-droppables); ~342 turns overflow the

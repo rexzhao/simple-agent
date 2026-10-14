@@ -354,12 +354,11 @@ func TestOpenDuringCloseDiscards(t *testing.T) {
 	}
 	<-closed
 
-	// No zombie state: nothing published, no placeholder left.
-	manager.mu.Lock()
-	sessions, opening := len(manager.sessions), len(manager.opening)
-	manager.mu.Unlock()
-	if sessions != 0 || opening != 0 {
-		t.Fatalf("post-close state: sessions=%d opening=%d, want 0/0", sessions, opening)
+	// No zombie state: nothing published (the placeholder's absence
+	// is pinned by the pool-level twin, TestOpenDuringCloseDiscards
+	// in internal/sessionhost).
+	if got := len(manager.pool.OpenIDs()); got != 0 {
+		t.Fatalf("post-close state: %d open sessions, want 0", got)
 	}
 
 	// The discarded session's OS lock was released: an independent

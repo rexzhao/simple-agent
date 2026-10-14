@@ -264,11 +264,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	defer release()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		release()
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -278,9 +278,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	client, snapshot, err := entry.hub.register(r.URL.Query().Get("from"), windowParam(r))
 	if err != nil {
 		http.Error(w, "register: "+err.Error(), http.StatusInternalServerError)
+		release()
 		return
 	}
 	defer entry.hub.unregister(client)
+	// The subscriber does NOT hold the lease for the stream's lifetime
+	// (§15.3): the hub reference is enough to stream, and "watched"
+	// semantics — no eviction, no deletion — ride on the pool's guards
+	// (EvictGuard/InUseGuard read the subscriber count) instead of
+	// pinned refs. Registering BEFORE releasing closes the handshake
+	// window (momentarily double-counted — the safe direction).
+	release()
 
 	writeFrame := func(frame []byte) {
 		fmt.Fprintf(w, "data: %s\n\n", frame)
