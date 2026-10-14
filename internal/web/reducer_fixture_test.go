@@ -2,7 +2,6 @@ package web
 
 import (
 	"fmt"
-	"github.com/rexzhao/simple-agent/internal/agent"
 	"net/http"
 	"os"
 	"os/exec"
@@ -96,7 +95,7 @@ func createSecondSession(t *testing.T, s *Server) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
+	created, err := ag.NewSession("test-ns", testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}

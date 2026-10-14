@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/model"

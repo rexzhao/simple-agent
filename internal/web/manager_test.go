@@ -12,12 +12,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessionhost"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
 )
+
+// testSessionMeta is the meta tests record in new sessions (the
+// test provider/model names) - the literal replacement of the
+// removed agent.SessionMetaForTest.
+var testSessionMeta = storage.SessionMeta{Provider: "test", Model: "model-test"}
 
 // newJSONLTestServer builds a manager over a REAL jsonl store (temp
 // server root, registered project dir): eviction, locks, and listings
@@ -74,7 +80,7 @@ func createJSONLSession(t *testing.T, provider model.Provider, store *jsonl.Stor
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession(ns, agent.SessionMetaForTest)
+	session, err := ag.NewSession(ns, testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}

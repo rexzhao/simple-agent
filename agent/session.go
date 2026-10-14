@@ -195,10 +195,9 @@ var (
 var ErrInterrupted = errors.New("run interrupted")
 
 // Send appends the user input durably and starts the run. It returns
-// as soon as the run is launched; output arrives on Events and via
-// Subscribe. A convenience wrapper over Start for callers that don't
-// need the Run object (the CLI's synchronous path migrates to a direct
-// Start + Done in milestone A step 4).
+// as soon as the run is launched; the output arrives through the
+// session stream (Stream). A convenience wrapper over Start for
+// callers that don't need the Run object (Done/Err/Stop).
 func (s *Session) Send(text string) error {
 	_, err := s.Start(context.Background(), text)
 	return err
@@ -1154,10 +1153,9 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, as
 	panic("unreachable")
 }
 
-// emitTransient enqueues a Transient event into the session stream AND
-// sends it on the per-run channel (transition: both paths exist until
-// step 3 migrates the hub; the stream is the canonical path for new
-// consumers). Called from the run path with the session's lock NOT held.
+// emitTransient enqueues a Transient event into the session stream
+// (the canonical path for all consumers). Called from the run path
+// with the session's lock NOT held.
 func (s *Session) emitTransient(event model.Event) {
 	s.mu.Lock()
 	s.enqueueStreamLocked(Transient{Event: event}, true) // droppable

@@ -16,11 +16,11 @@
 
 ## 1. 解耦架构（核心约束）
 
-**agent 主逻辑零依赖 mailbox 代码**——不是少依赖，是 `internal/agent`
+**agent 主逻辑零依赖 mailbox 代码**——不是少依赖，是 `agent`（原 internal/agent，B2 步骤 5 已公开）
 不 import 任何 mailbox 包。依赖方向单向：
 
 ```
-internal/mailbox ──(公共 API)──▶ internal/agent
+internal/mailbox ──(公共 API)──▶ agent
      ▲
 cmd/sai ──(flag 装配)
 ```

@@ -13,12 +13,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
 	"github.com/rexzhao/simple-agent/storage/memory"
 )
+
+// testSessionMeta is the meta tests record in new sessions (the
+// test provider/model names) - the literal replacement of the
+// removed agent.SessionMetaForTest.
+var testSessionMeta = storage.SessionMeta{Provider: "test", Model: "model-test"}
 
 func TestAppNameFromArgv0(t *testing.T) {
 	original := os.Args
@@ -82,7 +88,7 @@ func TestPromptAfterRunOutputByteLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
+	session, err := ag.NewSession("test-ns", testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +195,7 @@ func TestSendReturnsAfterEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
+	session, err := ag.NewSession("test-ns", testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +341,7 @@ func TestSendReturnsAfterCompactionAndEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
+	session, err := ag.NewSession("test-ns", testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,12 +478,12 @@ func TestNewCommandSwitchesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
+	session, err := ag.NewSession("test-ns", testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}
 	printer := &spinnerPrinter{}
-	cli := &cliApp{agent: ag, printer: printer, defaultMeta: agent.SessionMetaForTest}
+	cli := &cliApp{agent: ag, printer: printer, defaultMeta: testSessionMeta}
 	if err := cli.bind(session); err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +553,7 @@ func setupCLIFixture(t *testing.T, sessionIn string) (*agent.Agent, *agent.Agent
 	}
 	// Create the session under project A's ns through A's agent.
 	agA := newAgent(projectA)
-	session, err := agA.NewSession(projects.ProjectID(projectA), agent.SessionMetaForTest)
+	session, err := agA.NewSession(projects.ProjectID(projectA), testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +576,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	agA, agB, id := setupCLIFixture(t, "session")
 
 	// Same project: the -session path resumes.
-	cli, err := setupCLI(agA, agent.SessionMetaForTest, nil, id)
+	cli, err := setupCLI(agA, testSessionMeta, nil, id)
 	if err != nil {
 		t.Fatalf("same-project resume: %v", err)
 	}
@@ -580,7 +586,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	cli.closeSession()
 
 	// Cross project: a clean not-found with the explaining message.
-	_, err = setupCLI(agB, agent.SessionMetaForTest, nil, id)
+	_, err = setupCLI(agB, testSessionMeta, nil, id)
 	if err == nil {
 		t.Fatal("cross-project resume succeeded — Q1=B scoping is broken")
 	}
@@ -589,7 +595,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	}
 
 	// The /resume command is scoped the same way: same project works.
-	cli, err = setupCLI(agA, agent.SessionMetaForTest, nil, "")
+	cli, err = setupCLI(agA, testSessionMeta, nil, "")
 	if err != nil {
 		t.Fatalf("fresh setup: %v", err)
 	}
@@ -608,7 +614,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	// A fresh session (no resume id) lands in the CURRENT project's ns.
 	// The wiring mutant (ns derived from anything but CWD) makes the
 	// same-project resume above fail, so this is a positive control.
-	fresh, err := setupCLI(agA, agent.SessionMetaForTest, nil, "")
+	fresh, err := setupCLI(agA, testSessionMeta, nil, "")
 	if err != nil {
 		t.Fatalf("fresh setup (positive control): %v", err)
 	}

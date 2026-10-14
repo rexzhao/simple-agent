@@ -58,7 +58,11 @@ type staticResolver struct {
 	resolved Resolved
 }
 
-// NewStaticResolver resolves every session to the given configuration.
+// NewStaticResolver resolves every session to the given configuration
+// — the single-model host's resolver. Production configuration
+// parsing should build its own ModelResolver; this constructor is for
+// hosts that pin exactly one model. It currently has no host users:
+// its shape will be revisited when the first real host appears.
 func NewStaticResolver(provider model.Provider, parameters map[string]any, contextWindow, outputLimit int, developerRole model.MessageRole) ModelResolver {
 	if developerRole == "" {
 		developerRole = model.MessageRoleDeveloper
@@ -90,9 +94,3 @@ func resolveMeta(resolver ModelResolver, meta storage.SessionMeta) (Resolved, er
 	}
 	return resolved, nil
 }
-
-// SessionMetaForTest is the meta web/CLI tests record in new sessions
-// (the test provider/model names). Production hosts derive it from
-// their configuration; tests share one constant so the wire fixtures
-// stay stable.
-var SessionMetaForTest = storage.SessionMeta{Provider: "test", Model: "model-test"}

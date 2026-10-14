@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/model"
 	"github.com/rexzhao/simple-agent/storage"

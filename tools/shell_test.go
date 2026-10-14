@@ -3,7 +3,7 @@ package tools
 import (
 	"context"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/model"
 	"os"
 	"path/filepath"

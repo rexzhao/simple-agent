@@ -14,11 +14,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
 )
+
+// testSessionMeta is the meta tests record in new sessions (the
+// test provider/model names) - the literal replacement of the
+// removed agent.SessionMetaForTest.
+var testSessionMeta = storage.SessionMeta{Provider: "test", Model: "model-test"}
 
 // gatedProvider holds the stream open so the test can keep a run
 // active (Running() blocks eviction and deletion).
@@ -107,7 +113,7 @@ func newTestEnv(t *testing.T, opts func(*Options), provider model.Provider) *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession(ns, agent.SessionMetaForTest)
+	session, err := ag.NewSession(ns, testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}

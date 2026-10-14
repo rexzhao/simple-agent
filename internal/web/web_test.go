@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/model"
 	"github.com/rexzhao/simple-agent/storage"
@@ -113,7 +113,7 @@ func newTestManagerServerInner(t *testing.T, provider model.Provider) (*agent.Se
 	// THROUGH the manager — the returned object is the manager's, so
 	// direct sends notify the hub exactly like HTTP requests. The ns is
 	// the manager's registry-derived one (memory store ownership check).
-	created, err := ag.NewSession(projects.ProjectID(projectDir), agent.SessionMetaForTest)
+	created, err := ag.NewSession(projects.ProjectID(projectDir), testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/model"
@@ -486,7 +486,7 @@ func TestCompactionSegmentSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := ag.NewSession(projects.ProjectID(projectDir), agent.SessionMetaForTest)
+	created, err := ag.NewSession(projects.ProjectID(projectDir), testSessionMeta)
 	if err != nil {
 		t.Fatal(err)
 	}

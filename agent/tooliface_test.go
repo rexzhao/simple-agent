@@ -147,3 +147,17 @@ func TestNewRejectsDuplicateToolNames(t *testing.T) {
 		t.Fatalf("duplicate names: err = %v, want the duplicate-tool error", err)
 	}
 }
+
+// TestNewRejectsNilTool: a nil element in Options.Tools is a
+// construction error, not a panic at Definition() (the public API
+// must not panic on malformed input).
+func TestNewRejectsNilTool(t *testing.T) {
+	_, err := New(Options{
+		ModelResolver: NewStaticResolver(&fakeProvider{}, nil, 0, 0, ""),
+		Storage:       memory.OpenStore(),
+		Tools:         []Tool{nil},
+	})
+	if err == nil || !strings.Contains(err.Error(), "tool at index 0 is nil") {
+		t.Fatalf("nil tool: err = %v, want the index-named construction error", err)
+	}
+}

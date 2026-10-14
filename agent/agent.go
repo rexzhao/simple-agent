@@ -1,8 +1,3 @@
-// Package agent is the application core: it drives the model provider and
-// tool execution, and owns the session state layer. Every durable fact goes
-// through Session's commit path; the storage package only ever sees
-// records. All parameters are injected at construction — nothing reads
-// configuration at runtime.
 package agent
 
 import (
@@ -103,7 +98,10 @@ func New(options Options) (*Agent, error) {
 		maxIterations = DefaultMaxIterations
 	}
 	toolSet := make(map[string]Tool, len(options.Tools))
-	for _, tool := range options.Tools {
+	for i, tool := range options.Tools {
+		if tool == nil {
+			return nil, fmt.Errorf("tool at index %d is nil", i)
+		}
 		name := tool.Definition().Name
 		if name == "" {
 			return nil, fmt.Errorf("tool with an empty name is not addressable")

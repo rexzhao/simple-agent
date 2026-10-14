@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
@@ -103,7 +103,7 @@ func newOpenTestServer(t *testing.T, store storage.Store) (*Manager, *httptest.S
 		if err != nil {
 			t.Fatal(err)
 		}
-		session, err := ag.NewSession(projects.ProjectID(projectDir), agent.SessionMetaForTest)
+		session, err := ag.NewSession(projects.ProjectID(projectDir), testSessionMeta)
 		if err != nil {
 			t.Fatal(err)
 		}
