@@ -92,13 +92,12 @@ func TestCompactionReclaimsEnough(t *testing.T) {
 	}
 }
 
-// autoCompactAgent builds an agent with a small budget so tests can cross
-// the pressure limits with plain strings.
+// autoCompactAgent builds an agent whose sessions resolve to a small
+// budget so tests can cross the pressure limits with plain strings.
 func autoCompactAgent(t *testing.T, provider model.Provider, executor ToolExecutor, apply func(*Options)) (*Agent, *Session) {
 	t.Helper()
 	return newTestAgent(t, provider, executor, func(options *Options) {
-		options.ContextWindow = 100_000
-		options.MaxTokens = 10_000 // soft 70560, hard 88200
+		options.ModelResolver = NewStaticResolver(provider, nil, 100_000, 10_000, "")
 		options.AutoCompact = true
 		if apply != nil {
 			apply(options)

@@ -248,8 +248,9 @@ POST /api/s/<id>/stop                DELETE /api/s/<id>   （删除会话）
   里做）
 - `<id>` 先过 `ValidSessionID` / `ValidProjectID`（store 已有），非法即
   404 而非 500——路径片段不进目录扫描
-- 会话 ID 全局随机，理论唯一；但 `Open`/`OpenIn` 取第一个匹配，复制
-  目录会造出重名 → 多处命中返回 409（防御一行）
+- 会话 ID 全局随机，理论唯一；打开按 ns 定位（§15.1 后无跨 ns 扫描），
+  复制目录到另一 ns 不影响打开路径；跨注册项目同名时注册表探针多处
+  命中返回 409（防御一行）
 - **错误码全集**（可枚举的契约表，页面与 CLI 按码 switch，不解析
   散文；成功路径不入表——如 `POST /compact` 的 202 异步语义、
   `POST /send`/`steer` 的 200）：
@@ -265,6 +266,7 @@ POST /api/s/<id>/stop                DELETE /api/s/<id>   （删除会话）
   | `stale_anchor` | 409 | 否 | `history?before=` 锚点未知（链重建）；重试同请求仍会 stale，正确动作是丢弃持有记录与链、按 Rule A 全量重放——链路协议的正常信号，页面 Rule A 的唯一触发码 |
   | `nothing_to_compact` | 409 | 否 | `compact`：上下文为空 |
   | `compacting` | 409 | 否 | `compact`：已有压缩在飞（单飞槽） |
+  | `model_unavailable` | 409 | 否 | 会话记录的 provider/model/reasoning 不在当前配置中（含空值）——不回退默认模型，需恢复配置或迁移会话 |
   | `project_unavailable` | 500 | 否 | agent 装配失败（路径缺失等） |
   | `empty_input` | 400 | 否 | 空文本 |
   | （无码） | 404 | 否 | 未知会话 / 未注册项目 / 非法 id |

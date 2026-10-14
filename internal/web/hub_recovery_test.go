@@ -2,6 +2,7 @@ package web
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/storage"
@@ -468,11 +470,9 @@ func TestCompactionSegmentSwitch(t *testing.T) {
 	}
 	factory := func(projectCwd string) (*agent.Agent, error) {
 		return agent.New(agent.Options{
-			Provider:     provider,
-			ProviderName: "test",
-			ModelID:      "model-test",
-			Storage:      store,
-			CWD:          projectCwd,
+			ModelResolver: agent.NewStaticResolver(provider, nil, 0, 0, ""),
+			Storage:       store,
+			CWD:           projectCwd,
 		})
 	}
 	manager, err := NewManager(ManagerOptions{ServerRoot: root, Store: store, AgentFor: factory})
@@ -484,7 +484,7 @@ func TestCompactionSegmentSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := ag.NewSession(projects.ProjectID(projectDir))
+	created, err := ag.NewSession(projects.ProjectID(projectDir), agent.SessionMetaForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -657,28 +657,33 @@ func writeSegment(t *testing.T, store *jsonl.Store, projectDir, id string, recor
 	}
 }
 
-// TestHeaderlessSegmentsOpenAndStream pins the P1 regression: sessions
-// whose log has no session.created header (a hand-edited or truncated
-// first line — the store accepts them, ListSessions documents them as
-// "headerless stays untitled") must open through the manager and
-// stream, not panic in NewHub's genesis derivation. Both headerless
-// shapes: a segment-0 log starting at user.input, and a post-compaction
-// segment starting at the compaction itself (what the jsonl switch
-// writes when the old segment had no header to copy).
-func TestHeaderlessSegmentsOpenAndStream(t *testing.T) {
+// TestSegmentShapesOpenAndStream pins the P1 regression for the two
+// degraded segment SHAPES that carry a session.created header but
+// lost other structure: a segment-0 log with the header and input
+// only, and a post-compaction segment starting at the compaction.
+// Both must open through the manager and stream, not panic in
+// NewHub's genesis derivation. (A log with NO header at all is
+// refused — see TestOpenEmptyMetaRejectedByProductionResolver and
+// TestOpenEmptyMetaMaps409.)
+func TestSegmentShapesOpenAndStream(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		records []storage.Record
 	}{
 		{
-			name: "headerless segment 0",
+			name: "segment 0 with header and input only",
 			records: []storage.Record{
+				// The model identity lives on the session.created
+				// record alone (§15.2): the header is present, and
+				// the rest of the log starts at user.input.
+				{ItemID: "h00000000000000000000000000", Type: storage.TypeSessionCreated, Time: "2026-01-01T00:00:00Z", Provider: "test", Model: "model-test"},
 				{ItemID: "u00000000000000000000000001", Type: storage.TypeUserInput, Time: "2026-01-01T00:00:00Z", RunID: "run-1", Content: "hi"},
 			},
 		},
 		{
-			name: "headerless post-compaction segment",
+			name: "post-compaction segment",
 			records: []storage.Record{
+				{ItemID: "h00000000000000000000000000", Type: storage.TypeSessionCreated, Time: "2026-01-01T00:00:00Z", Provider: "test", Model: "model-test"},
 				{ItemID: "x00000000000000000000000001", Type: storage.TypeContextCompacted, Time: "2026-01-01T00:00:00Z", Content: "summary"},
 				{ItemID: "u00000000000000000000000002", Type: storage.TypeUserInput, Time: "2026-01-01T00:01:00Z", RunID: "run-2", Content: "after"},
 			},
@@ -702,11 +707,9 @@ func TestHeaderlessSegmentsOpenAndStream(t *testing.T) {
 
 			manager, err := NewManager(ManagerOptions{ServerRoot: root, Store: store, AgentFor: func(string) (*agent.Agent, error) {
 				return agent.New(agent.Options{
-					Provider:     &stagedProvider{},
-					ProviderName: "test",
-					ModelID:      "model-test",
-					Storage:      store,
-					CWD:          projectDir,
+					ModelResolver: agent.NewStaticResolver(&stagedProvider{}, nil, 0, 0, ""),
+					Storage:       store,
+					CWD:           projectDir,
 				})
 			}})
 			if err != nil {
@@ -739,12 +742,12 @@ func TestHeaderlessSegmentsOpenAndStream(t *testing.T) {
 	}
 }
 
-// TestHeaderlessCompactedSegmentChainStable pins the genesis rule for
-// the headerless post-compaction shape: a segment starting at the
-// compaction seeds from ITS ItemID, and the chain head is stable
-// across a reopen (the same derivation runs at truncation time and at
-// fresh Open — §14.4).
-func TestHeaderlessCompactedSegmentChainStable(t *testing.T) {
+// TestCompactedSegmentChainStable pins the genesis rule for the
+// post-compaction shape [created, compacted, …]: the segment seeds
+// from the COMPACTION's ItemID (not the header — §14.4), and the
+// chain head is stable across a reopen (the same derivation runs at
+// truncation time and at fresh Open).
+func TestCompactedSegmentChainStable(t *testing.T) {
 	root := t.TempDir()
 	projectDir := t.TempDir()
 	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
@@ -753,17 +756,16 @@ func TestHeaderlessCompactedSegmentChainStable(t *testing.T) {
 	}
 	id := storage.NewSessionID()
 	records := []storage.Record{
+		{ItemID: "h00000000000000000000000000", Type: storage.TypeSessionCreated, Time: "2026-01-01T00:00:00Z", Provider: "test", Model: "model-test"},
 		{ItemID: "x00000000000000000000000001", Type: storage.TypeContextCompacted, Time: "2026-01-01T00:00:00Z", Content: "summary"},
 		{ItemID: "u00000000000000000000000002", Type: storage.TypeUserInput, Time: "2026-01-01T00:01:00Z", RunID: "run-2", Content: "after"},
 	}
 	writeSegment(t, store, projectDir, id, records)
 
 	ag, err := agent.New(agent.Options{
-		Provider:     &stagedProvider{},
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      store,
-		CWD:          projectDir,
+		ModelResolver: agent.NewStaticResolver(&stagedProvider{}, nil, 0, 0, ""),
+		Storage:       store,
+		CWD:           projectDir,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -791,9 +793,9 @@ func TestHeaderlessCompactedSegmentChainStable(t *testing.T) {
 	if head1 != head2 {
 		t.Fatalf("reopened chain head %s != original %s — the headerless segment genesis is not restart-stable", head2, head1)
 	}
-	// And the derivation matches the rule: seed from records[0].
-	want := chainGenesisAt(id, records[0].ItemID)
-	folded := want
+	// And the derivation matches the production rule (segmentGenesis):
+	// [created, compacted, …] seeds from the compaction (records[1]).
+	folded := segmentGenesis(id, records)
 	for _, r := range records {
 		folded = chainStep(folded, r)
 	}
@@ -867,12 +869,12 @@ func TestManagerOpenPanicDoesNotWedge(t *testing.T) {
 	}
 }
 
-// TestHeaderlessCompactTruncation pins the third truncation point on
-// the headerless shape: a session whose log starts at user.input (no
-// session.created header) compacts into a segment of [compacted] ALONE
-// — no fabricated header — and the in-process view equals what a fresh
+// TestCompactTruncationKeepsHeader pins the third truncation point:
+// compacting a session whose segment is [created, input, …] produces
+// [session.created, context.compacted] — the header is never dropped
+// and never fabricated — and the in-process view equals what a fresh
 // Open replays, record by record.
-func TestHeaderlessCompactTruncation(t *testing.T) {
+func TestCompactTruncationKeepsHeader(t *testing.T) {
 	root := t.TempDir()
 	projectDir := t.TempDir()
 	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
@@ -881,6 +883,7 @@ func TestHeaderlessCompactTruncation(t *testing.T) {
 	}
 	id := storage.NewSessionID()
 	writeSegment(t, store, projectDir, id, []storage.Record{
+		{ItemID: "h00000000000000000000000000", Type: storage.TypeSessionCreated, Time: "2026-01-01T00:00:00Z", Provider: "test", Model: "model-test"},
 		{ItemID: "u00000000000000000000000001", Type: storage.TypeUserInput, Time: "2026-01-01T00:00:00Z", RunID: "run-1", Content: "hi"},
 	})
 	provider := &stagedProvider{byName: map[string]stagedTurn{
@@ -888,11 +891,9 @@ func TestHeaderlessCompactTruncation(t *testing.T) {
 		"summary": {pre: 1, post: 0},
 	}}
 	ag, err := agent.New(agent.Options{
-		Provider:     provider,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      store,
-		CWD:          projectDir,
+		ModelResolver: agent.NewStaticResolver(provider, nil, 0, 0, ""),
+		Storage:       store,
+		CWD:           projectDir,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -909,13 +910,11 @@ func TestHeaderlessCompactTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 	inProc := session.SnapshotStream().Records
-	if len(inProc) != 1 || inProc[0].Type != storage.TypeContextCompacted {
-		t.Fatalf("in-process records after the headerless compact = %v, want [context.compacted] alone", recordTypesWeb(inProc))
-	}
-	for _, r := range inProc {
-		if r.Type == storage.TypeSessionCreated {
-			t.Fatal("the headerless truncation fabricated a session.created header")
-		}
+	// With a created header on disk the truncation keeps it: the
+	// post-compact segment is [session.created, context.compacted]
+	// (the created header is never fabricated and never dropped).
+	if len(inProc) != 2 || inProc[0].Type != storage.TypeSessionCreated || inProc[1].Type != storage.TypeContextCompacted {
+		t.Fatalf("in-process records after the compact = %v, want [session.created context.compacted]", recordTypesWeb(inProc))
 	}
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
@@ -942,4 +941,222 @@ func recordTypesWeb(records []storage.Record) []string {
 		types[i] = r.Type
 	}
 	return types
+}
+
+// TestOpenUnavailableModelMaps409 pins acceptance (c) on the web side: a
+// session whose recorded model no longer resolves opens as a stable
+// 409 model_unavailable — never a 500, never a silent fallback.
+func TestOpenUnavailableModelMaps409(t *testing.T) {
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := &projects.Registry{Projects: []projects.Entry{
+		{Path: projectDir, Added: time.Now().UTC()},
+	}}
+	if err := registry.Save(projects.FilePath(root)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create the session with a resolver that works.
+	good := agent.NewStaticResolver(&recordingProvider{}, nil, 0, 0, "")
+	agGood, err := agent.New(agent.Options{Storage: store, ModelResolver: good, CWD: projectDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := projects.ProjectID(projectDir)
+	session, err := agGood.NewSession(ns, storage.SessionMeta{Provider: "gone", Model: "removed-model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.MaterializeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Serve with a resolver whose configuration no longer has the model.
+	bad := agent.NewStaticResolver(nil, nil, 0, 0, "")
+	_ = bad
+	manager, err := NewManager(ManagerOptions{
+		ServerRoot: root,
+		Store:      store,
+		AgentFor: func(string) (*agent.Agent, error) {
+			return agent.New(agent.Options{Storage: store, ModelResolver: &unavailableWebResolver{}})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.Close() })
+	server := New(manager)
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(httpServer.Close)
+
+	res, err := http.Get(httpServer.URL + "/api/s/" + session.ID() + "/state") //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", res.StatusCode)
+	}
+	var body struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error != "model_unavailable" {
+		t.Fatalf("error code = %q, want model_unavailable", body.Error)
+	}
+	if !strings.Contains(body.Message, "removed-model") {
+		t.Fatalf("message does not name the model: %q", body.Message)
+	}
+}
+
+// productionWebResolver builds the production config-backed resolver
+// (the web package can import internal/config). The provider
+// constructor is only reached after a successful resolve — for the
+// empty-meta cases it never runs.
+func productionWebResolver(t *testing.T) agent.ModelResolver {
+	t.Helper()
+	cfg := &config.Config{
+		DefaultProvider: "fake",
+		DefaultModel:    "fake-model",
+		Providers: map[string]config.ProviderConfig{
+			"fake": {
+				Name:    "fake",
+				BaseURL: "http://127.0.0.1:1",
+				APIKey:  "test",
+				Models: map[string]config.ModelProfile{
+					"fake-model": {ID: "fake-model", Type: config.ProviderTypeOpenAIChat},
+				},
+			},
+		},
+	}
+	resolver, err := config.NewModelResolver(cfg, func(config.ResolvedModel) (model.Provider, error) {
+		return &recordingProvider{}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolver
+}
+
+// unavailableWebResolver fails every Resolve with the typed error.
+type unavailableWebResolver struct{}
+
+func (r *unavailableWebResolver) Resolve(meta storage.SessionMeta) (agent.Resolved, error) {
+	return agent.Resolved{}, agent.ErrModelUnavailable
+}
+func (r *unavailableWebResolver) List() []agent.ModelDescriptor { return nil }
+
+// recordingProvider is a minimal provider for the web test (the agent
+// package's recordingProvider is not exported).
+type recordingProvider struct{}
+
+func (p *recordingProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
+	events := make(chan model.Event)
+	close(events)
+	return events, nil
+}
+
+// TestRecordFrameOmitsEmptyReasoningLevel pins the 2a wire invariant:
+// a session.created with an empty reasoning_level serializes to the
+// same JSON as before the field existed (omitempty drops it), so the
+// record frames and the digest chain are byte-identical to v1. The
+// digest's chainInput never includes ReasoningLevel (that lands in 2b
+// with the sai/v2/ bump).
+func TestRecordFrameOmitsEmptyReasoningLevel(t *testing.T) {
+	empty := storage.Record{ItemID: "h1", Type: storage.TypeSessionCreated, Provider: "p", Model: "m"}
+	withLevel := storage.Record{ItemID: "h1", Type: storage.TypeSessionCreated, Provider: "p", Model: "m", ReasoningLevel: "high"}
+
+	emptyJSON, err := json.Marshal(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(emptyJSON, []byte("reasoning_level")) {
+		t.Fatalf("empty level serialized into the wire: %s", emptyJSON)
+	}
+	withJSON, err := json.Marshal(withLevel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(withJSON, []byte("reasoning_level")) {
+		t.Fatalf("recorded level missing from the wire: %s", withJSON)
+	}
+	// The digest tuple is v1: ReasoningLevel is not part of chainInput.
+	if chainInput(withLevel) == chainInput(empty) {
+		// same tuple (level not folded) — expected
+	} else {
+		t.Fatal("chainInput includes ReasoningLevel — the v1 digest would change")
+	}
+}
+
+// TestOpenEmptyMetaMaps409 pins the web open-layer for empty meta
+// (§15.2): a session whose created record lacks provider/model opens
+// as 409 model_unavailable, the same code as a removed model — one
+// stable contract for "the session's model cannot run here".
+func TestOpenEmptyMetaMaps409(t *testing.T) {
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := &projects.Registry{Projects: []projects.Entry{
+		{Path: projectDir, Added: time.Now().UTC()},
+	}}
+	if err := registry.Save(projects.FilePath(root)); err != nil {
+		t.Fatal(err)
+	}
+
+	// A foreign log: created record with empty provider/model.
+	id := storage.NewSessionID()
+	writeSegment(t, store, projectDir, id, []storage.Record{
+		{ItemID: "h00000000000000000000000001", Type: storage.TypeSessionCreated, Time: "2026-01-01T00:00:00Z"},
+		{ItemID: "u00000000000000000000000002", Type: storage.TypeUserInput, Time: "2026-01-01T00:01:00Z", RunID: "run-1", Content: "hi"},
+	})
+
+	manager, err := NewManager(ManagerOptions{ServerRoot: root, Store: store, AgentFor: func(string) (*agent.Agent, error) {
+		return agent.New(agent.Options{
+			// The PRODUCTION config resolver (not the static test
+			// bridge): the empty-meta guard it enforces is what maps
+			// to the 409. Deleting that guard in config/resolver.go
+			// turns this test red (200 instead of 409).
+			ModelResolver: productionWebResolver(t),
+			Storage:       store,
+			CWD:           projectDir,
+		})
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.Close() })
+	server := New(manager)
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(httpServer.Close)
+
+	res, err := http.Get(httpServer.URL + "/api/s/" + id + "/state") //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", res.StatusCode)
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error != "model_unavailable" {
+		t.Fatalf("error code = %q, want model_unavailable", body.Error)
+	}
 }

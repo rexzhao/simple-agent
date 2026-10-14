@@ -24,6 +24,9 @@ type SessionInfo struct {
 	Title    string
 	Created  time.Time
 	Modified time.Time
+	// Meta is the session's model configuration, read from the
+	// session.created record (empty when the head cannot be parsed).
+	Meta SessionMeta
 }
 
 // Session is one stored session: an append-only sequence of records.
@@ -95,3 +98,11 @@ type Prober interface {
 // does not exist (or lives outside the requested project). Callers
 // classify with errors.Is — never by parsing the message.
 var ErrSessionNotFound = errors.New("session not found")
+
+// SessionMeta is the model configuration a session runs with: the payload
+// of session.created (§15.2). Provider and Model name configured entries;
+// ReasoningLevel selects a reasoning tier of that model ("" = the model's
+// default — old sessions without the field replay exactly as they did).
+type SessionMeta struct {
+	Provider, Model, ReasoningLevel string
+}

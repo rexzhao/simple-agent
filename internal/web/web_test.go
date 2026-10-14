@@ -91,11 +91,9 @@ func newTestManagerServerInner(t *testing.T, provider model.Provider) (*agent.Se
 	store := memory.OpenStore()
 	factory := func(projectCwd string) (*agent.Agent, error) {
 		return agent.New(agent.Options{
-			Provider:     provider,
-			ProviderName: "test",
-			ModelID:      "model-test",
-			Storage:      store,
-			CWD:          projectCwd,
+			ModelResolver: agent.NewStaticResolver(provider, nil, 0, 0, ""),
+			Storage:       store,
+			CWD:           projectCwd,
 		})
 	}
 	manager, err := NewManager(ManagerOptions{
@@ -115,7 +113,7 @@ func newTestManagerServerInner(t *testing.T, provider model.Provider) (*agent.Se
 	// THROUGH the manager — the returned object is the manager's, so
 	// direct sends notify the hub exactly like HTTP requests. The ns is
 	// the manager's registry-derived one (memory store ownership check).
-	created, err := ag.NewSession(projects.ProjectID(projectDir))
+	created, err := ag.NewSession(projects.ProjectID(projectDir), agent.SessionMetaForTest)
 	if err != nil {
 		t.Fatal(err)
 	}

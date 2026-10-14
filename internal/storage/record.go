@@ -45,9 +45,10 @@ type Record struct {
 	Iter int `json:"iter,omitempty"`
 
 	// Session metadata (session.created).
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model,omitempty"`
-	CWD      string `json:"cwd,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	ReasoningLevel string `json:"reasoning_level,omitempty"`
+	CWD            string `json:"cwd,omitempty"`
 
 	// Message payloads (user.input, assistant.message).
 	Content   string         `json:"content,omitempty"`
@@ -94,6 +95,7 @@ func (r Record) Normalized() Record {
 	r.RunID = strings.ToValidUTF8(r.RunID, replacementRune)
 	r.Provider = strings.ToValidUTF8(r.Provider, replacementRune)
 	r.Model = strings.ToValidUTF8(r.Model, replacementRune)
+	r.ReasoningLevel = strings.ToValidUTF8(r.ReasoningLevel, replacementRune)
 	r.CWD = strings.ToValidUTF8(r.CWD, replacementRune)
 	r.Content = strings.ToValidUTF8(r.Content, replacementRune)
 	r.Reasoning = strings.ToValidUTF8(r.Reasoning, replacementRune)

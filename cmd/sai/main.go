@@ -88,7 +88,7 @@ func main() {
 		return
 	}
 
-	ag, project, err := assembleCurrentDir(*serverRoot, *provider, *modelName)
+	ag, project, defaultMeta, err := assembleCurrentDir(*serverRoot, *provider, *modelName)
 	if err != nil {
 		log.Fatalf("sai: %v", err)
 	}
@@ -104,7 +104,7 @@ func main() {
 		resumeID = strings.TrimSpace(flag.Arg(0))
 	}
 
-	cli, err := setupCLI(ag, resumeID)
+	cli, err := setupCLI(ag, defaultMeta, resumeID)
 	if err != nil {
 		log.Fatalf("sai: %v", err)
 	}
@@ -154,15 +154,12 @@ func main() {
 // project's cwd at assembly time. serve mode instantiates lazily per
 // registered project; the CLI instantiates once for the process cwd.
 type agentFactory struct {
-	store         *jsonl.Store
-	cfg           *config.Config
-	provider      model.Provider
-	providerName  string
-	modelID       string
-	parameters    map[string]any
-	developerRole model.MessageRole
-	outputLimit   int
-	contextWindow int
+	store    *jsonl.Store
+	cfg      *config.Config
+	resolver agent.ModelResolver
+	// defaultMeta is what new sessions record when the host passes no
+	// override: the startup -provider/-model (Q2's inheritance base).
+	defaultMeta storage.SessionMeta
 }
 
 // assembleFactory resolves the project-independent half of the assembly.
@@ -172,21 +169,17 @@ func assembleFactory(serverRoot, providerName, modelName string) (*agentFactory,
 	if err != nil {
 		return nil, fmt.Errorf("load %s: %w", configPath, err)
 	}
+	// Validate the startup model early — a bad -provider/-model fails
+	// before anything else assembles.
 	resolved, err := cfg.ResolveModel(providerName, modelName)
 	if err != nil {
 		return nil, err
 	}
-	provider, err := newProvider(resolved)
+	// The model resolver is the per-session source of truth (§15.2);
+	// provider construction moves inside it (cached per name).
+	resolver, err := config.NewModelResolver(cfg, newProvider)
 	if err != nil {
 		return nil, err
-	}
-	parameters, err := config.ApplyReasoningLevel(resolved.Parameters, resolved.ReasoningConfig, "")
-	if err != nil {
-		return nil, fmt.Errorf("apply reasoning level: %w", err)
-	}
-	developerRole := model.MessageRoleDeveloper
-	if strings.TrimSpace(resolved.DeveloperRole) != "" {
-		developerRole = model.MessageRole(resolved.DeveloperRole)
 	}
 	// The store's corruption notices (mid-file discard warnings) ride
 	// the process logger — the one place both the CLI and serve see
@@ -196,16 +189,23 @@ func assembleFactory(serverRoot, providerName, modelName string) (*agentFactory,
 		return nil, err
 	}
 	return &agentFactory{
-		store:         store,
-		cfg:           cfg,
-		provider:      provider,
-		providerName:  resolved.ProviderName,
-		modelID:       resolved.ModelID,
-		parameters:    parameters,
-		developerRole: developerRole,
-		outputLimit:   resolved.OutputLimit,
-		contextWindow: resolved.ContextWindow,
+		store:    store,
+		cfg:      cfg,
+		resolver: resolver,
+		defaultMeta: storage.SessionMeta{
+			Provider: resolved.ProviderName,
+			Model:    providerNameOrModel(providerName, modelName, cfg),
+		},
 	}, nil
+}
+
+// providerNameOrModel normalizes the startup model reference for the
+// default meta: empty startup names mean the configured defaults.
+func providerNameOrModel(providerName, modelName string, cfg *config.Config) string {
+	if modelName = strings.TrimSpace(modelName); modelName != "" {
+		return modelName
+	}
+	return cfg.DefaultModel
 }
 
 // Agent assembles the agent for one project directory.
@@ -220,19 +220,13 @@ func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
 	}
 	project := projects.ProjectID(projectCwd)
 	ag, err := agent.New(agent.Options{
-		Provider:      f.provider,
-		ProviderName:  f.providerName,
-		ModelID:       f.modelID,
 		Storage:       f.store,
 		Tools:         []model.Tool{shell},
 		ToolExecutor:  namedExecutor{exec: executor},
 		SystemPrompt:  systemPrompt,
-		DeveloperRole: f.developerRole,
-		Parameters:    f.parameters,
-		MaxTokens:     f.outputLimit,
+		ModelResolver: f.resolver,
 		MaxIterations: f.cfg.Agent.MaxIterations,
 		CWD:           projectCwd,
-		ContextWindow: f.contextWindow,
 		AutoCompact:   f.cfg.Agent.AutoCompact,
 	})
 	if err != nil {
@@ -242,16 +236,17 @@ func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
 }
 
 // assembleCurrentDir is the CLI path: one agent for the process cwd.
-func assembleCurrentDir(serverRoot, providerName, modelName string) (*agent.Agent, string, error) {
+func assembleCurrentDir(serverRoot, providerName, modelName string) (*agent.Agent, string, storage.SessionMeta, error) {
 	cwd, err := filepath.Abs(".")
 	if err != nil {
-		return nil, "", fmt.Errorf("resolve working directory: %w", err)
+		return nil, "", storage.SessionMeta{}, fmt.Errorf("resolve working directory: %w", err)
 	}
 	factory, err := assembleFactory(serverRoot, providerName, modelName)
 	if err != nil {
-		return nil, "", err
+		return nil, "", storage.SessionMeta{}, err
 	}
-	return factory.Agent(cwd)
+	ag, project, err := factory.Agent(cwd)
+	return ag, project, factory.defaultMeta, err
 }
 
 // namedExecutor adapts the single-tool executor to the agent loop's
@@ -321,6 +316,9 @@ type cliApp struct {
 	agent   *agent.Agent
 	session *agent.Session
 	printer *spinnerPrinter
+	// defaultMeta is what /new records: the startup -provider/-model
+	// (step 4 adds per-command overrides).
+	defaultMeta storage.SessionMeta
 	// ns is the storage namespace of the working directory's project —
 	// opaque to the agent, derived here by the host (§15.1).
 	ns string
@@ -531,7 +529,7 @@ func (c *cliApp) closeSession() {
 
 // freshSession switches to a new empty session.
 func (c *cliApp) freshSession() error {
-	session, err := c.agent.NewSession(c.ns)
+	session, err := c.agent.NewSession(c.ns, c.defaultMeta)
 	if err != nil {
 		return err
 	}
@@ -658,9 +656,9 @@ func recordsAfter(records []storage.Record, itemID string) []storage.Record {
 // wiring (§15.1: Q1=B scopes -session and /resume to the current
 // project's ns), so a wiring regression is testable without invoking
 // main itself.
-func setupCLI(ag *agent.Agent, resumeID string) (*cliApp, error) {
+func setupCLI(ag *agent.Agent, defaultMeta storage.SessionMeta, resumeID string) (*cliApp, error) {
 	ns := projects.ProjectID(ag.CWD())
-	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}, ns: ns}
+	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}, ns: ns, defaultMeta: defaultMeta}
 	if resumeID != "" {
 		if err := cli.resume(resumeID); err != nil {
 			return nil, err

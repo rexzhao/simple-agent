@@ -25,76 +25,64 @@ type ToolExecutor interface {
 
 // Options configures Agent construction.
 type Options struct {
-	Provider      model.Provider
-	ProviderName  string // session metadata
-	ModelID       string // session metadata and requests
-	Storage       storage.Store
-	Tools         []model.Tool
-	ToolExecutor  ToolExecutor
+	Storage      storage.Store
+	Tools        []model.Tool
+	ToolExecutor ToolExecutor
+	// SystemPrompt is the UNRENDERED template: {{time.now}} and its
+	// siblings render at every request assembly, not here (§15.2).
 	SystemPrompt  string
-	DeveloperRole model.MessageRole
-	Parameters    map[string]any
-	MaxTokens     int
 	MaxIterations int
 	CWD           string
-	// ContextWindow is the model's context window in tokens; 0 means a
-	// conservative default. With AutoCompact it bounds the request budget.
-	ContextWindow int
+	// ModelResolver maps a session's recorded meta to its live model
+	// configuration (§15.2). Required: the agent carries no model of
+	// its own.
+	ModelResolver ModelResolver
 	// AutoCompact compacts the context automatically when the request
-	// approaches the budget (see budget.go).
+	// approaches the budget (see budget.go). The budget itself is
+	// per-session, derived from the session's resolved model.
 	AutoCompact bool
 }
 
-// Agent is one configured application instance: provider, tools, prompts,
-// and the session store, all immutable after construction.
+// Agent is one configured application instance: the project-side
+// assembly (tools, prompt template, cwd) plus the model resolver. The
+// model itself lives on the SESSION: each session resolves its
+// recorded meta through the resolver (§15.2).
 type Agent struct {
-	provider      model.Provider
-	providerName  string
-	modelID       string
 	store         storage.Store
 	tools         []model.Tool
 	toolExecutor  ToolExecutor
-	systemPrompt  string
-	developerRole model.MessageRole
-	parameters    map[string]any
-	outputLimit   int
+	systemPrompt  string // unrendered template
+	resolver      ModelResolver
 	maxIterations int
 	cwd           string
-	budget        contextBudget
 	autoCompact   bool
+	// clock is the time source for prompt rendering; tests inject a
+	// fake to pin {{time.now}} refreshes without sleeping.
+	clock func() time.Time
 }
 
 // New validates and assembles an agent.
 func New(options Options) (*Agent, error) {
-	if options.Provider == nil {
-		return nil, fmt.Errorf("agent provider is required")
-	}
 	if options.Storage == nil {
 		return nil, fmt.Errorf("agent storage is required")
+	}
+	if options.ModelResolver == nil {
+		return nil, fmt.Errorf("agent model resolver is required")
 	}
 	maxIterations := options.MaxIterations
 	if maxIterations <= 0 {
 		maxIterations = DefaultMaxIterations
 	}
-	developerRole := options.DeveloperRole
-	if developerRole == "" {
-		developerRole = model.MessageRoleDeveloper
-	}
 	return &Agent{
-		provider:      options.Provider,
-		providerName:  options.ProviderName,
-		modelID:       options.ModelID,
 		store:         options.Storage,
 		tools:         options.Tools,
 		toolExecutor:  options.ToolExecutor,
 		systemPrompt:  options.SystemPrompt,
-		developerRole: developerRole,
-		parameters:    options.Parameters,
-		outputLimit:   options.MaxTokens,
+		resolver:      options.ModelResolver,
 		maxIterations: maxIterations,
 		cwd:           options.CWD,
-		budget:        resolveContextBudget(options.ContextWindow, options.MaxTokens),
 		autoCompact:   options.AutoCompact,
+		clock:         time.Now,
 	}, nil
 }
 
@@ -106,22 +94,31 @@ func (a *Agent) CWD() string { return a.cwd }
 // session.created record is prepared here and committed ahead of the
 // session's first real record — so an empty session never touches the
 // storage.
-func (a *Agent) NewSession(ns string) (*Session, error) {
+func (a *Agent) NewSession(ns string, meta storage.SessionMeta) (*Session, error) {
 	stored, err := a.store.Create(ns)
 	if err != nil {
 		return nil, err
 	}
+	resolved, err := resolveMeta(a.resolver, meta)
+	if err != nil {
+		stored.Close()
+		return nil, err
+	}
 	return &Session{
-		agent:   a,
-		storage: stored,
-		state:   storage.NewState(stored.ID()),
+		agent:    a,
+		storage:  stored,
+		state:    storage.NewState(stored.ID()),
+		meta:     meta,
+		resolved: resolved,
+		budget:   resolveContextBudget(resolved.ContextWindow, resolved.OutputLimit),
 		pendingCreated: &storage.Record{
-			ItemID:   storage.NewSessionCreatedID(),
-			Type:     storage.TypeSessionCreated,
-			Provider: a.providerName,
-			Model:    a.modelID,
-			CWD:      a.cwd,
-			Time:     storage.NewTime(),
+			ItemID:         storage.NewSessionCreatedID(),
+			Type:           storage.TypeSessionCreated,
+			Provider:       meta.Provider,
+			Model:          meta.Model,
+			ReasoningLevel: meta.ReasoningLevel,
+			CWD:            a.cwd,
+			Time:           storage.NewTime(),
 		},
 	}, nil
 }
@@ -149,6 +146,32 @@ func (a *Agent) openSession(open func(string) (storage.Session, error), id strin
 	for _, record := range records {
 		storage.Fold(state, record)
 	}
+	// The session's model configuration comes from its session.created
+	// record (§15.2). Two degenerate cases resolve to ErrModelUnavailable
+	// (the resolver rejects empty provider/model — defaults are a
+	// creation-time concern, never a resolution-time fallback):
+	// (i) an empty record set (a lazily-created session that was never
+	// committed) has no created record — its meta is zero and the
+	// resolver refuses it; (ii) a created record with an empty provider
+	// or model (a hand-edited or foreign log). Hosts that need a model
+	// for case (i) create the session with an explicit meta instead of
+	// opening a never-committed one.
+	var meta storage.SessionMeta
+	for _, record := range records {
+		if record.Type == storage.TypeSessionCreated {
+			meta = storage.SessionMeta{
+				Provider:       record.Provider,
+				Model:          record.Model,
+				ReasoningLevel: record.ReasoningLevel,
+			}
+			break
+		}
+	}
+	resolved, err := resolveMeta(a.resolver, meta)
+	if err != nil {
+		stored.Close()
+		return nil, err
+	}
 	// Rebuild the since-compacted cooldown counter from the active
 	// segment (§14.4): the user inputs after the last context.compacted
 	// (all of them when the segment has none). The soft-attempt counter
@@ -166,26 +189,42 @@ func (a *Agent) openSession(open func(string) (storage.Session, error), id strin
 	}
 	return &Session{
 		agent: a, storage: stored, state: state, records: records,
+		meta:                 meta,
+		resolved:             resolved,
+		budget:               resolveContextBudget(resolved.ContextWindow, resolved.OutputLimit),
 		inputsSinceCompacted: inputsSinceCompacted,
 		hasCompacted:         hasCompacted,
 	}, nil
 }
 
-// buildRequest assembles the model request from the folded context: system
-// prompt first, then the sanitized wire history.
-func (a *Agent) buildRequest(context []model.Message) model.Request {
+// renderSystemPrompt expands the agent's template with the current
+// clock (§15.2: {{time.now}} refreshes at every assembly — the agent
+// is long-lived, a frozen timestamp would lie).
+func (a *Agent) renderSystemPrompt() string {
+	if a.systemPrompt == "" {
+		return ""
+	}
+	return strings.ReplaceAll(a.systemPrompt, "{{time.now}}", a.clock().UTC().Format(time.RFC3339))
+}
+
+// buildRequest assembles the model request from the folded context:
+// the rendered system prompt first, then the sanitized wire history.
+// A SESSION method: the model, parameters, and limits come from the
+// session's resolved configuration (§15.2).
+func (s *Session) buildRequest(context []model.Message) model.Request {
+	a := s.agent
 	messages := make([]model.Message, 0, len(context)+1)
-	if a.systemPrompt != "" {
-		messages = append(messages, model.Message{Role: model.MessageRoleSystem, Content: a.systemPrompt})
+	if prompt := a.renderSystemPrompt(); prompt != "" {
+		messages = append(messages, model.Message{Role: model.MessageRoleSystem, Content: prompt})
 	}
 	messages = append(messages, sanitizeContext(context)...)
 	return model.Request{
-		Model:         a.modelID,
+		Model:         s.meta.Model,
 		Messages:      messages,
 		Tools:         a.tools,
-		Parameters:    a.parameters,
-		DeveloperRole: a.developerRole,
-		MaxTokens:     a.outputLimit,
+		Parameters:    s.resolved.Parameters,
+		DeveloperRole: s.resolved.DeveloperRole,
+		MaxTokens:     s.resolved.OutputLimit,
 	}
 }
 
@@ -247,17 +286,18 @@ Write the summary as a compact briefing addressed to the assistant that continue
 
 // buildCompactionRequest assembles the summary request: the compaction
 // prompt instead of the normal system prompt, the sanitized history as
-// payload, and no tools — a summary must not call tools.
-func (a *Agent) buildCompactionRequest(context []model.Message) model.Request {
+// payload, and no tools — a summary must not call tools. A SESSION
+// method for the same reason as buildRequest.
+func (s *Session) buildCompactionRequest(context []model.Message) model.Request {
 	messages := make([]model.Message, 0, len(context)+1)
 	messages = append(messages, model.Message{Role: model.MessageRoleSystem, Content: compactionPrompt})
 	messages = append(messages, sanitizeContext(context)...)
 	return model.Request{
-		Model:         a.modelID,
+		Model:         s.meta.Model,
 		Messages:      messages,
-		Parameters:    a.parameters,
-		DeveloperRole: a.developerRole,
-		MaxTokens:     a.outputLimit,
+		Parameters:    s.resolved.Parameters,
+		DeveloperRole: s.resolved.DeveloperRole,
+		MaxTokens:     s.resolved.OutputLimit,
 	}
 }
 
@@ -265,10 +305,10 @@ func (a *Agent) buildCompactionRequest(context []model.Message) model.Request {
 // provider failures with the same backoff as a normal turn: an automatic
 // compaction must not die to one hiccup while the context is already
 // large. onRetry (optional) is notified before each backoff wait.
-func (a *Agent) summarizeContext(ctx context.Context, request model.Request, onRetry func(err error, attempt, maxAttempts int, delay time.Duration)) (string, error) {
+func (a *Agent) summarizeContext(ctx context.Context, session *Session, request model.Request, onRetry func(err error, attempt, maxAttempts int, delay time.Duration)) (string, error) {
 	const maxAttempts = 5
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		summary, retryable, err := a.summarizeOnce(ctx, request)
+		summary, retryable, err := a.summarizeOnce(ctx, session.resolved.Provider, request)
 		if err == nil {
 			return summary, nil
 		}
@@ -286,8 +326,8 @@ func (a *Agent) summarizeContext(ctx context.Context, request model.Request, onR
 	panic("unreachable")
 }
 
-func (a *Agent) summarizeOnce(ctx context.Context, request model.Request) (string, bool, error) {
-	stream, err := a.provider.Stream(ctx, request)
+func (a *Agent) summarizeOnce(ctx context.Context, provider model.Provider, request model.Request) (string, bool, error) {
+	stream, err := provider.Stream(ctx, request)
 	if err != nil {
 		return "", model.IsRetryableProviderError(err), err
 	}
@@ -306,13 +346,14 @@ func (a *Agent) summarizeOnce(ctx context.Context, request model.Request) (strin
 	return content.String(), false, nil
 }
 
-// contextPressure grades a request against the compaction budget.
-func (a *Agent) contextPressure(request model.Request) compactionPressure {
+// contextPressure grades a request against the session's compaction
+// budget. A free function: the budget lives on the session (§15.2).
+func contextPressure(budget contextBudget, request model.Request) compactionPressure {
 	estimated := estimateRequestTokens(request)
-	if a.budget.HardInputLimit > 0 && estimated >= a.budget.HardInputLimit {
+	if budget.HardInputLimit > 0 && estimated >= budget.HardInputLimit {
 		return pressureHard
 	}
-	if a.budget.SoftInputLimit > 0 && estimated >= a.budget.SoftInputLimit {
+	if budget.SoftInputLimit > 0 && estimated >= budget.SoftInputLimit {
 		return pressureSoft
 	}
 	return pressureNone

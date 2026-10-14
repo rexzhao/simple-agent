@@ -73,6 +73,12 @@ func (r *Run) Err() error { return r.err }
 type Session struct {
 	agent   *Agent
 	storage storage.Session
+	// meta is the session's recorded model configuration
+	// (session.created payload); resolved is its live form and budget
+	// the per-session pressure limits derived from it (§15.2).
+	meta     storage.SessionMeta
+	resolved Resolved
+	budget   contextBudget
 
 	mu    sync.RWMutex
 	state *storage.State
@@ -234,7 +240,7 @@ func (s *Session) Start(ctx context.Context, input string) (*Run, error) {
 		cancel()
 		return nil, err
 	}
-	request := s.agent.buildRequest(s.state.Context)
+	request := s.buildRequest(s.state.Context)
 	s.currentRun = r
 	// The run-start Status. Records were already enqueued by
 	// appendLocked (the single write path).
@@ -718,7 +724,7 @@ func (s *Session) compactContext(ctx context.Context, itemID string, pressure co
 		return false, fmt.Errorf("nothing to compact")
 	}
 	s.state.Compacting = &storage.CompactingItem{ItemID: itemID, StartedAt: time.Now()}
-	request := s.agent.buildCompactionRequest(s.state.Context)
+	request := s.buildCompactionRequest(s.state.Context)
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -726,7 +732,7 @@ func (s *Session) compactContext(ctx context.Context, itemID string, pressure co
 		s.mu.Unlock()
 	}()
 
-	summary, err := s.agent.summarizeContext(ctx, request, func(retryErr error, attempt, maxAttempts int, delay time.Duration) {
+	summary, err := s.agent.summarizeContext(ctx, s, request, func(retryErr error, attempt, maxAttempts int, delay time.Duration) {
 		s.emitTransient(model.ProviderRetryEvent{
 			Attempt: attempt + 1, MaxAttempts: maxAttempts, Delay: delay, Reason: model.RetryReason(retryErr),
 		})
@@ -739,13 +745,14 @@ func (s *Session) compactContext(ctx context.Context, itemID string, pressure co
 	}
 	summary = summaryFrame + summary
 	if pressure == pressureSoft {
-		after := estimateRequestTokens(s.agent.buildRequest([]model.Message{{Role: model.MessageRoleUser, Content: summary}}))
+		after := estimateRequestTokens(s.buildRequest([]model.Message{{Role: model.MessageRoleUser, Content: summary}}))
 		if !compactionReclaimsEnough(beforeTokens, after) {
 			return false, nil
 		}
 	}
 	if err := s.commit(storage.Record{
 		ItemID: itemID, Type: storage.TypeContextCompacted, Content: summary,
+		// The compacted record becomes the new segment's root.
 	}, nil); err != nil {
 		return false, err
 	}
@@ -760,7 +767,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request) (
 	if !s.agent.autoCompact {
 		return request, false, nil
 	}
-	pressure := s.agent.contextPressure(request)
+	pressure := contextPressure(s.budget, request)
 	if pressure == pressureNone {
 		return request, false, nil
 	}
@@ -772,7 +779,7 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request) (
 		// request is sent and the provider decides.
 		if pressure == pressureHard {
 			s.emitTransient(model.ContextPressureEvent{
-				EstimatedTokens: estimateRequestTokens(request), HardInputLimit: s.agent.budget.HardInputLimit,
+				EstimatedTokens: estimateRequestTokens(request), HardInputLimit: s.budget.HardInputLimit,
 			})
 		}
 		return request, false, nil
@@ -824,10 +831,10 @@ func (s *Session) maybeAutoCompact(ctx context.Context, request model.Request) (
 	s.mu.RLock()
 	context := append([]model.Message(nil), s.state.Context...)
 	s.mu.RUnlock()
-	compactedRequest := s.agent.buildRequest(context)
+	compactedRequest := s.buildRequest(context)
 	// Hard pressure must actually relieve the budget: a summary that
 	// still exceeds the safe limit cannot be sent.
-	if pressure == pressureHard && s.agent.contextPressure(compactedRequest) == pressureHard {
+	if pressure == pressureHard && contextPressure(s.budget, compactedRequest) == pressureHard {
 		return request, false, fmt.Errorf(
 			"automatic compaction could not reclaim enough context: the summary still exceeds the safe input limit (estimated %d tokens)",
 			estimateRequestTokens(compactedRequest))
@@ -1061,7 +1068,7 @@ func (s *Session) streamModelTurn(ctx context.Context, request model.Request, as
 			// streaming content is already empty; clear defensively.
 			s.resetStreaming(assistantItemID)
 		}
-		stream, err := s.agent.provider.Stream(ctx, request)
+		stream, err := s.resolved.Provider.Stream(ctx, request)
 		if err != nil {
 			// A failed Stream() call never made progress, so only the
 			// classification, budget, and context decide whether to retry.

@@ -297,7 +297,8 @@ Compacting 槽 → 带重试的摘要调用 → 软压回收检查 → commit）
 或"完全生效"，无新崩溃语义。旧单文件会话即单段会话，首次压缩才
 产生归档，向后兼容。
 
-**预算推导**（budget.go，移植自旧栈）：`context_window − 输出预留
+**预算推导**（budget.go，§15.2 修订：**按会话**——窗口与输出预留来自
+该会话 resolved 的模型配置，非进程级 Agent）：`context_window − 输出预留
 （output_limit 或 clamp(窗口/8, 4K–20K)，且不超过窗口/4）= 容量`；硬线 =
 容量 − 安全边（2%，clamp 512–8K）；软线 = 硬线 − headroom（硬线的 20%，
 clamp 2K–32K）。退化配置（微小窗口、输出预留 ≥ 窗口）回退到窗口的 3/4
@@ -753,6 +754,12 @@ type Resolved struct {
 - **打开会话**：replay 后从 `session.created` 读 meta → Resolve →
   `ErrModelUnavailable`（类型化；web 映射稳定错误码
   `model_unavailable`，错误码表新增一行）→ **绝不悄悄换默认模型**。
+  **空值同样拒绝**（Resolve 对空 provider/model 返回
+  ErrModelUnavailable——ResolveModel 的默认值替换是创建时语义，
+  解析期不做；两种退化情形：无头会话 = 无 created 记录 → 空 meta →
+  拒绝；有记录但 provider/model 为空 = 手改/外来日志 → 拒绝。生产
+  写入路径不可能写出空值：CLI/serve 的 meta 一律来自已解析的
+  ResolveModel 输出，空值在到达 agent 前就被配置校验拦下）。
 - **预算**：`resolveContextBudget` 改为按会话调用（open 时用该会话的
   ContextWindow/OutputLimit 算出，挂在 Session 上）；压缩预算随之按
   会话。

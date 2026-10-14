@@ -37,11 +37,9 @@ func newJSONLTestServer(t *testing.T, provider model.Provider) (*Manager, *Serve
 	}
 	factory := func(projectCwd string) (*agent.Agent, error) {
 		return agent.New(agent.Options{
-			Provider:     provider,
-			ProviderName: "test",
-			ModelID:      "model-test",
-			Storage:      store,
-			CWD:          projectCwd,
+			ModelResolver: agent.NewStaticResolver(provider, nil, 0, 0, ""),
+			Storage:       store,
+			CWD:           projectCwd,
 		})
 	}
 	manager, err := NewManager(ManagerOptions{
@@ -68,16 +66,14 @@ func createJSONLSession(t *testing.T, provider model.Provider, store *jsonl.Stor
 	t.Helper()
 	ns := projects.ProjectID(projectDir)
 	ag, err := agent.New(agent.Options{
-		Provider:     provider,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      store,
-		CWD:          projectDir,
+		ModelResolver: agent.NewStaticResolver(provider, nil, 0, 0, ""),
+		Storage:       store,
+		CWD:           projectDir,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession(ns)
+	session, err := ag.NewSession(ns, agent.SessionMetaForTest)
 	if err != nil {
 		t.Fatal(err)
 	}

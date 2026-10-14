@@ -343,7 +343,9 @@ func copyModels(models map[string]ModelProfile) map[string]ModelProfile {
 
 func copyParameters(parameters map[string]any) map[string]any {
 	if parameters == nil {
-		return nil
+		// An empty map, not nil: ApplyReasoningLevel writes the
+		// reasoning value into the copy — a nil map would panic.
+		return map[string]any{}
 	}
 
 	copied := make(map[string]any, len(parameters))
@@ -555,6 +557,15 @@ func loadProviders(providerDir string) (map[string]ProviderConfig, error) {
 func validateProvider(path string, provider ProviderConfig) error {
 	if err := ValidateProviderName(provider.Name); err != nil {
 		return fmt.Errorf("provider file %q: %w", path, err)
+	}
+	if strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/") == "" {
+		// The provider constructors all refuse an empty base URL, but
+		// without a load-time check that refusal surfaced only at the
+		// first session open (as a panic in the model resolver — a
+		// regression from the pre-resolver era's clean startup error).
+		// Same treatment as the other provider-level checks: fail at
+		// load, naming the file.
+		return fmt.Errorf("provider file %q: base_url is required", path)
 	}
 	if provider.RequestTimeout != "" {
 		requestTimeout, err := time.ParseDuration(provider.RequestTimeout)

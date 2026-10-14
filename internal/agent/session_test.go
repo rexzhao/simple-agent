@@ -17,16 +17,21 @@ import (
 	"github.com/rexzhao/simple-agent/internal/storage/memory"
 )
 
-// newTestAgent assembles an agent over an in-memory store.
+// testModel is the meta every test session records unless a test
+// overrides it.
+var testModel = storage.SessionMeta{Provider: "test", Model: "model-test"}
+
+// newTestAgent assembles an agent over an in-memory store with a static
+// resolver: every session resolves to the given provider and the
+// default test budget. Tests that need per-session budgets use
+// newBudgetAgent.
 func newTestAgent(t *testing.T, provider model.Provider, executor ToolExecutor, options ...func(*Options)) (*Agent, *Session) {
 	t.Helper()
 	optionsStruct := Options{
-		Provider:     provider,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
-		Tools:        []model.Tool{{Name: "echo"}},
-		ToolExecutor: executor,
+		ModelResolver: NewStaticResolver(provider, nil, 0, 0, ""),
+		Storage:       memory.OpenStore(),
+		Tools:         []model.Tool{{Name: "echo"}},
+		ToolExecutor:  executor,
 	}
 	for _, apply := range options {
 		apply(&optionsStruct)
@@ -35,7 +40,7 @@ func newTestAgent(t *testing.T, provider model.Provider, executor ToolExecutor, 
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	session, err := ag.NewSession("test-ns")
+	session, err := ag.NewSession("test-ns", testModel)
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -678,16 +683,14 @@ func TestCompactSegmentsAcrossReopenWithJSONL(t *testing.T) {
 		{model.TextDeltaEvent{Text: "the summary"}},
 	}}
 	ag, err := New(Options{
-		Provider:     provider,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      store,
-		CWD:          "/w",
+		ModelResolver: NewStaticResolver(provider, nil, 0, 0, ""),
+		Storage:       store,
+		CWD:           "/w",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	session, err := ag.NewSession(ns)
+	session, err := ag.NewSession(ns, testModel)
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -989,16 +992,14 @@ func TestCooldownCountersRebuiltAtOpen(t *testing.T) {
 		{model.TextDeltaEvent{Text: "more"}},
 	}}
 	ag, err := New(Options{
-		Provider:     provider,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      store,
-		CWD:          "/w",
+		ModelResolver: NewStaticResolver(provider, nil, 0, 0, ""),
+		Storage:       store,
+		CWD:           "/w",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns")
+	session, err := ag.NewSession("test-ns", testModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1056,16 +1057,14 @@ func TestCompactionBoundsRecordMemory(t *testing.T) {
 	turns = append(turns, []model.Event{model.TextDeltaEvent{Text: "final"}})
 	provider := &fakeProvider{turns: turns}
 	ag, err := New(Options{
-		Provider:     provider,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      store,
-		CWD:          "/w",
+		ModelResolver: NewStaticResolver(provider, nil, 0, 0, ""),
+		Storage:       store,
+		CWD:           "/w",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns")
+	session, err := ag.NewSession("test-ns", testModel)
 	if err != nil {
 		t.Fatal(err)
 	}

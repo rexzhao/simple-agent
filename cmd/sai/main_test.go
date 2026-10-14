@@ -76,15 +76,13 @@ func (p *scriptedProvider) Stream(ctx context.Context, request model.Request) (<
 // shows it, and the committed record is skipped.
 func TestPromptAfterRunOutputByteLevel(t *testing.T) {
 	ag, err := agent.New(agent.Options{
-		Provider:     &scriptedProvider{},
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
+		ModelResolver: agent.NewStaticResolver(&scriptedProvider{}, nil, 0, 0, ""),
+		Storage:       memory.OpenStore(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns")
+	session, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,12 +174,10 @@ func (p *toolLoopProvider) Stream(ctx context.Context, request model.Request) (<
 // overflows the 1024-slot buffer.
 func TestSendReturnsAfterEviction(t *testing.T) {
 	ag, err := agent.New(agent.Options{
-		Provider:     &toolLoopProvider{rounds: 700},
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
-		Tools:        []model.Tool{{Name: "noop"}},
-		ToolExecutor: noopExecutor{},
+		ModelResolver: agent.NewStaticResolver(&toolLoopProvider{rounds: 700}, nil, 0, 0, ""),
+		Storage:       memory.OpenStore(),
+		Tools:         []model.Tool{{Name: "noop"}},
+		ToolExecutor:  noopExecutor{},
 		// The default iteration cap (8) would end the run long before
 		// the 1024-slot buffer overflows; the eviction needs the full
 		// 700-round volume.
@@ -190,7 +186,7 @@ func TestSendReturnsAfterEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns")
+	session, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,11 +322,9 @@ func TestSendReturnsAfterCompactionAndEviction(t *testing.T) {
 	gate := make(chan struct{})
 	entered := make(chan struct{})
 	ag, err := agent.New(agent.Options{
-		Provider: &compactingToolLoopProvider{
+		ModelResolver: agent.NewStaticResolver(&compactingToolLoopProvider{
 			rounds: 700, gateAt: 50, gate: gate, entered: entered,
-		},
-		ProviderName:  "test",
-		ModelID:       "model-test",
+		}, nil, 0, 0, ""),
 		Storage:       memory.OpenStore(),
 		Tools:         []model.Tool{{Name: "noop"}},
 		ToolExecutor:  noopExecutor{},
@@ -339,7 +333,7 @@ func TestSendReturnsAfterCompactionAndEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns")
+	session, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,20 +464,18 @@ func TestSendReturnsAfterCompactionAndEviction(t *testing.T) {
 // command (the unknown-command path).
 func TestNewCommandSwitchesSession(t *testing.T) {
 	ag, err := agent.New(agent.Options{
-		Provider:     &scriptedProvider{},
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
+		ModelResolver: agent.NewStaticResolver(&scriptedProvider{}, nil, 0, 0, ""),
+		Storage:       memory.OpenStore(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns")
+	session, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	printer := &spinnerPrinter{}
-	cli := &cliApp{agent: ag, printer: printer}
+	cli := &cliApp{agent: ag, printer: printer, defaultMeta: agent.SessionMetaForTest}
 	if err := cli.bind(session); err != nil {
 		t.Fatal(err)
 	}
@@ -539,11 +531,9 @@ func setupCLIFixture(t *testing.T, sessionIn string) (*agent.Agent, *agent.Agent
 	}
 	newAgent := func(cwd string) *agent.Agent {
 		ag, err := agent.New(agent.Options{
-			Provider:     &scriptedProvider{},
-			ProviderName: "test",
-			ModelID:      "model-test",
-			Storage:      store,
-			CWD:          cwd,
+			ModelResolver: agent.NewStaticResolver(&scriptedProvider{}, nil, 0, 0, ""),
+			Storage:       store,
+			CWD:           cwd,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -555,7 +545,7 @@ func setupCLIFixture(t *testing.T, sessionIn string) (*agent.Agent, *agent.Agent
 	}
 	// Create the session under project A's ns through A's agent.
 	agA := newAgent(projectA)
-	session, err := agA.NewSession(projects.ProjectID(projectA))
+	session, err := agA.NewSession(projects.ProjectID(projectA), agent.SessionMetaForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +568,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	agA, agB, id := setupCLIFixture(t, "session")
 
 	// Same project: the -session path resumes.
-	cli, err := setupCLI(agA, id)
+	cli, err := setupCLI(agA, agent.SessionMetaForTest, id)
 	if err != nil {
 		t.Fatalf("same-project resume: %v", err)
 	}
@@ -588,7 +578,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	cli.closeSession()
 
 	// Cross project: a clean not-found with the explaining message.
-	_, err = setupCLI(agB, id)
+	_, err = setupCLI(agB, agent.SessionMetaForTest, id)
 	if err == nil {
 		t.Fatal("cross-project resume succeeded — Q1=B scoping is broken")
 	}
@@ -597,7 +587,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	}
 
 	// The /resume command is scoped the same way: same project works.
-	cli, err = setupCLI(agA, "")
+	cli, err = setupCLI(agA, agent.SessionMetaForTest, "")
 	if err != nil {
 		t.Fatalf("fresh setup: %v", err)
 	}
@@ -616,7 +606,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	// A fresh session (no resume id) lands in the CURRENT project's ns.
 	// The wiring mutant (ns derived from anything but CWD) makes the
 	// same-project resume above fail, so this is a positive control.
-	fresh, err := setupCLI(agA, "")
+	fresh, err := setupCLI(agA, agent.SessionMetaForTest, "")
 	if err != nil {
 		t.Fatalf("fresh setup (positive control): %v", err)
 	}

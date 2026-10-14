@@ -49,6 +49,8 @@ prompt:
 name: paperhub
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
+# base_url is REQUIRED at load time: a missing value (or one that is
+# only slashes) fails startup with a file-naming error.
 request_timeout: 60s       # optional, positive duration
 http_proxy: http://127.0.0.1:7890    # optional
 https_proxy: http://127.0.0.1:7890   # optional
@@ -108,6 +110,25 @@ replaced by the summary.
 
 `pricing`, `input`, and `input_limit` in a model profile are accepted and
 ignored (web-stack leftovers); they are not sent to the provider.
+
+## Session model pinning
+
+Each session records the provider, model, and reasoning level it was
+created with (the `session.created` record). Opening the session
+resolves that recorded triple against the current configuration:
+
+- **The session keeps its model**: removing the provider or model from
+  the configuration makes the session fail to open with
+  `model_unavailable` (HTTP 409) — it NEVER silently falls back to the
+  configured default. Restore the model in the configuration, or start
+  a new session on the default, to continue.
+- A recorded **empty** provider or model is the same error: defaults
+  apply only at CREATION time (the CLI/serve startup parameters), never
+  at resolution.
+- Old sessions without a recorded reasoning level resolve to the
+  model's configured default level.
+- The context/compaction budget is derived from the SESSION's model
+  (its `context_window` and `output_limit`), not the current default.
 
 ## Codex authentication
 

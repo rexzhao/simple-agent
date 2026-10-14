@@ -186,6 +186,11 @@ loop:
 				if parsed, err := time.Parse(time.RFC3339Nano, record.Time); err == nil {
 					info.Created = parsed
 				}
+				info.Meta = storage.SessionMeta{
+					Provider:       record.Provider,
+					Model:          record.Model,
+					ReasoningLevel: record.ReasoningLevel,
+				}
 			}
 		case storage.TypeUserInput:
 			// The FIRST input is the title — unless the structured guard

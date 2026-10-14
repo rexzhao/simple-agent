@@ -84,11 +84,9 @@ func newOpenTestServer(t *testing.T, store storage.Store) (*Manager, *httptest.S
 	}
 	factory := func(projectCwd string) (*agent.Agent, error) {
 		return agent.New(agent.Options{
-			Provider:     &webFakeProvider{},
-			ProviderName: "test",
-			ModelID:      "model-test",
-			Storage:      store,
-			CWD:          projectCwd,
+			ModelResolver: agent.NewStaticResolver(&webFakeProvider{}, nil, 0, 0, ""),
+			Storage:       store,
+			CWD:           projectCwd,
 		})
 	}
 	manager, err := NewManager(ManagerOptions{
@@ -105,7 +103,7 @@ func newOpenTestServer(t *testing.T, store storage.Store) (*Manager, *httptest.S
 		if err != nil {
 			t.Fatal(err)
 		}
-		session, err := ag.NewSession(projects.ProjectID(projectDir))
+		session, err := ag.NewSession(projects.ProjectID(projectDir), agent.SessionMetaForTest)
 		if err != nil {
 			t.Fatal(err)
 		}

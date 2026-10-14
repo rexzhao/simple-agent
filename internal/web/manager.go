@@ -398,6 +398,13 @@ func (m *Manager) openSlow(id string) (*sessionEntry, int, error) {
 		if errors.Is(err, storage.ErrSessionNotFound) {
 			return nil, http.StatusNotFound, fmt.Errorf("unknown session")
 		}
+		if errors.Is(err, agent.ErrModelUnavailable) {
+			// The session's recorded model no longer resolves against
+			// the configuration (§15.2): a stable conflict — the
+			// operator must restore the model or migrate the session;
+			// a silent fallback would change behavior without a trace.
+			return nil, http.StatusConflict, &apiError{code: "model_unavailable", cause: err}
+		}
 		// Segment corruption, permissions: real errors, surfaced.
 		return nil, http.StatusInternalServerError, err
 	}

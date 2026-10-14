@@ -26,15 +26,13 @@ func TestStoppedHubDoesNotBlockCommitter(t *testing.T) {
 	}
 	provider := &webFakeProvider{turns: turns}
 	ag, err := agent.New(agent.Options{
-		Provider:     provider,
-		ProviderName: "test",
-		ModelID:      "model-test",
-		Storage:      memory.OpenStore(),
+		ModelResolver: agent.NewStaticResolver(provider, nil, 0, 0, ""),
+		Storage:       memory.OpenStore(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := ag.NewSession("test-ns")
+	session, err := ag.NewSession("test-ns", agent.SessionMetaForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,11 +96,9 @@ func TestFirstStreamSeesHistory(t *testing.T) {
 	// The first-ever /stream request is the racing client.
 	factory := func(projectCwd string) (*agent.Agent, error) {
 		return agent.New(agent.Options{
-			Provider:     provider,
-			ProviderName: "test",
-			ModelID:      "model-test",
-			Storage:      store,
-			CWD:          projectCwd,
+			ModelResolver: agent.NewStaticResolver(provider, nil, 0, 0, ""),
+			Storage:       store,
+			CWD:           projectCwd,
 		})
 	}
 	m2, err := NewManager(ManagerOptions{

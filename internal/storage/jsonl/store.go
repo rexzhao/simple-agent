@@ -580,6 +580,11 @@ func readSessionHead(dir string) (storage.SessionInfo, error) {
 		return info, nil
 	}
 	info.Created = parseRecordTime(records[0].Time)
+	info.Meta = storage.SessionMeta{
+		Provider:       records[0].Provider,
+		Model:          records[0].Model,
+		ReasoningLevel: records[0].ReasoningLevel,
+	}
 	if len(records) > 1 && records[1].Type == storage.TypeContextCompacted {
 		return info, nil
 	}
