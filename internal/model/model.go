@@ -13,7 +13,7 @@ type Provider interface {
 type Request struct {
 	Model         string
 	Messages      []Message
-	Tools         []Tool
+	Tools         []ToolDefinition
 	Parameters    map[string]any
 	SessionID     string
 	DeveloperRole MessageRole
@@ -85,7 +85,7 @@ type ResponseState struct {
 	OutputItems    []json.RawMessage
 }
 
-type Tool struct {
+type ToolDefinition struct {
 	Name        string
 	Description string
 	InputSchema map[string]any

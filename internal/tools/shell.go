@@ -50,19 +50,19 @@ func (f ExecutorFunc) Execute(ctx context.Context, arguments map[string]any) (mo
 // Shell returns the shell tool: its provider-facing definition and the
 // executor. Every command runs with rootDir as its working directory; the
 // shell itself is never path confined.
-func Shell(rootDir string) (model.Tool, Executor, error) {
+func Shell(rootDir string) (model.ToolDefinition, Executor, error) {
 	if strings.TrimSpace(rootDir) == "" {
-		return model.Tool{}, nil, fmt.Errorf("rootDir must not be blank")
+		return model.ToolDefinition{}, nil, fmt.Errorf("rootDir must not be blank")
 	}
 	root, err := filepath.Abs(rootDir)
 	if err != nil {
-		return model.Tool{}, nil, fmt.Errorf("resolve rootDir: %w", err)
+		return model.ToolDefinition{}, nil, fmt.Errorf("resolve rootDir: %w", err)
 	}
 	return shellDefinition(), newShellExecutor(root), nil
 }
 
-func shellDefinition() model.Tool {
-	return model.Tool{
+func shellDefinition() model.ToolDefinition {
+	return model.ToolDefinition{
 		Name:        BuiltinShell,
 		Description: "Execute a Bash command in the workspace. Commands use Bash/POSIX syntax (not PowerShell or cmd.exe syntax). On Windows this runs Git Bash or another bash.exe found on the machine; stdout and stderr are returned together.",
 		InputSchema: map[string]any{

@@ -166,7 +166,7 @@ func anthropicUserContent(message model.Message) (any, error) {
 	return content, nil
 }
 
-func buildTools(tools []model.Tool, toolNames *toolNameMapper) []map[string]any {
+func buildTools(tools []model.ToolDefinition, toolNames *toolNameMapper) []map[string]any {
 	out := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
 		out = append(out, map[string]any{
@@ -267,7 +267,7 @@ type toolNameMapper struct {
 	nextAlias   int
 }
 
-func newToolNameMapper(tools []model.Tool) *toolNameMapper {
+func newToolNameMapper(tools []model.ToolDefinition) *toolNameMapper {
 	mapper := &toolNameMapper{
 		toAnthropic: make(map[string]string, len(tools)),
 		toInternal:  make(map[string]string, len(tools)),

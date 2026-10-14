@@ -57,7 +57,7 @@ func TestBuildRequestBodyMapsToolsAssistantToolUseAndToolResults(t *testing.T) {
 			{Role: model.MessageRoleTool, ToolCallID: "call_search", Content: "found"},
 			{Role: model.MessageRoleTool, ToolCallID: "call_read", Content: "missing file", IsError: true},
 		},
-		Tools: []model.Tool{
+		Tools: []model.ToolDefinition{
 			{
 				Name:        "read_file",
 				Description: "Read a file.",
@@ -125,7 +125,7 @@ func TestBuildRequestBodyMapsToolsAssistantToolUseAndToolResults(t *testing.T) {
 func TestBuildRequestBodyAvoidsAnthropicToolNameAliasConflicts(t *testing.T) {
 	body, err := BuildRequestBody(model.Request{
 		Model: "claude-sonnet-5",
-		Tools: []model.Tool{
+		Tools: []model.ToolDefinition{
 			{Name: "tool_0", Description: "Already legal."},
 			{Name: "mcp.local.search", Description: "Needs an alias."},
 		},

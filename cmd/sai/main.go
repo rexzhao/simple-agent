@@ -222,7 +222,7 @@ func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
 	project := projects.ProjectID(projectCwd)
 	ag, err := agent.New(agent.Options{
 		Storage:       f.store,
-		Tools:         []model.Tool{shell},
+		Tools:         []model.ToolDefinition{shell},
 		ToolExecutor:  namedExecutor{exec: executor},
 		SystemPrompt:  systemPrompt,
 		ModelResolver: f.resolver,

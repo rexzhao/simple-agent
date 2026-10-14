@@ -126,7 +126,7 @@ func TestStreamEventDecoderCarriesMessageStartInputTokensIntoUsage(t *testing.T)
 }
 
 func TestStreamEventDecoderAccumulatesToolUseInputJSONDeltas(t *testing.T) {
-	decoder := newStreamEventDecoder(newToolNameMapper([]model.Tool{
+	decoder := newStreamEventDecoder(newToolNameMapper([]model.ToolDefinition{
 		{Name: "mcp.local.search"},
 	}))
 

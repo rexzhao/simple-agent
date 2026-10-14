@@ -172,7 +172,7 @@ func TestStreamSeesEveryWritePath(t *testing.T) {
 		{model.TextDeltaEvent{Text: "summary of the conversation"}, model.MessageDoneEvent{}},
 	}}
 	_, session := newTestAgent(t, provider, executor, func(o *Options) {
-		o.Tools = []model.Tool{{Name: "check"}}
+		o.Tools = []model.ToolDefinition{{Name: "check"}}
 	})
 
 	// Subscribe BEFORE any write — then MaterializeHeader exercises the
@@ -614,7 +614,7 @@ func TestStreamSnapshotRunningToolPositive(t *testing.T) {
 	}}
 	// Override the tool executor via agent options.
 	ag, session := newTestAgent(t, provider, executor, func(o *Options) {
-		o.Tools = []model.Tool{{Name: "check"}}
+		o.Tools = []model.ToolDefinition{{Name: "check"}}
 	})
 	_ = ag
 

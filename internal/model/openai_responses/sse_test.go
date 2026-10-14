@@ -84,7 +84,7 @@ func TestEventsFromChunkConvertsReasoningSummaryDelta(t *testing.T) {
 }
 
 func TestEventsFromSSEConvertsFunctionCallArgumentDeltasAndDoneOnce(t *testing.T) {
-	toolNames := newToolNameMapper([]model.Tool{{Name: "mcp.local.search"}})
+	toolNames := newToolNameMapper([]model.ToolDefinition{{Name: "mcp.local.search"}})
 	events, done, err := newStreamEventDecoder(toolNames).EventsFromSSE([]byte(
 		"event: response.output_item.added\n" +
 			"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"tool_0\",\"arguments\":\"\"}}\n\n" +

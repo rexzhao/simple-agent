@@ -181,7 +181,7 @@ func TestBuildRequestBodyMapsToolsFunctionCallsToolOutputsAndToolParameters(t *t
 			{Role: model.MessageRoleTool, ToolCallID: "call_search", Content: "found"},
 			{Role: model.MessageRoleTool, ToolCallID: "call_read", Content: "missing file", IsError: true},
 		},
-		Tools: []model.Tool{
+		Tools: []model.ToolDefinition{
 			{
 				Name:        "read_file",
 				Description: "Read a file.",
@@ -248,7 +248,7 @@ func TestBuildRequestBodyMapsToolsFunctionCallsToolOutputsAndToolParameters(t *t
 func TestBuildRequestBodyAvoidsResponsesToolNameAliasConflicts(t *testing.T) {
 	body, err := BuildRequestBody(model.Request{
 		Model: "gpt-5.1",
-		Tools: []model.Tool{
+		Tools: []model.ToolDefinition{
 			{Name: "tool_0", Description: "Already legal."},
 			{Name: "mcp.local.search", Description: "Needs an alias."},
 		},
@@ -282,7 +282,7 @@ func TestBuildRequestBodyAvoidsResponsesToolNameAliasConflicts(t *testing.T) {
 func TestBuildRequestBodyMapsForcedToolChoiceAlias(t *testing.T) {
 	body, err := BuildRequestBody(model.Request{
 		Model: "gpt-5.1",
-		Tools: []model.Tool{{Name: "mcp.local.search", Description: "Search local data."}},
+		Tools: []model.ToolDefinition{{Name: "mcp.local.search", Description: "Search local data."}},
 		Parameters: map[string]any{
 			"tool_choice": map[string]any{
 				"type": "function",
@@ -314,7 +314,7 @@ func TestBuildRequestBodyMapsForcedToolChoiceAlias(t *testing.T) {
 func TestBuildRequestBodyMapsAllowedToolsToolChoiceAliases(t *testing.T) {
 	body, err := BuildRequestBody(model.Request{
 		Model: "gpt-5.1",
-		Tools: []model.Tool{{Name: "mcp.local.search", Description: "Search local data."}},
+		Tools: []model.ToolDefinition{{Name: "mcp.local.search", Description: "Search local data."}},
 		Parameters: map[string]any{
 			"tool_choice": map[string]any{
 				"type": "allowed_tools",
@@ -566,7 +566,7 @@ func TestBuildProviderRequestReplaysResponsesOutputItemsWhenStoreFalse(t *testin
 			},
 			{Role: model.MessageRoleTool, ToolCallID: "call_1", Content: "result"},
 		},
-		Tools: []model.Tool{{Name: "lookup"}},
+		Tools: []model.ToolDefinition{{Name: "lookup"}},
 	}, true, requestBodyOptions{origin: "https://api.openai.com/v1"})
 	if err != nil {
 		t.Fatalf("buildProviderRequest() error = %v", err)

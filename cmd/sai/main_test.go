@@ -176,7 +176,7 @@ func TestSendReturnsAfterEviction(t *testing.T) {
 	ag, err := agent.New(agent.Options{
 		ModelResolver: agent.NewStaticResolver(&toolLoopProvider{rounds: 700}, nil, 0, 0, ""),
 		Storage:       memory.OpenStore(),
-		Tools:         []model.Tool{{Name: "noop"}},
+		Tools:         []model.ToolDefinition{{Name: "noop"}},
 		ToolExecutor:  noopExecutor{},
 		// The default iteration cap (8) would end the run long before
 		// the 1024-slot buffer overflows; the eviction needs the full
@@ -326,7 +326,7 @@ func TestSendReturnsAfterCompactionAndEviction(t *testing.T) {
 			rounds: 700, gateAt: 50, gate: gate, entered: entered,
 		}, nil, 0, 0, ""),
 		Storage:       memory.OpenStore(),
-		Tools:         []model.Tool{{Name: "noop"}},
+		Tools:         []model.ToolDefinition{{Name: "noop"}},
 		ToolExecutor:  noopExecutor{},
 		MaxIterations: 750,
 	})

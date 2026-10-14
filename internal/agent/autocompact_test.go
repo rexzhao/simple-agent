@@ -34,7 +34,7 @@ func TestEstimateRequestTokensIncludesOverheads(t *testing.T) {
 	}
 	withTools := estimateRequestTokens(model.Request{
 		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "hi"}},
-		Tools:    []model.Tool{{Name: "shell", Description: "run a command"}},
+		Tools:    []model.ToolDefinition{{Name: "shell", Description: "run a command"}},
 	})
 	if withTools <= small {
 		t.Fatalf("tools not counted: %d <= %d", withTools, small)
@@ -367,7 +367,7 @@ func TestEstimateRequestTokensCountsToolSchema(t *testing.T) {
 	without := estimateRequestTokens(model.Request{Messages: []model.Message{{Role: model.MessageRoleUser, Content: "hi"}}})
 	with := estimateRequestTokens(model.Request{
 		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "hi"}},
-		Tools:    []model.Tool{{Name: "shell", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}},
+		Tools:    []model.ToolDefinition{{Name: "shell", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}},
 	})
 	if with <= without+8 { // name + description + schema text
 		t.Fatalf("input schema not counted: %d vs %d", with, without)

@@ -152,7 +152,7 @@ func buildMessageToolCalls(toolCalls []model.ToolCall, toolNames ...*toolNameMap
 	return out
 }
 
-func buildTools(tools []model.Tool, toolNames ...*toolNameMapper) []map[string]any {
+func buildTools(tools []model.ToolDefinition, toolNames ...*toolNameMapper) []map[string]any {
 	var mapper *toolNameMapper
 	if len(toolNames) > 0 {
 		mapper = toolNames[0]
@@ -186,7 +186,7 @@ type toolNameMapper struct {
 	nextAlias  int
 }
 
-func newToolNameMapper(tools []model.Tool) *toolNameMapper {
+func newToolNameMapper(tools []model.ToolDefinition) *toolNameMapper {
 	mapper := &toolNameMapper{
 		toProvider: make(map[string]string, len(tools)),
 		toInternal: make(map[string]string, len(tools)),

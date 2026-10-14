@@ -26,7 +26,7 @@ type ToolExecutor interface {
 // Options configures Agent construction.
 type Options struct {
 	Storage      storage.Store
-	Tools        []model.Tool
+	Tools        []model.ToolDefinition
 	ToolExecutor ToolExecutor
 	// SystemPrompt is the UNRENDERED template: {{time.now}} and its
 	// siblings render at every request assembly, not here (§15.2).
@@ -49,7 +49,7 @@ type Options struct {
 // recorded meta through the resolver (§15.2).
 type Agent struct {
 	store         storage.Store
-	tools         []model.Tool
+	tools         []model.ToolDefinition
 	toolExecutor  ToolExecutor
 	systemPrompt  string // unrendered template
 	resolver      ModelResolver
@@ -361,7 +361,7 @@ func contextPressure(budget contextBudget, request model.Request) compactionPres
 
 // enabledToolNames indexes the request's tool schemas for the enabled-tool
 // check during execution.
-func enabledToolNames(toolSchemas []model.Tool) map[string]struct{} {
+func enabledToolNames(toolSchemas []model.ToolDefinition) map[string]struct{} {
 	enabled := make(map[string]struct{}, len(toolSchemas))
 	for _, tool := range toolSchemas {
 		enabled[tool.Name] = struct{}{}

@@ -82,7 +82,7 @@ func TestBuildRequestBodyMapsToolsToOpenAIFunctionShape(t *testing.T) {
 		Messages: []model.Message{
 			{Role: model.MessageRoleUser, Content: "Read a file"},
 		},
-		Tools: []model.Tool{
+		Tools: []model.ToolDefinition{
 			{
 				Name:        "read_file",
 				Description: "Read a file from the workspace.",
@@ -132,7 +132,7 @@ func TestOpenAIChatToolNameMapperRoundTripsCanonicalWebEval(t *testing.T) {
 			Role:      model.MessageRoleAssistant,
 			ToolCalls: []model.ToolCall{{ID: "call-1", Name: "web.eval", Arguments: `{"code":"1"}`}},
 		}},
-		Tools: []model.Tool{{Name: "web.eval", Description: "debug", InputSchema: map[string]any{"type": "object"}}},
+		Tools: []model.ToolDefinition{{Name: "web.eval", Description: "debug", InputSchema: map[string]any{"type": "object"}}},
 	}
 	body, err := BuildRequestBody(request, true)
 	if err != nil {
@@ -178,12 +178,12 @@ func TestOpenAIChatToolNameMapperRoundTripsCanonicalWebEval(t *testing.T) {
 }
 
 func TestOpenAIChatToolNameMapperPreservesLegalNamesAndAvoidsAliasCollisions(t *testing.T) {
-	legal := newToolNameMapper([]model.Tool{{Name: "read_file"}})
+	legal := newToolNameMapper([]model.ToolDefinition{{Name: "read_file"}})
 	if got := legal.providerName("read_file"); got != "read_file" || legal.internalName(got) != "read_file" {
 		t.Fatalf("legal tool round trip = %q -> %q, want read_file", got, legal.internalName(got))
 	}
 
-	mapper := newToolNameMapper([]model.Tool{{Name: "web.eval"}, {Name: "tool_0"}})
+	mapper := newToolNameMapper([]model.ToolDefinition{{Name: "web.eval"}, {Name: "tool_0"}})
 	alias := mapper.providerName("web.eval")
 	if alias == "web.eval" || alias == "tool_0" || !isValidOpenAIChatToolName(alias) {
 		t.Fatalf("web.eval alias = %q, want deterministic legal non-conflicting alias", alias)
@@ -191,7 +191,7 @@ func TestOpenAIChatToolNameMapperPreservesLegalNamesAndAvoidsAliasCollisions(t *
 	if mapper.providerName("web.eval") != alias || mapper.internalName(alias) != "web.eval" || mapper.internalName(mapper.providerName("tool_0")) != "tool_0" {
 		t.Fatalf("alias mapping did not round trip: alias=%q map=%#v", alias, mapper.toInternal)
 	}
-	other := newToolNameMapper([]model.Tool{{Name: "web.eval"}, {Name: "tool_0"}})
+	other := newToolNameMapper([]model.ToolDefinition{{Name: "web.eval"}, {Name: "tool_0"}})
 	if other.providerName("web.eval") != alias {
 		t.Fatalf("alias was not deterministic: first=%q second=%q", alias, other.providerName("web.eval"))
 	}
@@ -203,7 +203,7 @@ func TestBuildRequestBodyMapsNilToolSchemaAndPreservesToolOrder(t *testing.T) {
 		Messages: []model.Message{
 			{Role: model.MessageRoleUser, Content: "Use tools"},
 		},
-		Tools: []model.Tool{
+		Tools: []model.ToolDefinition{
 			{
 				Name:        "list_files",
 				Description: "List files in the workspace.",

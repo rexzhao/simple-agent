@@ -956,6 +956,9 @@ created 记录，加字段即得）。
 
 ### 16.1 现状盘点
 
+（本表是设计时刻的快照；步骤 1 改名后文中的 `model.Tool` 均已为
+`model.ToolDefinition`，接口形状未变。）
+
 **接口三件套（分散三处，语义互不认识）**：
 
 | 位置 | 形状 | 角色 |
@@ -993,8 +996,8 @@ ItemID、占 Running 槽）→ 执行 → ToolResult 落盘（同 ItemID upsert�
 type Tool interface {
     // Definition is the provider-facing shape: name, description,
     // JSON schema. Returned by value; callers must not mutate maps.
-    // (model.ToolDefinition per the step-1 rename; 16.1's table keeps
-    // model.Tool where it describes the CURRENT code.)
+    // (model.ToolDefinition per the step-1 rename — landed; 16.1's
+    // inventory keeps model.Tool as the pre-rename spelling.)
     Definition() model.ToolDefinition
     // Execute runs one call. Contract:
     //  - Arguments are self-validated: an invalid argument returns a
@@ -1236,7 +1239,7 @@ Tool 接口相反）。
 
 | 步骤 | 内容 | 回归保护 | doc-sync |
 |---|---|---|---|
-| 1 | `model.Tool → model.ToolDefinition` 改名（纯 Go API，wire 零变化） | 全仓 build/test；grep 旧名清零 | development.md 若提及 |
+| 1 | `model.Tool → model.ToolDefinition` 改名（纯 Go API，wire 零变化）**（已落地）** | 全仓 build/test；grep 旧名清零 | development.md 若提及 |
 | 2 | 包迁移·model（含 provider 子包）：git mv + 导入重写 + 收口注释 | 每步后全绿；旧路径 grep 为零；`go list ./...` 无 internal/model | README 包布局段 |
 | 3 | 包迁移·storage（jsonl/memory 同批）+ **doc.go 写明公开契约**：log.jsonl 记录格式、段切换（.next/归档/恢复规则）、sai/v2/ 摘要链——公开即契约，内部注释不够 | 同上 | storage 包文档、development.md 格式附录（若引用） |
 | 4 | 包迁移·tools + Tool 接口落地（接口在 `agent.Tool`（internal/agent，随步骤 5 公开）；`tools.Named` 适配、`Shell` 返回 `agent.Tool`、`agent.Options.Tools []agent.Tool`、namedExecutor 删除） | 既有 agent/web/CLI 测试不改断言；接口 kill（按名分发丢失→运行期错误测试红） | design §8 注记、README |

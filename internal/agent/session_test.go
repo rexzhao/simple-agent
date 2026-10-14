@@ -30,7 +30,7 @@ func newTestAgent(t *testing.T, provider model.Provider, executor ToolExecutor, 
 	optionsStruct := Options{
 		ModelResolver: NewStaticResolver(provider, nil, 0, 0, ""),
 		Storage:       memory.OpenStore(),
-		Tools:         []model.Tool{{Name: "echo"}},
+		Tools:         []model.ToolDefinition{{Name: "echo"}},
 		ToolExecutor:  executor,
 	}
 	for _, apply := range options {
