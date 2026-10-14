@@ -1001,7 +1001,56 @@ func (r *Run) execute(runID string, request model.Request) {
 			}
 			resultItemID := storage.NewToolResultID()
 			s.beginTool(resultItemID, toolCall)
-			result := executeToolCall(ctx, s, s.agent.toolSet, toolCall, resultItemID)
+
+			// The policy hook (§16.3): synchronous, never blocks.
+			// Allow executes; Deny lands as an is_error result; Ask
+			// hands the decision to the approval state machine (the
+			// run goroutine waits, bounded by this ctx).
+			info := ToolCallInfo{
+				SessionID: s.ID(), RunID: runID, ItemID: resultItemID,
+				Name: toolCall.Name, Arguments: toolCall.Arguments,
+			}
+			decision := s.agent.decideToolCall(ctx, info)
+			var result model.ToolResult
+			switch decision.Action {
+			case ToolActionDeny:
+				// The refusal lands as a tool.result is_error (the
+				// model sees it and can adjust); the run continues.
+				result = toolErrorResult(toolCall, "%s", decision.Reason)
+				if result.Content == "" {
+					result.Content = "tool call denied by policy"
+				}
+				s.agent.observeToolCall(ctx, info, result)
+			case ToolActionAsk:
+				d, err := s.awaitApproval(ctx, toolCall, resultItemID)
+				if err != nil {
+					// Cancelled: an interruption — no tool.result, no
+					// after-hook (no result object exists).
+					return
+				}
+				if !d.allow {
+					result = toolErrorResult(toolCall, "%s", d.reason)
+					if result.Content == "" {
+						result.Content = "tool call denied"
+					}
+					s.agent.observeToolCall(ctx, info, result)
+					break
+				}
+				// Approved — but the run may have been stopped between
+				// the approval and the execution: recheck ctx (§13).
+				// Defense-in-depth alongside awaitApproval's internal
+				// recheck (which usually catches this first); the
+				// post-approval/pre-execute window is not reliably
+				// constructible from the test side.
+				if ctx.Err() != nil {
+					return
+				}
+				result = executeToolCall(ctx, s, s.agent.toolSet, toolCall, resultItemID)
+				s.agent.observeToolCall(ctx, info, result)
+			default: // Allow
+				result = executeToolCall(ctx, s, s.agent.toolSet, toolCall, resultItemID)
+				s.agent.observeToolCall(ctx, info, result)
+			}
 			if err := s.commitToolResult(resultItemID, runID, iteration, result); err != nil {
 				failure = fmt.Sprintf("persist tool result: %v", err)
 				s.emitTransient(model.ErrorEvent{Err: err, Message: "persist tool result"})

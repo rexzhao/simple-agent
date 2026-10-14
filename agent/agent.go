@@ -50,6 +50,9 @@ type Options struct {
 	// Tools is the enabled tool set; the agent dispatches by
 	// Definition().Name (duplicate names are a construction error).
 	Tools []Tool
+	// Hooks is the optional tool policy (§16.3): the zero value
+	// allows every call and observes nothing.
+	Hooks Hooks
 	// SystemPrompt is the UNRENDERED template: {{time.now}} and its
 	// siblings render at every request assembly, not here (§15.2).
 	SystemPrompt  string
@@ -72,6 +75,7 @@ type Options struct {
 type Agent struct {
 	store storage.Store
 	tools []Tool
+	hooks Hooks
 	// toolSet indexes tools by Definition().Name for the loop's
 	// per-call dispatch; built once at construction.
 	toolSet       map[string]Tool
@@ -114,6 +118,7 @@ func New(options Options) (*Agent, error) {
 	return &Agent{
 		store:         options.Storage,
 		tools:         options.Tools,
+		hooks:         options.Hooks,
 		toolSet:       toolSet,
 		systemPrompt:  options.SystemPrompt,
 		resolver:      options.ModelResolver,

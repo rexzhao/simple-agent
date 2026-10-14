@@ -611,6 +611,7 @@ type state struct {
 	Count      int            `json:"count"`
 	Digest     string         `json:"digest"`
 	Streaming  *StreamingWire `json:"streaming,omitempty"`
+	Tool       *ToolWire      `json:"tool,omitempty"`
 	Steered    []SteeredWire  `json:"steered,omitempty"`
 	Pressure   string         `json:"pressure,omitempty"`
 	Retry      string         `json:"retry,omitempty"`
@@ -641,6 +642,15 @@ func (h *Hub) state() state {
 			Item:      snapshot.Streaming.ItemID,
 			Content:   snapshot.Streaming.Message.Content,
 			Reasoning: snapshot.Streaming.Message.ReasoningContent,
+		}
+	}
+	if snapshot.Running != nil {
+		s.Tool = &ToolWire{
+			Item:             snapshot.Running.ItemID,
+			CallID:           snapshot.Running.ToolCall.ID,
+			Name:             snapshot.Running.ToolCall.Name,
+			Args:             snapshot.Running.ToolCall.Arguments,
+			AwaitingApproval: snapshot.Running.AwaitingApproval,
 		}
 	}
 	for _, entry := range snapshot.Steered {

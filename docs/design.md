@@ -981,7 +981,7 @@ created 记录，加字段即得）。
 **tool call 生命周期**（§8 已述）：delta 累积在 Streaming 的
 ToolCalls → assistant.message 落盘（wire ID）→ ToolStarted（mint result
 ItemID、占 Running 槽）→ 执行 → ToolResult 落盘（同 ItemID upsert）。
-审批 Hooks 挂在"ToolStarted 之后、执行之前"与"执行之后"（16.3）。
+审批 Hooks 挂在"Running 槽/result ItemID 建立之后、执行之前"与"执行之后"（16.3）。
 
 **输出截断（两层，归属不同）**：工具层——shell 的 `limitedOutput`
 （shell.go:164，执行期字节帽，防 OOM）；agent 层——
@@ -1061,8 +1061,9 @@ type Hooks struct {
     // Boundaries: runs for executed calls AND for denials (the
     // observer sees the same is_error result the model sees); does
     // NOT run for cancelled calls (no result object exists); never
-    // runs at process exit. Errors and panics are logged and
-    // swallowed — it cannot affect the run.
+    // runs at process exit. A panic inside the hook is recovered and
+    // silently discarded (the agent holds no logger); hosts that need
+    // telemetry handle their own errors inside the hook.
     AfterToolCall func(ctx context.Context, call ToolCallInfo, result model.ToolResult)
 }
 
@@ -1071,7 +1072,7 @@ type ToolCallInfo struct {
     RunID     string
     ItemID    string // the tool RESULT item id (approval identity)
     Name      string
-    Arguments map[string]any
+    Arguments string // raw JSON (policies parse as needed)
 }
 
 type ToolDecision struct {
@@ -1080,7 +1081,7 @@ type ToolDecision struct {
 }
 ```
 
-**挂点**：仅工具级（执行前策略 + 执行后观察）。**run 级挂点不提供**
+**挂点**：仅工具级（Running 槽/result ItemID 建立之后、执行之前的策略 + 执行后的观察；策略 Deny 不发 ToolStarted——未执行的调用不发执行开始事件）。**run 级挂点不提供**
 （B2）：run 生命周期已在会话流上（Status 事件），宿主经 `Stream()`
 已可观察；若将来 C 的宿主需要 run 级**干预**再议。
 
