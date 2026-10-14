@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 func foldRecords(t *testing.T, records []Record) State {

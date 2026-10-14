@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model/httpstream"
+	"github.com/rexzhao/simple-agent/model/httpstream"
 )
 
 func TestIsRetryableProviderError(t *testing.T) {

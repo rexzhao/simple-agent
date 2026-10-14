@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/rexzhao/simple-agent/internal/model/httpstream"
+	"github.com/rexzhao/simple-agent/model/httpstream"
 )
 
 // IsRetryableProviderError reports whether err is a transient provider or

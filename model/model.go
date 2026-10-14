@@ -6,10 +6,15 @@ import (
 	"time"
 )
 
+// Provider is a model transport: one Stream call is one conversational
+// request; the returned channel delivers the response as events and is
+// closed when the response ends (or the request fails after retries).
 type Provider interface {
 	Stream(ctx context.Context, request Request) (<-chan Event, error)
 }
 
+// Request is one conversational request to a model: the message
+// history, the tool definitions, and the provider parameters.
 type Request struct {
 	Model         string
 	Messages      []Message
@@ -25,6 +30,10 @@ type Request struct {
 	MaxTokens int
 }
 
+// MessageRole is a message's role in the conversation. The wire roles
+// (system/developer/user/assistant/tool) map onto each provider's API;
+// MessageRoleProvider marks provider-specific items (Anthropic thinking
+// blocks, Responses reasoning items) that ride in history verbatim.
 type MessageRole string
 
 const (
@@ -36,6 +45,8 @@ const (
 	MessageRoleProvider  MessageRole = "provider"
 )
 
+// Message is one entry of the conversation history, in the unified
+// shape every provider adapter translates to and from.
 type Message struct {
 	Role             MessageRole
 	Content          string
@@ -85,12 +96,19 @@ type ResponseState struct {
 	OutputItems    []json.RawMessage
 }
 
+// ToolDefinition is the provider-facing tool shape: name, description,
+// and JSON schema. Pure data — the agent pairs it with execution (the
+// agent.Tool interface).
 type ToolDefinition struct {
 	Name        string
 	Description string
 	InputSchema map[string]any
 }
 
+// ToolCall is the model's request to execute a tool. ID is the
+// agent-minted identity used for record addressing; ProviderID is the
+// wire identity (tool_call_id / tool_use_id) used for context pairing
+// — the agent mints one when the provider returns none.
 type ToolCall struct {
 	ID         string
 	ProviderID string
@@ -98,6 +116,9 @@ type ToolCall struct {
 	Arguments  string
 }
 
+// ToolResult is the outcome of one tool call, delivered back to the
+// model as the tool role message. IsError carries refusals and
+// failures — the model sees them and can adjust.
 type ToolResult struct {
 	ToolCallID string
 	Name       string
@@ -105,6 +126,8 @@ type ToolResult struct {
 	IsError    bool
 }
 
+// EventType discriminates the Event variants (the streaming protocol
+// between providers and the agent loop).
 type EventType string
 
 const (
@@ -132,10 +155,15 @@ const (
 	EventTypeSteerWithdrawn            EventType = "steer_withdrawn"
 )
 
+// Event is one streaming step of a model response: text/reasoning
+// deltas, tool-call deltas and completions, usage, retry notices, and
+// errors. The channel closes when the response ends.
 type Event interface {
 	Type() EventType
 }
 
+// AgentIterationStartedEvent opens an iteration (one logical request
+// plus its tool executions).
 type AgentIterationStartedEvent struct {
 	Iteration int
 }
@@ -182,6 +210,7 @@ func (AgentIterationStartedEvent) Type() EventType {
 	return EventTypeAgentIterationStarted
 }
 
+// TextDeltaEvent appends a chunk of assistant text.
 type TextDeltaEvent struct {
 	Text string
 }
@@ -190,6 +219,8 @@ func (TextDeltaEvent) Type() EventType {
 	return EventTypeTextDelta
 }
 
+// ReasoningDeltaEvent appends a chunk of reasoning content
+// (Anthropic thinking / interleaved reasoning).
 type ReasoningDeltaEvent struct {
 	Text string
 }
@@ -198,6 +229,8 @@ func (ReasoningDeltaEvent) Type() EventType {
 	return EventTypeReasoningDelta
 }
 
+// MessageDoneEvent marks the assistant message complete — the final
+// text and tool calls are settled.
 type MessageDoneEvent struct {
 	Message      Message
 	FinishReason string
@@ -207,6 +240,8 @@ func (MessageDoneEvent) Type() EventType {
 	return EventTypeMessageDone
 }
 
+// ToolCallDeltaEvent appends an incremental piece of one tool call
+// (streaming argument fragments).
 type ToolCallDeltaEvent struct {
 	Index          int
 	ID             string
@@ -218,6 +253,7 @@ func (ToolCallDeltaEvent) Type() EventType {
 	return EventTypeToolCallDelta
 }
 
+// ToolCallDoneEvent completes one tool call of the message.
 type ToolCallDoneEvent struct {
 	ToolCall ToolCall
 }
@@ -241,6 +277,8 @@ func (ToolStartedEvent) Type() EventType {
 	return EventTypeToolStarted
 }
 
+// ToolResultEvent carries one finished tool result back to the
+// consumer of the stream.
 type ToolResultEvent struct {
 	Result ToolResult
 }
@@ -295,6 +333,8 @@ func (ContextPressureEvent) Type() EventType {
 	return EventTypeContextPressure
 }
 
+// Usage is the token accounting of a request, as reported by the
+// provider.
 type Usage struct {
 	// InputTokens excludes tokens reported in CachedTokens and
 	// CacheWriteTokens. The four token buckets are mutually exclusive.
@@ -325,6 +365,7 @@ func UsageFromInclusiveInput(inputTokens, outputTokens, cachedTokens, cacheWrite
 	}
 }
 
+// UsageEvent reports token usage for the request.
 type UsageEvent struct {
 	Usage Usage
 }
@@ -333,10 +374,15 @@ func (UsageEvent) Type() EventType {
 	return EventTypeUsage
 }
 
+// ResponseStateEvent carries provider-internal state (OpenAI
+// Responses reasoning items) that must round-trip to continue a
+// conversation on that provider.
 type ResponseStateEvent struct {
 	State ResponseState
 }
 
+// ProviderRetryEvent announces an upcoming retry after a retryable
+// provider error (attempt, delay, reason).
 type ProviderRetryEvent struct {
 	Attempt     int
 	MaxAttempts int
@@ -352,6 +398,8 @@ func (ResponseStateEvent) Type() EventType {
 	return EventTypeResponseState
 }
 
+// ErrorEvent reports a failure after retries were exhausted; the
+// channel closes right after.
 type ErrorEvent struct {
 	Err     error
 	Message string

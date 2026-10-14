@@ -9,12 +9,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/model/httpstream"
+	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/model/httpstream"
 )
 
 const anthropicVersion = "2023-06-01"
 
+// ProviderConfig assembles the Anthropic Messages adapter: endpoint,
+// credentials, and transport options.
 type ProviderConfig struct {
 	BaseURL     string
 	APIKey      string
@@ -22,6 +24,7 @@ type ProviderConfig struct {
 	HTTPOptions httpstream.Options
 }
 
+// Provider implements model.Provider for the Anthropic Messages API.
 type Provider struct {
 	baseURL     string
 	apiKey      string
@@ -31,6 +34,7 @@ type Provider struct {
 
 var _ model.Provider = (*Provider)(nil)
 
+// NewProvider validates the configuration and returns the adapter.
 func NewProvider(config ProviderConfig) (*Provider, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(config.BaseURL), "/")
 	if baseURL == "" {

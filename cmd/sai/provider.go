@@ -10,11 +10,11 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/codexauth"
 	"github.com/rexzhao/simple-agent/internal/config"
-	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/model/anthropic_messages"
-	"github.com/rexzhao/simple-agent/internal/model/httpstream"
-	"github.com/rexzhao/simple-agent/internal/model/openai_chat"
-	"github.com/rexzhao/simple-agent/internal/model/openai_responses"
+	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/model/anthropic_messages"
+	"github.com/rexzhao/simple-agent/model/httpstream"
+	"github.com/rexzhao/simple-agent/model/openai_chat"
+	"github.com/rexzhao/simple-agent/model/openai_responses"
 )
 
 // newProvider builds the transport provider for a resolved model. This is

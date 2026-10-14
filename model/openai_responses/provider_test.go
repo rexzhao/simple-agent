@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/codexauth"
-	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/model/httpstream"
+	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/model/httpstream"
 )
 
 func TestProviderStreamPostsResponsesRequestAndEmitsEvents(t *testing.T) {

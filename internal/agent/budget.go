@@ -5,7 +5,7 @@ import (
 	"math"
 	"unicode/utf8"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // Token estimation and the context budget, ported from the previous

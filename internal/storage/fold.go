@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // State is the session's live state. It has two regions with different

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // TestPageReducerFixture runs the page's actual state machine (the

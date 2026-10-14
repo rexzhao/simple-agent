@@ -6,9 +6,11 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
+// BuildRequestBody translates a unified request into the OpenAI Chat
+// Completions API body.
 func BuildRequestBody(request model.Request, stream bool) ([]byte, error) {
 	compatibility, _ := resolveCompatibility("")
 	return buildRequestBody(request, stream, compatibility)

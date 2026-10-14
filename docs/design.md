@@ -1240,7 +1240,7 @@ Tool 接口相反）。
 | 步骤 | 内容 | 回归保护 | doc-sync |
 |---|---|---|---|
 | 1 | `model.Tool → model.ToolDefinition` 改名（纯 Go API，wire 零变化）**（已落地）** | 全仓 build/test；grep 旧名清零 | development.md 若提及 |
-| 2 | 包迁移·model（含 provider 子包）：git mv + 导入重写 + 收口注释 | 每步后全绿；旧路径 grep 为零；`go list ./...` 无 internal/model | README 包布局段 |
+| 2 | 包迁移·model（含 provider 子包）：git mv + 导入重写 + 收口注释**（已落地）** | 每步后全绿；旧路径 grep 为零；`go list ./...` 无 internal/model | README 包布局段 |
 | 3 | 包迁移·storage（jsonl/memory 同批）+ **doc.go 写明公开契约**：log.jsonl 记录格式、段切换（.next/归档/恢复规则）、sai/v2/ 摘要链——公开即契约，内部注释不够 | 同上 | storage 包文档、development.md 格式附录（若引用） |
 | 4 | 包迁移·tools + Tool 接口落地（接口在 `agent.Tool`（internal/agent，随步骤 5 公开）；`tools.Named` 适配、`Shell` 返回 `agent.Tool`、`agent.Options.Tools []agent.Tool`、namedExecutor 删除） | 既有 agent/web/CLI 测试不改断言；接口 kill（按名分发丢失→运行期错误测试红） | design §8 注记、README |
 | 5 | 包迁移·agent（SessionEvent/Stream 随包公开；SessionMetaForTest 删除；NewStaticResolver 文档化） | 测试改字面量后全绿；公开 API 清单核对 | 同上 |

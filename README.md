@@ -184,7 +184,7 @@ internal/agent       state layer + agent loop (owns State, commit is the only wr
 internal/storage     record schema + Fold + Store/Session interfaces
   jsonl/             append-only JSONL file store (torn-tail recovery)
   memory/            in-memory store for tests and ephemeral sessions
-internal/model       provider adapters (OpenAI Chat/Responses, Anthropic)
+model/               provider adapters (OpenAI Chat/Responses, Anthropic) — public (B2, v0: no stability guarantees until v1)
 internal/tools       the shell tool (Bash on every platform, incl. Windows via Git Bash)
 internal/config      startup-time config parsing (cmd-only dependency)
 ```

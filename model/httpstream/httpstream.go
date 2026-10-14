@@ -22,6 +22,8 @@ const (
 	DefaultTimeoutRetries    = 1
 )
 
+// Options tunes one HTTP request round: timeouts, retries, and the
+// request factory.
 type Options struct {
 	RequestTimeout    time.Duration
 	StreamIdleTimeout time.Duration
@@ -45,6 +47,8 @@ func (o Options) WithDefaults() Options {
 	return o
 }
 
+// StatusError is a non-2xx response, with the status and the error
+// body the server sent.
 type StatusError struct {
 	StatusCode int
 	Status     string
@@ -59,6 +63,8 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Status, e.Body)
 }
 
+// RequestTimeoutError is a client-side request timeout (the request
+// may or may not have been processed server-side).
 type RequestTimeoutError struct {
 	Timeout  time.Duration
 	Attempts int
@@ -71,6 +77,8 @@ func (e *RequestTimeoutError) Error() string {
 	return fmt.Sprintf("request timeout waiting for response headers after %s", e.Timeout)
 }
 
+// StreamIdleTimeoutError is a stream that produced no bytes within
+// the idle window — the request is retried safely.
 type StreamIdleTimeoutError struct {
 	Timeout time.Duration
 }
@@ -79,11 +87,16 @@ func (e *StreamIdleTimeoutError) Error() string {
 	return fmt.Sprintf("SSE stream idle timeout after %s without data", e.Timeout)
 }
 
+// IsStreamIdleTimeout reports whether the error is a stream idle
+// timeout (retryable: nothing was consumed).
 func IsStreamIdleTimeout(err error) bool {
 	var timeoutErr *StreamIdleTimeoutError
 	return errors.As(err, &timeoutErr)
 }
 
+// DoRequest performs one HTTP round with retry semantics: status
+// retries with backoff, timeout retries when the request is safely
+// reissuable.
 func DoRequest(ctx context.Context, client *http.Client, options Options, newRequest func(context.Context) (*http.Request, error), readErrorBody func(io.Reader) string) (*http.Response, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -138,6 +151,9 @@ func doRequestWithTimeoutRetry(ctx context.Context, client *http.Client, options
 	panic("unreachable")
 }
 
+// ReadSSEFrames streams SSE frames from the body until the stream
+// ends, the handler stops it, or no bytes arrive within the idle
+// window (StreamIdleTimeoutError — safe to retry).
 func ReadSSEFrames(ctx context.Context, body io.Reader, idleTimeout time.Duration, handle func([]byte) bool) error {
 	if idleTimeout <= 0 {
 		idleTimeout = DefaultStreamIdleTimeout
@@ -196,6 +212,8 @@ func ReadSSEFrames(ctx context.Context, body io.Reader, idleTimeout time.Duratio
 	}
 }
 
+// ReadErrorBody drains an error response body for diagnostics,
+// redacting the given secret.
 func ReadErrorBody(body io.Reader, secret string) string {
 	data, err := io.ReadAll(io.LimitReader(body, 4096))
 	if err != nil {

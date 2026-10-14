@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // steerFlowProvider holds the stream open so the test can steer mid-run.

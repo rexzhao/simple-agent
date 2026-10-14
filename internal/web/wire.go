@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // Digest chain (docs/webui.md §4.1).

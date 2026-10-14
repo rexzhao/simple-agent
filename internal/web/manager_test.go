@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
-	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessionhost"
 	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // newJSONLTestServer builds a manager over a REAL jsonl store (temp

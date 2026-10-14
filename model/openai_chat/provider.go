@@ -9,10 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/model/httpstream"
+	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/model/httpstream"
 )
 
+// ProviderConfig assembles the OpenAI Chat Completions adapter:
+// endpoint, credentials, compatibility mode, and transport options.
 type ProviderConfig struct {
 	BaseURL       string
 	APIKey        string
@@ -22,6 +24,8 @@ type ProviderConfig struct {
 	RecordRequest func(endpoint string, body []byte) error
 }
 
+// Provider implements model.Provider for the OpenAI Chat
+// Completions API (and compatible endpoints, via Compatibility).
 type Provider struct {
 	baseURL       string
 	apiKey        string
@@ -33,6 +37,7 @@ type Provider struct {
 
 var _ model.Provider = (*Provider)(nil)
 
+// NewProvider validates the configuration and returns the adapter.
 func NewProvider(config ProviderConfig) (*Provider, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(config.BaseURL), "/")
 	if baseURL == "" {

@@ -11,10 +11,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/model/httpstream"
+	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/model/httpstream"
 )
 
+// ProviderConfig assembles the OpenAI Responses adapter: endpoint,
+// credentials, transport options, and the Responses-specific
+// behaviors.
 type ProviderConfig struct {
 	BaseURL         string
 	APIKey          string
@@ -28,15 +31,18 @@ type ProviderConfig struct {
 	RecordRequest       func(endpoint string, body []byte) error
 }
 
+// TokenSource supplies OAuth access tokens for the Responses API.
 type TokenSource interface {
 	AccessToken(ctx context.Context) (AccessToken, error)
 }
 
+// AccessToken is one token value with its expiry.
 type AccessToken struct {
 	Token     string
 	AccountID string
 }
 
+// Provider implements model.Provider for the OpenAI Responses API.
 type Provider struct {
 	baseURL             string
 	apiKey              string
@@ -52,6 +58,7 @@ type Provider struct {
 
 var _ model.Provider = (*Provider)(nil)
 
+// NewProvider validates the configuration and returns the adapter.
 func NewProvider(config ProviderConfig) (*Provider, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(config.BaseURL), "/")
 	if baseURL == "" {

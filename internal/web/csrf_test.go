@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // Mutations must be JSON content-type (a preflighted type our zero-CORS

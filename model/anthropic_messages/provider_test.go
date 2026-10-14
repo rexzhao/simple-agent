@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/model/httpstream"
+	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/model/httpstream"
 )
 
 func TestProviderStreamPostsMessagesRequestAndEmitsText(t *testing.T) {

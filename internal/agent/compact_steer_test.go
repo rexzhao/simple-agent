@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // blockCallProvider blocks exactly one provider call (by call number,

@@ -12,9 +12,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/model"
+	"github.com/rexzhao/simple-agent/model/httpstream"
 )
 
 // providerRetryBackoff is the delay before retry attempt n (1-based).

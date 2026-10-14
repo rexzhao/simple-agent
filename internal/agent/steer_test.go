@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // steerGatedProvider streams a final answer and then blocks on a gate,

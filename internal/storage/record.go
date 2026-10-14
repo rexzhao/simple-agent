@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // Record types. The set is closed: Fold ignores unknown types so a newer

@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // terminal is the output surface the live writer needs; *spinnerPrinter

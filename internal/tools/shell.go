@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // BuiltinShell is the shell tool name.

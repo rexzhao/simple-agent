@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
+// SSEMessage is one parsed server-sent-event frame.
 type SSEMessage struct {
 	Data string
 }
 
+// ParseSSE splits a raw SSE payload into its frames.
 func ParseSSE(data []byte) []SSEMessage {
 	normalized := strings.ReplaceAll(string(data), "\r\n", "\n")
 	normalized = strings.ReplaceAll(normalized, "\r", "\n")
@@ -40,10 +42,14 @@ func ParseSSE(data []byte) []SSEMessage {
 	return appendSSEMessage(messages, dataLines)
 }
 
+// EventsFromSSE decodes a complete SSE payload into streaming events.
+// The boolean reports whether the payload contained a done frame.
 func EventsFromSSE(data []byte) ([]model.Event, bool, error) {
 	return newStreamEventDecoder().EventsFromSSE(data)
 }
 
+// EventsFromChunk decodes one data frame into streaming events. The
+// boolean reports a done frame.
 func EventsFromChunk(data []byte) ([]model.Event, bool, error) {
 	return newStreamEventDecoder().eventsFromChunk(data)
 }

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // blockSummaryProvider answers the first N calls instantly and blocks

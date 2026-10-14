@@ -6,8 +6,8 @@ import (
 	"sync"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
-	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // NewModelResolver implements agent.ModelResolver over the loaded

@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 func TestParseSSEIgnoresEventAndCommentLines(t *testing.T) {

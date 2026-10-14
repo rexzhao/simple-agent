@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 const (

@@ -20,11 +20,11 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
-	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/storage"
 	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/internal/storage/memory"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // stagedProvider routes turns by the user input's content, so tests

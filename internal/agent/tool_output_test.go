@@ -8,7 +8,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 func TestLimitToolResultOutputLeavesSmallContentUnchanged(t *testing.T) {

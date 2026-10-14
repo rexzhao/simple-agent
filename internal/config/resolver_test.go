@@ -10,8 +10,8 @@ import (
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
-	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/storage"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // testConfigForResolver builds a minimal Config with one provider and

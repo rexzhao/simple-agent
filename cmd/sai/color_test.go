@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 func TestGrayGatedByColorEnabled(t *testing.T) {

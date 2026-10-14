@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/storage"
 	"github.com/rexzhao/simple-agent/internal/storage/jsonl"
 	"github.com/rexzhao/simple-agent/internal/storage/memory"
+	"github.com/rexzhao/simple-agent/model"
 )
 
 // testModel is the meta every test session records unless a test
