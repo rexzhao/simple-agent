@@ -135,7 +135,11 @@ independently verified layers, each with its own fixture:
 
 Note: `dist/` is manually built and gitignored — after pulling server
 or client changes, `npm run build` before (re)starting serve, or the
-page may be an older bundle than the binary expects. This is REQUIRED
+page may be an older bundle than the binary expects. The serve side
+sends `Cache-Control: no-cache` on the HTML entry (and every un-hashed
+file), so a rebuilt dist is picked up on the next reload — only the
+content-hashed `assets/` files are cached immutable. No forced refresh
+needed. This is REQUIRED
 after a digest-chain version bump (e.g. sai/v1/ → sai/v2/): the chain
 module is bundled into dist, so an un-rebuilt dist keeps folding with
 the old prefix and permanently shows ❌ drift (every server digest

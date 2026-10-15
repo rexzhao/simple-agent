@@ -118,7 +118,10 @@ clients/chat/      独立构建的 assistant-ui 聊天客户端（React+Vite，
   当前会话时复用进程内 session 对象，不重新 Open（双 Log 对象在同
   进程同样会损坏）
 - **零依赖**：SSE 是纯 HTTP；无 WebSocket 库、无前端框架、无构建
-  步骤。静态资源 go:embed 进二进制。
+  步骤。静态资源 go:embed 进二进制；两棵静态树（/log 与 /chat）都带
+  缓存策略：HTML 入口与不带内容哈希的文件 `Cache-Control: no-cache`
+  （每次重验证——升级二进制/重建 dist 后普通刷新即生效），Vite 的
+  `assets/`（文件名即内容哈希）`public, max-age=31536000, immutable`。
 - **单会话**：一个 server 进程一个会话（与 CLI 同构）。
   【已取代】多项目/多会话、路由前缀与装配见 `docs/multi-session.md`，
   以该文为准；本文的快照协议/摘要链/hub 语义仍然有效。

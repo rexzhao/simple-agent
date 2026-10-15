@@ -128,16 +128,25 @@ func New(manager *Manager, opts ...ServerOption) *Server {
 	}
 	// Exact + subtree patterns both point at the same handler: the
 	// subtree form is what serves nested assets, the exact form avoids
-	// a redirect hop for the bare path.
-	mux.Handle("/log/", http.StripPrefix("/log", http.FileServer(http.FS(page))))
-	mux.Handle("/log", http.StripPrefix("/log", http.FileServer(http.FS(page))))
-	chat := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// a redirect hop for the bare path. Both static trees go through
+	// cacheHeaders (see there): without it the plain FileServer sends
+	// no Cache-Control at all, and browsers heuristic-cache the HTML
+	// entry — a rebuilt dist keeps showing the old UI until a forced
+	// refresh.
+	mux.Handle("/log/", http.StripPrefix("/log", cacheHeaders(http.FileServer(http.FS(page)))))
+	mux.Handle("/log", http.StripPrefix("/log", cacheHeaders(http.FileServer(http.FS(page)))))
+	// The landing is an HTML entry too: without the no-cache header a
+	// binary upgrade would leave the browser on the old mount-point
+	// instructions — the same heuristic-cache hole as the dist's
+	// index.html (cacheHeaders only adds headers; the Content-Type
+	// set here stays).
+	chat := http.Handler(cacheHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Landing doubles as the mount-point instructions.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(chatLanding))
-	}))
+	})))
 	if s.opts.staticDir != "" {
-		chat = http.StripPrefix("/chat", http.FileServer(http.Dir(s.opts.staticDir)))
+		chat = http.StripPrefix("/chat", cacheHeaders(http.FileServer(http.Dir(s.opts.staticDir))))
 	}
 	mux.Handle("/chat/", chat)
 	mux.Handle("/chat", chat)
@@ -222,6 +231,27 @@ func isLoopbackHost(hostPort string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// cacheHeaders sets the static trees' caching policy. The Vite build
+// hashes its assets/ filenames (index-9uxWyZ9T.js — the content IS the
+// name), so those are immutable for a year: a new build changes the
+// name and the old cached entry is simply never referenced again.
+// Everything else — the HTML entries (a rebuilt dist must be picked
+// up on the next reload), the un-hashed /log files (app.js,
+// reducer.mjs — same file names across binary versions), and any
+// future SPA fallback — is no-cache: the browser may keep a copy but
+// revalidates every time. Runs INSIDE the mount's StripPrefix, so the
+// paths it sees are relative to the tree root.
+func cacheHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // guardAPI rejects cross-site requests. The write endpoints trigger
