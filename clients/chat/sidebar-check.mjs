@@ -13,8 +13,11 @@ import { join } from "node:path";
 
 const base = process.argv[2];
 const shots = process.argv[3];
-if (!base || !shots) {
-  console.error("sidebar_check: missing args (base-url shots-dir)");
+const projectA = process.argv[4];
+const projectB = process.argv[5];
+const projectC = process.argv[6];
+if (!base || !shots || !projectA || !projectB || !projectC) {
+  console.error("sidebar_check: missing args (base-url shots-dir projectA projectB projectC)");
   process.exit(2);
 }
 mkdirSync(shots, { recursive: true });
@@ -22,6 +25,33 @@ mkdirSync(shots, { recursive: true });
 const failures = [];
 function assert(cond, what) {
   if (!cond) failures.push(what);
+}
+
+// The API log ring: the tail is printed when a step fails — a
+// bare "--- FAIL (13.07s)" (opus's 1/8 first-run flake) diagnoses
+// nothing.
+const apiLog = [];
+function noteApi(line) {
+  apiLog.push(line);
+  if (apiLog.length > 30) apiLog.shift();
+  console.log("API: " + line);
+}
+
+// step wraps one numbered check: a failure records the step name,
+// takes a screenshot, and prints the API tail before rethrowing.
+let stepName = "(before step 1)";
+async function step(name, fn) {
+  stepName = name;
+  try {
+    await fn();
+  } catch (e) {
+    const failShot = join(shots, "FAIL-" + name.replace(/[^a-z0-9]+/gi, "-") + ".png");
+    await page.screenshot({ path: failShot }).catch(() => {});
+    console.error("STEP FAILED: " + name);
+    console.error("FAILURE SHOT: " + failShot);
+    console.error("API TAIL: " + (apiLog.join(" | ") || "(none)"));
+    throw e;
+  }
 }
 
 // expectSettled polls the server state until the run is done — the
@@ -57,19 +87,68 @@ page.on("console", m => {
   if (m.type() === "error") console.error("CONSOLE: " + m.text().slice(0, 300));
 });
 page.on("response", r => {
-  if (r.url().includes("/api/")) console.log("API: " + r.status() + " " + r.request().method() + " " + r.url().slice(-40));
+  if (r.url().includes("/api/")) noteApi(r.status() + " " + r.request().method() + " " + r.url().slice(-40));
 });
 
 // 1. The empty state: the landing redirects to /chat; nothing is
 // selected; the sidebar still carries the new-session entry.
 await page.goto(base + "/", { waitUntil: "networkidle" });
-const newBtn = page.getByRole("button", { name: "new session" });
+const newBtn = page.getByRole("button", { name: "new session", exact: true });
 assert((await newBtn.count()) === 1, "the sidebar's new-session button is missing");
 assert(await newBtn.isVisible(), "the new-session button is not visible");
 assert(await newBtn.isEnabled(), "the new-session button is disabled with no session selected");
-const navText = (await page.textContent("nav")) || "";
-assert(navText.includes("no sessions"), "the empty-list text is missing");
-await page.screenshot({ path: join(shots, "1-no-session.png") });
+// The tree: three project nodes; B's seeded session is B's CHILD;
+// C shows the per-project empty line.
+const nodeB = page.locator(`[data-project='${projectB}']`);
+const nodeC = page.locator(`[data-project='${projectC}']`);
+await nodeB.waitFor({ state: "visible", timeout: 10000 });
+// The project row's visible label is the BASENAME (a forward-slash-
+// only split once showed the full path on Windows — review's catch).
+const bLabel = await nodeB.locator("button").nth(1).textContent();
+// Derive the expected basename WITHOUT regex escapes (the same
+// forward-slash-only trap the app itself fell into): normalize both
+// separators, then take the last non-empty segment.
+const titleB = (await nodeB.locator("div").first().getAttribute("title")) || "";
+const segsB = titleB.split(String.fromCharCode(92)).join("/").split("/");
+const wantB = segsB.filter(seg => seg !== "").pop() || "";
+assert(
+  (bLabel || "").trim() === wantB,
+  "the project row shows " + JSON.stringify(bLabel) + ", want the basename " + JSON.stringify(wantB),
+);
+assert(
+  (await nodeB.locator("button", { hasText: "seeded session" }).count()) === 1,
+  "project B's session is not its tree child",
+);
+assert(
+  (await nodeC.textContent() || "").includes("no sessions"),
+  "the empty project lacks its no-sessions line",
+);
+await page.screenshot({ path: join(shots, "1-tree.png") });
+
+// Collapse: the toggle reads "collapse project" while open; clicking
+// it hides the children.
+await nodeB.getByRole("button", { name: "collapse project" }).first().click();
+await nodeB.locator("button", { hasText: "seeded session" }).waitFor({ state: "hidden", timeout: 5000 });
+await page.screenshot({ path: join(shots, "1b-collapsed.png") });
+// The collapse persists across a reload (localStorage).
+await page.reload({ waitUntil: "networkidle" });
+await page.locator(`[data-project='${projectB}']`).waitFor({ state: "visible", timeout: 10000 });
+assert(
+  (await page.locator(`[data-project='${projectB}'] button`, { hasText: "seeded session" }).count()) === 0,
+  "the collapsed state did not survive the reload",
+);
+await page.locator(`[data-project='${projectB}']`).getByRole("button", { name: "expand project" }).first().click();
+await page.locator(`[data-project='${projectB}'] button`, { hasText: "seeded session" }).waitFor({ state: "visible", timeout: 5000 });
+const nodeB2 = page.locator(`[data-project='${projectB}']`);
+
+// A session row's height does not change on hover (the archive and
+// delete buttons float inside, they must not stretch the row).
+const bRow = nodeB2.locator("button", { hasText: "seeded session" }).first();
+const before = (await bRow.boundingBox())?.height ?? 0;
+await bRow.hover();
+await page.waitForTimeout(200);
+const after = (await bRow.boundingBox())?.height ?? 0;
+assert(before === after, "the session row changed height on hover (" + before + " -> " + after + ")");
 
 // 2. Clicking it opens the dialog: project + model selects and the
 // Create button.
@@ -94,6 +173,16 @@ await dialog.getByRole("button", { name: "Create", exact: true }).click();
 // The composer enables as soon as the navigation lands; the budget
 // is 20s because under load the POST/render chain exceeds a tight
 // one (review reproduced 2/3 red under parallel load; 0/4 at 20s).
+// The DRAFT row: a created-but-never-messaged session is not in the
+// server listing (§17.8 e) — the client shows it locally, now
+// (C6a-fix2), before any message. The draft row lands in the SAME
+// React commit as the session selection — waiting for it first makes
+// the composer-enabled assertion race-free.
+const nodeA = page.locator(`[data-project='${projectA}']`);
+const draftRow = nodeA.locator("button", { hasText: "new session (draft)" });
+await draftRow.waitFor({ state: "visible", timeout: 20000 });
+assert((await draftRow.count()) === 1, "the draft row is missing or duplicated");
+await page.screenshot({ path: join(shots, "3b-draft-row.png") });
 const composer = page.getByRole("textbox", { name: "Message input" });
 await composer.waitFor({ state: "visible", timeout: 20000 });
 assert(await composer.isEnabled(), "the composer is still disabled after creating a session");
@@ -102,13 +191,20 @@ await composer.press("Enter");
 // The reply lands and the poll (5s) picks the materialized session
 // up. The row's title is the FIRST USER INPUT (the listing rule), so
 // wait for the sent text — not "untitled".
-const row = page.locator("nav button", { hasText: "hello" });
+const row = nodeA.locator("button", { hasText: "hello" });
 try {
   await row.waitFor({ state: "visible", timeout: 15000 });
 } catch (e) {
   await page.screenshot({ path: join(shots, "FAIL-step3.png") });
   throw e;
 }
+// The listing superseded the draft: no leftover draft row, and the
+// session appears exactly once.
+assert(
+  (await nodeA.locator("button", { hasText: "new session (draft)" }).count()) === 0,
+  "the draft row survived materialization",
+);
+assert((await row.count()) === 1, "the session row is duplicated after materialization");
 await page.waitForTimeout(500); // let the reply settle into the shot
 await page.screenshot({ path: join(shots, "3-session-created.png") });
 
@@ -174,7 +270,22 @@ const archivedRow = page.locator("nav button", { hasText: "hello" });
 await archivedRow.waitFor({ state: "visible", timeout: 5000 });
 await page.screenshot({ path: join(shots, "7-archived.png") });
 
-// 7. The deep-link probe: an unknown session id presents the hint and
+// 7. The per-project "+": hovering a project row reveals its own
+// new-session button, and the dialog opens with THAT project
+// preselected.
+const aLabel = nodeA.locator("div").first();
+await aLabel.hover();
+const aPlus = nodeA.getByRole("button", { name: "new session in" });
+await aPlus.waitFor({ state: "visible", timeout: 5000 });
+await aPlus.click();
+const presetDialog = page.getByRole("dialog");
+await presetDialog.waitFor({ state: "visible", timeout: 5000 });
+const presetValue = await presetDialog.locator("select").first().inputValue();
+assert(presetValue === projectA, "the per-project + did not preselect its project");
+await presetDialog.getByRole("button", { name: "Cancel" }).click();
+await presetDialog.waitFor({ state: "hidden", timeout: 5000 });
+
+// 8. The deep-link probe: an unknown session id presents the hint and
 // bounces to the list.
 await page.goto(base + "/#/s/s00000000000000000000000000", { waitUntil: "networkidle" });
 await page.waitForTimeout(500);
@@ -190,5 +301,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `sidebar_check: OK (button, dialog, create->live, approval card approve->resolved, delete-confirm cancel, archive section, deep-link hint; shots in ${shots})`,
+  `sidebar_check: OK (tree+collapse+empty-line, button, dialog, per-project + preselect, create->draft-row->live, approval card approve->resolved, delete-confirm cancel, archive subnode, deep-link hint; shots in ${shots})`,
 );

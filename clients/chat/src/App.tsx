@@ -22,7 +22,6 @@ import {
   archiveBlockedHint,
   deleteBlockedHint,
   opStep,
-  partitionSessions,
   stateProbeHint,
   type ModelDescriptor,
   type OpStep,
@@ -140,6 +139,50 @@ export default function App() {
   // ---- new-session dialog (C6a) ----
   const [newOpen, setNewOpen] = useState(false);
   const openNew = useCallback(() => setNewOpen(true), []);
+  // ---- local draft entries (C6a-fix2, design §17.2) ----
+  // A created-but-never-messaged session is NOT in the server listing
+  // (the §17.8-e trade-off) — the client shows it locally until the
+  // first message materializes it (the poll's row then supersedes the
+  // draft). In-memory only: a reload or an eviction loses it, exactly
+  // the accepted semantics.
+  const [drafts, setDrafts] = useState<{ id: string; project: string }[]>([]);
+  // ---- the sidebar tree (C6a-fix2) ----
+  // Collapsed projects persist in localStorage; the default is
+  // EXPANDED (discoverability first — a fresh serve shows everything,
+  // collapsing is opt-in).
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem("sai.collapsedProjects") || "[]"));
+    } catch {
+      return new Set();
+    }
+  });
+  const toggleProject = useCallback((id: string) => {
+    setCollapsed(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      try {
+        localStorage.setItem("sai.collapsedProjects", JSON.stringify([...next]));
+      } catch {
+        /* a full or blocked localStorage keeps the state in-memory */
+      }
+      return next;
+    });
+  }, []);
+  // Which project's archived subnode is expanded (per visit, not
+  // persisted — the archived tree is a detour, not a destination).
+  const [archivedOpenIn, setArchivedOpenIn] = useState<string | null>(null);
+  // The per-project "+" preselects its project in the dialog.
+  const [newPreset, setNewPreset] = useState<string | null>(null);
+  const openNewIn = useCallback((projectId: string) => {
+    setNewPreset(projectId);
+    setNewOpen(true);
+  }, []);
+  const onCreated = useCallback((id: string, project: string) => {
+    setDrafts(prev => (prev.some(d => d.id === id) ? prev : [...prev, { id, project }]));
+    setSessionID(id);
+  }, [setSessionID]);
   const currentProject = useMemo(() => {
     for (const p of projects?.projects || []) {
       if (p.sessions.some((sess) => sess.id === sessionID)) return p.id;
@@ -225,7 +268,6 @@ export default function App() {
   // session navigates away first (same detach-then-act shape as the
   // delete), the parked row reappears in the collapsed section when
   // the poll refreshes.
-  const [archivedOpen, setArchivedOpen] = useState(false);
   const [opHint, setOpHint] = useState("");
   const [opBusy, setOpBusy] = useState(false);
   const archive = useCallback(
@@ -291,29 +333,41 @@ export default function App() {
     store ? store.getSnapshot : () => null,
   );
 
-  const sessions = useMemo(() => {
-    const out: { id: string; title: string; project: string; path: string; archived: boolean }[] = [];
+  // The sidebar tree (C6a-fix2): project nodes with their session
+  // children. Draft rows ride inside their project until the listing
+  // takes over.
+  const projectNodes = useMemo(() => {
+    const nodes: {
+      id: string;
+      path: string;
+      live: { id: string; title: string; path: string }[];
+      archived: { id: string; title: string; path: string }[];
+      drafts: string[];
+    }[] = [];
     for (const p of projects?.projects || []) {
-      for (const s of p.sessions)
-        out.push({
+      const live: { id: string; title: string; path: string }[] = [];
+      const archived: { id: string; title: string; path: string }[] = [];
+      for (const s of p.sessions) {
+        (s.archived ? archived : live).push({
           id: s.id,
           title: s.title || "untitled",
-          project: p.id,
-          // The registered path (tail segment as the visible label,
-          // full path on the tooltip) — a project hash reads as noise.
           path: p.path,
-          archived: !!s.archived,
         });
+      }
+      const listed = new Set([...live, ...archived].map(s => s.id));
+      nodes.push({
+        id: p.id,
+        path: p.path,
+        live,
+        archived,
+          // The draft carries the project id straight from the dialog —
+        // no client-side path→id derivation (that hash is the
+        // server's business).
+        drafts: drafts.filter(d => d.project === p.id && !listed.has(d.id)).map(d => d.id),
+      });
     }
-    return out;
-  }, [projects]);
-  const { liveSessions, archivedSessions } = useMemo(
-    () => ({
-      liveSessions: partitionSessions(sessions).live,
-      archivedSessions: partitionSessions(sessions).archived,
-    }),
-    [sessions],
-  );
+    return nodes;
+  }, [projects, drafts]);
 
   const verified = snap ? snap.verified : null;
   const notice = snap ? snap.notice : "";
@@ -361,93 +415,139 @@ export default function App() {
                 </a>
               </span>
             </div>
-            <div className="flex flex-col gap-0.5 overflow-y-auto p-2">
-              {liveSessions.length === 0 && archivedSessions.length === 0 && (
-                <div className="text-muted-foreground px-3 py-4 text-sm">
-                  no sessions — create one from the "+" above
-                </div>
-              )}
-              {liveSessions.map(s => (
-                <div
-                  key={s.id}
-                  className={
-                    "group flex items-stretch gap-0.5 rounded-lg font-sans text-sm " +
-                    (s.id === sessionID ? "bg-accent text-accent-foreground" : "hover:bg-accent/50")
-                  }
-                  title={s.path}
-                >
-                  <button
-                    className={
-                      "flex min-w-0 flex-1 cursor-pointer flex-col gap-0.5 border-none bg-transparent px-3 py-2 text-left " +
-                      (s.id === sessionID
-                        ? "text-accent-foreground"
-                        : "bg-transparent")
-                    }
-                    onClick={() => setSessionID(s.id)}
-                  >
-                    <span className="truncate">{s.title}</span>
-                    <span className="text-muted-foreground truncate text-xs">
-                      {s.path.replace(/[\\/]$/, "").split(/[\\/]/).pop()}
-                    </span>
-                  </button>
-                  <span className="flex flex-col self-start pt-2 pr-1">
-                    <button
-                      className="text-muted-foreground hover:text-foreground invisible cursor-pointer border-none bg-transparent px-1 text-xs group-hover:visible"
-                      disabled={opBusy}
-                      onClick={e => {
-                        e.stopPropagation();
-                        archive(s.id);
-                      }}
-                      aria-label={`archive session ${s.title || "untitled"}`}
-                      title="park this session out of the working set"
+            <div className="flex flex-col gap-1 overflow-y-auto p-2">
+              {projectNodes.map(node => {
+                const open = !collapsed.has(node.id);
+                // basename: strip trailing separators, then the last
+                // path segment — BOTH separators, because a Windows
+                // path of only backslashes would survive a
+                // forward-slash-only split and show the full path.
+                const label = node.path.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+                return (
+                  <div key={node.id} data-project={node.id}>
+                    <div
+                      className="group flex h-10 items-center gap-1 rounded-lg px-2 hover:bg-accent/50"
+                      title={node.path}
                     >
-                      ⌄
-                    </button>
-                    <button
-                      className="text-muted-foreground hover:text-destructive invisible cursor-pointer border-none bg-transparent px-1 text-xs group-hover:visible"
-                      onClick={e => {
-                        e.stopPropagation();
-                        requestDelete(s.id, s.title);
-                      }}
-                      aria-label={`delete session ${s.title || "untitled"}`}
-                      title="delete this session"
-                    >
-                      ×
-                    </button>
-                  </span>
-                </div>
-              ))}
-              {archivedSessions.length > 0 && (
-                <div className="border-border mt-1 border-t pt-1">
-                  <button
-                    className="text-muted-foreground hover:text-foreground w-full cursor-pointer border-none bg-transparent px-3 py-1.5 text-left text-xs uppercase tracking-wider"
-                    onClick={() => setArchivedOpen(!archivedOpen)}
-                    aria-expanded={archivedOpen}
-                  >
-                    archived ({archivedSessions.length}) {archivedOpen ? "▾" : "▸"}
-                  </button>
-                  {archivedOpen &&
-                    archivedSessions.map(s => (
-                      <div
-                        key={s.id}
-                        className="group text-muted-foreground flex items-stretch gap-0.5 rounded-lg font-sans text-sm hover:bg-accent/50"
-                        title={s.path}
+                      <button
+                        className="text-muted-foreground hover:text-foreground flex h-full w-5 shrink-0 cursor-pointer items-center justify-center border-none bg-transparent text-xs"
+                        onClick={() => toggleProject(node.id)}
+                        aria-expanded={open}
+                        aria-label={open ? "collapse project " + label : "expand project " + label}
                       >
-                        <button
-                          className="flex min-w-0 flex-1 cursor-pointer flex-col gap-0.5 border-none bg-transparent px-3 py-2 text-left"
-                          disabled={opBusy}
-                          onClick={() => restore(s.id)}
-                          title="restore this session to the working set"
-                        >
-                          <span className="truncate">{s.title}</span>
-                          <span className="text-muted-foreground truncate text-xs">
-                            {s.path.replace(/[\\/]$/, "").split(/[\\/]/).pop()} · click to restore
-                          </span>
-                        </button>
+                        {open ? "▾" : "▸"}
+                      </button>
+                      <button
+                        className="text-foreground flex h-full min-w-0 flex-1 cursor-pointer items-center truncate border-none bg-transparent text-left text-sm font-medium"
+                        onClick={() => toggleProject(node.id)}
+                      >
+                        {label}
+                      </button>
+                      <button
+                        className="text-muted-foreground hover:text-foreground invisible h-6 w-6 shrink-0 cursor-pointer border-none bg-transparent text-base leading-none group-hover:visible"
+                        onClick={() => openNewIn(node.id)}
+                        aria-label={"new session in " + label}
+                        title={"new session in this project"}
+                      >
+                        +
+                      </button>
+                    </div>
+                    {open && (
+                      <div className="ml-3 flex flex-col gap-0.5 border-l border-border pl-1">
+                        {node.live.map(sess => (
+                          <div
+                            key={sess.id}
+                            className={
+                              "group flex h-8 items-center gap-0.5 rounded-md font-sans text-sm " +
+                              (sess.id === sessionID ? "bg-accent text-accent-foreground" : "hover:bg-accent/50")
+                            }
+                          >
+                            <button
+                              className="flex h-full min-w-0 flex-1 cursor-pointer items-center truncate border-none bg-transparent px-2 text-left"
+                              onClick={() => setSessionID(sess.id)}
+                              title={sess.title}
+                            >
+                              <span className="truncate">{sess.title}</span>
+                            </button>
+                            <span className="flex h-full items-center pr-1">
+                              <button
+                                className="text-muted-foreground hover:text-foreground invisible cursor-pointer border-none bg-transparent px-1 text-xs group-hover:visible"
+                                disabled={opBusy}
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  archive(sess.id);
+                                }}
+                                aria-label={"archive session " + sess.title}
+                                title="park this session out of the working set"
+                              >
+                                ⌄
+                              </button>
+                              <button
+                                className="text-muted-foreground hover:text-destructive invisible cursor-pointer border-none bg-transparent px-1 text-xs group-hover:visible"
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  requestDelete(sess.id, sess.title);
+                                }}
+                                aria-label={"delete session " + sess.title}
+                                title="delete this session"
+                              >
+                                ×
+                              </button>
+                            </span>
+                          </div>
+                        ))}
+                        {node.drafts.map(id => (
+                          <div
+                            key={id}
+                            className={
+                              "group flex h-8 items-center rounded-md font-sans text-sm " +
+                              (id === sessionID ? "bg-accent text-accent-foreground" : "hover:bg-accent/50")
+                            }
+                          >
+                            <button
+                              className="flex h-full min-w-0 flex-1 cursor-pointer items-center truncate border-none bg-transparent px-2 text-left"
+                              onClick={() => setSessionID(id)}
+                              title="created, not yet messaged — the listing takes over with the first message"
+                            >
+                              <span className="text-muted-foreground truncate italic">new session (draft)</span>
+                            </button>
+                          </div>
+                        ))}
+                        {node.live.length === 0 && node.drafts.length === 0 && (
+                          <div className="text-muted-foreground flex h-8 items-center px-2 text-sm">
+                            no sessions
+                          </div>
+                        )}
+                        {node.archived.length > 0 && (
+                          <div>
+                            <button
+                              className="text-muted-foreground hover:text-foreground flex h-7 w-full cursor-pointer items-center border-none bg-transparent px-2 text-left text-xs uppercase tracking-wider"
+                              onClick={() =>
+                                setArchivedOpenIn(archivedOpenIn === node.id ? null : node.id)
+                              }
+                              aria-expanded={archivedOpenIn === node.id}
+                            >
+                              archived ({node.archived.length}) {archivedOpenIn === node.id ? "▾" : "▸"}
+                            </button>
+                            {archivedOpenIn === node.id &&
+                              node.archived.map(sess => (
+                                <button
+                                  key={sess.id}
+                                  className="text-muted-foreground flex h-8 w-full cursor-pointer items-center truncate rounded-md border-none bg-transparent px-2 text-left font-sans text-sm hover:bg-accent/50"
+                                  disabled={opBusy}
+                                  onClick={() => restore(sess.id)}
+                                  title="restore this session to the working set"
+                                >
+                                  <span className="truncate">{sess.title} · click to restore</span>
+                                </button>
+                              ))}
+                          </div>
+                        )}
                       </div>
-                    ))}
-                </div>
-              )}
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </nav>
           <div className="relative flex min-w-0 flex-1 flex-col">
@@ -486,11 +586,14 @@ export default function App() {
         </div>
         <NewSessionDialog
           open={newOpen}
-          onClose={() => setNewOpen(false)}
+          onClose={() => {
+            setNewOpen(false);
+            setNewPreset(null);
+          }}
           projects={(projects?.projects ?? []).map((p) => ({ id: p.id, path: p.path }))}
           models={models ?? []}
-          currentProject={currentProject}
-          onCreated={setSessionID}
+          currentProject={newPreset ?? currentProject}
+          onCreated={onCreated}
         />
         <ConfirmDeleteDialog
           target={deleteTarget}

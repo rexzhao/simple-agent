@@ -33,7 +33,7 @@ export function NewSessionDialog({
   projects: { id: string; path: string }[];
   models: ModelDescriptor[];
   currentProject: string;
-  onCreated: (id: string) => void;
+  onCreated: (id: string, project: string) => void;
 }) {
   // Defaults re-derive each time the dialog OPENS: the projects poll
   // and the models fetch are outside this component's lifetime, and a
@@ -80,7 +80,7 @@ export function NewSessionDialog({
         model,
         reasoning_level: reasoning,
       });
-      onCreated(created.id);
+      onCreated(created.id, project);
       onClose();
     } catch (e) {
       const err =

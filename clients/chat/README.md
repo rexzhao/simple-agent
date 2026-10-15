@@ -100,6 +100,15 @@ list. The decision logic lives in `src/newsession.ts` and is pinned
 by `internal/web/testdata/newsession_check.mjs` (node fixture, driven
 by `TestNewSessionFixture`, 9 scenario blocks).
 
+The sidebar is a project → session tree (the user's layout request,
+C6a-fix2): project rows (directory basename, full path on hover,
+collapse arrow — state persists in localStorage, expanded by default)
+with their session children (single-line titles, ~1.5× line height,
+indented); each project row's hover reveals its own "+" which opens
+the dialog with THAT project preselected; the archived sessions live
+in a per-project collapsible subnode (hidden when empty); an empty
+project shows a dim "no sessions" line.
+
 Real-browser smoke (C6a-fix onward): `internal/web`'s
 TestSidebarUIFixture serves the BUILT dist through a live manager and
 drives it with headless Chromium (playwright — the client's
@@ -114,7 +123,11 @@ review/opus attachment for UI steps. The dist is rebuilt by the test
 when any source file is newer than the build. Without a selected
 session the composer stays DISABLED (a sessionless send has no
 address) — the placeholder points at the sidebar's +, which is the
-creation entry in that state.
+creation entry in that state. A created-but-never-messaged session
+appears in the sidebar immediately as a local draft row ("new session
+(draft)") — the server listing takes over with the first message (the
+§17.8-e trade-off: empty sessions are not listed); a reload or an
+eviction loses the draft, which is the accepted semantics.
 
 Known v1 gaps, on purpose: `context.compacted` / `session.created`
 records have no chat rendering (the `/log` view is the record-level

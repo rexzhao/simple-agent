@@ -63,12 +63,17 @@ func buildChatDistIfStale(t *testing.T, chatDir string) string {
 // newChatUIFixture builds a manager wired like the production serve
 // (jsonl store, registry with one project, ModelList for the create
 // validation) and serves the chat dist at /chat.
-func newChatUIFixture(t *testing.T, dist string) (*httptest.Server, string) {
+func newChatUIFixture(t *testing.T, dist string) chatUIWorld {
 	t.Helper()
 	root := t.TempDir()
-	projectDir := t.TempDir()
+	// Three projects: A carries the scripted flow; B arrives with a
+	// materialized session (tree/collapse assertions); C is empty
+	// (the per-project "no sessions" line).
+	dirA, dirB, dirC := t.TempDir(), t.TempDir(), t.TempDir()
 	if err := (&projects.Registry{Projects: []projects.Entry{
-		{Path: projectDir, Added: time.Now().UTC()},
+		{Path: dirA, Added: time.Now().UTC()},
+		{Path: dirB, Added: time.Now().UTC()},
+		{Path: dirC, Added: time.Now().UTC()},
 	}}).Save(projects.FilePath(root)); err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +81,7 @@ func newChatUIFixture(t *testing.T, dist string) (*httptest.Server, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	seedDiskSession(t, store, projects.ProjectID(dirB))
 	cfg := &config.Config{
 		DefaultProvider: "fake",
 		DefaultModel:    "fake-model",
@@ -138,7 +144,38 @@ func newChatUIFixture(t *testing.T, dist string) (*httptest.Server, string) {
 	server := New(manager, WithStaticDir(dist))
 	ts := httptest.NewServer(server.Handler())
 	t.Cleanup(func() { ts.Close(); server.Close() })
-	return ts, projects.ProjectID(projectDir)
+	return chatUIWorld{
+		base:     ts.URL,
+		projectA: projects.ProjectID(dirA),
+		projectB: projects.ProjectID(dirB),
+		projectC: projects.ProjectID(dirC),
+	}
+}
+
+// chatUIWorld names what the browser script needs to address.
+type chatUIWorld struct {
+	base                         string
+	projectA, projectB, projectC string
+}
+
+// seedDiskSession materializes one session directly on disk (the
+// listing's shape: session.created + a first user input for the
+// title) — the tree fixture's pre-existing row.
+func seedDiskSession(t *testing.T, store *jsonl.Store, ns string) {
+	t.Helper()
+	session, err := store.Create(ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := `{"item":"h` + strings.Repeat("0", 26) + `","t":"session.created","ts":"2026-01-02T03:04:05Z","provider":"fake","model":"fake-model"}` + "\n" +
+		`{"item":"u` + strings.Repeat("1", 26) + `","t":"user.input","ts":"2026-01-02T03:04:06Z","content":"seeded session"}` + "\n"
+	sessDir := filepath.Join(store.Root(), ns, session.ID())
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, "log.jsonl"), []byte(header), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // uiScriptedProvider: turn 1 a plain reply (materializes the
@@ -180,7 +217,7 @@ func TestSidebarUIFixture(t *testing.T) {
 	}
 	dist := buildChatDistIfStale(t, chatDir)
 
-	base, _ := newChatUIFixture(t, dist)
+	world := newChatUIFixture(t, dist)
 
 	shots, err := os.MkdirTemp("", "sai-ui-shots-")
 	if err != nil {
@@ -191,7 +228,7 @@ func TestSidebarUIFixture(t *testing.T) {
 	t.Logf("sidebar_check: shots dir %s", shots)
 
 	script := filepath.Join(chatDir, "sidebar-check.mjs")
-	cmd := exec.Command(node, script, base.URL, shots)
+	cmd := exec.Command(node, script, world.base, shots, world.projectA, world.projectB, world.projectC)
 	cmd.Dir = chatDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
