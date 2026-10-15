@@ -1,6 +1,7 @@
 package jsonl
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/storage"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 // TestSessionLockSecondOpenFails verifies the single-writer invariant: a
@@ -148,10 +150,57 @@ func TestReadLockHolderRetriesThroughWriteGap(t *testing.T) {
 	}()
 	start := time.Now()
 	holder := readLockHolder(path)
-	if holder != "pid 123\n" {
-		t.Fatalf("holder = %q, want the late-written content", holder)
+	if holder != "pid 123" {
+		t.Fatalf("holder = %q, want the late-written content (trimmed)", holder)
 	}
 	if elapsed := time.Since(start); elapsed < 15*time.Millisecond {
 		t.Fatalf("returned in %v without retrying through the write gap", elapsed)
+	}
+}
+
+// TestLockHeldHolderMessageNoNewline (C9a): the holder note is written
+// "pid %d" + LF; the loser's error message must not inherit that
+// line break — "(holder: pid N; may be stale)" is one line on a
+// terminal.
+func TestLockHeldHolderMessageNoNewline(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := testNS(t)
+	session, err := store.Create(ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, session, headerRecord("2026-10-10T01:00:00Z"))
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	external, err := OpenStore(store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := external.Open(ns, session.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	_, err = store.Open(ns, session.ID())
+	if err == nil {
+		t.Fatal("the locked session opened twice")
+	}
+	var lockErr *lockfile.LockHeldError
+	if !errors.As(err, &lockErr) {
+		t.Fatalf("err = %v, want LockHeldError", err)
+	}
+	msg := lockErr.Error()
+	if strings.ContainsAny(msg, "\n\r") {
+		t.Fatalf("the lock message leaks the holder note's line break: %q", msg)
+	}
+	if !strings.Contains(msg, "holder: pid ") {
+		t.Fatalf("the lock message lost the holder note: %q", msg)
 	}
 }

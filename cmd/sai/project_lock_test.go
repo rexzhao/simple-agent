@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/projects"
-	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 func TestProjectAddWaitsForRegistryLock(t *testing.T) {
@@ -39,7 +39,7 @@ func TestProjectAddWaitsForRegistryLock(t *testing.T) {
 	// While the lock is HELD (the test plays a concurrent serve's
 	// register), the add retries briefly, then refuses — it must NOT
 	// write under the holder.
-	lock, err := jsonl.AcquirePathLock(projects.LockPath(root))
+	lock, err := lockfile.AcquirePathLock(projects.LockPath(root))
 	if err != nil {
 		t.Fatal(err)
 	}

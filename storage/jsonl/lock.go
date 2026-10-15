@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 // fileLock is an OS-level exclusive lock on one session directory. Two
@@ -35,10 +38,10 @@ func lockSession(dir string) (*fileLock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open session lock: %w", err)
 	}
-	if err := lockFileExclusive(file); err != nil {
+	if err := lockfile.LockExclusive(file); err != nil {
 		file.Close()
 		holder := readLockHolder(filepath.Join(dir, "holder"))
-		return nil, &LockHeldError{Target: "session " + filepath.Base(dir), Holder: holder}
+		return nil, &lockfile.LockHeldError{Target: "session " + filepath.Base(dir), Holder: holder}
 	}
 	lock := &fileLock{file: file, holder: filepath.Join(dir, "holder")}
 	// Best-effort holder info for the next loser's error message.
@@ -67,7 +70,12 @@ func readLockHolder(path string) string {
 	deadline := time.Now().Add(100 * time.Millisecond)
 	for {
 		if data, err := os.ReadFile(path); err == nil {
-			holder := string(data)
+			// The note is written with a trailing newline
+			// ("pid %d" + LF; it must not leak into the error
+			// message — a "holder: pid 123" line break inside the
+			// "(holder: ...; may be stale)" tail is mojibake on a
+			// terminal).
+			holder := strings.TrimSpace(string(data))
 			if len(holder) > 200 {
 				holder = holder[:200]
 			}
@@ -80,51 +88,4 @@ func readLockHolder(path string) string {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-}
-
-// LockHeldError reports a session (or path) lock held by another process.
-// Callers classify it with errors.As — never by parsing the message. The
-// holder string is informational (a pid note for humans); mutual exclusion
-// never depends on it.
-type LockHeldError struct {
-	Target string
-	Holder string
-}
-
-func (e *LockHeldError) Error() string {
-	if e.Holder == "" {
-		return fmt.Sprintf("%s is locked by another process", e.Target)
-	}
-	return fmt.Sprintf("%s is locked by another process (holder: %s; may be stale)", e.Target, e.Holder)
-}
-
-// AcquirePathLock takes an exclusive OS lock on a dedicated file that is
-// never renamed or replaced — the serve-mode root lock (<serverRoot>/
-// serve.lock). Locking a file that atomic writers replace (rename) would
-// leave the lock stranded on the old inode while the path points at a new
-// one; dedicated files have no such lifecycle.
-func AcquirePathLock(path string) (*PathLock, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open lock file: %w", err)
-	}
-	if err := lockFileExclusive(file); err != nil {
-		file.Close()
-		return nil, &LockHeldError{Target: path}
-	}
-	return &PathLock{file: file}, nil
-}
-
-// PathLock is a held dedicated-file lock.
-type PathLock struct {
-	file *os.File
-}
-
-// Release drops the lock.
-func (p *PathLock) Release() {
-	if p == nil || p.file == nil {
-		return
-	}
-	p.file.Close()
-	p.file = nil
 }

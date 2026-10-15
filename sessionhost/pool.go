@@ -9,6 +9,7 @@ import (
 	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 // Typed errors. The HTTP layer maps each to a stable status + code
@@ -131,7 +132,7 @@ type Pool struct {
 	idle          time.Duration
 	sweepInterval time.Duration
 
-	rootLock *jsonl.PathLock
+	rootLock *lockfile.PathLock
 
 	mu       sync.Mutex
 	agents   map[string]*agent.Agent // projectID → agent (never evicted; bounded by registrations)
@@ -162,10 +163,10 @@ type poolEntry struct {
 
 // New acquires the root lock (a second pool on the same root fails
 // fast) and starts the sweeper. The caller owns triaging the lock
-// error (jsonl.LockHeldError distinguishes "another process holds
+// error (lockfile.LockHeldError distinguishes "another process holds
 // it").
 func New(opts Options) (*Pool, error) {
-	lock, err := jsonl.AcquirePathLock(opts.RootLockPath)
+	lock, err := lockfile.AcquirePathLock(opts.RootLockPath)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +334,7 @@ func (p *Pool) openSlow(id string) (*poolEntry, error) {
 
 	session, err := ag.OpenSession(ns, id)
 	if err != nil {
-		var held *jsonl.LockHeldError
+		var held *lockfile.LockHeldError
 		if errors.As(err, &held) {
 			// Held by another process (a CLI, most likely): not
 			// retryable from this serve — the page must not loop.
@@ -562,7 +563,7 @@ func (p *Pool) Delete(id string) error {
 		return fmt.Errorf("store cannot delete sessions")
 	}
 	if err := deleter.Delete(ns, id); err != nil {
-		var held *jsonl.LockHeldError
+		var held *lockfile.LockHeldError
 		switch {
 		case errors.As(err, &held):
 			return Coded(ErrLocked, held.Error())
@@ -651,7 +652,7 @@ func (p *Pool) Archive(id string) error {
 		return fmt.Errorf("store cannot archive sessions")
 	}
 	if err := archiver.Archive(ns, id); err != nil {
-		var held *jsonl.LockHeldError
+		var held *lockfile.LockHeldError
 		switch {
 		case errors.As(err, &held):
 			return Coded(ErrLocked, held.Error())
@@ -685,7 +686,7 @@ func (p *Pool) Unarchive(id string) error {
 		return fmt.Errorf("store cannot archive sessions")
 	}
 	if err := archiver.Unarchive(ns, id); err != nil {
-		var held *jsonl.LockHeldError
+		var held *lockfile.LockHeldError
 		switch {
 		case errors.As(err, &held):
 			return Coded(ErrLocked, held.Error())

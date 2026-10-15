@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 // Entry is one registered project. Path is stored canonicalized (what
@@ -90,14 +90,14 @@ func Mutate(serverRoot string, mutate func(*Registry) error) error {
 // contention: two concurrent registrations (or a CLI racing a serve)
 // resolve within the budget; a longer hold surfaces as
 // ErrRegistryLocked instead of blocking the caller forever.
-func acquireRegistryLock(path string) (*jsonl.PathLock, error) {
+func acquireRegistryLock(path string) (*lockfile.PathLock, error) {
 	deadline := time.Now().Add(lockRetryBudget)
 	for {
-		lock, err := jsonl.AcquirePathLock(path)
+		lock, err := lockfile.AcquirePathLock(path)
 		if err == nil {
 			return lock, nil
 		}
-		var held *jsonl.LockHeldError
+		var held *lockfile.LockHeldError
 		if !errors.As(err, &held) {
 			return nil, err
 		}

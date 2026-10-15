@@ -29,9 +29,11 @@ const (
 	reservedOutputMin    = 4 * 1024
 	reservedOutputMax    = 20 * 1024
 
-	// DefaultContextWindowTokens is the conservative window assumed when a
-	// model profile does not configure one.
-	DefaultContextWindowTokens = 32_000
+	// defaultContextWindowTokens is the conservative window assumed when
+	// a model profile does not configure one. Unexported on purpose
+	// (C9's §17.7 convergence): no host reads the fallback — a host
+	// that cares configures the window per model.
+	defaultContextWindowTokens = 32_000
 )
 
 // estimateRequestTokens estimates the input size of a request.
@@ -99,7 +101,7 @@ type contextBudget struct {
 // limit sits below the hard one by a bounded headroom.
 func resolveContextBudget(contextWindow, maxOutputTokens int) contextBudget {
 	if contextWindow <= 0 {
-		contextWindow = DefaultContextWindowTokens
+		contextWindow = defaultContextWindowTokens
 	}
 	reservedOutput := maxOutputTokens
 	if reservedOutput <= 0 {

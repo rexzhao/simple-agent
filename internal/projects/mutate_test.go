@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 func TestMutateWaitsForLockThenRefuses(t *testing.T) {
@@ -30,7 +30,7 @@ func TestMutateWaitsForLockThenRefuses(t *testing.T) {
 
 	// A held lock: bounded retry, then the typed refusal — never a
 	// write under the holder.
-	lock, err := jsonl.AcquirePathLock(LockPath(root))
+	lock, err := lockfile.AcquirePathLock(LockPath(root))
 	if err != nil {
 		t.Fatal(err)
 	}

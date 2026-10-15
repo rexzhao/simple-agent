@@ -1499,6 +1499,26 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
 - `sessionhost.Coded`/`Options.Locate` 的宿主语义：看 Create/Archive
   路径是否需要变更签名。
 
+**C9a 收敛结论（2026-10-15，逐项附调用点证据）**：
+- **`Send`/`Start`：都保留。** `Start` 的生产调用点：CLI 的 send
+  （cmd/sai/main.go，需要 Run 做 /stop）；`Send` 的生产调用点：web
+  的 POST /send（internal/web/server.go——fire-and-forget，不需要
+  Run 对象），另有 114 处测试调用。`Send` 是三行便利封装，方法注释
+  已写明"for callers that don't need the Run object"。
+- **`SnapshotStream`/`SnapshotStreamState`：都保留。** 前者的生产
+  调用点：CLI bind 的历史渲染（订阅后快照）；后者：hub 的每请求
+  快照帧（不订阅）。二者语义不同（订阅 vs 不订阅），注释已区分。
+- **`DefaultContextWindowTokens`：已内化**（agent/budget.go 改小写
+  `defaultContextWindowTokens`）——仓库内唯一使用点是 budget 的
+  回退逻辑；无任何宿主读取它，关心窗口的宿主应按模型配置覆盖。
+- **`sessionhost.Coded`/`Options.Locate` 的 projectPath：保留。**
+  `Coded` 是 web 错误码映射的载体（writePoolError 消费），签名无
+  变更需求；`Locate` 返回的 projectPath 由唯一的实现（web Manager）
+  传给 `AgentFor(projectCwd)`——池的 Options 面本就是宿主装配向的
+  （§15.3），把"项目路径"改名为更中性的"宿主上下文"只损失信息
+  （现在传递的确实是一个项目工作目录），不启用任何新形态。等出现
+  第二种宿主形状再议。
+
 ### 17.8 待用户拍板的问题（已全部裁定）
 
 **裁定（用户 2026-10-15，opus 转达）：以下五题全部按推荐方案。

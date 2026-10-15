@@ -1,7 +1,6 @@
 package jsonl
 
 import (
-	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/storage"
 )
 
@@ -543,26 +543,13 @@ func TestStoreDelete(t *testing.T) {
 	}
 }
 
-// testNS derives a valid namespace: the "p"+base32(sha256(path))
-// shape ValidNamespace accepts. The derivation proper lives in the
-// projects package — but projects now imports jsonl (the registry
-// file lock, §17.4), so this internal test cannot import it back
-// without a cycle. The same shape, encoded locally; uniqueness is
-// all the tests need (the store treats ns as opaque, §15.1).
+// testNS derives a valid namespace the way the host does (§15.1): the
+// projects package owns path→ns derivation. (The C8 detour — a local
+// base32 copy because projects imported jsonl for the registry lock —
+// is gone: the lock primitive lives in storage/lockfile now, and
+// projects no longer imports jsonl, so the import is cycle-free
+// again.)
 func testNS(t *testing.T) string {
 	t.Helper()
-	sum := sha256.Sum256([]byte(t.TempDir()))
-	ns := make([]byte, 0, 17)
-	ns = append(ns, 'p')
-	var buffer uint32
-	var bits uint
-	for _, b := range sum[:10] {
-		buffer = buffer<<8 | uint32(b)
-		bits += 8
-		for bits >= 5 {
-			bits -= 5
-			ns = append(ns, base32Alphabet[(buffer>>bits)&0x1f])
-		}
-	}
-	return string(ns)
+	return projects.ProjectID(t.TempDir())
 }

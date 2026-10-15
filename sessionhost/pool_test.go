@@ -19,6 +19,7 @@ import (
 	"github.com/rexzhao/simple-agent/model"
 	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 // testSessionMeta is the meta tests record in new sessions (the
@@ -764,7 +765,7 @@ func TestRootLockRejectsSecondPool(t *testing.T) {
 	if err == nil {
 		t.Fatal("second pool on the same root succeeded")
 	}
-	var held *jsonl.LockHeldError
+	var held *lockfile.LockHeldError
 	if !errors.As(err, &held) {
 		t.Fatalf("second pool error = %v, want a LockHeldError", err)
 	}

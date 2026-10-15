@@ -32,6 +32,7 @@ import (
 	"github.com/rexzhao/simple-agent/model"
 	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 	"github.com/rexzhao/simple-agent/tools"
 )
 
@@ -624,6 +625,13 @@ func (c *cliApp) resume(id string) error {
 		if errors.Is(err, storage.ErrSessionNotFound) {
 			return fmt.Errorf("session %s not found in this project — sessions can only be resumed from the project directory they belong to", id)
 		}
+		// The startup path (-session / the positional id) hits this
+		// without the listing pre-check /resume has: the archived
+		// refusal gets the same "unarchive first" hint (C9a, the C7
+		// carry-over).
+		if errors.Is(err, storage.ErrArchived) {
+			return fmt.Errorf("session %s is archived — /unarchive it first (start the CLI in this project's directory and run /unarchive %s)", id, id)
+		}
 		return err
 	}
 	return c.bind(session)
@@ -806,7 +814,7 @@ func (c *cliApp) resolveSessionArg(arg string, numberOverArchived bool) (storage
 
 // archiveOpError maps the Archiver's storage errors to CLI wording.
 func archiveOpError(err error) error {
-	var held *jsonl.LockHeldError
+	var held *lockfile.LockHeldError
 	if errors.As(err, &held) {
 		return fmt.Errorf("%s (is serve or another CLI running?)", held)
 	}

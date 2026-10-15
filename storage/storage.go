@@ -104,7 +104,7 @@ type Prober interface {
 // Unarchive acquire the SESSION's own OS lock (the same one Open
 // takes) and write/remove the marker inside it; an external holder
 // (e.g. a CLI mid-write) refuses with the implementation's lock error
-// (jsonl.LockHeldError) instead of mutating under an active writer.
+// (lockfile.LockHeldError) instead of mutating under an active writer.
 // No root lock is required: the CLI never builds a Pool and cannot
 // hold one. Both operations are IDEMPOTENT (an already-(un)archived
 // session is a no-op success). An archived session refuses to open

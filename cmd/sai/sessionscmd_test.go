@@ -17,6 +17,7 @@ import (
 	"github.com/rexzhao/simple-agent/agent"
 	"github.com/rexzhao/simple-agent/storage"
 	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 // newDeadAgent assembles the CLI's agent over the store (a dead-port
@@ -353,7 +354,7 @@ func commonPrefix(a, b string) string {
 // TestArchiveOpErrorMapping: the storage errors reach the user in CLI
 // wording.
 func TestArchiveOpErrorMapping(t *testing.T) {
-	held := &jsonl.LockHeldError{Target: "session s000…"}
+	held := &lockfile.LockHeldError{Target: "session s000…"}
 	if msg := archiveOpError(held).Error(); !strings.Contains(msg, "is locked by another process") ||
 		!strings.Contains(msg, "is serve or another CLI running") {
 		t.Fatalf("lock wording = %q", msg)

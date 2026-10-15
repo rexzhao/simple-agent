@@ -104,6 +104,10 @@ func newTestManagerServerInner(t *testing.T, provider model.Provider) (*agent.Se
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The test-side factory registry (see reducer_fixture_test.go):
+	// fixtures that mint extra agents reach the closure through here.
+	fixtureAgentForRegistry[manager] = factory
+	t.Cleanup(func() { delete(fixtureAgentForRegistry, manager) })
 	ag, err := factory(projectDir)
 	if err != nil {
 		t.Fatal(err)

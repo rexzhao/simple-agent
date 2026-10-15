@@ -16,7 +16,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/sessionhost"
 	"github.com/rexzhao/simple-agent/storage"
-	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 // Manager is the web host: the HTTP adapter over the session pool,
@@ -37,9 +37,6 @@ type Manager struct {
 	root  string
 	store storage.Store
 	pool  *sessionhost.Pool
-	// agentFactory is the CLI assembly (kept for test-side session
-	// creation — the pool consumes the same function).
-	agentFactory func(projectCwd string) (*agent.Agent, error)
 	// modelList backs GET /api/models (nil: not wired).
 	modelList agent.ModelResolver
 
@@ -103,11 +100,10 @@ type ManagerOptions struct {
 // once: a corrupt projects.json exits here, not per request.
 func NewManager(options ManagerOptions) (*Manager, error) {
 	m := &Manager{
-		root:         options.ServerRoot,
-		store:        options.Store,
-		agentFactory: options.AgentFor,
-		modelList:    options.ModelList,
-		hubs:         make(map[string]*Hub),
+		root:      options.ServerRoot,
+		store:     options.Store,
+		modelList: options.ModelList,
+		hubs:      make(map[string]*Hub),
 	}
 	pool, err := sessionhost.New(sessionhost.Options{
 		Store:         options.Store,
@@ -123,7 +119,7 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 		InUseGuard:    m.subscribed,
 	})
 	if err != nil {
-		var held *jsonl.LockHeldError
+		var held *lockfile.LockHeldError
 		if errors.As(err, &held) {
 			return nil, fmt.Errorf("another serve already holds %s", options.ServerRoot)
 		}

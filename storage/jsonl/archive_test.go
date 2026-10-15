@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/rexzhao/simple-agent/storage"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 // seedArchivable creates one materialized session and returns its id.
@@ -153,7 +154,7 @@ func TestArchiveRefusesExternalLock(t *testing.T) {
 	if err := store.Archive(project, id); err == nil {
 		t.Fatal("Archive under an external lock holder succeeded")
 	} else {
-		var lockErr *LockHeldError
+		var lockErr *lockfile.LockHeldError
 		if !errors.As(err, &lockErr) {
 			t.Fatalf("Archive under lock: err = %v, want LockHeldError", err)
 		}

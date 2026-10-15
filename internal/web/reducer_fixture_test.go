@@ -11,7 +11,24 @@ import (
 	"testing"
 
 	"github.com/rexzhao/simple-agent/model"
+
+	"github.com/rexzhao/simple-agent/agent"
 )
+
+// fixtureAgentFor is the TEST-SIDE registry of the fixtures' AgentFor
+// closures: the production Manager no longer retains one (the pool
+// consumed it at construction — C9a's convergence), and the fixtures
+// that mint extra agents look their own closure up here.
+var fixtureAgentForRegistry = map[*Manager]func(projectCwd string) (*agent.Agent, error){}
+
+func fixtureAgentFor(t *testing.T, m *Manager) func(projectCwd string) (*agent.Agent, error) {
+	t.Helper()
+	factory, ok := fixtureAgentForRegistry[m]
+	if !ok {
+		t.Fatal("no fixture factory registered for this manager")
+	}
+	return factory
+}
 
 // TestPageReducerFixture runs the page's actual state machine (the
 // reducer app.js consumes) against a live in-process server through the
@@ -91,7 +108,7 @@ func createSecondSession(t *testing.T, s *Server) string {
 	if len(entries) == 0 {
 		t.Fatal("no registered project for a second session")
 	}
-	ag, err := m.agentFactory(entries[0].Path)
+	ag, err := fixtureAgentFor(t, m)(entries[0].Path)
 	if err != nil {
 		t.Fatal(err)
 	}

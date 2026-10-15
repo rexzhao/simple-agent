@@ -22,6 +22,7 @@ agent/               state layer + agent loop (merges the old chatapp) — publi
 sessionhost/         the serve-mode session pool — public (B2, v0)
                      session owns State, commit is the only write path
 storage/            record schema + Fold() + Store/Session interfaces — public (B2, v0)
+  lockfile/          the OS-level exclusive file-lock primitive — public (C9, v0)
   jsonl/             file layout, ProjectID, torn-tail recovery
   memory/            in-memory map for tests and ephemeral sessions
 model/               provider adapters: openai_chat, openai_responses,

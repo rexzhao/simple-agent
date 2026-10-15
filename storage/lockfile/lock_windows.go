@@ -1,6 +1,6 @@
 //go:build windows
 
-package jsonl
+package lockfile
 
 import (
 	"fmt"
@@ -19,11 +19,11 @@ const (
 	lockfileFailImmediately = 0x0001
 )
 
-// lockFileExclusive takes a non-blocking exclusive byte-range lock via
+// LockExclusive takes a non-blocking exclusive byte-range lock via
 // LockFileEx. The lock lives on the file handle: it is released by
 // CloseHandle (and by process death, which is what makes crash recovery
 // automatic).
-func lockFileExclusive(file *os.File) error {
+func LockExclusive(file *os.File) error {
 	// Lock the whole file: offset 0, length max (0 wraps to the maximum
 	// range on NTFS).
 	var overlapped syscall.Overlapped

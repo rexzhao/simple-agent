@@ -182,3 +182,47 @@ func uniquePrefixOf(id string, others ...string) string {
 	}
 	return id
 }
+
+// TestCLIEntrypointArchivedSession (C9a, the C7 carry-over): the
+// startup id (-session / positional) hitting an ARCHIVED session gets
+// the "unarchive it first" hint instead of a raw storage error.
+func TestCLIEntrypointArchivedSession(t *testing.T) {
+	bin := buildSaiBinary(t)
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	writeFakeProviderConfig(t, root)
+
+	store, err := jsonl.OpenStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := projects.ProjectID(projectDir)
+	session, err := store.Create(ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := `{"item":"h` + strings.Repeat("0", 26) + `","t":"session.created","ts":"2026-01-02T03:04:05Z","provider":"fake","model":"fake-model"}` + "\n"
+	sessDir := filepath.Join(store.Root(), ns, session.ID())
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, "log.jsonl"), []byte(header), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Archive(ns, session.ID()); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-session", session.ID())
+	cmd.Dir = projectDir
+	cmd.Env = append(os.Environ(), "SAI_SERVER_ROOT="+root)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("startup on an archived session succeeded")
+	}
+	msg := stderr.String()
+	if !strings.Contains(msg, "is archived") || !strings.Contains(msg, "/unarchive") {
+		t.Fatalf("archived startup stderr = %q, want the unarchive hint", msg)
+	}
+}

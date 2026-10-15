@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/projects"
-	"github.com/rexzhao/simple-agent/storage/jsonl"
+	"github.com/rexzhao/simple-agent/storage/lockfile"
 )
 
 func registerPost(t *testing.T, base *httptest.Server, path string) (*http.Response, map[string]string) {
@@ -203,7 +203,7 @@ func TestRegistryLockedRefuses(t *testing.T) {
 	t.Cleanup(provider.release)
 	manager, _, base, _ := newJSONLTestServer(t, provider)
 
-	lock, err := jsonl.AcquirePathLock(projects.LockPath(manager.root))
+	lock, err := lockfile.AcquirePathLock(projects.LockPath(manager.root))
 	if err != nil {
 		t.Fatal(err)
 	}
