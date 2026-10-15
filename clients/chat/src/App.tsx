@@ -343,13 +343,23 @@ export default function App() {
           <nav className="bg-background border-border hidden w-64 shrink-0 flex-col border-r md:flex">
             <div className="text-muted-foreground border-border flex items-baseline justify-between border-b px-4 py-3 text-xs tracking-wider uppercase">
               sessions
-              <a
-                className="hover:text-foreground no-underline"
-                href="/log"
-                title="the record-level log view"
-              >
-                /log
-              </a>
+              <span className="flex items-center gap-2">
+                <button
+                  className="hover:text-foreground cursor-pointer border-none bg-transparent text-base leading-none"
+                  onClick={openNew}
+                  aria-label="new session"
+                  title="new session (also: type /new in the composer)"
+                >
+                  +
+                </button>
+                <a
+                  className="hover:text-foreground no-underline"
+                  href="/log"
+                  title="the record-level log view"
+                >
+                  /log
+                </a>
+              </span>
             </div>
             <div className="flex flex-col gap-0.5 overflow-y-auto p-2">
               {liveSessions.length === 0 && archivedSessions.length === 0 && (
@@ -463,7 +473,14 @@ export default function App() {
                   onHint={hint => setApprovalHint(hint)}
                 />
               )}
-              <Thread autoFocus />
+              <Thread
+                autoFocus
+                placeholder={
+                  sessionID
+                    ? undefined
+                    : "No session — create one with the + above, or type /new once it exists"
+                }
+              />
             </div>
           </div>
         </div>

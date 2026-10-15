@@ -100,6 +100,22 @@ list. The decision logic lives in `src/newsession.ts` and is pinned
 by `internal/web/testdata/newsession_check.mjs` (node fixture, driven
 by `TestNewSessionFixture`, 9 scenario blocks).
 
+Real-browser smoke (C6a-fix onward): `internal/web`'s
+TestSidebarUIFixture serves the BUILT dist through a live manager and
+drives it with headless Chromium (playwright — the client's
+devDependency, browsers from the playwright cache). It walks the whole
+session-management surface: the sidebar's new-session button (visible
+and enabled with nothing selected), the creation dialog (project +
+model selects), create → live session → first message → the sidebar
+row, the delete confirmation (cancel keeps the row), archive → the
+collapsed section, and the unknown-id deep-link hint. Screenshots land
+in a `sai-ui-shots-*` temp dir (logged by the test) — the
+review/opus attachment for UI steps. The dist is rebuilt by the test
+when any source file is newer than the build. Without a selected
+session the composer stays DISABLED (a sessionless send has no
+address) — the placeholder points at the sidebar's +, which is the
+creation entry in that state.
+
 Known v1 gaps, on purpose: `context.compacted` / `session.created`
 records have no chat rendering (the `/log` view is the record-level
 truth), anchored queue moves are no-ops (the server queue is FIFO by

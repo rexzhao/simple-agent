@@ -135,6 +135,10 @@ const taskAwareGroupBy = (
 export type ThreadProps = {
   components?: ThreadComponents | undefined;
   autoFocus?: boolean | undefined;
+  // The composer's placeholder. The app passes a no-session variant
+  // pointing at the sidebar's new-session button (the composer stays
+  // disabled without a session — see runtime's isDisabled).
+  placeholder?: string | undefined;
 };
 
 const EMPTY_COMPONENTS: ThreadComponents = {};
@@ -179,19 +183,21 @@ const ThreadHistorySkeleton: FC = () => (
 export const Thread: FC<ThreadProps> = ({
   components = EMPTY_COMPONENTS,
   autoFocus = true,
+  placeholder,
 }) => {
   const isEmpty = useAuiState(isNewChatView);
 
   return (
     <ThreadComponentsContext.Provider value={components}>
-      <ThreadRoot isEmpty={isEmpty} autoFocus={autoFocus} />
+      <ThreadRoot isEmpty={isEmpty} autoFocus={autoFocus} placeholder={placeholder} />
     </ThreadComponentsContext.Provider>
   );
 };
 
-const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
+const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean; placeholder?: string }> = ({
   isEmpty,
   autoFocus,
+  placeholder,
 }) => {
   const { Welcome = ThreadWelcome } = useContext(ThreadComponentsContext);
 
@@ -244,7 +250,7 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
           >
             <ThreadScrollToBottom />
             <ThreadFollowupSuggestions />
-            <Composer autoFocus={autoFocus} />
+            <Composer autoFocus={autoFocus} placeholder={placeholder} />
             <AuiIf condition={(s) => isNewChatView(s) && s.composer.isEmpty}>
               <ThreadSuggestions />
             </AuiIf>
@@ -465,7 +471,7 @@ const ThreadSuggestionItem: FC = () => {
   );
 };
 
-const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
+const Composer: FC<{ autoFocus: boolean; placeholder?: string }> = ({ autoFocus, placeholder }) => {
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
       {/* sai: queued steer items — mirrored from the session's queue
@@ -491,7 +497,7 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
         )}
       </ComposerPrimitive.Queue>
       <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-foreground/10 focus-within:border-foreground/25 data-[dragging=true]:border-ring flex w-full cursor-text flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) transition-[border-color] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))]" />}><ComposerAttachments /><ComposerPrimitive.Input
-                      placeholder="Send a message..."
+                      placeholder={placeholder ?? "Send a message..."}
                       className="aui-composer-input caret-primary placeholder:text-muted-foreground/60 max-h-48 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base leading-6 outline-none"
                       rows={1}
                       autoFocus={autoFocus}

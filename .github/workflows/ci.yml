@@ -28,7 +28,27 @@ jobs:
           cache-dependency-path: clients/chat/package-lock.json
       - name: Install chat client dependencies
         working-directory: clients/chat
+        # playwright's postinstall would download browsers here; the
+        # explicit step below owns that (cached, version-pinned).
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
         run: npm ci
+      # The real-browser UI fixture (TestSidebarUIFixture) is the UI
+      # steps' evidence layer — without the browser in CI it would be
+      # local-only coverage. Cached by the playwright version in the
+      # lockfile.
+      - name: Cache playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('clients/chat/package-lock.json') }}
+      - name: Install headless Chromium
+        working-directory: clients/chat
+        # --with-deps: playwright's own Ubuntu advice — apt-installs
+        # libnss3/libatk/libasound2 etc. so a slimmed runner image
+        # fails loudly HERE, not as a browser that will not start
+        # (opus ruling, p4v0ccfkwd).
+        run: npx playwright install --with-deps chromium
       # vite build does not typecheck, and node running .ts strips types
       # without checking them — the only real type gate is tsc.
       - name: Typecheck chat client

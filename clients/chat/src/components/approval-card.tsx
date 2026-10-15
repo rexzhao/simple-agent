@@ -57,7 +57,7 @@ export function ApprovalCard({
           : null;
 
   return (
-    <div className="border-border bg-muted/30 mx-auto mb-2 w-full max-w-2xl rounded-lg border p-3 text-sm">
+    <div data-testid="approval-card" className="border-border bg-muted/30 mx-auto mb-2 w-full max-w-2xl rounded-lg border p-3 text-sm">
       <div className="flex items-baseline justify-between gap-2">
         <span className="font-medium">
           tool approval{approval.name ? `: ${approval.name}` : ""}

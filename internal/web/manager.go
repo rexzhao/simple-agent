@@ -490,8 +490,16 @@ func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 	// Identity goes in BEFORE the listings: a failed listing then
 	// leaves a project with no sessions rather than an empty shell
 	// with no id (which the page could neither render nor debug).
+	// Sessions starts as an EMPTY ARRAY, not a nil slice: the wire
+	// contract says an array, and a null made the chat client's
+	// p.sessions.some(...) crash on projects with no sessions (the
+	// real-browser fixture's catch).
 	for i, entry := range entries {
-		body.Projects[i] = projectsProjectWire{ID: projects.ProjectID(entry.Path), Path: entry.Path}
+		body.Projects[i] = projectsProjectWire{
+			ID:       projects.ProjectID(entry.Path),
+			Path:     entry.Path,
+			Sessions: []projectsSessionWire{},
+		}
 	}
 	lister, canList := m.store.(storage.Lister)
 	// The all-listing is a separate optional capability: a store
