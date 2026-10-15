@@ -1546,23 +1546,36 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
 
 | 步骤 | 内容 | 回归保护 | 硬依赖（弱序见下行说明） | doc-sync |
 |---|---|---|---|---|
-| C1 | 标题问题：**先复现**（A 形态：真实压缩路径断言标题非空——实测预期绿）；绿则取用户磁盘形态（log-*.jsonl 清单）分流 B/C；**B 是规则冲突**——改规则需用户裁定（"撒谎比留空更糟"→"最早可读输入"）；C 另议或接受（**已落地：仅复现测试；规则不变**——用户裁定维持现有规则，不做阶段二，2026-10-15） | A/B/C 三形态各有独立断言的测试；现有 list 测试全过 | 无 | **若改规则**：multi-session.md 的 Title 规则（"绝不取中途输入"段）+ storage/jsonl/store.go 的 readSessionHead 注释 + storage/storage.go 的 SessionInfo.Title 文档契约（"empty when the session start is no longer on disk"句）三处同步 |
-| C2 | 共享校验函数 `ValidateSessionMeta`（B1 下沉）+ CLI /new 切换 + resolver level 校验测试 | CLI /new 既有测试不改断言；校验 kill（level 不校验→红） | 无 | design §17.2 |
-| C3 | `ModelDescriptor.Default` + `List()` 测试 + `GET /api/models` | List 顺序/默认标记 pin；端点过 guardAPI | （建议）C2 | multi-session 码表+路由 |
-| C4 | `sessionhost.Pool.Create` + `POST /api/projects/{pid}/sessions` | Create 校验 kill（非法 meta→400 码）；端点测试（unknown_project/model_unavailable/严格字段） | C2、C3 | 同上 |
-| C5 | `Archiver`（标记文件）+ SessionInfo.Archived + ListSessions 过滤 + `Pool.Archive` 互斥 | 归档/取消/IsArchived round-trip；打开归档→ErrArchived；运行中归档→ErrRunActive；列表默认过滤+--all | （建议）C1 | storage doc.go 契约；multi-session.md §4 码表（session_archived 409）+ 归档路由；**§15.5 前置条件补指针**（"C 阶段 0 修订：互斥机制见 §17.3"） |
-| C5w | web 归档端点（POST/DELETE /api/s/{id}/archive）+ 409 session_archived 映射 | 端点测试：归档/取消 round-trip、打开归档→409 码、锁竞争→session_locked | C5 | 同 C5 |
-| C6a | chat 新建对话框 + 删除二次确认 | 对话框提交→POST→导航；tsc | C3、C4 | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地）
-| C6b | chat 侧栏归档区（归档/恢复按钮 + 折叠区） | UI 消费 SessionInfo.Archived；tsc | C5、C5w | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地）
-| C6c | chat **审批卡**（若 (b) 通过） | UI 消费 tool_approval_pending/resolved + 快照 awaiting_approval；回答走 /approval；tsc | 无（wire 事件编码在本步补齐——B2 只落了 ToolWire.awaiting_approval 标志） | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md） |（已落地）
-| C7 | CLI：/sessions、/archive、/unarchive、/resume 序号+前缀+精确匹配收紧 | /resumefoo stderr 断言（B2 待办）；序号/前缀/歧义用例 | C5 | README |
-| C8 | web 项目注册/注销端点 + 注册表文件锁 + CLI project add 走锁 | 并发注册/注销测试；注销有打开会话→409；缓存自动失效验证 | C4 | multi-session |（已落地）
-| C9 | **公开 API 收敛**（17.7 清单，按 C 代码的实际用法） | 全部 C 测试不改断言通过 + 收敛项的调用方迁移 | C1–C8 | README API 面 |
+| C1 | 标题问题：**先复现**（A 形态：真实压缩路径断言标题非空——实测预期绿）；绿则取用户磁盘形态（log-*.jsonl 清单）分流 B/C；**B 是规则冲突**——改规则需用户裁定（"撒谎比留空更糟"→"最早可读输入"）；C 另议或接受（**已落地：仅复现测试；规则不变**——用户裁定维持现有规则，不做阶段二，2026-10-15；commit `4a39846`） | A/B/C 三形态各有独立断言的测试；现有 list 测试全过 | 无 | **若改规则**：multi-session.md 的 Title 规则（"绝不取中途输入"段）+ storage/jsonl/store.go 的 readSessionHead 注释 + storage/storage.go 的 SessionInfo.Title 文档契约（"empty when the session start is no longer on disk"句）三处同步 |
+| C2 | 共享校验函数 `ValidateSessionMeta`（B1 下沉）+ CLI /new 切换 + resolver level 校验测试 | CLI /new 既有测试不改断言；校验 kill（level 不校验→红） | 无 | design §17.2 |（已落地，commit `ca1eb33`） |
+| C3 | `ModelDescriptor.Default` + `List()` 测试 + `GET /api/models` | List 顺序/默认标记 pin；端点过 guardAPI | （建议）C2 | multi-session 码表+路由 |（已落地，commit `4f17303`） |
+| C4 | `sessionhost.Pool.Create` + `POST /api/projects/{pid}/sessions` | Create 校验 kill（非法 meta→400 码）；端点测试（unknown_project/model_unavailable/严格字段） | C2、C3 | 同上 |（已落地，commit `11508a0`） |
+| C5 | `Archiver`（标记文件）+ SessionInfo.Archived + ListSessions 过滤 + `Pool.Archive` 互斥 | 归档/取消/IsArchived round-trip；打开归档→ErrArchived；运行中归档→ErrRunActive；列表默认过滤+--all | （建议）C1 | storage doc.go 契约；multi-session.md §4 码表（session_archived 409）+ 归档路由；**§15.5 前置条件补指针**（"C 阶段 0 修订：互斥机制见 §17.3"） |（已落地，commit `6e8eb88`，含 C5w） |
+| C5w | web 归档端点（POST/DELETE /api/s/{id}/archive）+ 409 session_archived 映射 | 端点测试：归档/取消 round-trip、打开归档→409 码、锁竞争→session_locked | C5 | 同 C5 |（已落地，与 C5 同 commit `6e8eb88`） |
+| C6a | chat 新建对话框 + 删除二次确认 | 对话框提交→POST→导航；tsc | C3、C4 | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地，commit `b686438`）
+| C6b | chat 侧栏归档区（归档/恢复按钮 + 折叠区） | UI 消费 SessionInfo.Archived；tsc | C5、C5w | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地，commit `b227ee6`）
+| C6c | chat **审批卡**（若 (b) 通过） | UI 消费 tool_approval_pending/resolved + 快照 awaiting_approval；回答走 /approval；tsc | 无（wire 事件编码在本步补齐——B2 只落了 ToolWire.awaiting_approval 标志） | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md） |（已落地，commit `a836fa5`）
+| C7 | CLI：/sessions、/archive、/unarchive、/resume 序号+前缀+精确匹配收紧 | /resumefoo stderr 断言（B2 待办）；序号/前缀/歧义用例 | C5 | README |（已落地，commit `f1e0e43`） |
+| C8 | web 项目注册/注销端点 + 注册表文件锁 + CLI project add 走锁 | 并发注册/注销测试；注销有打开会话→409；缓存自动失效验证 | C4 | multi-session |（已落地，commit eb296c1；C8b 判定修正 17078cf）
+| C9 | **公开 API 收敛**（17.7 清单，按 C 代码的实际用法） | 全部 C 测试不改断言通过 + 收敛项的调用方迁移 | C1–C8 | README API 面 |（已落地：C9a 结构与 API 收敛 commit `3c984d9`；C9b 事件 wire 守卫 + 文档收尾本步） |
 
 硬依赖只有：C4→C2、C3；C5w→C5；C6a→C3、C4；C6b→C5、C5w；C7→C5；
 C8→C4；C9→C1–C8。其余顺序（如 C1 在 C5 前）只是建议（避开同文件
 编辑冲突）。后端（C1–C5、C5w、C8）先于前端（C6a/b/c）；CLI（C7）
 与 web（C6*）在 C5 后可并行。C9 收尾。
+
+### 17.9.1 遗留与未做（裁定记录，供后续参考）
+
+里程碑 C 结束时**经裁定不做**的项及原因：
+
+- **`/archive` 命中已归档会话的 "already archived" 措辞**——不做（opus，jgwfqzd5y1）：存储层幂等，结果正确；多一句措辞无收益。
+- **provider/model 单侧为空时 "/m" 形状的显示**——不做（opus，jgwfqzd5y1）：合法会话两者必有，空值只出现在异常记录上。
+- **删除对话框空标题 "untitled" 与 CLI（无标题）措辞统一**——不做（opus，jgwfqzd5y1）：两个界面各自一致即可。
+- **`sai <id>` / `-session` 接受序号**——不做（opus，ykheyugd15）：脚本与 -session 的稳定入口，不引入不稳定序号；完整 ID only（归档命中的提示已在 C9a 补上）。
+- **C1 标题规则变更（阶段二）**——不做（用户，p6ixoucavm）：维持现有规则（最早段缺失/损坏时留空，不取中途输入）。
+- **注销项目时"在途打开"窗口的消灭**——不做（设计 §17.4）：接受窗口（在途打开是合法旧世界请求，会话照常工作，驱逐后不可重开），文档写明而非消灭。
+- **`fixtureAgentForRegistry` 改结构体字段形态**——保持包级 var（review 认可，lu745aqfa0）：已是最简形态，改字段收益有限。
+- **chat 深链到 locked/archived 会话的进一步处理**——已做基础（C6b：提示 + 停留/回列表）；无进一步计划。
 
 ### 17.10 与既有设计的关系
 
