@@ -14,7 +14,7 @@ import (
 // such a session fails — the alternative (silently falling back to a
 // default model) would change the conversation's behavior without a
 // trace in the record.
-var ErrModelUnavailable = errors.New("the session's model is not available in the configuration")
+var ErrModelUnavailable = errors.New("the model is not available in the configuration")
 
 // Resolved is the per-session model configuration: what a SessionMeta
 // resolves to through a ModelResolver. The provider instance is shared
@@ -25,6 +25,11 @@ type Resolved struct {
 	ContextWindow int
 	OutputLimit   int
 	DeveloperRole model.MessageRole
+	// ReasoningLevels are the model's supported reasoning tiers.
+	// NIL means the resolver did not report them (ValidateSessionMeta
+	// skips the tier check); non-nil empty means the model takes no
+	// reasoning configuration (a non-empty level is rejected).
+	ReasoningLevels []string
 }
 
 // ModelResolver maps a session's recorded meta to its live model

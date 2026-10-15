@@ -106,7 +106,7 @@ func newCmdWorld(t *testing.T, defaultMeta storage.SessionMeta) (*cliApp, *newCm
 	if err != nil {
 		t.Fatal(err)
 	}
-	cli, err := setupCLI(ag, defaultMeta, newMetaValidator(cfg), "")
+	cli, err := setupCLI(ag, defaultMeta, newMetaValidator(resolver), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,8 +467,11 @@ models:
 	if !strings.Contains(badOut, "takes no reasoning levels") {
 		t.Fatalf("illegal /new lacks the user-facing message: %s", badOut)
 	}
-	if strings.Contains(badOut, "not available in the configuration") {
-		t.Fatalf("illegal /new surfaced the internal resolver text: %s", badOut)
+	// The shared contract (§17.2): the sentinel prefix names the
+	// failure class (the parameter-naming text is already asserted
+	// above).
+	if !strings.Contains(badOut, "the model is not available in the configuration") {
+		t.Fatalf("illegal /new lacks the shared sentinel prefix: %s", badOut)
 	}
 	dirsAfter, err := os.ReadDir(nsDir)
 	if err != nil {

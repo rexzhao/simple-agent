@@ -249,30 +249,15 @@ func assembleCurrentDir(serverRoot, providerName, modelName string) (*agent.Agen
 		return nil, "", storage.SessionMeta{}, nil, err
 	}
 	ag, project, err := factory.Agent(cwd)
-	return ag, project, factory.defaultMeta, newMetaValidator(factory.cfg), err
+	return ag, project, factory.defaultMeta, newMetaValidator(factory.resolver), err
 }
 
-// newMetaValidator builds the /new override check from the live
-// configuration. The user is CHOOSING a model here, so the messages
-// say which parameter is wrong and what the alternatives are (the
-// resolver's texts list them) — not the internal "not available"
-// phrasing of the open path.
-func newMetaValidator(cfg *config.Config) func(storage.SessionMeta) error {
+// newMetaValidator builds the /new override check: the SHARED
+// ValidateSessionMeta (§17.2 — agent package, ModelResolver input) so
+// the CLI and the web create path give identical answers.
+func newMetaValidator(resolver agent.ModelResolver) func(storage.SessionMeta) error {
 	return func(meta storage.SessionMeta) error {
-		resolved, err := cfg.ResolveModel(meta.Provider, meta.Model)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(meta.ReasoningLevel) == "" {
-			return nil
-		}
-		if len(resolved.ReasoningConfig.Levels) == 0 {
-			return fmt.Errorf("model %q takes no reasoning levels (drop -reasoning)", meta.Model)
-		}
-		if _, err := config.ApplyReasoningLevel(resolved.Parameters, resolved.ReasoningConfig, meta.ReasoningLevel); err != nil {
-			return fmt.Errorf("-reasoning: %v", err)
-		}
-		return nil
+		return agent.ValidateSessionMeta(resolver, meta)
 	}
 }
 

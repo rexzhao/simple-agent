@@ -58,11 +58,12 @@ func (r *configResolver) Resolve(meta storage.SessionMeta) (agent.Resolved, erro
 		developerRole = model.MessageRole(resolved.DeveloperRole)
 	}
 	return agent.Resolved{
-		Provider:      r.providerFor(resolved),
-		Parameters:    parameters,
-		ContextWindow: resolved.ContextWindow,
-		OutputLimit:   resolved.OutputLimit,
-		DeveloperRole: developerRole,
+		Provider:        r.providerFor(resolved),
+		Parameters:      parameters,
+		ContextWindow:   resolved.ContextWindow,
+		OutputLimit:     resolved.OutputLimit,
+		DeveloperRole:   developerRole,
+		ReasoningLevels: reasoningLevelNames(resolved.ReasoningConfig),
 	}, nil
 }
 
