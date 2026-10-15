@@ -271,28 +271,37 @@ func TestApprovalCancel(t *testing.T) {
 }
 
 // TestApprovalDoubleResolve: the second answer gets
-// ErrApprovalResolved (distinct from unknown).
+// ErrApprovalResolved (distinct from unknown). The pending entry is
+// set directly (in-package) instead of through awaitApproval — the
+// old form raced the waiter's drain under -race -cpu=2 (the waiter
+// occasionally consumed the first decision and cleared the entry
+// between the two resolves, turning the second into the correct
+// ErrApprovalUnknown — but that is not what this test pins). Setting
+// the entry directly makes the two resolves purely sequential state
+// transitions with no concurrent consumer.
 func TestApprovalDoubleResolve(t *testing.T) {
 	session, _ := approvalTestWorld(t)
 	itemID, call := openToolSlot(session)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan approvalDecision, 1)
-	go func() {
-		d, _ := session.awaitApproval(ctx, call, itemID)
-		done <- d
-	}()
-	waitForFlag(t, session, itemID)
+	// Install the pending ENTRY without starting a waiter — the same
+	// pending-ENTRY shape awaitApproval's flag section produces
+	// (itemID, call, buffered(1) decision channel). Note: the flag
+	// section ALSO sets Running.AwaitingApproval and emits the Pending
+	// event; the double-resolve semantics tested here depend only on
+	// the pending entry itself.
+	session.mu.Lock()
+	session.pendingApproval = &pendingApproval{
+		itemID:   itemID,
+		call:     call,
+		decision: make(chan approvalDecision, 1),
+	}
+	session.mu.Unlock()
 
 	if err := session.ResolveApproval(itemID, true, ""); err != nil {
 		t.Fatal(err)
 	}
-	// Before the waiter drains, a second resolve is "already answered".
 	if err := session.ResolveApproval(itemID, false, "second"); !errors.Is(err, ErrApprovalResolved) {
 		t.Fatalf("double resolve: %v, want ErrApprovalResolved", err)
 	}
-	<-done
 }
 
 // TestApprovalUnknownItem: resolving a nonexistent item gets
