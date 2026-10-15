@@ -255,20 +255,21 @@ func TestStreamingSlotVisibleWhileGenerating(t *testing.T) {
 	}
 	// Wait until the run is mid-stream: the streaming slot holds the
 	// partial message, identity included, before anything is committed.
+	// The slot appears BEFORE the first delta is applied (the item is
+	// minted, the content is still empty) — keep polling until the
+	// delta lands, then assert. A single-shot check on `Streaming !=
+	// nil` reads the empty window and flaked (~4/11000).
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		snapshot := session.Snapshot()
-		if snapshot.Streaming != nil {
-			if snapshot.Streaming.Message.Content != "partial" {
-				t.Fatalf("streaming content = %q, want partial", snapshot.Streaming.Message.Content)
-			}
+		if snapshot.Streaming != nil && snapshot.Streaming.Message.Content == "partial" {
 			if snapshot.Streaming.ItemID == "" {
 				t.Fatal("streaming item id is empty")
 			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("streaming slot never appeared")
+			t.Fatal("streaming slot never appeared (or the partial content never landed)")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
