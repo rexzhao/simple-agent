@@ -59,43 +59,52 @@ func registryPath() string {
 }
 
 func projectAdd(path string) int {
-	registry, err := projects.Load(registryPath())
+	canonical := projects.Canonical(path)
+	added := false
+	// The locked read-modify-write (§17.4): the CLI races a running
+	// serve's register endpoint on the same file — the registry lock
+	// serializes them, and the in-lock Load keeps corrupt-refusal and
+	// duplicate-detection decisions on the CURRENT document.
+	err := projects.Mutate(resolvedServerRoot, func(registry *projects.Registry) error {
+		if _, exists := registry.Lookup(canonical); exists {
+			return nil // idempotent
+		}
+		registry.Projects = append(registry.Projects, projects.Entry{
+			Path:  canonical,
+			Added: time.Now().UTC(),
+		})
+		added = true
+		return nil
+	})
 	if err != nil {
 		// A corrupt registry must refuse the write: read-modify-rename
 		// over it would silently drop every other project.
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		return 1
 	}
-	canonical := projects.Canonical(path)
-	if _, exists := registry.Lookup(canonical); exists {
+	if !added {
 		fmt.Fprintf(os.Stderr, "sai: already registered: %s\n", canonical)
 		return 0
-	}
-	registry.Projects = append(registry.Projects, projects.Entry{
-		Path:  canonical,
-		Added: time.Now().UTC(),
-	})
-	if err := registry.Save(registryPath()); err != nil {
-		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
-		return 1
 	}
 	fmt.Fprintf(os.Stderr, "sai: registered %s (%s)\n", canonical, projects.ProjectID(canonical))
 	return 0
 }
 
 func projectRemove(path string) int {
-	registry, err := projects.Load(registryPath())
+	canonical := projects.Canonical(path)
+	removed := false
+	err := projects.Mutate(resolvedServerRoot, func(registry *projects.Registry) error {
+		if registry.Remove(canonical) > 0 {
+			removed = true
+		}
+		return nil
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		return 1
 	}
-	canonical := projects.Canonical(path)
-	if registry.Remove(canonical) == 0 {
+	if !removed {
 		fmt.Fprintf(os.Stderr, "sai: not registered: %s\n", canonical)
-		return 1
-	}
-	if err := registry.Save(registryPath()); err != nil {
-		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(os.Stderr, "sai: unregistered %s\n", canonical)

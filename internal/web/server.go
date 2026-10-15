@@ -157,6 +157,8 @@ func New(manager *Manager, opts ...ServerOption) *Server {
 	mux.HandleFunc("POST /api/s/{id}/approval", s.handleApproval)
 	mux.HandleFunc("GET /api/models", s.handleModels)
 	mux.HandleFunc("POST /api/projects/{pid}/sessions", s.handleCreateSession)
+	mux.HandleFunc("POST /api/projects", manager.RegisterProjectHandler)
+	mux.HandleFunc("DELETE /api/projects/{pid}", manager.UnregisterProjectHandler)
 	// Unmatched /api paths answer with a JSON 404, never the page
 	// redirect: API consumers must not be sent wandering (a 3xx on an
 	// unknown route reads as "route exists" to a naive client).

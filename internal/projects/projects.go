@@ -19,6 +19,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/rexzhao/simple-agent/storage/jsonl"
 )
 
 // Entry is one registered project. Path is stored canonicalized (what
@@ -39,6 +41,71 @@ type Registry struct {
 // FilePath returns the registry location for a server root.
 func FilePath(serverRoot string) string {
 	return filepath.Join(serverRoot, "projects.json")
+}
+
+// LockPath returns the registry's dedicated lock file: the same
+// AcquirePathLock primitive the session store uses, one file per
+// server root, so the CLI's `project add` and a running serve's
+// register/unregister serialize on the same object (§17.4).
+func LockPath(serverRoot string) string {
+	return FilePath(serverRoot) + ".lock"
+}
+
+// ErrRegistryLocked: the registry file lock stayed held by another
+// writer through Mutate's bounded retry — a transient, retryable
+// state.
+var ErrRegistryLocked = errors.New("registry locked by another writer")
+
+// The lock retry: short and bounded (§17.4) — 2ms steps within a
+// 100ms budget, ~50 attempts.
+const (
+	lockRetryBudget = 100 * time.Millisecond
+	lockRetryStep   = 2 * time.Millisecond
+)
+
+// Mutate performs one locked read-modify-write on the registry: it
+// takes the registry file lock (a bounded retry on contention, then
+// ErrRegistryLocked), loads the CURRENT document (not a caller-held
+// snapshot — the lock is what makes the read authoritative), hands it
+// to mutate, and saves the result (temp file + rename) before
+// releasing. Both the CLI's project add/remove and the serve's
+// register/unregister endpoints go through here.
+func Mutate(serverRoot string, mutate func(*Registry) error) error {
+	lock, err := acquireRegistryLock(LockPath(serverRoot))
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	registry, err := Load(FilePath(serverRoot))
+	if err != nil {
+		return err
+	}
+	if err := mutate(registry); err != nil {
+		return err
+	}
+	return registry.Save(FilePath(serverRoot))
+}
+
+// acquireRegistryLock takes the registry lock, retrying briefly on
+// contention: two concurrent registrations (or a CLI racing a serve)
+// resolve within the budget; a longer hold surfaces as
+// ErrRegistryLocked instead of blocking the caller forever.
+func acquireRegistryLock(path string) (*jsonl.PathLock, error) {
+	deadline := time.Now().Add(lockRetryBudget)
+	for {
+		lock, err := jsonl.AcquirePathLock(path)
+		if err == nil {
+			return lock, nil
+		}
+		var held *jsonl.LockHeldError
+		if !errors.As(err, &held) {
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			return nil, ErrRegistryLocked
+		}
+		time.Sleep(lockRetryStep)
+	}
 }
 
 // Canonical normalizes a path the same way ProjectID does before hashing

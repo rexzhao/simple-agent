@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -371,6 +372,77 @@ func (m *Manager) registryEntries() ([]projects.Entry, error) {
 	return m.regEntries, nil
 }
 
+// ErrInvalidPath: the register endpoint's path check failed — the
+// path does not exist or is not a directory.
+var ErrInvalidPath = errors.New("path is not an existing directory")
+
+// RegisterProject adds a project to the registry (§17.4): the path is
+// canonicalized (the same Canonical ProjectID hashes — a second
+// spelling of a registered path is the SAME project, not a second
+// one), must exist as a directory, and the write goes through the
+// registry file lock so a concurrent CLI add or serve register
+// serializes instead of last-writer-wins. The second return reports
+// whether the call CREATED the entry (false = it was already there —
+// the idempotent 200).
+func (m *Manager) RegisterProject(path string) (projects.Entry, bool, error) {
+	canonical := projects.Canonical(path)
+	if info, err := os.Stat(canonical); err != nil || !info.IsDir() {
+		return projects.Entry{}, false, ErrInvalidPath
+	}
+	created := false
+	var entry projects.Entry
+	err := projects.Mutate(m.root, func(registry *projects.Registry) error {
+		if existing, exists := registry.Lookup(canonical); exists {
+			entry = existing
+			return nil
+		}
+		entry = projects.Entry{Path: canonical, Added: time.Now().UTC()}
+		registry.Projects = append(registry.Projects, entry)
+		created = true
+		return nil
+	})
+	if err != nil {
+		return projects.Entry{}, false, err
+	}
+	return entry, created, nil
+}
+
+// UnregisterProject removes a project from the registry (§17.4). The
+// open-session check happens BEFORE the write: a snapshot now plus
+// the Locate gate (which reads the registry AFTER the write) refusing
+// later opens is the accepted narrowing — an open already in flight
+// when the write lands is a legitimate old-world request (the session
+// keeps working; after eviction it cannot reopen). Disk sessions are
+// NOT deleted (the user's ruling: unregistering keeps the data).
+func (m *Manager) UnregisterProject(pid string) error {
+	entries, err := m.registryEntries()
+	if err != nil {
+		return err
+	}
+	var target projects.Entry
+	found := false
+	for _, entry := range entries {
+		if projects.ProjectID(entry.Path) == pid {
+			target = entry
+			found = true
+			break
+		}
+	}
+	if !found {
+		return sessionhost.ErrNotFound
+	}
+	// Open sessions of THIS project refuse the unregister.
+	for _, id := range m.pool.OpenIDs() {
+		if ns, _, locErr := m.locate(id); locErr == nil && ns == pid {
+			return sessionhost.ErrInUse
+		}
+	}
+	return projects.Mutate(m.root, func(registry *projects.Registry) error {
+		registry.Remove(target.Path)
+		return nil
+	})
+}
+
 // projectsSessionWire and projectsProjectWire are the /api/projects DTOs.
 type projectsSessionWire struct {
 	ID       string    `json:"id"`
@@ -572,6 +644,79 @@ func (m *Manager) DeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := m.pool.Delete(id); err != nil {
 		writePoolError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// RegisterProjectHandler serves POST /api/projects (§17.4): a
+// strict {path} body, the path checks, and the locked write. 201 when
+// the entry was created, 200 when it was already registered (the
+// idempotent re-register).
+func (m *Manager) RegisterProjectHandler(w http.ResponseWriter, r *http.Request) {
+	if !guardAPI(w, r, true) {
+		return
+	}
+	var body struct {
+		Path string `json:"path"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		// The C4-v4 contract: unknown JSON keys are unexpected_field,
+		// everything else (malformed JSON, type errors) invalid_input —
+		// the stdlib reports unknown keys as 'json: unknown field "x"'
+		// with no dedicated type, so the prefix is the discriminator.
+		code := "invalid_input"
+		if strings.HasPrefix(err.Error(), "json: unknown field ") {
+			code = "unexpected_field"
+		}
+		writeAPIError(w, http.StatusBadRequest, &apiError{code: code, cause: err})
+		return
+	}
+	if strings.TrimSpace(body.Path) == "" {
+		writeAPIError(w, http.StatusBadRequest, &apiError{code: "invalid_input", cause: errors.New("path is required")})
+		return
+	}
+	entry, created, err := m.RegisterProject(body.Path)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidPath):
+			writeAPIError(w, http.StatusBadRequest, &apiError{code: "invalid_path", cause: err})
+		case errors.Is(err, projects.ErrRegistryLocked):
+			writeAPIError(w, http.StatusConflict, &apiError{code: "registry_locked", cause: err})
+		default:
+			writeAPIError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, map[string]string{
+		"id":   projects.ProjectID(entry.Path),
+		"path": entry.Path,
+	})
+}
+
+// UnregisterProjectHandler serves DELETE /api/projects/{pid} (§17.4).
+func (m *Manager) UnregisterProjectHandler(w http.ResponseWriter, r *http.Request) {
+	if !guardAPI(w, r, true) {
+		return
+	}
+	pid := r.PathValue("pid")
+	if err := m.UnregisterProject(pid); err != nil {
+		switch {
+		case errors.Is(err, sessionhost.ErrNotFound):
+			writeAPIError(w, http.StatusNotFound, &apiError{code: "unknown_project", cause: err})
+		case errors.Is(err, sessionhost.ErrInUse):
+			writeAPIError(w, http.StatusConflict, &apiError{code: "project_in_use", cause: err})
+		case errors.Is(err, projects.ErrRegistryLocked):
+			writeAPIError(w, http.StatusConflict, &apiError{code: "registry_locked", cause: err})
+		default:
+			writeAPIError(w, http.StatusInternalServerError, err)
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

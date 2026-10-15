@@ -6,7 +6,9 @@ package main
 
 import (
 	"strings"
+	"time"
 
+	"bytes"
 	"encoding/json"
 	"github.com/rexzhao/simple-agent/internal/projects"
 	"net/http"
@@ -168,5 +170,125 @@ models:
 	stateResp.Body.Close()
 	if stateResp.StatusCode != http.StatusOK {
 		t.Fatalf("state on the created session: %d, want 200", stateResp.StatusCode)
+	}
+}
+
+// TestServeManagerProjectRegistry drives the register/unregister
+// endpoints through the real serve assembly (the C8 seam test): the
+// CLI-facing surface a scripts user gets.
+func TestServeManagerProjectRegistry(t *testing.T) {
+	root := t.TempDir()
+	projectDir := t.TempDir()
+	writeServeConfig(t, root)
+	factory, err := assembleFactory(root, "fake", "fake-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := newServeManager(factory, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.Close() })
+	server := web.New(manager)
+	ts := httptest.NewServer(server.Handler())
+	t.Cleanup(func() { ts.Close(); server.Close() })
+
+	// Register through the endpoint.
+	pathBody, _ := json.Marshal(map[string]string{"path": projectDir})
+	resp, err := http.Post(ts.URL+"/api/projects", "application/json", bytes.NewReader(pathBody)) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]string
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || body["id"] != projects.ProjectID(projectDir) {
+		t.Fatalf("register: %d %v", resp.StatusCode, body)
+	}
+
+	// The listing carries it.
+	found := false
+	deadline := time.Now().Add(4 * time.Second)
+	for !found && time.Now().Before(deadline) {
+		listResp, err := http.Get(ts.URL + "/api/projects") //nolint:noctx // test
+		if err != nil {
+			t.Fatal(err)
+		}
+		var listBody struct {
+			Projects []struct {
+				ID string `json:"id"`
+			} `json:"projects"`
+		}
+		_ = json.NewDecoder(listResp.Body).Decode(&listBody)
+		listResp.Body.Close()
+		for _, p := range listBody.Projects {
+			if p.ID == projects.ProjectID(projectDir) {
+				found = true
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !found {
+		t.Fatal("the registered project never appeared in /api/projects")
+	}
+
+	// Unregister: 200, then the listing drops it.
+	req, _ := http.NewRequest("DELETE", ts.URL+"/api/projects/"+projects.ProjectID(projectDir), nil) //nolint:noctx // test
+	delResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delResp.Body.Close()
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("unregister: %d", delResp.StatusCode)
+	}
+	gone := false
+	deadline = time.Now().Add(4 * time.Second)
+	for !gone && time.Now().Before(deadline) {
+		listResp, err := http.Get(ts.URL + "/api/projects") //nolint:noctx // test
+		if err != nil {
+			t.Fatal(err)
+		}
+		var listBody struct {
+			Projects []struct {
+				ID string `json:"id"`
+			} `json:"projects"`
+		}
+		_ = json.NewDecoder(listResp.Body).Decode(&listBody)
+		listResp.Body.Close()
+		gone = true
+		for _, p := range listBody.Projects {
+			if p.ID == projects.ProjectID(projectDir) {
+				gone = false
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !gone {
+		t.Fatal("the unregistered project never left /api/projects")
+	}
+}
+
+// writeServeConfig lays out the config + provider the assembly needs
+// (dead port — no network contact).
+func writeServeConfig(t *testing.T, root string) {
+	t.Helper()
+	cfg := "default_provider: fake\ndefault_model: fake-model\n"
+	if err := os.WriteFile(filepath.Join(root, "sai.yaml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	provider := `name: fake
+base_url: http://127.0.0.1:1
+api_key: test
+models:
+  fake-model:
+    id: fake-model
+    type: openai-chat
+`
+	if err := os.MkdirAll(filepath.Join(root, "providers"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "providers", "fake.yaml"), []byte(provider), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

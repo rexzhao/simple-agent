@@ -1536,7 +1536,7 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
 | C6b | chat 侧栏归档区（归档/恢复按钮 + 折叠区） | UI 消费 SessionInfo.Archived；tsc | C5、C5w | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地）
 | C6c | chat **审批卡**（若 (b) 通过） | UI 消费 tool_approval_pending/resolved + 快照 awaiting_approval；回答走 /approval；tsc | 无（wire 事件编码在本步补齐——B2 只落了 ToolWire.awaiting_approval 标志） | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md） |（已落地）
 | C7 | CLI：/sessions、/archive、/unarchive、/resume 序号+前缀+精确匹配收紧 | /resumefoo stderr 断言（B2 待办）；序号/前缀/歧义用例 | C5 | README |
-| C8 | web 项目注册/注销端点 + 注册表文件锁 + CLI project add 走锁 | 并发注册/注销测试；注销有打开会话→409；缓存自动失效验证 | C4 | multi-session |
+| C8 | web 项目注册/注销端点 + 注册表文件锁 + CLI project add 走锁 | 并发注册/注销测试；注销有打开会话→409；缓存自动失效验证 | C4 | multi-session |（已落地）
 | C9 | **公开 API 收敛**（17.7 清单，按 C 代码的实际用法） | 全部 C 测试不改断言通过 + 收敛项的调用方迁移 | C1–C8 | README API 面 |
 
 硬依赖只有：C4→C2、C3；C5w→C5；C6a→C3、C4；C6b→C5、C5w；C7→C5；

@@ -255,6 +255,8 @@ POST /api/s/<id>/stop                POST /api/s/<id>/approval （工具审批�
                                      POST /api/projects/{pid}/sessions（新建会话，§17.2）
                                      DELETE /api/s/<id>   （删除会话）
                                      POST /api/s/<id>/archive   （归档，§17.3）
+                                     POST /api/projects           （注册项目，§17.4）
+                                     DELETE /api/projects/<pid>   （注销项目，§17.4）
                                      DELETE /api/s/<id>/archive （取消归档，§17.3）
 ```
 
@@ -290,8 +292,11 @@ POST /api/s/<id>/stop                POST /api/s/<id>/approval （工具审批�
   | `session_conflict` | 409 | 否 | 同一 id 出现在多个注册项目（手拷目录）——拒绝而不静默挑一个（N3：error 字段有值，message 保留原文） |
   | `unknown_project` | 404 | 否 | POST /api/projects/{pid}/sessions 的 pid 不在注册表（§17.2 新码） |
   | `session_archived` | 409 | 否 | 打开或操作归档会话（§17.3；先 DELETE /api/s/{id}/archive 恢复） |
-  | `unexpected_field` | 400 | 否 | POST …/sessions 的 body 含未知字段（§17.2；C4 起新端点用码——旧端点的 400 纯文本是既有约定） |
-  | `invalid_input` | 400 | 否 | POST …/sessions 的 body 缺 provider/model 或 JSON 坏（§17.2） |
+  | `invalid_path` | 400 | 否 | POST /api/projects 的 path 不存在或非目录（§17.4） |
+  | `registry_locked` | 409 | 否 | 注册表文件锁被另一写操作持有（§17.4；瞬时态，可重试） |
+  | `project_in_use` | 409 | 否 | DELETE /api/projects/{pid} 时该项目有打开会话（§17.4） |
+  | `unexpected_field` | 400 | 否 | POST 端点 body 含未知字段（§17.2/§17.4；C4 起新端点用码——旧端点的 400 纯文本是既有约定） |
+  | `invalid_input` | 400 | 否 | POST 端点 body 缺必填字段或 JSON 坏（§17.2/§17.4） |
   | `project_unavailable` | 500 | 否 | agent 装配失败（路径缺失等） |
   | `empty_input` | 400 | 否 | 空文本 |
   | `unknown_session` | 404 | 否 | 未知会话 / 未注册项目 / 非法 id（N3：由纯文本升为码，message 保留原文 "unknown session"） |
