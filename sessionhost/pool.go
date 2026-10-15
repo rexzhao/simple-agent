@@ -418,6 +418,30 @@ func (p *Pool) OpenIDs() []string {
 	return ids
 }
 
+// OpenInNamespace reports whether the pool holds any OPEN entry for a
+// namespace — including a created-but-never-messaged session (it is
+// in the table, holding its lease; it has nothing on disk, so a
+// disk-probing id→ns resolution cannot see it). The host's unregister
+// gate is the caller; ns stays an opaque grouping key here (§15.1 —
+// no registry concept in the pool).
+//
+// Counting rules: PUBLISHED entries count (the table under p.mu is
+// the moment's truth). An OPEN still in flight (p.opening) does not —
+// its ns is not settled until publish, and §17.4 accepts the in-flight
+// window anyway. A closing claim does not — the entry is already out
+// of the table and on its way down; after teardown the Locate gate
+// keeps it from coming back.
+func (p *Pool) OpenInNamespace(ns string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, entry := range p.sessions {
+		if entry.projectID == ns {
+			return true
+		}
+	}
+	return false
+}
+
 // StopRuns stops every active run across all open sessions.
 func (p *Pool) StopRuns() {
 	p.mu.Lock()

@@ -334,3 +334,56 @@ func TestRegisterProjectBadBodyCodes(t *testing.T) {
 		})
 	}
 }
+
+// TestUnregisterRefusesCreatedNotMessaged (C8b): a session created
+// through the endpoint but with NO first message has nothing on disk
+// — the disk-probing locate could not see it, the pool's namespace
+// record can. The unregister must refuse; after the sweeper evicts
+// the empty entry, it must succeed.
+func TestUnregisterRefusesCreatedNotMessaged(t *testing.T) {
+	// createTestServer (the C4 fixture) wires the ModelList the create
+	// endpoint's shared validation needs, with a 50ms idle window so
+	// the empty entry's eviction is observable.
+	base, ns := createTestServer(t)
+
+	// Create a session through the endpoint; the lease is released by
+	// the handler (C4), leaving a table entry with no disk presence.
+	resp, err := http.Post(base.URL+"/api/projects/"+ns+"/sessions", "application/json",
+		strings.NewReader(`{"provider":"fake","model":"fake-model"}`)) //nolint:noctx // test
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || created.ID == "" {
+		t.Fatalf("create: %d %+v", resp.StatusCode, created)
+	}
+
+	// The never-messaged session blocks the unregister: 409.
+	resp2, body := unregisterDelete(t, base, ns)
+	if resp2.StatusCode != http.StatusConflict || body["error"] != "project_in_use" {
+		t.Fatalf("created-not-messaged: %d %v", resp2.StatusCode, body)
+	}
+
+	// After the idle sweeper tears the empty entry down (its lease is
+	// gone — the fixture's 50ms window), the unregister succeeds. Poll
+	// the endpoint itself: every refusal until then must be the SAME
+	// project_in_use (an unrelated 409 would hide here otherwise).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp3, body := unregisterDelete(t, base, ns)
+		if resp3.StatusCode == http.StatusOK {
+			return
+		}
+		if resp3.StatusCode != http.StatusConflict || body["error"] != "project_in_use" {
+			t.Fatalf("unregister during eviction wait: %d %v", resp3.StatusCode, body)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the empty created session was never evicted")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

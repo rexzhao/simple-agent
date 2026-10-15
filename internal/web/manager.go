@@ -431,11 +431,15 @@ func (m *Manager) UnregisterProject(pid string) error {
 	if !found {
 		return sessionhost.ErrNotFound
 	}
-	// Open sessions of THIS project refuse the unregister.
-	for _, id := range m.pool.OpenIDs() {
-		if ns, _, locErr := m.locate(id); locErr == nil && ns == pid {
-			return sessionhost.ErrInUse
-		}
+	// Open sessions of THIS project refuse the unregister. The POOL's
+	// own namespace record answers (its table is the moment's truth,
+	// and it sees created-but-never-messaged sessions that a
+	// disk-probing locate cannot). The check runs BEFORE the locked
+	// registry write; an open already in flight when the write lands
+	// is the §17.4-accepted window (the session keeps working, and
+	// after eviction the Locate gate refuses the reopen).
+	if m.pool.OpenInNamespace(pid) {
+		return sessionhost.ErrInUse
 	}
 	return projects.Mutate(m.root, func(registry *projects.Registry) error {
 		registry.Remove(target.Path)
