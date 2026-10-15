@@ -6,14 +6,26 @@ import {
 } from "@assistant-ui/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Thread } from "@/components/thread.aui";
-import { APIError, deleteSession, getModels, getProjects } from "./api";
+import {
+  APIError,
+  archiveSession,
+  deleteSession,
+  getModels,
+  getProjectsAll,
+  getState,
+  unarchiveSession,
+} from "./api";
 import { useSaiAdapter } from "./runtime";
 import { SessionStore } from "./store";
 import { convertRecords } from "./convert";
 import {
+  archiveBlockedHint,
   deleteBlockedHint,
-  deleteRetryable,
+  opStep,
+  partitionSessions,
+  stateProbeHint,
   type ModelDescriptor,
+  type OpStep,
 } from "./newsession";
 import { NewSessionDialog } from "./components/new-session-dialog";
 import { ConfirmDeleteDialog } from "./components/confirm-delete-dialog";
@@ -46,7 +58,9 @@ function useProjects(): ProjectsResponse | null {
     let stop = false;
     const tick = async () => {
       try {
-        const p = await getProjects();
+        // The all view (§17.3): archived rows arrive flagged and the
+        // sidebar partitions them — one poll serves both sections.
+        const p = await getProjectsAll();
         if (!stop) setProjects(p);
       } catch {
         /* keep last good */
@@ -134,40 +148,129 @@ export default function App() {
 
   // ---- delete confirmation (C6a) ----
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
-  const [deleteHint, setDeleteHint] = useState("");
-  const [deleteBusy, setDeleteBusy] = useState(false);
   const requestDelete = useCallback((id: string, title: string) => {
-    setDeleteHint("");
+    setOpHint("");
     setDeleteTarget({ id, title });
   }, []);
+  // runOp is the shared delete/archive flow (opStep drives it): the
+  // busy flag spans the WHOLE loop — set before the first attempt,
+  // cleared only at done or hint — so a retry in flight cannot be
+  // double-clicked into a second concurrent loop.
+  const runOp = useCallback(
+    async (
+      send: () => Promise<unknown>,
+      blockedHint: (e: { status: number; code: string }) => string | null,
+      onDone: () => void,
+    ) => {
+      setOpBusy(true);
+      try {
+        for (let attempt = 0; ; attempt++) {
+          let e: { status: number; code: string } | null = null;
+          try {
+            await send();
+          } catch (err) {
+            e = err instanceof APIError
+              ? { status: err.status, code: err.code }
+              : { status: 0, code: "" };
+          }
+          const step: OpStep = opStep(
+            attempt,
+            10,
+            e,
+            blockedHint,
+            "the operation did not go through — try again in a moment",
+          );
+          if (step.kind === "done") {
+            onDone();
+            return;
+          }
+          if (step.kind === "retry") {
+            await new Promise((res) => setTimeout(res, 500));
+            continue;
+          }
+          setOpHint(step.hint);
+          return;
+        }
+      } finally {
+        setOpBusy(false);
+      }
+    },
+    [],
+  );
+
   const confirmDelete = useCallback(async () => {
     if (!deleteTarget) return;
-    setDeleteBusy(true);
     const id = deleteTarget.id;
     // Deleting the open session first navigates away (the stream
     // holds server-side refs → session_open); bounded retries cover
-    // the closing window, the same flow the runtime used to own.
+    // the closing window.
     if (id === sessionID) setSessionID("");
-    for (let attempt = 0; attempt < 10; attempt++) {
-      try {
-        await deleteSession(id);
+    await runOp(
+      () => deleteSession(id),
+      deleteBlockedHint,
+      () => {
         onDeleted(id);
         setDeleteTarget(null);
-        return;
-      } catch (e) {
-        if (e instanceof APIError && deleteRetryable(e.code)) {
-          await new Promise((res) => setTimeout(res, 500));
-          continue;
+      },
+    );
+  }, [deleteTarget, sessionID, setSessionID, onDeleted, runOp]);
+
+  // ---- archive / restore (C6b) ----
+  // Archiving is reversible, so no confirmation dialog: the current
+  // session navigates away first (same detach-then-act shape as the
+  // delete), the parked row reappears in the collapsed section when
+  // the poll refreshes.
+  const [archivedOpen, setArchivedOpen] = useState(false);
+  const [opHint, setOpHint] = useState("");
+  const [opBusy, setOpBusy] = useState(false);
+  const archive = useCallback(
+    (id: string) => {
+      setOpHint("");
+      void (async () => {
+        if (id === sessionID) setSessionID("");
+        await runOp(
+          () => archiveSession(id),
+          archiveBlockedHint,
+          () => setOpHint(""),
+        );
+      })();
+    },
+    [sessionID, setSessionID, runOp],
+  );
+  const restore = useCallback(
+    (id: string) => {
+      setOpHint("");
+      void runOp(() => unarchiveSession(id), archiveBlockedHint, () => setOpHint(""));
+    },
+    [runOp],
+  );
+
+  // ---- deep-link probe (the log view's unknown-id handling) ----
+  // The SSE stream cannot read status codes; a deep link to a deleted
+  // or unknown session would otherwise sit as a silent empty view.
+  // Probe /state first: 404 presents the hint and bounces to the
+  // list; a locked session presents its conflict and stays.
+  const [routeHint, setRouteHint] = useState("");
+  useEffect(() => {
+    if (!sessionID) return;
+    let cancelled = false;
+    getState(sessionID)
+      .then(() => setRouteHint(""))
+      .catch((e) => {
+        if (cancelled) return;
+        const err = e instanceof APIError ? { status: e.status, code: e.code } : null;
+        const hint = err ? stateProbeHint(err) : null;
+        if (err?.status === 404) {
+          setRouteHint(hint ?? "session not found");
+          setSessionID("");
+        } else if (hint) {
+          setRouteHint(hint);
         }
-        const hint = e instanceof APIError ? deleteBlockedHint(e) : null;
-        setDeleteHint(hint ?? "delete failed — try again");
-        return;
-      } finally {
-        setDeleteBusy(false);
-      }
-    }
-    setDeleteHint("the session stayed open — try again in a moment");
-  }, [deleteTarget, sessionID, setSessionID, onDeleted]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionID, setSessionID]);
 
   const adapter = useSaiAdapter(stores, sessionID, projects, setSessionID, onDeleted, openNew, requestDelete);
   const runtime = useExternalStoreRuntime(adapter);
@@ -181,7 +284,7 @@ export default function App() {
   );
 
   const sessions = useMemo(() => {
-    const out: { id: string; title: string; project: string; path: string }[] = [];
+    const out: { id: string; title: string; project: string; path: string; archived: boolean }[] = [];
     for (const p of projects?.projects || []) {
       for (const s of p.sessions)
         out.push({
@@ -191,10 +294,18 @@ export default function App() {
           // The registered path (tail segment as the visible label,
           // full path on the tooltip) — a project hash reads as noise.
           path: p.path,
+          archived: !!s.archived,
         });
     }
     return out;
   }, [projects]);
+  const { liveSessions, archivedSessions } = useMemo(
+    () => ({
+      liveSessions: partitionSessions(sessions).live,
+      archivedSessions: partitionSessions(sessions).archived,
+    }),
+    [sessions],
+  );
 
   const verified = snap ? snap.verified : null;
   const notice = snap ? snap.notice : "";
@@ -233,12 +344,12 @@ export default function App() {
               </a>
             </div>
             <div className="flex flex-col gap-0.5 overflow-y-auto p-2">
-              {sessions.length === 0 && (
+              {liveSessions.length === 0 && archivedSessions.length === 0 && (
                 <div className="text-muted-foreground px-3 py-4 text-sm">
-                  no sessions — create one from the CLI
+                  no sessions — create one from the "+" above
                 </div>
               )}
-              {sessions.map(s => (
+              {liveSessions.map(s => (
                 <div
                   key={s.id}
                   className={
@@ -261,19 +372,64 @@ export default function App() {
                       {s.path.replace(/[\\/]$/, "").split(/[\\/]/).pop()}
                     </span>
                   </button>
-                  <button
-                    className="text-muted-foreground hover:text-destructive invisible mr-1 cursor-pointer self-start border-none bg-transparent px-1 pt-2 text-xs group-hover:visible"
-                    onClick={e => {
-                      e.stopPropagation();
-                      requestDelete(s.id, s.title);
-                    }}
-                    aria-label={`delete session ${s.title || "untitled"}`}
-                    title="delete this session"
-                  >
-                    ×
-                  </button>
+                  <span className="flex flex-col self-start pt-2 pr-1">
+                    <button
+                      className="text-muted-foreground hover:text-foreground invisible cursor-pointer border-none bg-transparent px-1 text-xs group-hover:visible"
+                      disabled={opBusy}
+                      onClick={e => {
+                        e.stopPropagation();
+                        archive(s.id);
+                      }}
+                      aria-label={`archive session ${s.title || "untitled"}`}
+                      title="park this session out of the working set"
+                    >
+                      ⌄
+                    </button>
+                    <button
+                      className="text-muted-foreground hover:text-destructive invisible cursor-pointer border-none bg-transparent px-1 text-xs group-hover:visible"
+                      onClick={e => {
+                        e.stopPropagation();
+                        requestDelete(s.id, s.title);
+                      }}
+                      aria-label={`delete session ${s.title || "untitled"}`}
+                      title="delete this session"
+                    >
+                      ×
+                    </button>
+                  </span>
                 </div>
               ))}
+              {archivedSessions.length > 0 && (
+                <div className="border-border mt-1 border-t pt-1">
+                  <button
+                    className="text-muted-foreground hover:text-foreground w-full cursor-pointer border-none bg-transparent px-3 py-1.5 text-left text-xs uppercase tracking-wider"
+                    onClick={() => setArchivedOpen(!archivedOpen)}
+                    aria-expanded={archivedOpen}
+                  >
+                    archived ({archivedSessions.length}) {archivedOpen ? "▾" : "▸"}
+                  </button>
+                  {archivedOpen &&
+                    archivedSessions.map(s => (
+                      <div
+                        key={s.id}
+                        className="group text-muted-foreground flex items-stretch gap-0.5 rounded-lg font-sans text-sm hover:bg-accent/50"
+                        title={s.path}
+                      >
+                        <button
+                          className="flex min-w-0 flex-1 cursor-pointer flex-col gap-0.5 border-none bg-transparent px-3 py-2 text-left"
+                          disabled={opBusy}
+                          onClick={() => restore(s.id)}
+                          title="restore this session to the working set"
+                        >
+                          <span className="truncate">{s.title}</span>
+                          <span className="text-muted-foreground truncate text-xs">
+                            {s.path.replace(/[\\/]$/, "").split(/[\\/]/).pop()} · click to restore
+                          </span>
+                        </button>
+                      </div>
+                    ))}
+                </div>
+              )}
             </div>
           </nav>
           <div className="relative flex min-w-0 flex-1 flex-col">
@@ -286,6 +442,8 @@ export default function App() {
                 {verified === false ? "chain drift!" : verified ? "verified" : "…"}
               </span>
               {notice && <span className="text-accent-foreground">{notice}</span>}
+              {routeHint && <span className="text-destructive">{routeHint}</span>}
+              {opHint && <span className="text-destructive">{opHint}</span>}
             </div>
             <div className="aui-root relative flex min-h-0 flex-1 flex-col items-center justify-start">
               <Thread autoFocus />
@@ -304,8 +462,8 @@ export default function App() {
           target={deleteTarget}
           onCancel={() => setDeleteTarget(null)}
           onConfirm={() => void confirmDelete()}
-          hint={deleteHint}
-          busy={deleteBusy}
+          hint={opHint}
+          busy={opBusy}
         />
       </AssistantRuntimeProvider>
     </TooltipProvider>

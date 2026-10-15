@@ -130,15 +130,24 @@ export function NewSessionDialog({
               model
               <select
                 className={selectClass}
-                value={provider + "/" + model}
+                value={String(
+                  models.findIndex(
+                    (m) => m.provider === provider && m.model === model,
+                  ),
+                )}
                 onChange={(e) => {
-                  const [p, m] = e.target.value.split("/");
-                  setProvider(p);
-                  setModel(m);
+                  // Keyed by LIST INDEX, not a provider+"/"+model join:
+                  // a provider name is user configuration and may
+                  // contain "/" (C6b — opus ruling).
+                  const m = models[Number(e.target.value)];
+                  if (m) {
+                    setProvider(m.provider);
+                    setModel(m.model);
+                  }
                 }}
               >
-                {models.map((m) => (
-                  <option key={m.provider + "/" + m.model} value={m.provider + "/" + m.model}>
+                {models.map((m, i) => (
+                  <option key={m.provider + "/" + m.model} value={String(i)}>
                     {m.provider}/{m.model}
                     {m.default ? " (default)" : ""}
                   </option>

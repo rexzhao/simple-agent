@@ -61,6 +61,15 @@ export const deleteSteer = (id: string, item: string) =>
   request<unknown>(`/api/s/${id}/steer?item=${encodeURIComponent(item)}`, "DELETE");
 export const postStop = (id: string) => request<unknown>(`/api/s/${id}/stop`, "POST", {});
 export const deleteSession = (id: string) => request<unknown>(`/api/s/${id}`, "DELETE");
+export const getProjectsAll = () =>
+  request<ProjectsResponse>("/api/projects?include_archived=1", "GET");
+
+export const archiveSession = (id: string) =>
+  request<unknown>(`/api/s/${id}/archive`, "POST", {});
+
+export const unarchiveSession = (id: string) =>
+  request<unknown>(`/api/s/${id}/archive`, "DELETE");
+
 export const getModels = () =>
   request<ModelDescriptor[]>("/api/models", "GET");
 

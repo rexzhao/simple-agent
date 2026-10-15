@@ -223,7 +223,7 @@ inputsSinceSoftAttempt 纯内存），见 design §13。
 全局路由（新增）：
 
 ```
-GET /api/projects
+GET /api/projects[?include_archived=1]
   → {"projects": [{
        "id":   "pxxxxx…",
        "path": "F:\\work\\paperhub",

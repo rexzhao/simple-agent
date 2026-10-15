@@ -5,19 +5,22 @@
 // `node newsession_check.mjs` (type stripping, like store_check).
 //
 // Scenario-block integrity (the B2-2b K4b/K4d lesson): every block
-// declares a BLOCK-SCOPED marker const and pushes its own name into
-// `done` — deleting a block removes the marker from `done` and the
-// summary line changes; a block deleted with its push line but
-// without its asserts still fails its marker reference. The runner
-// (TestNewSessionFixture) asserts the EXACT expected list, so a
-// missing or renamed scenario cannot pass silently.
+// pushes its own name into `done` and the summary derives from the
+// blocks that actually ran — deleting a block (or its push line)
+// changes the summary list. The runner (TestNewSessionFixture)
+// asserts the EXACT expected list, so a missing or renamed scenario
+// cannot pass silently.
 import {
   isSlashNew,
   defaultModel,
   reasoningLevelsOf,
   createSessionHint,
   deleteBlockedHint,
-  deleteRetryable,
+  refusalRetryable,
+  archiveBlockedHint,
+  partitionSessions,
+  opStep,
+  stateProbeHint,
 } from "../../../clients/chat/src/newsession.ts";
 
 const failures = [];
@@ -108,10 +111,10 @@ function assert(cond, what) {
 {
   const s5run = deleteBlockedHint({ status: 409, code: "run_active" });
   const s5open = deleteBlockedHint({ status: 409, code: "session_open" });
-  const s5retryOpen = deleteRetryable("session_open");
-  const s5retryClosing = deleteRetryable("session_closing");
-  const s5retryRun = deleteRetryable("run_active");
-  const s5retryUnknown = deleteRetryable("");
+  const s5retryOpen = refusalRetryable("session_open");
+  const s5retryClosing = refusalRetryable("session_closing");
+  const s5retryRun = refusalRetryable("run_active");
+  const s5retryUnknown = refusalRetryable("");
   assert(s5run?.includes("stop it"), "s5: run_active tells the user to stop the run");
   assert(s5open === null, "s5: session_open is not a user block");
   assert(s5retryOpen === true, "s5: session_open retries");
@@ -119,6 +122,77 @@ function assert(cond, what) {
   assert(s5retryRun === false, "s5: run_active does NOT retry");
   assert(s5retryUnknown === false, "s5: unknown codes do not retry");
   done.push("s5");
+}
+
+// s6: sidebar partition — flagged rows go to the archived section,
+// the working set keeps the rest, order preserved.
+{
+  const rows = [
+    { id: "a", archived: false },
+    { id: "b", archived: true },
+    { id: "c" },
+    { id: "d", archived: true },
+  ];
+  const s6split = partitionSessions(rows);
+  assert(
+    JSON.stringify(s6split.live.map((r) => r.id)) === JSON.stringify(["a", "c"]),
+    "s6: live section keeps unflagged rows in order",
+  );
+  assert(
+    JSON.stringify(s6split.archived.map((r) => r.id)) === JSON.stringify(["b", "d"]),
+    "s6: archived section collects flagged rows in order",
+  );
+  assert(partitionSessions([]).live.length === 0, "s6: empty listing → empty sections");
+  done.push("s6");
+}
+
+// s7: archive/restore refusals — run_active and session_locked are
+// user-actionable; the closing-window codes retry silently.
+{
+  const s7run = archiveBlockedHint({ status: 409, code: "run_active" });
+  const s7locked = archiveBlockedHint({ status: 409, code: "session_locked" });
+  const s7open = archiveBlockedHint({ status: 409, code: "session_open" });
+  assert(s7run?.includes("stop it"), "s7: run_active tells the user to stop the run");
+  assert(s7locked?.includes("another process"), "s7: session_locked names the other holder");
+  assert(s7open === null, "s7: session_open is not a user block (retries)");
+  done.push("s7");
+}
+
+// s8: the shared retry step — done on success, retry while under the
+// attempt budget, hint at the boundary (the flow TERMINATES) and for
+// non-retryable codes.
+{
+  const s8done = opStep(0, 10, null, deleteBlockedHint, "fallback");
+  const s8retry = opStep(3, 10, { status: 409, code: "session_open" }, deleteBlockedHint, "fallback");
+  const s8boundary = opStep(9, 10, { status: 409, code: "session_open" }, deleteBlockedHint, "fallback");
+  const s8run = opStep(0, 10, { status: 409, code: "run_active" }, deleteBlockedHint, "fallback");
+  const s8unknown = opStep(0, 10, { status: 500, code: "" }, deleteBlockedHint, "fallback");
+  assert(s8done.kind === "done", "s8: success is done");
+  assert(s8retry.kind === "retry", "s8: retryable code under budget retries");
+  assert(
+    s8boundary.kind === "hint" && s8boundary.hint === "fallback",
+    "s8: at the attempt budget the flow terminates with the fallback hint",
+  );
+  assert(s8run.kind === "hint" && s8run.hint.includes("stop it"), "s8: run_active hints immediately");
+  assert(s8unknown.kind === "hint" && s8unknown.hint === "fallback", "s8: unknown errors surface the fallback");
+  done.push("s8");
+}
+
+// s9: the deep-link probe — 404 bounces with the hint;
+// locked/archived present and stay; other statuses are null.
+{
+  const s9missing = stateProbeHint({ status: 404, code: "unknown_session" });
+  const s9locked = stateProbeHint({ status: 409, code: "session_locked" });
+  const s9archived = stateProbeHint({ status: 409, code: "session_archived" });
+  const s9server = stateProbeHint({ status: 500, code: "" });
+  assert(s9missing?.includes("not found"), "s9: 404 bounces with the not-found hint");
+  assert(s9locked?.includes("locked"), "s9: session_locked presents the conflict");
+  assert(
+    s9archived?.includes("archived") && s9archived.includes("restore"),
+    "s9: an archived deep link hints the restore path (NOT silently swallowed)",
+  );
+  assert(s9server === null, "s9: 5xx is not a route hint");
+  done.push("s9");
 }
 
 if (failures.length) {

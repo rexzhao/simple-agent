@@ -1531,7 +1531,7 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
 | C5 | `Archiver`（标记文件）+ SessionInfo.Archived + ListSessions 过滤 + `Pool.Archive` 互斥 | 归档/取消/IsArchived round-trip；打开归档→ErrArchived；运行中归档→ErrRunActive；列表默认过滤+--all | （建议）C1 | storage doc.go 契约；multi-session.md §4 码表（session_archived 409）+ 归档路由；**§15.5 前置条件补指针**（"C 阶段 0 修订：互斥机制见 §17.3"） |
 | C5w | web 归档端点（POST/DELETE /api/s/{id}/archive）+ 409 session_archived 映射 | 端点测试：归档/取消 round-trip、打开归档→409 码、锁竞争→session_locked | C5 | 同 C5 |
 | C6a | chat 新建对话框 + 删除二次确认 | 对话框提交→POST→导航；tsc | C3、C4 | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地）
-| C6b | chat 侧栏归档区（归档/恢复按钮 + 折叠区） | UI 消费 SessionInfo.Archived；tsc | C5、C5w | webui.md |
+| C6b | chat 侧栏归档区（归档/恢复按钮 + 折叠区） | UI 消费 SessionInfo.Archived；tsc | C5、C5w | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地）
 | C6c | chat **审批卡**（若 (b) 通过） | UI 消费 tool_approval_pending/resolved + 快照 awaiting_approval；回答走 /approval；tsc | 无（wire 已在 B2 落地） | webui.md |
 | C7 | CLI：/sessions、/archive、/unarchive、/resume 序号+前缀+精确匹配收紧 | /resumefoo stderr 断言（B2 待办）；序号/前缀/歧义用例 | C5 | README |
 | C8 | web 项目注册/注销端点 + 注册表文件锁 + CLI project add 走锁 | 并发注册/注销测试；注销有打开会话→409；缓存自动失效验证 | C4 | multi-session |

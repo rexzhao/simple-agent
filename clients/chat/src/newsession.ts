@@ -76,9 +76,82 @@ export function deleteBlockedHint(e: CodeError): string | null {
   return null;
 }
 
-// deleteRetryable: the closing-window and still-open refusals clear
-// on their own (detach + sweep); the delete flow retries these
-// instead of surfacing them.
-export function deleteRetryable(code: string): boolean {
+// refusalRetryable: the closing-window and still-open refusals clear
+// on their own (detach + sweep); the delete and archive flows retry
+// these instead of surfacing them.
+export function refusalRetryable(code: string): boolean {
   return code === "session_open" || code === "session_closing";
+}
+
+// ---- C6b: the archive sidebar section ----
+
+// archiveBlockedHint maps an archive/restore refusal the USER must
+// act on; null means "not user-actionable" (the retryable codes loop
+// silently, anything else surfaces raw).
+export function archiveBlockedHint(e: CodeError): string | null {
+  if (e.code === "run_active")
+    return "the session is running — stop it before archiving";
+  if (e.code === "session_locked")
+    return "another process holds the session — close it first";
+  return null;
+}
+
+// SidebarRow is one /api/projects?include_archived=1 session row.
+export type SidebarRow = { id: string; archived?: boolean };
+
+// partitionSessions splits the listing into the working set and the
+// parked rows — the sidebar's two sections (§17.3: archived hidden
+// from the working set, shown collapsed at the bottom).
+export function partitionSessions<T extends SidebarRow>(rows: T[]): {
+  live: T[];
+  archived: T[];
+} {
+  const live: T[] = [];
+  const archived: T[] = [];
+  for (const row of rows) (row.archived ? archived : live).push(row);
+  return { live, archived };
+}
+
+// ---- the shared bounded-retry step (delete C6a, archive C6b) ----
+
+// OpStep is one decision of a delete-or-archive flow: the request
+// succeeded (done), a self-healing refusal says try again (retry —
+// the caller sleeps and re-sends), or the user must act (hint).
+export type OpStep =
+  | { kind: "done" }
+  | { kind: "retry" }
+  | { kind: "hint"; hint: string };
+
+// opStep decides the next move after one attempt: e null means the
+// request succeeded; retryable codes retry until maxAttempts (then
+// the fallback hint — the flow must TERMINATE, never loop forever);
+// everything else maps through blockedHint (null → the fallback).
+// The BUSY flag spans the whole flow by construction: the caller
+// stays disabled from the first attempt until a done or a hint, so a
+// second click cannot start a concurrent loop mid-retry.
+export function opStep(
+  attempt: number,
+  maxAttempts: number,
+  e: CodeError | null,
+  blockedHint: (e: CodeError) => string | null,
+  fallback: string,
+): OpStep {
+  if (!e) return { kind: "done" };
+  if (refusalRetryable(e.code) && attempt + 1 < maxAttempts) return { kind: "retry" };
+  return { kind: "hint", hint: blockedHint(e) ?? fallback };
+}
+
+// ---- the deep-link probe (the log view's unknown-id handling) ----
+
+// stateProbeHint maps a failed GET /api/s/{id}/state probe — the
+// pre-connect existence check an SSE stream cannot make — onto the
+// route hint. 404 bounces to the list (the session was deleted or
+// never existed); 409 presents the conflict and stays.
+export function stateProbeHint(e: CodeError): string | null {
+  if (e.status === 404) return "session not found — deleted or unknown; back to the list";
+  if (e.code === "session_locked")
+    return "session is locked by another process";
+  if (e.code === "session_archived")
+    return "this session is archived — restore it from the sidebar";
+  return null;
 }

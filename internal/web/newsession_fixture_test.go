@@ -29,7 +29,7 @@ func TestNewSessionFixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newsession_check.mjs: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "newsession_check: OK (5 scenarios: s1,s2,s3,s4,s5)") {
+	if !strings.Contains(string(out), "newsession_check: OK (9 scenarios: s1,s2,s3,s4,s5,s6,s7,s8,s9)") {
 		t.Fatalf("newsession_check.mjs: unexpected output\n%s", out)
 	}
 }

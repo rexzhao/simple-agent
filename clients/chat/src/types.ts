@@ -68,7 +68,13 @@ export type ProjectsResponse = {
   projects: {
     id: string;
     path: string;
-    sessions: { id: string; title: string; created: string; active: boolean }[];
+    sessions: {
+      id: string;
+      title: string;
+      created: string;
+      active: boolean;
+      archived?: boolean;
+    }[];
   }[];
   registry_ok: boolean;
 };

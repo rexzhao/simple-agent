@@ -49,9 +49,14 @@ type Manager struct {
 	hubsMu sync.Mutex
 	hubs   map[string]*Hub
 
-	projectsMu     sync.Mutex
-	projectsCache  []byte    // marshaled /api/projects body
-	projectsCached time.Time // when it was built
+	projectsMu sync.Mutex
+	// One cache slot per /api/projects variant: the default body and
+	// the include_archived one differ, and a shared slot would serve
+	// the wrong rows to whichever variant asked second.
+	projectsCache     []byte // default body (archived hidden)
+	projectsCached    time.Time
+	projectsCacheAll  []byte // ?include_archived=1 body
+	projectsCachedAll time.Time
 
 	// regMu guards the registry cache: stat-gated (mtime+size), so an
 	// unchanged projects.json costs one os.Stat, not a parse. Its own
@@ -368,10 +373,11 @@ func (m *Manager) registryEntries() ([]projects.Entry, error) {
 
 // projectsSessionWire and projectsProjectWire are the /api/projects DTOs.
 type projectsSessionWire struct {
-	ID      string    `json:"id"`
-	Title   string    `json:"title"`
-	Created time.Time `json:"created"`
-	Active  bool      `json:"active"`
+	ID       string    `json:"id"`
+	Title    string    `json:"title"`
+	Created  time.Time `json:"created"`
+	Active   bool      `json:"active"`
+	Archived bool      `json:"archived"`
 }
 
 type projectsProjectWire struct {
@@ -387,11 +393,14 @@ type projectsBody struct {
 
 // Projects serves /api/projects: the registered projects, their
 // sessions (id, title, created, active), and the registry health.
+// ?include_archived=1 (§17.3) adds the parked rows with archived:true
+// — the chat sidebar's collapsed section; the default body hides them.
 func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 	if !guardAPI(w, r, false) {
 		return
 	}
-	if cache, ok := m.projectsCachedBody(); ok {
+	includeArchived := r.URL.Query().Get("include_archived") == "1"
+	if cache, ok := m.projectsCachedBody(includeArchived); ok {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(cache)
@@ -413,6 +422,10 @@ func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 		body.Projects[i] = projectsProjectWire{ID: projects.ProjectID(entry.Path), Path: entry.Path}
 	}
 	lister, canList := m.store.(storage.Lister)
+	// The all-listing is a separate optional capability: a store
+	// without it silently degrades to the default view (archived
+	// rows stay hidden rather than failing the whole endpoint).
+	allLister, canListAll := m.store.(storage.AllLister)
 	var wg sync.WaitGroup
 	for i, entry := range entries {
 		wg.Add(1)
@@ -421,17 +434,24 @@ func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 			if !canList {
 				return
 			}
-			infos, err := lister.ListSessions(projectID)
+			var infos []storage.SessionInfo
+			var err error
+			if includeArchived && canListAll {
+				infos, err = allLister.ListSessionsAll(projectID)
+			} else {
+				infos, err = lister.ListSessions(projectID)
+			}
 			if err != nil {
 				log.Printf("sai: serve: list %s: %v", projectID, err)
 				return
 			}
 			for _, info := range infos {
 				body.Projects[i].Sessions = append(body.Projects[i].Sessions, projectsSessionWire{
-					ID:      info.ID,
-					Title:   info.Title,
-					Created: info.Created,
-					Active:  openIDs[info.ID],
+					ID:       info.ID,
+					Title:    info.Title,
+					Created:  info.Created,
+					Active:   openIDs[info.ID],
+					Archived: info.Archived,
 				})
 			}
 		}(i, projects.ProjectID(entry.Path))
@@ -444,16 +464,26 @@ func (m *Manager) Projects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.projectsMu.Lock()
-	m.projectsCache, m.projectsCached = encoded, time.Now()
+	if includeArchived {
+		m.projectsCacheAll, m.projectsCachedAll = encoded, time.Now()
+	} else {
+		m.projectsCache, m.projectsCached = encoded, time.Now()
+	}
 	m.projectsMu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(encoded)
 }
 
-func (m *Manager) projectsCachedBody() ([]byte, bool) {
+func (m *Manager) projectsCachedBody(includeArchived bool) ([]byte, bool) {
 	m.projectsMu.Lock()
 	defer m.projectsMu.Unlock()
+	if includeArchived {
+		if m.projectsCacheAll == nil || time.Since(m.projectsCachedAll) > projectsCacheTTL {
+			return nil, false
+		}
+		return m.projectsCacheAll, true
+	}
 	if m.projectsCache == nil || time.Since(m.projectsCached) > projectsCacheTTL {
 		return nil, false
 	}
