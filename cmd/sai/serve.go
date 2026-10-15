@@ -24,14 +24,7 @@ func serve(serverRoot, addr, providerName, modelName, resumeID, staticDir string
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		os.Exit(1)
 	}
-	manager, err := web.NewManager(web.ManagerOptions{
-		ServerRoot: serverRoot,
-		Store:      factory.Store(),
-		AgentFor: func(projectCwd string) (*agent.Agent, error) {
-			ag, _, err := factory.Agent(projectCwd)
-			return ag, err
-		},
-	})
+	manager, err := newServeManager(factory, serverRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		os.Exit(1)
@@ -138,4 +131,21 @@ func serve(serverRoot, addr, providerName, modelName, resumeID, staticDir string
 		fmt.Fprintf(os.Stderr, "sai: unknown command %q (try /help)\n", text)
 	}
 	shutdown()
+}
+
+// newServeManager assembles the serve-mode Manager from the CLI
+// factory - the one place the production wiring lives (C3's /api/models
+// resolver, C4's create path, C8's registry all hang off it).
+// Extracted from serve() so the assembly is testable without
+// starting a process.
+func newServeManager(factory *agentFactory, serverRoot string) (*web.Manager, error) {
+	return web.NewManager(web.ManagerOptions{
+		ModelList:  factory.Resolver(),
+		ServerRoot: serverRoot,
+		Store:      factory.Store(),
+		AgentFor: func(projectCwd string) (*agent.Agent, error) {
+			ag, _, err := factory.Agent(projectCwd)
+			return ag, err
+		},
+	})
 }

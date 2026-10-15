@@ -688,7 +688,8 @@ var resolvedServerRoot string
 
 // Store exposes the shared storage (the serve-mode manager needs it for
 // listing and scoped opens).
-func (f *agentFactory) Store() *jsonl.Store { return f.store }
+func (f *agentFactory) Store() *jsonl.Store           { return f.store }
+func (f *agentFactory) Resolver() agent.ModelResolver { return f.resolver }
 
 // recordsAfter returns the records committed after the given item. A
 // missing marker (a compaction truncated the stream since it was

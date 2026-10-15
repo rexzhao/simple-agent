@@ -39,6 +39,8 @@ type Manager struct {
 	// agentFactory is the CLI assembly (kept for test-side session
 	// creation — the pool consumes the same function).
 	agentFactory func(projectCwd string) (*agent.Agent, error)
+	// modelList backs GET /api/models (nil: not wired).
+	modelList agent.ModelResolver
 
 	// preopen is the serve-mode -session claim: a lease held for the
 	// process lifetime so the sweeper never evicts the pinned session.
@@ -84,6 +86,10 @@ type ManagerOptions struct {
 	// (the ticker captures the interval at construction).
 	IdleWindow    time.Duration
 	SweepInterval time.Duration
+	// ModelList is the resolver backing GET /api/models (§17.2). Nil
+	// means the host did not wire one (the endpoint answers an empty
+	// list).
+	ModelList agent.ModelResolver
 }
 
 // NewManager builds the pool (which takes the serve-mode root lock —
@@ -94,6 +100,7 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 		root:         options.ServerRoot,
 		store:        options.Store,
 		agentFactory: options.AgentFor,
+		modelList:    options.ModelList,
 		hubs:         make(map[string]*Hub),
 	}
 	pool, err := sessionhost.New(sessionhost.Options{
@@ -180,6 +187,15 @@ func (m *Manager) hubOf(sessionID string) *Hub {
 func (m *Manager) subscribed(sessionID string) bool {
 	hub := m.hubOf(sessionID)
 	return hub != nil && hub.Subscribers() > 0
+}
+
+// models returns the configuration's selectable models (the
+// /api/models data source; §17.2).
+func (m *Manager) models() []agent.ModelDescriptor {
+	if m.modelList == nil {
+		return nil
+	}
+	return m.modelList.List()
 }
 
 // Close stops the pool (sweeper, every session, the root lock) and

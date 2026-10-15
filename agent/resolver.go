@@ -54,6 +54,9 @@ type ModelDescriptor struct {
 	// ReasoningLevels are the model's supported reasoning tiers; empty
 	// means the model takes no reasoning configuration.
 	ReasoningLevels []string
+	// Default marks the configuration's default model (exactly one
+	// entry in a List has it; zero when no default is configured).
+	Default bool
 }
 
 // staticResolver resolves every meta to one fixed configuration — the

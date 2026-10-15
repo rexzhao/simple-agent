@@ -109,6 +109,10 @@ func (r *configResolver) List() []agent.ModelDescriptor {
 			// The reasoning tiers come from the profile's config; empty
 			// means the model takes no reasoning configuration.
 			ReasoningLevels: reasoningLevelNames(profile.ReasoningConfig),
+			// The default mark: exactly the default_provider +
+			// default_model pair (zero entries when no default is
+			// configured).
+			Default: info.Provider == r.cfg.DefaultProvider && info.Profile == r.cfg.DefaultModel,
 		})
 	}
 	return out

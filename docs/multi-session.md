@@ -251,6 +251,7 @@ GET  /api/s/<id>/state               POST /api/s/<id>/steer
 GET  /api/s/<id>/history             PUT  /api/s/<id>/steer
 POST /api/s/<id>/compact             DELETE /api/s/<id>/steer?item=
 POST /api/s/<id>/stop                POST /api/s/<id>/approval （工具审批，§16.3）
+                                     GET /api/models        （可选模型列表，§17.2）
                                      DELETE /api/s/<id>   （删除会话）
 ```
 

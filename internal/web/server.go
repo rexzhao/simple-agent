@@ -151,6 +151,7 @@ func New(manager *Manager, opts ...ServerOption) *Server {
 	mux.HandleFunc("POST /api/s/{id}/compact", s.handleCompact)
 	mux.HandleFunc("POST /api/s/{id}/stop", s.handleStop)
 	mux.HandleFunc("POST /api/s/{id}/approval", s.handleApproval)
+	mux.HandleFunc("GET /api/models", s.handleModels)
 	// Unmatched /api paths answer with a JSON 404, never the page
 	// redirect: API consumers must not be sent wandering (a 3xx on an
 	// unknown route reads as "route exists" to a naive client).
@@ -255,6 +256,33 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// handleModels serves GET /api/models (§17.2): the configuration's
+// selectable models — provider, model, reasoning tiers, and the
+// default mark. Read-only; guardAPI's GET checks (loopback host,
+// no cross-origin writes) apply.
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	if !guardAPI(w, r, false) {
+		return
+	}
+	descriptors := s.manager.models()
+	type modelWire struct {
+		Provider        string   `json:"provider"`
+		Model           string   `json:"model"`
+		ReasoningLevels []string `json:"reasoning_levels"`
+		Default         bool     `json:"default"`
+	}
+	out := make([]modelWire, len(descriptors))
+	for i, d := range descriptors {
+		out[i] = modelWire{
+			Provider:        d.Provider,
+			Model:           d.Model,
+			ReasoningLevels: d.ReasoningLevels,
+			Default:         d.Default,
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
