@@ -189,6 +189,41 @@ func (m *Manager) subscribed(sessionID string) bool {
 	return hub != nil && hub.Subscribers() > 0
 }
 
+// CreateSession creates a new session in the given project's
+// namespace (§17.2): validate the meta through the shared check,
+// publish through the pool, return the id. The client navigates
+// (no server-side switch).
+func (m *Manager) CreateSession(ns string, meta storage.SessionMeta) (string, error) {
+	if m.modelList == nil {
+		return "", fmt.Errorf("no model resolver wired")
+	}
+	entries, err := m.registryEntries()
+	if err != nil {
+		return "", err
+	}
+	var projectPath string
+	for _, entry := range entries {
+		if projects.ProjectID(entry.Path) == ns {
+			projectPath = entry.Path
+			break
+		}
+	}
+	if projectPath == "" {
+		return "", sessionhost.Coded(sessionhost.ErrNotFound, "unknown project: "+ns)
+	}
+	lease, err := m.pool.Create(ns, projectPath, m.modelList, meta)
+	if err != nil {
+		return "", err
+	}
+	// The web's create endpoint drops the lease — the client
+	// navigates by the returned id; the pool entry is reachable
+	// through the table (the lazy header means the disk has nothing
+	// until the first append).
+	id := lease.Session().ID()
+	lease.Release()
+	return id, nil
+}
+
 // models returns the configuration's selectable models (the
 // /api/models data source; §17.2).
 func (m *Manager) models() []agent.ModelDescriptor {

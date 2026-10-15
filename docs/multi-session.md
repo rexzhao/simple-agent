@@ -252,6 +252,7 @@ GET  /api/s/<id>/history             PUT  /api/s/<id>/steer
 POST /api/s/<id>/compact             DELETE /api/s/<id>/steer?item=
 POST /api/s/<id>/stop                POST /api/s/<id>/approval （工具审批，§16.3）
                                      GET /api/models        （可选模型列表，§17.2）
+                                     POST /api/projects/{pid}/sessions（新建会话，§17.2）
                                      DELETE /api/s/<id>   （删除会话）
 ```
 
@@ -285,6 +286,9 @@ POST /api/s/<id>/stop                POST /api/s/<id>/approval （工具审批�
   | `compacting` | 409 | 否 | `compact`：已有压缩在飞（单飞槽） |
   | `model_unavailable` | 409 | 否 | 会话记录的 provider/model/reasoning 不在当前配置中（含空值）——不回退默认模型，需恢复配置或迁移会话 |
   | `session_conflict` | 409 | 否 | 同一 id 出现在多个注册项目（手拷目录）——拒绝而不静默挑一个（N3：error 字段有值，message 保留原文） |
+  | `unknown_project` | 404 | 否 | POST /api/projects/{pid}/sessions 的 pid 不在注册表（§17.2 新码） |
+  | `unexpected_field` | 400 | 否 | POST …/sessions 的 body 含未知字段（§17.2；C4 起新端点用码——旧端点的 400 纯文本是既有约定） |
+  | `invalid_input` | 400 | 否 | POST …/sessions 的 body 缺 provider/model 或 JSON 坏（§17.2） |
   | `project_unavailable` | 500 | 否 | agent 装配失败（路径缺失等） |
   | `empty_input` | 400 | 否 | 空文本 |
   | `unknown_session` | 404 | 否 | 未知会话 / 未注册项目 / 非法 id（N3：由纯文本升为码，message 保留原文 "unknown session"） |

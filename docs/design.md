@@ -1317,7 +1317,7 @@ log-*.jsonl 清单）：归档齐全 → 报告另有来源（旧版本段布局
 
 ### 17.2 新建会话
 
-**服务端**：`sessionhost.Pool.Create(ns string, meta storage.SessionMeta) (*Lease, error)`（§15.5 预留落地）：
+**服务端**：`sessionhost.Pool.Create(ns, projectPath string, resolver agent.ModelResolver, meta storage.SessionMeta) (*Lease, error)`（§15.5 预留落地）：
 - 校验 meta 经**共享校验函数**（`agent.ValidateSessionMeta(resolver, meta)`——B1 待办"level 校验下沉"在此落地）：provider/model 必须解析、reasoning_level 必须是该模型支持的档位（空=默认）。CLI `/new` 的 `newMetaValidator` 与 web 都调它，非法输入得到同一份错误。
 - 校验通过 → `agent.NewSession(ns, meta)`（惰性 header：磁盘无目录，首条 append 才落盘——现状不变）。
 - **发布进 Pool 表**：Create 走与 **Acquire 慢路径**同款的发布序列——openSlow（OnOpened 钩子：建 hub，宿主伴随对象先于任何客户端可见；失败 → 关会话 + 返回错误）→ `s.mu` 内置表（refs=1）→ defer 占位清理（不留半开条目）。之后 `GET /api/s/{id}/stream` 走表内**快路径**（不经 Locate——未落盘会话没有目录，`HasSession` 探针找不到它，Locate 必然 404；表内命中是它唯一的服务端入口）。
@@ -1530,6 +1530,7 @@ C8→C4；C9→C1–C8。其余顺序（如 C1 在 C5 前）只是建议（避�
   写。
 - §15.6 Q1=B 的项目范围语义贯穿（/sessions、/resume 均当前 ns）。
 - §16（B2）的审批 wire（事件+快照+端点）在 C6 消费，无新 wire 字段。
+- Create 的签名在 §15.5 预留的 `Create(meta)` 上扩展为 `Create(ns, projectPath, resolver, meta)`（宿主解析 ns→path；sessionhost 不引入注册表概念）。
 - 需改的既有段落：§15.5 的 Archiver 前置条件原文（"调用方必须持
   有 root lock 且该会话无在途 Lease"）**被 §17.3 修订**——落地时在
   §15.5 补一句"（C 阶段 0 修订：互斥机制见 §17.3）"；其余既有段落

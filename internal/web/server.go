@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"github.com/rexzhao/simple-agent/agent"
+	"github.com/rexzhao/simple-agent/sessionhost"
+	"github.com/rexzhao/simple-agent/storage"
 )
 
 //go:embed static
@@ -152,6 +154,7 @@ func New(manager *Manager, opts ...ServerOption) *Server {
 	mux.HandleFunc("POST /api/s/{id}/stop", s.handleStop)
 	mux.HandleFunc("POST /api/s/{id}/approval", s.handleApproval)
 	mux.HandleFunc("GET /api/models", s.handleModels)
+	mux.HandleFunc("POST /api/projects/{pid}/sessions", s.handleCreateSession)
 	// Unmatched /api paths answer with a JSON 404, never the page
 	// redirect: API consumers must not be sent wandering (a 3xx on an
 	// unknown route reads as "route exists" to a naive client).
@@ -283,6 +286,66 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleCreateSession is the web's session-creation endpoint (§17.2):
+// strict body (unknown fields are rejected), the shared meta
+// validation, and a 201 with the new id — the client navigates to
+// it (no server-side switch).
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	if !guardAPI(w, r, true) {
+		return
+	}
+	ns := r.PathValue("pid")
+	var body struct {
+		Provider       string `json:"provider"`
+		Model          string `json:"model"`
+		ReasoningLevel string `json:"reasoning_level"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		// C4's new-endpoint contract (§17.2): the 400s carry a code
+		// (writeAPIError); older endpoints' plain-text 400s are the
+		// pre-existing convention. Decode errors split: an unknown
+		// JSON key is unexpected_field; everything else (malformed
+		// JSON, type mismatches) is invalid_input. The standard
+		// library reports unknown keys as `json: unknown field "x"`
+		// — there is no dedicated error type, so the prefix is the
+		// discriminator.
+		code := "invalid_input"
+		if strings.HasPrefix(err.Error(), "json: unknown field ") {
+			code = "unexpected_field"
+		}
+		writeAPIError(w, http.StatusBadRequest, &apiError{code: code, cause: err})
+		return
+	}
+	if strings.TrimSpace(body.Provider) == "" || strings.TrimSpace(body.Model) == "" {
+		writeAPIError(w, http.StatusBadRequest, &apiError{code: "invalid_input", cause: errors.New("provider and model are required")})
+		return
+	}
+	meta := storage.SessionMeta{
+		Provider:       body.Provider,
+		Model:          body.Model,
+		ReasoningLevel: body.ReasoningLevel,
+	}
+	id, err := s.manager.CreateSession(ns, meta)
+	if err != nil {
+		switch {
+		case errors.Is(err, sessionhost.ErrNotFound):
+			// unknown_project (ns not in the registry) or
+			// unknown session — here it is the project.
+			writeAPIError(w, http.StatusNotFound, &apiError{code: "unknown_project", cause: err})
+		case errors.Is(err, sessionhost.ErrProjectUnavailable):
+			writeAPIError(w, http.StatusInternalServerError, &apiError{code: "project_unavailable", cause: err})
+		case errors.Is(err, agent.ErrModelUnavailable):
+			writeAPIError(w, http.StatusConflict, &apiError{code: "model_unavailable", cause: err})
+		default:
+			writeAPIError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"id": id, "ns": ns})
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
