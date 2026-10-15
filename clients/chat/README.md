@@ -61,20 +61,35 @@ preflights for loopback origins, so a direct connection works too.
   defaults autoScroll OFF — classic chat behavior wanted).
   `tooltip-icon-button.tsx` uses the Base UI `delay` prop name.
 
+Session management (C6a): the sidebar's "+" (or an exact `/new` in
+the composer — `/newfoo` sends as an ordinary message) opens the
+new-session dialog — project (defaults to the current session's),
+model (from `GET /api/models`, the marked default preselected),
+reasoning level (only when the selected model has tiers); submitting
+POSTs `/api/projects/{pid}/sessions` and navigates to the created id;
+error codes keep the dialog open with a readable hint. Each sidebar
+row has a delete button behind a confirmation dialog — cancelling
+sends nothing; `run_active`/`model_unavailable` refusals surface a
+hint, the closing-window codes retry silently. The dialog's decision
+logic lives in `src/newsession.ts` and is pinned by
+`internal/web/testdata/newsession_check.mjs` (node fixture, driven by
+`TestNewSessionFixture`).
+
 Known v1 gaps, on purpose: `context.compacted` / `session.created`
 records have no chat rendering (the `/log` view is the record-level
 truth), anchored queue moves are no-ops (the server queue is FIFO by
 mint time), message edit/branch/regenerate are not wired (the wire
-protocol has no branching), and there is no session-delete affordance
-in the chat client (the `/log` view has it; the runtime's onDelete is
-unreachable until a thread list is rendered — and once deletion lands
-here, a deep link to a deleted session becomes a common path: copy
-the log view's three-line unknown-id handling, hint + hash clear,
-instead of the current silent empty view).
+protocol has no branching), and archiving has no chat surface yet
+(the sidebar lists the default view only — C6b).
 
 Also known: a deep link to an UNKNOWN session id (or one this serve
 cannot open) selects it, fails to connect, and stays an empty view
 with a disabled composer — no explanation, no bounce to the list.
+With deletion now in the chat client, a deep link to a DELETED
+session is the common path into this gap: the fix is the log view's
+three-line unknown-id handling (hint + hash clear). Deferred — not in
+C6a's acceptance list; queued for opus to rule (with C6b, which
+touches the same sidebar).
 ## Sizes
 
 Measured after the official-style switch: JS 1,073,593 B (333,255 B

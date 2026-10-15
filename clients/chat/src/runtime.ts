@@ -5,7 +5,8 @@
 // and update the lanes.
 import { useMemo, useSyncExternalStore } from "react";
 import type { AppendMessage, ExternalStoreAdapter } from "@assistant-ui/react";
-import { APIError, deleteSession, postSend, postSteer, postStop, putSteer, deleteSteer } from "./api";
+import { APIError, postSend, postSteer, postStop, putSteer, deleteSteer } from "./api";
+import { isSlashNew } from "./newsession";
 import { convertLive, convertRecords, toThreadMessageLike, type ChatMessage } from "./convert";
 import { SessionStore, type Snap } from "./store";
 import type { ProjectsResponse } from "./types";
@@ -67,6 +68,8 @@ export function useSaiAdapter(
   projects: ProjectsResponse | null,
   onSwitch: (id: string) => void,
   onDeleted: (id: string) => void,
+  onSlashNew: () => void,
+  onRequestDelete: (id: string, title: string) => void,
 ): ExternalStoreAdapter<ChatMessage> {
   let store = stores.get(sessionID) ?? (sessionID ? (stores.set(sessionID, new SessionStore()), stores.get(sessionID)!) : undefined);
   const handle = useSyncExternalStore(store ? store.subscribe : noopSubscribe, store ? store.getSnapshot : emptySnap);
@@ -110,7 +113,17 @@ export function useSaiAdapter(
         await activeStore?.loadEarlier();
       },
       onNew: async (message: AppendMessage) => {
-        await sendOrSteer(sessionID, running, textOf(message));
+        const text = textOf(message);
+        // EXACT /new opens the creation dialog instead of sending —
+        // the CLI's exact-match contract carried into the chat
+        // client ("/newfoo" is an ordinary message; so is
+        // "/new -provider x": the dialog is the only creation
+        // surface here).
+        if (isSlashNew(text)) {
+          onSlashNew();
+          return;
+        }
+        await sendOrSteer(sessionID, running, text);
       },
       onCancel: async () => {
         await postStop(sessionID);
@@ -191,29 +204,17 @@ export function useSaiAdapter(
             onSwitch(id);
           },
           onDelete: (id: string) => {
-            // Deleting the open session first detaches (the SSE stream
-            // holds server-side refs → session_open); bounded retries
-            // cover the closing window.
-            void (async () => {
-              if (id === sessionID) onSwitch("");
-              for (let attempt = 0; attempt < 10; attempt++) {
-                try {
-                  await deleteSession(id);
-                  onDeleted(id);
-                  return;
-                } catch (e) {
-                  if (e instanceof APIError && (e.code === "session_open" || e.code === "session_closing")) {
-                    await new Promise(res => setTimeout(res, 500));
-                    continue;
-                  }
-                  console.error(e);
-                  return;
-                }
-              }
-            })();
+            // Deletion is confirmed first (C6a): the flow — detach
+            // the open stream, bounded retries over the closing
+            // window, refusal hints — lives in App, next to the
+            // sidebar rows that trigger it.
+            const entry = (projects?.projects ?? [])
+              .flatMap(p => p.sessions)
+              .find(sess => sess.id === id);
+            onRequestDelete(id, entry?.title || "untitled");
           },
         },
       },
     };
-  }, [snap, projects, onSwitch, onDeleted]);
+  }, [snap, projects, onSwitch, onDeleted, onSlashNew, onRequestDelete]);
 }

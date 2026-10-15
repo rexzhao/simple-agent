@@ -6,13 +6,39 @@ import {
 } from "@assistant-ui/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Thread } from "@/components/thread.aui";
-import { getProjects } from "./api";
+import { APIError, deleteSession, getModels, getProjects } from "./api";
 import { useSaiAdapter } from "./runtime";
 import { SessionStore } from "./store";
 import { convertRecords } from "./convert";
+import {
+  deleteBlockedHint,
+  deleteRetryable,
+  type ModelDescriptor,
+} from "./newsession";
+import { NewSessionDialog } from "./components/new-session-dialog";
+import { ConfirmDeleteDialog } from "./components/confirm-delete-dialog";
 import type { ProjectsResponse } from "./types";
 
 // ---- projects sidebar (own poll, like the log page) ----
+
+// useModels fetches the selectable models once (§17.2): the list is
+// configuration, not live state — a change is a config reload away
+// and the dialog can live with a stale copy until the next open.
+function useModels(): ModelDescriptor[] | null {
+  const [models, setModels] = useState<ModelDescriptor[] | null>(null);
+  useEffect(() => {
+    let stop = false;
+    getModels()
+      .then((m) => !stop && setModels(m))
+      .catch(() => {
+        /* the dialog shows "no models" — the poll will not fix a dead serve */
+      });
+    return () => {
+      stop = true;
+    };
+  }, []);
+  return models;
+}
 
 function useProjects(): ProjectsResponse | null {
   const [projects, setProjects] = useState<ProjectsResponse | null>(null);
@@ -46,6 +72,7 @@ function parseSessionHash(): string {
 
 export default function App() {
   const projects = useProjects();
+  const models = useModels();
   // Hash routing, same contract as the log page: #/s/<id> selects a
   // session (deep links, back/forward, and automation written against
   // the log page's convention all work); anything else is the list.
@@ -94,7 +121,55 @@ export default function App() {
     },
     [stores],
   );
-  const adapter = useSaiAdapter(stores, sessionID, projects, setSessionID, onDeleted);
+
+  // ---- new-session dialog (C6a) ----
+  const [newOpen, setNewOpen] = useState(false);
+  const openNew = useCallback(() => setNewOpen(true), []);
+  const currentProject = useMemo(() => {
+    for (const p of projects?.projects || []) {
+      if (p.sessions.some((sess) => sess.id === sessionID)) return p.id;
+    }
+    return projects?.projects[0]?.id ?? "";
+  }, [projects, sessionID]);
+
+  // ---- delete confirmation (C6a) ----
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+  const [deleteHint, setDeleteHint] = useState("");
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const requestDelete = useCallback((id: string, title: string) => {
+    setDeleteHint("");
+    setDeleteTarget({ id, title });
+  }, []);
+  const confirmDelete = useCallback(async () => {
+    if (!deleteTarget) return;
+    setDeleteBusy(true);
+    const id = deleteTarget.id;
+    // Deleting the open session first navigates away (the stream
+    // holds server-side refs → session_open); bounded retries cover
+    // the closing window, the same flow the runtime used to own.
+    if (id === sessionID) setSessionID("");
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        await deleteSession(id);
+        onDeleted(id);
+        setDeleteTarget(null);
+        return;
+      } catch (e) {
+        if (e instanceof APIError && deleteRetryable(e.code)) {
+          await new Promise((res) => setTimeout(res, 500));
+          continue;
+        }
+        const hint = e instanceof APIError ? deleteBlockedHint(e) : null;
+        setDeleteHint(hint ?? "delete failed — try again");
+        return;
+      } finally {
+        setDeleteBusy(false);
+      }
+    }
+    setDeleteHint("the session stayed open — try again in a moment");
+  }, [deleteTarget, sessionID, setSessionID, onDeleted]);
+
+  const adapter = useSaiAdapter(stores, sessionID, projects, setSessionID, onDeleted, openNew, requestDelete);
   const runtime = useExternalStoreRuntime(adapter);
 
   // The status strip reads the current session's snapshot directly —
@@ -164,22 +239,40 @@ export default function App() {
                 </div>
               )}
               {sessions.map(s => (
-                <button
+                <div
                   key={s.id}
                   className={
-                    "flex cursor-pointer flex-col gap-0.5 rounded-lg border-none px-3 py-2 text-left font-sans text-sm " +
-                    (s.id === sessionID
-                      ? "bg-accent text-accent-foreground"
-                      : "bg-transparent hover:bg-accent/50")
+                    "group flex items-stretch gap-0.5 rounded-lg font-sans text-sm " +
+                    (s.id === sessionID ? "bg-accent text-accent-foreground" : "hover:bg-accent/50")
                   }
-                  onClick={() => setSessionID(s.id)}
                   title={s.path}
                 >
-                  <span className="truncate">{s.title}</span>
-                  <span className="text-muted-foreground truncate text-xs">
-                    {s.path.replace(/[\\/]$/, "").split(/[\\/]/).pop()}
-                  </span>
-                </button>
+                  <button
+                    className={
+                      "flex min-w-0 flex-1 cursor-pointer flex-col gap-0.5 border-none bg-transparent px-3 py-2 text-left " +
+                      (s.id === sessionID
+                        ? "text-accent-foreground"
+                        : "bg-transparent")
+                    }
+                    onClick={() => setSessionID(s.id)}
+                  >
+                    <span className="truncate">{s.title}</span>
+                    <span className="text-muted-foreground truncate text-xs">
+                      {s.path.replace(/[\\/]$/, "").split(/[\\/]/).pop()}
+                    </span>
+                  </button>
+                  <button
+                    className="text-muted-foreground hover:text-destructive invisible mr-1 cursor-pointer self-start border-none bg-transparent px-1 pt-2 text-xs group-hover:visible"
+                    onClick={e => {
+                      e.stopPropagation();
+                      requestDelete(s.id, s.title);
+                    }}
+                    aria-label={`delete session ${s.title || "untitled"}`}
+                    title="delete this session"
+                  >
+                    ×
+                  </button>
+                </div>
               ))}
             </div>
           </nav>
@@ -199,6 +292,21 @@ export default function App() {
             </div>
           </div>
         </div>
+        <NewSessionDialog
+          open={newOpen}
+          onClose={() => setNewOpen(false)}
+          projects={(projects?.projects ?? []).map((p) => ({ id: p.id, path: p.path }))}
+          models={models ?? []}
+          currentProject={currentProject}
+          onCreated={setSessionID}
+        />
+        <ConfirmDeleteDialog
+          target={deleteTarget}
+          onCancel={() => setDeleteTarget(null)}
+          onConfirm={() => void confirmDelete()}
+          hint={deleteHint}
+          busy={deleteBusy}
+        />
       </AssistantRuntimeProvider>
     </TooltipProvider>
   );

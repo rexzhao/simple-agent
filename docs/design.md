@@ -1330,12 +1330,12 @@ log-*.jsonl 清单）：归档齐全 → 报告另有来源（旧版本段布局
 - **发布进 Pool 表**：Create 走与 **Acquire 慢路径**同款的发布序列——openSlow（OnOpened 钩子：建 hub，宿主伴随对象先于任何客户端可见；失败 → 关会话 + 返回错误）→ `s.mu` 内置表（refs=1）→ defer 占位清理（不留半开条目）。之后 `GET /api/s/{id}/stream` 走表内**快路径**（不经 Locate——未落盘会话没有目录，`HasSession` 探针找不到它，Locate 必然 404；表内命中是它唯一的服务端入口）。
 - **ID 冲突**：NewSession mint 的新 ID 与表内/磁盘冲突概率为零（26 字符随机）；仍加一行守卫（表内已有该 id → 返回错误）——零概率一旦发生就是覆盖活条目，一行守卫比事后排查便宜。
 - **Pool 关闭**：`p.closed` 时 Create 返回 ErrClosing（与 Acquire 同款）。
-- **未落盘会话的生命周期**：表内条目受空闲驱逐管辖——refs 归零且无订阅者（EvictGuard）后，清扫者照常拆除：**拆除即永久丢失**（磁盘无目录，重启后同样不可恢复；`#s=<id>` 返回 unknown_session）。**刷新在空闲窗口内可回到**（表内快路径），**超时或重启后回不去**——这是惰性 header + 驱逐的真实代价，不是"只能靠 #s=<id>"那么温和。
+- **未落盘会话的生命周期**：表内条目受空闲驱逐管辖——refs 归零且无订阅者（EvictGuard）后，清扫者照常拆除：**拆除即永久丢失**（磁盘无目录，重启后同样不可恢复；`#/s/<id>` 返回 unknown_session）。**刷新在空闲窗口内可回到**（表内快路径），**超时或重启后回不去**——这是惰性 header + 驱逐的真实代价，不是"只能靠 #/s/<id>"那么温和。
 - **列表可见性**：惰性 header 意味着 `ListSessions` 看不见未落盘会话（jsonl 的 `listSession` 要求 hasSegment）。这是现状语义（CLI /new 的会话在首条消息前也不在 /api/projects 里），**保持**：对话框不含首条消息（用户拍板），新会话在侧栏显示靠**客户端本地状态**（创建返回的 ID 直接导航），服务端列表要等首条消息落盘。
 
 **端点**：`POST /api/projects/{pid}/sessions`
 - body（严格：未知字段 → 400 `unexpected_field`）：`{"provider": "p", "model": "m", "reasoning_level": ""}`；provider/model 必填（客户端默认填充后提交），reasoning_level 可选。
-- 201 + `{"id": "<sid>", "ns": "<pid>"}`；客户端用返回的 id 导航（`#s=<id>`）——**无服务端切换逻辑**（用户拍板）。
+- 201 + `{"id": "<sid>", "ns": "<pid>"}`；客户端用返回的 id 导航（`#/s/<id>`）——**无服务端切换逻辑**（用户拍板）。
 - 错误码：`model_unavailable`（409，校验失败——理由：客户端只从 GET /api/models 选择，提交失配意味着**配置在选取与提交之间变了**；reasoning_level 不在该模型档位时同样返回此码）；`unknown_project`（404，**新码**——项目不在注册表）；`invalid_input`（400，字段缺失/类型错/未知字段）。
 
 **GET /api/models**：`[{"provider": "p", "model": "m", "reasoning_levels": ["low","high"], "default": bool}]`——`ModelDescriptor` 增 `Default bool`（config resolver 的 List 填充：default_provider+default_model 组合为 true）。`List()` 需测试（B1 待办）：pin 顺序稳定（按 provider 名、model 名排序）。
@@ -1530,7 +1530,7 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
 | C4 | `sessionhost.Pool.Create` + `POST /api/projects/{pid}/sessions` | Create 校验 kill（非法 meta→400 码）；端点测试（unknown_project/model_unavailable/严格字段） | C2、C3 | 同上 |
 | C5 | `Archiver`（标记文件）+ SessionInfo.Archived + ListSessions 过滤 + `Pool.Archive` 互斥 | 归档/取消/IsArchived round-trip；打开归档→ErrArchived；运行中归档→ErrRunActive；列表默认过滤+--all | （建议）C1 | storage doc.go 契约；multi-session.md §4 码表（session_archived 409）+ 归档路由；**§15.5 前置条件补指针**（"C 阶段 0 修订：互斥机制见 §17.3"） |
 | C5w | web 归档端点（POST/DELETE /api/s/{id}/archive）+ 409 session_archived 映射 | 端点测试：归档/取消 round-trip、打开归档→409 码、锁竞争→session_locked | C5 | 同 C5 |
-| C6a | chat 新建对话框 + 删除二次确认 | 对话框提交→POST→导航；tsc | C3、C4 | webui.md |
+| C6a | chat 新建对话框 + 删除二次确认 | 对话框提交→POST→导航；tsc | C3、C4 | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地）
 | C6b | chat 侧栏归档区（归档/恢复按钮 + 折叠区） | UI 消费 SessionInfo.Archived；tsc | C5、C5w | webui.md |
 | C6c | chat **审批卡**（若 (b) 通过） | UI 消费 tool_approval_pending/resolved + 快照 awaiting_approval；回答走 /approval；tsc | 无（wire 已在 B2 落地） | webui.md |
 | C7 | CLI：/sessions、/archive、/unarchive、/resume 序号+前缀+精确匹配收紧 | /resumefoo stderr 断言（B2 待办）；序号/前缀/歧义用例 | C5 | README |

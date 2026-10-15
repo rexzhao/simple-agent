@@ -3,6 +3,7 @@
 // serve, and the serve side answers CORS preflights for loopback
 // origins.
 import type { HistoryResponse, ProjectsResponse, StateResponse } from "./types";
+import type { ModelDescriptor } from "./newsession";
 
 export class APIError extends Error {
   status: number;
@@ -60,3 +61,26 @@ export const deleteSteer = (id: string, item: string) =>
   request<unknown>(`/api/s/${id}/steer?item=${encodeURIComponent(item)}`, "DELETE");
 export const postStop = (id: string) => request<unknown>(`/api/s/${id}/stop`, "POST", {});
 export const deleteSession = (id: string) => request<unknown>(`/api/s/${id}`, "DELETE");
+export const getModels = () =>
+  request<ModelDescriptor[]>("/api/models", "GET");
+
+// createSession posts the new-session form (§17.2): the body carries
+// only the meta fields, reasoning_level ONLY when set ("" means "the
+// model's default" and the server treats absence identically — but
+// the strict body makes the explicit-empty form a future
+// compatibility risk for no gain).
+export const createSession = (
+  pid: string,
+  meta: { provider: string; model: string; reasoning_level?: string },
+) => {
+  const body: Record<string, string> = {
+    provider: meta.provider,
+    model: meta.model,
+  };
+  if (meta.reasoning_level) body.reasoning_level = meta.reasoning_level;
+  return request<{ id: string; ns: string }>(
+    `/api/projects/${encodeURIComponent(pid)}/sessions`,
+    "POST",
+    body,
+  );
+};
