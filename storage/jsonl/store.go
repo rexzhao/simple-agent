@@ -28,6 +28,12 @@ import (
 const (
 	logFileName      = "log.jsonl"
 	logSwitchStaging = "log.jsonl.next"
+	// archivedMarker is the archive flag (§17.3, option A: a marker
+	// file, not a directory move): the session's path invariant
+	// <root>/<ns>/<id> and its lock file both stay put, external
+	// tools (grep/backup) keep one tree, and the flag is crash-safe —
+	// two states, os.Create+close, no rename chain.
+	archivedMarker   = "archived"
 	logArchivePrefix = "log-"
 	logArchiveSuffix = ".jsonl"
 )
@@ -255,13 +261,20 @@ func (s *Store) Open(ns, sessionID string) (storage.Session, error) {
 }
 
 // openDir takes the session lock, recovers an interrupted segment switch,
-// and opens the active log — the shared path behind Open.
+// and opens the active log — the shared path behind Open. The archive
+// marker is checked INSIDE the lock (§17.3): the archiver writes the
+// marker under the same lock, so the check and the write serialize and
+// the open-vs-archive TOCTOU window does not exist.
 func (s *Store) openDir(id, dir string) (storage.Session, error) {
 	// The lock precedes recovery and the log open: both touch files a
 	// concurrent writer could be mid-switch on.
 	lock, err := lockSession(dir)
 	if err != nil {
 		return nil, err
+	}
+	if _, err := os.Stat(filepath.Join(dir, archivedMarker)); err == nil {
+		lock.Release()
+		return nil, fmt.Errorf("open session %q: %w", id, storage.ErrArchived)
 	}
 	if err := recoverSegments(dir); err != nil {
 		lock.Release()
@@ -467,6 +480,16 @@ func (s *Session) Close() error {
 // right now), and sessions without a log file hold nothing and stay
 // unlisted.
 func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
+	return s.listSessions(projectID, false)
+}
+
+// ListSessionsAll is ListSessions including archived rows (§17.3):
+// the archive UI's "--all" view; SessionInfo.Archived marks them.
+func (s *Store) ListSessionsAll(projectID string) ([]storage.SessionInfo, error) {
+	return s.listSessions(projectID, true)
+}
+
+func (s *Store) listSessions(projectID string, includeArchived bool) ([]storage.SessionInfo, error) {
 	if !ValidNamespace(projectID) {
 		return nil, fmt.Errorf("invalid project id %q", projectID)
 	}
@@ -490,7 +513,7 @@ func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
 			// loudly when opened — that is where corruption belongs.
 			continue
 		}
-		if ok {
+		if ok && (includeArchived || !info.Archived) {
 			infos = append(infos, info)
 		}
 	}
@@ -509,7 +532,8 @@ func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
 // — either way there is nothing to list). Modified is CONTENT activity:
 // the newest mtime among segment files only — the lock/holder bookkeeping
 // (rewritten on every open) must not make an opened-but-idle session look
-// recently active.
+// recently active. Archived reflects the marker file in the same ReadDir
+// pass (no extra IO; §17.3).
 func listSession(dir string) (storage.SessionInfo, bool, error) {
 	files, err := os.ReadDir(dir)
 	if err != nil {
@@ -517,7 +541,12 @@ func listSession(dir string) (storage.SessionInfo, bool, error) {
 	}
 	var modified time.Time
 	hasSegment := false
+	archived := false
 	for _, file := range files {
+		if file.Name() == archivedMarker {
+			archived = true
+			continue
+		}
 		if file.IsDir() || !isSegmentName(file.Name()) {
 			continue
 		}
@@ -535,6 +564,7 @@ func listSession(dir string) (storage.SessionInfo, bool, error) {
 	}
 	info.ID = filepath.Base(dir)
 	info.Modified = modified
+	info.Archived = archived
 	return info, true, nil
 }
 
@@ -688,6 +718,11 @@ func (s *Store) HasSession(projectID, sessionID string) bool {
 // advisory flock would not stop the unlink, so the lock is the only
 // guard. The manager additionally refuses sessions it has open.
 //
+// An ARCHIVED session deletes normally (§17.3: archive ≠ delete): the
+// content sweep below removes the marker along with everything else,
+// so the archived state needs no special casing — deleting a parked
+// session just works and leaves no directory behind.
+//
 // Windows cannot remove a directory while a handle inside it is open,
 // so the deletion is staged: the CONTENT (log segments) dies while the
 // lock is held — the data is gone under exclusive control — then the
@@ -703,6 +738,82 @@ func (s *Store) HasSession(projectID, sessionID string) bool {
 // next open. A tombstone checked by openDir could close even that —
 // at the price of a marker whose failed removal permanently wedges
 // the session — not worth it until a real workload hits the window.
+// Archive parks a session out of the working set by creating the
+// marker file (§17.3). The session's own OS lock is taken first — an
+// external holder (a CLI mid-write, another serve) refuses with
+// LockHeldError — and the marker is written inside the lock, so the
+// marker check in openDir (same lock) serializes with it: an open that
+// lost the race sees ErrArchived, never a half-parked session.
+// Idempotent: an already-archived session is a no-op success.
+func (s *Store) Archive(projectID, sessionID string) error {
+	return s.writeMarker(projectID, sessionID, true)
+}
+
+// Unarchive returns a session to the working set by removing the
+// marker. Lock semantics match Archive; idempotent (no marker is a
+// no-op success — the CLI's /unarchive must not fail on a race with
+// another unarchive).
+func (s *Store) Unarchive(projectID, sessionID string) error {
+	return s.writeMarker(projectID, sessionID, false)
+}
+
+// writeMarker is the shared Archive/Unarchive path: take the session
+// lock, then create/remove the archived marker inside it.
+func (s *Store) writeMarker(projectID, sessionID string, archive bool) error {
+	if !ValidNamespace(projectID) {
+		return fmt.Errorf("invalid project id %q", projectID)
+	}
+	if !ValidSessionID(sessionID) {
+		return fmt.Errorf("invalid session id %q", sessionID)
+	}
+	dir := filepath.Join(s.root, projectID, sessionID)
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
+	}
+	lock, err := lockSession(dir)
+	if err != nil {
+		return err
+	}
+	marker := filepath.Join(dir, archivedMarker)
+	if archive {
+		if _, err := os.Stat(marker); err == nil {
+			lock.Release()
+			return nil // already archived — idempotent
+		}
+		if err := os.WriteFile(marker, nil, 0o644); err != nil {
+			lock.Release()
+			return fmt.Errorf("archive session %q: %w", sessionID, err)
+		}
+	} else {
+		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+			lock.Release()
+			return fmt.Errorf("unarchive session %q: %w", sessionID, err)
+		}
+	}
+	lock.Release()
+	return nil
+}
+
+// IsArchived reports the marker WITHOUT taking the session lock: a
+// query in a listing view, atomic enough for a two-state flag whose
+// transitions happen under the lock.
+func (s *Store) IsArchived(projectID, sessionID string) (bool, error) {
+	if !ValidNamespace(projectID) {
+		return false, fmt.Errorf("invalid project id %q", projectID)
+	}
+	if !ValidSessionID(sessionID) {
+		return false, fmt.Errorf("invalid session id %q", sessionID)
+	}
+	_, err := os.Stat(filepath.Join(s.root, projectID, sessionID, archivedMarker))
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
 func (s *Store) Delete(projectID, sessionID string) error {
 	if !ValidNamespace(projectID) {
 		return fmt.Errorf("invalid project id %q", projectID)

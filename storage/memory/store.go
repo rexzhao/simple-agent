@@ -22,11 +22,13 @@ type Store struct {
 	// projectOf mirrors the jsonl layout: which namespace each session
 	// belongs to. Open's ownership gate and ListSessions' scoping depend
 	projectOf map[string]string
+	// archived mirrors the jsonl marker file (§17.3): parked sessions.
+	archived map[string]bool
 }
 
 // OpenStore returns an empty in-memory store.
 func OpenStore() *Store {
-	return &Store{sessions: make(map[string]*records), projectOf: make(map[string]string)}
+	return &Store{sessions: make(map[string]*records), projectOf: make(map[string]string), archived: make(map[string]bool)}
 }
 
 // Create returns a new session inside the namespace.
@@ -52,6 +54,9 @@ func (s *Store) Open(ns, id string) (storage.Session, error) {
 	log, ok := s.sessions[id]
 	if !ok {
 		return nil, fmt.Errorf("open session %q: %w", id, storage.ErrSessionNotFound)
+	}
+	if s.archived[id] {
+		return nil, fmt.Errorf("open session %q: %w", id, storage.ErrArchived)
 	}
 	return &Session{id: id, log: log}, nil
 }
@@ -140,6 +145,16 @@ func (s *Session) Close() error {
 // ListSessions enumerates a project's sessions, newest activity first.
 // Sessions with no records hold nothing and stay unlisted.
 func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
+	return s.listSessions(projectID, false)
+}
+
+// ListSessionsAll is ListSessions including archived rows (§17.3) —
+// the memory mirror of the jsonl "--all" view.
+func (s *Store) ListSessionsAll(projectID string) ([]storage.SessionInfo, error) {
+	return s.listSessions(projectID, true)
+}
+
+func (s *Store) listSessions(projectID string, includeArchived bool) ([]storage.SessionInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var infos []storage.SessionInfo
@@ -147,8 +162,12 @@ func (s *Store) ListSessions(projectID string) ([]storage.SessionInfo, error) {
 		if s.projectOf[id] != projectID {
 			continue
 		}
+		if s.archived[id] && !includeArchived {
+			continue
+		}
 		info, ok := describeSession(id, log.snapshot())
 		if ok {
+			info.Archived = s.archived[id]
 			infos = append(infos, info)
 		}
 	}
@@ -238,5 +257,46 @@ func (s *Store) Delete(projectID, sessionID string) error {
 	}
 	delete(s.sessions, sessionID)
 	delete(s.projectOf, sessionID)
+	delete(s.archived, sessionID)
 	return nil
+}
+
+// Archive parks a session out of the working set (§17.3). The store
+// mutex serializes the marker (the archived set) with Open's refusal
+// check — the memory analogue of the jsonl in-lock check. NOT fully
+// equivalent to the jsonl session lock: an already-open memory session
+// can still append while archived (jsonl refuses the archive itself
+// under the lock); the memory store is a test double, not a
+// cross-process guard. The OWNERSHIP gate applies as everywhere;
+// idempotent (already archived is a no-op success).
+func (s *Store) Archive(projectID, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.projectOf[sessionID] != projectID {
+		return fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
+	}
+	s.archived[sessionID] = true
+	return nil
+}
+
+// Unarchive returns a session to the working set. Idempotent (no
+// marker is a no-op success).
+func (s *Store) Unarchive(projectID, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.projectOf[sessionID] != projectID {
+		return fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
+	}
+	delete(s.archived, sessionID)
+	return nil
+}
+
+// IsArchived reports the marker.
+func (s *Store) IsArchived(projectID, sessionID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.projectOf[sessionID] != projectID {
+		return false, fmt.Errorf("open session %q: %w", sessionID, storage.ErrSessionNotFound)
+	}
+	return s.archived[sessionID], nil
 }

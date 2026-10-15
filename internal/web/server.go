@@ -150,6 +150,8 @@ func New(manager *Manager, opts ...ServerOption) *Server {
 	mux.HandleFunc("PUT /api/s/{id}/steer", s.handleSteerUpdate)
 	mux.HandleFunc("DELETE /api/s/{id}/steer", s.handleSteerWithdraw)
 	mux.HandleFunc("DELETE /api/s/{id}", manager.DeleteSession)
+	mux.HandleFunc("POST /api/s/{id}/archive", manager.ArchiveSession)
+	mux.HandleFunc("DELETE /api/s/{id}/archive", manager.UnarchiveSession)
 	mux.HandleFunc("POST /api/s/{id}/compact", s.handleCompact)
 	mux.HandleFunc("POST /api/s/{id}/stop", s.handleStop)
 	mux.HandleFunc("POST /api/s/{id}/approval", s.handleApproval)

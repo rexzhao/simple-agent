@@ -511,6 +511,10 @@ func writePoolError(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "run_active"
 	case errors.Is(err, sessionhost.ErrInUse):
 		status, code = http.StatusConflict, "session_open"
+	case errors.Is(err, sessionhost.ErrArchived):
+		// Parked out of the working set (§17.3): a stable conflict —
+		// the session must be unarchived first.
+		status, code = http.StatusConflict, "session_archived"
 	case errors.Is(err, sessionhost.ErrProjectUnavailable):
 		status, code = http.StatusInternalServerError, "project_unavailable"
 	case errors.Is(err, agent.ErrModelUnavailable):
@@ -537,6 +541,34 @@ func (m *Manager) DeleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if err := m.pool.Delete(id); err != nil {
+		writePoolError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ArchiveSession parks a session out of the working set (§17.3, the
+// web surface): the refusals and the closing window are Pool.Archive's
+// contract; the marker write happens under the session's OS lock.
+func (m *Manager) ArchiveSession(w http.ResponseWriter, r *http.Request) {
+	if !guardAPI(w, r, true) {
+		return
+	}
+	id := r.PathValue("id")
+	if err := m.pool.Archive(id); err != nil {
+		writePoolError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// UnarchiveSession returns a parked session to the working set.
+func (m *Manager) UnarchiveSession(w http.ResponseWriter, r *http.Request) {
+	if !guardAPI(w, r, true) {
+		return
+	}
+	id := r.PathValue("id")
+	if err := m.pool.Unarchive(id); err != nil {
 		writePoolError(w, err)
 		return
 	}

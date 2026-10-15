@@ -938,6 +938,10 @@ created 记录，加字段即得）。
   露与否。**前置条件（写进接口注释）**：调用方必须持有 root lock 且
   该会话无在途 Lease——归档与追加互斥。
 
+  **C 阶段 0 修订（§17.3）**：前置条件改为**会话自己的 OS 锁**
+  （CLI 不建 Pool 不持 root lock；serve 打开同一会话时也持这把
+  锁）——互斥机制见 §17.3。已按此落地，接口注释为 §17.3 版本。
+
 ### 15.6 产品决策（已定，opus chk2ajpl1j）
 
 - **Q1 = 方案 B**：CLI 的 `-session`/`/resume` 只在当前目录对应项目
@@ -1282,7 +1286,10 @@ page_provider_check fixture 与对应 Go 测试、README 的调试章节。理�
 | 标题 | `readSessionHead`：最早段 records[0]=session.created 且 records[1]≠compacted 时扫首条 user.input | 用户报告"压缩后标题变空"——**规则冲突，非单纯 bug**（见下方实测基线：A 形态该分支不可达） |
 | /resume | `strings.HasPrefix(text, "/resume")`（B2 待办：/resumefoo 误匹配） | 精确匹配收紧 |
 
-**标题问题（设计点 6，实测基线 + 规则冲突）**：用户报告"压缩后标题
+**标题问题（设计点 6，实测基线 + 规则冲突）**：
+**C1 结论（用户裁定，2026-10-15）：维持现有规则，不追查；压缩后
+标题变空的 B 形态是既有规则的预期行为。**
+用户报告"压缩后标题
 变空"。这**不是单纯的 bug，而是用户报告与既有书面规则的冲突**——
 multi-session.md（§ Title 规则）明文规定"若最早段前两行是
 created+compacted → Title 留空；**绝不取中途输入当标题——标题撒谎
@@ -1382,8 +1389,10 @@ root lock——CLI 不建 Pool 不持 root lock，而 serve 可能正打开着�
   ErrRunActive；refs>0 或有订阅者（InUseGuard）→ ErrInUse——**不
   强制驱逐用户正在看的会话**；空闲 → 置 closing 占位（defer 清理，
   与 Delete 同款）→ 池内 teardown → 获取会话锁 → 写标记 → 清占位。
-  占位期间 Acquire 得 ErrClosing。Unarchive 经 Pool 时同样过
-  InUseGuard（归档会话不在池里，通常直接锁内删标记）。
+  占位期间 Acquire 得 ErrClosing。Unarchive 经 Pool 时靠**会话锁**
+  拒绝：被任何进程（含本池——池内条目存活期间持有该会话的 OS 锁）
+  打开着的会话 → ErrLocked / 409 `session_locked`；归档会话不在池
+  里，空闲时直接锁内删标记（落地即此口径，不加 InUseGuard）。
 - **CLI 路径**：`/archive` 直接经 Store 的 Archiver（获取会话锁 →
   写标记）——CLI 与 serve 各自持锁串行，跨进程安全；serve 若已打
   开该会话（持锁中）→ CLI 得 session_locked。
@@ -1477,7 +1486,10 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
 - `sessionhost.Coded`/`Options.Locate` 的宿主语义：看 Create/Archive
   路径是否需要变更签名。
 
-### 17.8 待用户拍板的问题
+### 17.8 待用户拍板的问题（已全部裁定）
+
+**裁定（用户 2026-10-15，opus 转达）：以下五题全部按推荐方案。
+另：C1 标题问题另行裁定维持现状（见 §17.1）。**
 
 - **(a) 归档存储方式**：推荐 A（标记文件）——路径不变量不动、崩溃
   一致性两态、锁语义连续（17.3 对比表）；B（目录移动）的收益只有
@@ -1501,7 +1513,7 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
 
 | 步骤 | 内容 | 回归保护 | 硬依赖（弱序见下行说明） | doc-sync |
 |---|---|---|---|---|
-| C1 | 标题问题：**先复现**（A 形态：真实压缩路径断言标题非空——实测预期绿）；绿则取用户磁盘形态（log-*.jsonl 清单）分流 B/C；**B 是规则冲突**——改规则需用户裁定（"撒谎比留空更糟"→"最早可读输入"）；C 另议或接受 | A/B/C 三形态各有独立断言的测试；现有 list 测试全过 | 无 | **若改规则**：multi-session.md 的 Title 规则（"绝不取中途输入"段）+ storage/jsonl/store.go 的 readSessionHead 注释 + storage/storage.go 的 SessionInfo.Title 文档契约（"empty when the session start is no longer on disk"句）三处同步 |
+| C1 | 标题问题：**先复现**（A 形态：真实压缩路径断言标题非空——实测预期绿）；绿则取用户磁盘形态（log-*.jsonl 清单）分流 B/C；**B 是规则冲突**——改规则需用户裁定（"撒谎比留空更糟"→"最早可读输入"）；C 另议或接受（**已落地：仅复现测试；规则不变**——用户裁定维持现有规则，不做阶段二，2026-10-15） | A/B/C 三形态各有独立断言的测试；现有 list 测试全过 | 无 | **若改规则**：multi-session.md 的 Title 规则（"绝不取中途输入"段）+ storage/jsonl/store.go 的 readSessionHead 注释 + storage/storage.go 的 SessionInfo.Title 文档契约（"empty when the session start is no longer on disk"句）三处同步 |
 | C2 | 共享校验函数 `ValidateSessionMeta`（B1 下沉）+ CLI /new 切换 + resolver level 校验测试 | CLI /new 既有测试不改断言；校验 kill（level 不校验→红） | 无 | design §17.2 |
 | C3 | `ModelDescriptor.Default` + `List()` 测试 + `GET /api/models` | List 顺序/默认标记 pin；端点过 guardAPI | （建议）C2 | multi-session 码表+路由 |
 | C4 | `sessionhost.Pool.Create` + `POST /api/projects/{pid}/sessions` | Create 校验 kill（非法 meta→400 码）；端点测试（unknown_project/model_unavailable/严格字段） | C2、C3 | 同上 |

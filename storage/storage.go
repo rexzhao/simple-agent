@@ -27,6 +27,11 @@ type SessionInfo struct {
 	// Meta is the session's model configuration, read from the
 	// session.created record (empty when the head cannot be parsed).
 	Meta SessionMeta
+	// Archived reports the archive marker (§17.3): the session stays
+	// on disk but refuses to open. It is false for every row of the
+	// DEFAULT listing (archived sessions are filtered out); only the
+	// include-archived view (AllLister) carries true rows.
+	Archived bool
 }
 
 // Session is one stored session: an append-only sequence of records.
@@ -94,10 +99,42 @@ type Prober interface {
 	HasSession(ns, id string) bool
 }
 
+// Archiver is the optional archive capability (§17.3): a session can
+// be parked out of the working set without deleting it. Archive and
+// Unarchive acquire the SESSION's own OS lock (the same one Open
+// takes) and write/remove the marker inside it; an external holder
+// (e.g. a CLI mid-write) refuses with the implementation's lock error
+// (jsonl.LockHeldError) instead of mutating under an active writer.
+// No root lock is required: the CLI never builds a Pool and cannot
+// hold one. Both operations are IDEMPOTENT (an already-(un)archived
+// session is a no-op success). An archived session refuses to open
+// with ErrArchived; Delete ignores the marker (archive ≠ delete).
+type Archiver interface {
+	Store
+	Archive(ns, id string) error
+	Unarchive(ns, id string) error
+	IsArchived(ns, id string) (bool, error)
+}
+
+// AllLister enumerates sessions INCLUDING archived ones (§17.3): the
+// archive UI's "--all" view, with SessionInfo.Archived marking the
+// parked rows. Hosts that only know Lister see the default view —
+// archived sessions hidden from the working set.
+type AllLister interface {
+	Lister
+	ListSessionsAll(ns string) ([]SessionInfo, error)
+}
+
 // ErrSessionNotFound is the typed sentinel for opening a session that
 // does not exist (or lives outside the requested project). Callers
 // classify with errors.Is — never by parsing the message.
 var ErrSessionNotFound = errors.New("session not found")
+
+// ErrArchived is the typed sentinel for opening an ARCHIVED session
+// (§17.3): the session exists on disk but is parked out of the
+// working set — it must be unarchived first. Callers classify with
+// errors.Is.
+var ErrArchived = errors.New("session archived")
 
 // SessionMeta is the model configuration a session runs with: the payload
 // of session.created (§15.2). Provider and Model name configured entries;

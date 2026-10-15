@@ -30,6 +30,14 @@
 //   - Locking (the jsonl implementation): one writer per session,
 //     enforced by a lock file next to the log (flock / LockFileEx);
 //     a second open fails with jsonl.LockHeldError.
+//   - Archiving (§17.3): a marker file <root>/<ns>/<id>/archived parks
+//     a session out of the working set — the directory tree, the path
+//     invariant, and the lock file all stay put. Archive/Unarchive
+//     take the session's own OS lock (an external holder refuses with
+//     jsonl.LockHeldError); Open checks the marker INSIDE the same
+//     lock and refuses with ErrArchived; both operations are
+//     idempotent. Delete ignores the marker: archive ≠ delete, a
+//     parked session deletes like any other.
 //
 // Compatibility: v0 — NO stability guarantees. Breaking changes land
 // without notice until v1 is declared. If you embed this package, pin

@@ -34,6 +34,9 @@ var (
 	// project failed (surfaced as a distinct code so the operator can
 	// tell a config problem from a session problem).
 	ErrProjectUnavailable = errors.New("project unavailable")
+	// ErrArchived: the session is parked out of the working set
+	// (§17.3); it must be unarchived before it can open.
+	ErrArchived = errors.New("session archived")
 )
 
 // Coded wraps a typed error with the wire message: the HTTP layer
@@ -339,6 +342,9 @@ func (p *Pool) openSlow(id string) (*poolEntry, error) {
 		if errors.Is(err, storage.ErrSessionNotFound) {
 			return nil, ErrNotFound
 		}
+		if errors.Is(err, storage.ErrArchived) {
+			return nil, Coded(ErrArchived, "unarchive the session first")
+		}
 		// agent.ErrModelUnavailable passes through unchanged (the
 		// host maps it); segment corruption, permissions: real
 		// errors, surfaced.
@@ -543,6 +549,128 @@ func (p *Pool) Delete(id string) error {
 		}
 	}
 
+	return nil
+}
+
+// Archive parks a session out of the working set (§17.3) — the same
+// shape as Delete, minus the unlink: the open entry (if any) is torn
+// down, then the storage marker is written under the session's OS
+// lock. Refusals mirror Delete: running (ErrRunActive), in-flight or
+// host-held references (ErrInUse). The closing claim covers the
+// teardown AND the marker write: a concurrent Acquire in that window
+// gets ErrClosing (retryable), and after the marker lands it
+// converges to ErrArchived — a reopen can never race the archive.
+func (p *Pool) Archive(id string) error {
+	if !jsonl.ValidSessionID(id) {
+		return ErrNotFound
+	}
+	// Pre-checks and the claim under one critical section; teardown
+	// and the marker write run outside it — Delete's shape.
+	p.mu.Lock()
+	var entry *poolEntry
+	if e := p.sessions[id]; e != nil {
+		if e.session.Running() {
+			p.mu.Unlock()
+			return Coded(ErrRunActive, "")
+		}
+		if e.refs > 0 || (p.opts.InUseGuard != nil && p.opts.InUseGuard(id)) {
+			p.mu.Unlock()
+			return Coded(ErrInUse, "")
+		}
+		delete(p.sessions, id)
+		entry = e
+	}
+	if _, busy := p.closing[id]; busy {
+		p.mu.Unlock()
+		return Coded(ErrClosing, "")
+	}
+	p.closing[id] = struct{}{}
+	p.mu.Unlock()
+
+	// Same panic-proof claim as Delete: OnClosed is a host callback
+	// running in this goroutine; a recovered panic must not wedge the
+	// id in ErrClosing.
+	defer func() {
+		p.mu.Lock()
+		delete(p.closing, id)
+		p.mu.Unlock()
+	}()
+
+	if entry != nil {
+		func() {
+			defer func() { _ = entry.session.Close() }()
+			if p.opts.OnClosed != nil {
+				p.opts.OnClosed(id, entry.session, entry.hostData)
+			}
+		}()
+	}
+
+	// Drain in-flight opens (Delete's reasoning: the marker write must
+	// never race an open's replay).
+	for {
+		p.mu.Lock()
+		inFlight := p.opening[id]
+		p.mu.Unlock()
+		if inFlight == nil {
+			break
+		}
+		<-inFlight
+	}
+
+	ns, _, err := p.opts.Locate(id)
+	if err != nil {
+		return err
+	}
+
+	archiver, canArchive := p.store.(storage.Archiver)
+	if !canArchive {
+		return fmt.Errorf("store cannot archive sessions")
+	}
+	if err := archiver.Archive(ns, id); err != nil {
+		var held *jsonl.LockHeldError
+		switch {
+		case errors.As(err, &held):
+			return Coded(ErrLocked, held.Error())
+		case errors.Is(err, storage.ErrSessionNotFound):
+			return ErrNotFound
+		default:
+			return err
+		}
+	}
+	return nil
+}
+
+// Unarchive returns a parked session to the working set. An archived
+// session cannot be open (the open path refuses ErrArchived), so
+// there is no entry to tear down and no closing window to hold — the
+// marker removal under the session lock is the whole operation. A
+// session held open by ANY process — this pool included: the pool
+// keeps the session's OS lock while the entry lives — refuses with
+// ErrLocked (web 409 session_locked); only after the entry is torn
+// down (eviction or pool Close) does the marker removal succeed.
+func (p *Pool) Unarchive(id string) error {
+	if !jsonl.ValidSessionID(id) {
+		return ErrNotFound
+	}
+	ns, _, err := p.opts.Locate(id)
+	if err != nil {
+		return err
+	}
+	archiver, canArchive := p.store.(storage.Archiver)
+	if !canArchive {
+		return fmt.Errorf("store cannot archive sessions")
+	}
+	if err := archiver.Unarchive(ns, id); err != nil {
+		var held *jsonl.LockHeldError
+		switch {
+		case errors.As(err, &held):
+			return Coded(ErrLocked, held.Error())
+		case errors.Is(err, storage.ErrSessionNotFound):
+			return ErrNotFound
+		default:
+			return err
+		}
+	}
 	return nil
 }
 
