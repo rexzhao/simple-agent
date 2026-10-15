@@ -284,9 +284,9 @@ test server 复用 frames.go + 自算 Accept。
 
 | 步骤 | 内容 | 回归保护 | doc-sync |
 |---|---|---|---|
-| D1 | frames.go + client.go + 最小 WS test server | 握手/掩码/rid/超时/notify/致命码/重连 generation 的表驱动测试；变异：掩码丢一位→server 拒；rid 错配→超时 | 本文 §9 |
+| D1 | frames.go + client.go + 最小 WS test server | 握手（含 Accept 校验 + **超时，成功后清除**）/掩码/长度边界（125/126/65535/65536，双向）/分片拒绝/超限/ping-pong/close/rid 关联/超时/断开即失败/**Done/Err 可观察**/notify/致命码的表驱动测试；变异：掩码丢→server 拒、Accept 不校验、rid 错配、断开不清在途、16 位长度编码错一位、握手无 deadline 挂、done 不关 | 本文 §9 |
 | D2 | daemon.go：registry 解析/探测/拉起 + host-id/项目身份派生 | registry 缺失/死端口/版本不符/拉起超时；**固定输入集交叉测试**（同一组 hostId+路径喂 Go 与 TS 两实现，断言同 projectId/sessionId） | 本文 §5 |
-| D3 | plugin.go：会话生命周期接线（OnOpened/OnClosed/OnEvicted）+ 错峰重连 + 积压拉取 | sessionhost 钩子驱动的注册/断开/重开；驱逐不被 Lease 阻止（既有池测试不改断言）；**daemon 不可达时 Acquire 延迟不变**（OnOpened 只登记不联网） | 本文 §2.1 |
+| D3 | plugin.go：会话生命周期接线（OnOpened/OnClosed/OnEvicted）+ **重连 generation 语义** + 错峰重连 + 积压拉取 | sessionhost 钩子驱动的注册/断开/重开；驱逐不被 Lease 阻止（既有池测试不改断言）；**daemon 不可达时 Acquire 延迟不变**（OnOpened 只登记不联网）；generation：旧连接的迟到响应不得解析新连接的请求；**监督经 Client.Done()/Err() 感知断连与成因**（D1 落地） | 本文 §2.1 |
 | D4 | inject.go：Send/Steer/followup + 投递确认（ItemID/mail-id）+ Read | **活跃段内至多一次注入**集成测试：notify → 注入 → 落盘确认；**记录已落盘 → 断开 → 重连 → 不重投**（记录去重）；未落盘 → 断开 → 重连 → 重投；Ask 挂起期间驱逐重连 → 不重投；**压缩后重连 → 重复注入（记录性，§4 边界）** | 本文 §3/§4 |
 | D5 | `-mailbox` flag（CLI + serve 装配）+ serve 的 ns→path 接线 | CLI/serve 装配测试（真实 flag 路径） | 本文 §7 |
 | D6 | 冒烟：真实 mailboxd + sai↔sai（或 pi）互发 | 冒烟记录（截图/日志路径）进送审邮件 | README |
