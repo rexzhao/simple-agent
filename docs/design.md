@@ -1462,6 +1462,17 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
   `strings.HasPrefix(text, "/resume ")`——`/resumefoo` 落 unknown
   command（与 /new 同款 + stderr 断言测试）。
 
+**C7 落地的两个补白**（实现期定）：
+- **序号基准**：`/resume <n>` 与 `/archive <n>` 的序号索引**未归档**
+  行（两种视图下同基准，无歧义）；`/unarchive <n>` 的序号索引
+  **归档**行（`--all` 中标 A 的行按 mtime 降序）——live 序号对恢复
+  操作无意义。ID 前缀对三个命令都匹配**全集**（含归档行，故
+  `/resume` 对归档命中能提示"先 /unarchive"而非"找不到"）。
+- **归档当前会话**：**拒绝**（"this is the current session — pick
+  another, or /quit first"），不自动切换。理由：当前会话的 OS 锁
+  由本进程持有，标记写不进去（锁决定了必须先关闭）；且显式拒绝
+  优于把用户静默丢进一个他没要的新会话。
+
 ### 17.6 chat 客户端
 
 - **新建对话框**：侧栏"+"按钮与输入框 `/new` 均打开；项目下拉（默认

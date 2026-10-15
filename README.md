@@ -65,9 +65,20 @@ An optional positional argument resumes a stored session. Slash commands:
   conversation before the compaction is replaced by it. Compaction also
   happens automatically when the request approaches the model's context
   budget (`agent.auto_compact`, on by default)
-- `/resume <id>` — reopen a stored session (searched in the current
+- `/resume <#|id-prefix>` — reopen a stored session (searched in the current
   directory's project only; history prints as the last
-  20 records; the full log stays in the file)
+  20 records; the full log stays in the file). `#` is the position in the
+  latest `/sessions` output — unstable across commands; an id prefix is
+  the stable addressing. An archived session refuses with a hint to
+  `/unarchive` it first
+- `/sessions [--all]` — list the project's sessions, newest activity
+  first, live rows numbered (`#`), model from the session meta. Archived
+  sessions are hidden by default; `--all` shows them marked `A`
+- `/archive <#|id-prefix>` — park a session out of the working set (kept
+  on disk, hidden from listings, refused on open). The current session
+  is refused — its lock is held by this process
+- `/unarchive <#|id-prefix>` — restore an archived session; `#` indexes
+  the archived rows of `/sessions --all`
 - `/stop` — stop the active run (Ctrl+C does the same)
 - `/quit` — exit (a second Ctrl+C when idle also exits)
 

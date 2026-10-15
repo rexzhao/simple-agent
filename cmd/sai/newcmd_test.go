@@ -106,7 +106,7 @@ func newCmdWorld(t *testing.T, defaultMeta storage.SessionMeta) (*cliApp, *newCm
 	if err != nil {
 		t.Fatal(err)
 	}
-	cli, err := setupCLI(ag, defaultMeta, newMetaValidator(resolver), "")
+	cli, err := setupCLI(ag, store, defaultMeta, newMetaValidator(resolver), "")
 	if err != nil {
 		t.Fatal(err)
 	}

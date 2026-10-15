@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -89,7 +90,7 @@ func main() {
 		return
 	}
 
-	ag, project, defaultMeta, validateMeta, err := assembleCurrentDir(*serverRoot, *provider, *modelName)
+	ag, store, project, defaultMeta, validateMeta, err := assembleCurrentDir(*serverRoot, *provider, *modelName)
 	if err != nil {
 		log.Fatalf("sai: %v", err)
 	}
@@ -105,7 +106,7 @@ func main() {
 		resumeID = strings.TrimSpace(flag.Arg(0))
 	}
 
-	cli, err := setupCLI(ag, defaultMeta, validateMeta, resumeID)
+	cli, err := setupCLI(ag, store, defaultMeta, validateMeta, resumeID)
 	if err != nil {
 		log.Fatalf("sai: %v", err)
 	}
@@ -126,7 +127,7 @@ func main() {
 		}
 	}()
 
-	fmt.Fprintln(os.Stderr, "sai: /new /compact /resume <id> /stop /help /quit")
+	fmt.Fprintln(os.Stderr, "sai: /new /compact /resume <#|id> /sessions [--all] /archive <#|id> /unarchive <#|id> /stop /help /quit")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for {
@@ -239,17 +240,17 @@ func (f *agentFactory) Agent(projectCwd string) (*agent.Agent, string, error) {
 // The returned validator is the /new override check (§15.4 step 4):
 // provider/model must resolve in the live configuration and the
 // reasoning level must be one the chosen model supports.
-func assembleCurrentDir(serverRoot, providerName, modelName string) (*agent.Agent, string, storage.SessionMeta, func(storage.SessionMeta) error, error) {
+func assembleCurrentDir(serverRoot, providerName, modelName string) (*agent.Agent, *jsonl.Store, string, storage.SessionMeta, func(storage.SessionMeta) error, error) {
 	cwd, err := filepath.Abs(".")
 	if err != nil {
-		return nil, "", storage.SessionMeta{}, nil, fmt.Errorf("resolve working directory: %w", err)
+		return nil, nil, "", storage.SessionMeta{}, nil, fmt.Errorf("resolve working directory: %w", err)
 	}
 	factory, err := assembleFactory(serverRoot, providerName, modelName)
 	if err != nil {
-		return nil, "", storage.SessionMeta{}, nil, err
+		return nil, nil, "", storage.SessionMeta{}, nil, err
 	}
 	ag, project, err := factory.Agent(cwd)
-	return ag, project, factory.defaultMeta, newMetaValidator(factory.resolver), err
+	return ag, factory.store, project, factory.defaultMeta, newMetaValidator(factory.resolver), err
 }
 
 // newMetaValidator builds the /new override check: the SHARED
@@ -259,6 +260,16 @@ func newMetaValidator(resolver agent.ModelResolver) func(storage.SessionMeta) er
 	return func(meta storage.SessionMeta) error {
 		return agent.ValidateSessionMeta(resolver, meta)
 	}
+}
+
+// outputSurface is the printer contract the app needs: record lines,
+// streamed text, and the spinner's frame/clear. *spinnerPrinter is
+// the production implementation; tests record into a buffer.
+type outputSurface interface {
+	line(string)
+	write(string)
+	frame(string)
+	clear()
 }
 
 // spinnerPrinter interleaves the stderr spinner with stdout record lines:
@@ -314,7 +325,7 @@ func (p *spinnerPrinter) write(text string) {
 type cliApp struct {
 	agent   *agent.Agent
 	session *agent.Session
-	printer *spinnerPrinter
+	printer outputSurface
 	// defaultMeta is what /new records: the startup -provider/-model
 	// (per-command overrides merge over THIS, never over a previous
 	// /new's values — bare /new always returns to the startup default).
@@ -327,6 +338,11 @@ type cliApp struct {
 	// ns is the storage namespace of the working directory's project —
 	// opaque to the agent, derived here by the host (§15.1).
 	ns string
+	// store is the shared jsonl store: /sessions lists from it and
+	// /archive //unarchive go through its Archiver directly (§17.3 —
+	// the CLI holds no root lock and builds no Pool; the session's own
+	// OS lock is the mutual exclusion).
+	store *jsonl.Store
 	// lastRenderedItem is the ItemID of the last record this app
 	// accounted for (printed or live-rendered): the eviction catch-up
 	// resumes the snapshot's records after it. Identity, not an index —
@@ -365,9 +381,15 @@ func (c *cliApp) dispatch(text string) bool {
 			fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 		}
 	case text == "/help":
-		fmt.Fprintln(os.Stderr, "sai: /new [-provider p] [-model m] [-reasoning lvl] new session (omitted items inherit the startup defaults) · /compact summarize the context · /resume <id> reopen a session · /stop stop the run · /quit exit")
-	case strings.HasPrefix(text, "/resume"):
+		fmt.Fprintln(os.Stderr, "sai: /new [-provider p] [-model m] [-reasoning lvl] new session (omitted items inherit the startup defaults) · /compact summarize the context · /resume <#|id> reopen a session · /sessions [--all] list sessions (numbers are positions in the latest listing — unstable across commands; id prefixes are stable) · /archive <#|id> park a session out of the working set · /unarchive <#|id> restore one · /stop stop the run · /quit exit")
+	case text == "/resume" || strings.HasPrefix(text, "/resume "):
 		c.resumeCommand(strings.TrimSpace(strings.TrimPrefix(text, "/resume")))
+	case text == "/sessions" || strings.HasPrefix(text, "/sessions "):
+		c.sessionsCommand(strings.TrimSpace(strings.TrimPrefix(text, "/sessions")))
+	case text == "/archive" || strings.HasPrefix(text, "/archive "):
+		c.archiveCommand(strings.TrimSpace(strings.TrimPrefix(text, "/archive")))
+	case text == "/unarchive" || strings.HasPrefix(text, "/unarchive "):
+		c.unarchiveCommand(strings.TrimSpace(strings.TrimPrefix(text, "/unarchive")))
 	default:
 		if strings.HasPrefix(text, "/") {
 			fmt.Fprintf(os.Stderr, "sai: unknown command %s (try /help)\n", text)
@@ -607,15 +629,225 @@ func (c *cliApp) resume(id string) error {
 	return c.bind(session)
 }
 
-// resumeCommand implements /resume: it requires a session id.
+// resumeCommand implements /resume: the argument is a 1-based number
+// of the live listing or a session-id prefix (§17.5).
 func (c *cliApp) resumeCommand(arg string) {
 	if arg == "" {
-		fmt.Fprintln(os.Stderr, "sai: usage: /resume <session-id>")
+		fmt.Fprintln(os.Stderr, "sai: usage: /resume <#|id-prefix> (# = position in /sessions)")
 		return
 	}
-	if err := c.resume(arg); err != nil {
+	info, err := c.resolveSessionArg(arg, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sai: /resume: %v\n", err)
+		return
+	}
+	if info.Archived {
+		fmt.Fprintf(os.Stderr, "sai: /resume: session %s is archived — /unarchive it first\n", info.ID)
+		return
+	}
+	if err := c.resume(info.ID); err != nil {
 		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
 	}
+}
+
+// sessionsCommand implements /sessions: the project's sessions, live
+// rows numbered 1..N (mtime descending), archived rows only with
+// --all and marked A. The numbers index LIVE rows in both views, so
+// /resume <#> and /archive <#> are unambiguous.
+func (c *cliApp) sessionsCommand(arg string) {
+	all := false
+	switch arg {
+	case "":
+	case "--all":
+		all = true
+	default:
+		fmt.Fprintf(os.Stderr, "sai: /sessions: unknown flag %q (only --all)\n", arg)
+		return
+	}
+	rows, err := c.listSessions(all)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sai: %v\n", err)
+		return
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(os.Stderr, "sai: no sessions in this project")
+		return
+	}
+	live := 0
+	for _, info := range rows {
+		marker := "A"
+		if !info.Archived {
+			live++
+			marker = strconv.Itoa(live)
+		}
+		c.printer.line(fmt.Sprintf("%2s  %s  %s  %s  %s",
+			marker, shortSessionID(info.ID), sessionListTitle(info.Title),
+			sessionListModel(info.Meta), info.Modified.Local().Format("01-02 15:04")))
+	}
+	if all {
+		fmt.Fprintln(os.Stderr, "sai: A = archived (restore with /unarchive <#|id-prefix>)")
+	}
+}
+
+// archiveCommand implements /archive: park a session out of the
+// working set via the store's Archiver (§17.3 — the CLI holds no root
+// lock; the session's own OS lock is the mutual exclusion).
+func (c *cliApp) archiveCommand(arg string) {
+	if arg == "" {
+		fmt.Fprintln(os.Stderr, "sai: usage: /archive <#|id-prefix> (# = live position in /sessions)")
+		return
+	}
+	info, err := c.resolveSessionArg(arg, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sai: /archive: %v\n", err)
+		return
+	}
+	if info.ID == c.session.ID() {
+		// Refused, not auto-switched: the current session's OS lock is
+		// held by THIS process, so the marker write cannot proceed
+		// anyway — and an explicit refusal beats silently dropping the
+		// user into a fresh session they did not ask for.
+		fmt.Fprintln(os.Stderr, "sai: /archive: this is the current session — pick another, or /quit first")
+		return
+	}
+	if err := c.store.Archive(c.ns, info.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "sai: /archive: %v\n", archiveOpError(err))
+		return
+	}
+	fmt.Fprintf(os.Stderr, "sai: archived %s\n", info.ID)
+}
+
+// unarchiveCommand implements /unarchive: restore a parked session.
+// A NUMBER here indexes the ARCHIVED rows (the A-marked ones of
+// /sessions --all, mtime descending) — the live numbering would be
+// meaningless for a restore.
+func (c *cliApp) unarchiveCommand(arg string) {
+	if arg == "" {
+		fmt.Fprintln(os.Stderr, "sai: usage: /unarchive <#|id-prefix> (# = archived position in /sessions --all)")
+		return
+	}
+	info, err := c.resolveSessionArg(arg, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sai: /unarchive: %v\n", err)
+		return
+	}
+	if err := c.store.Unarchive(c.ns, info.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "sai: /unarchive: %v\n", archiveOpError(err))
+		return
+	}
+	fmt.Fprintf(os.Stderr, "sai: unarchived %s\n", info.ID)
+}
+
+// listSessions returns the listing rows: live-only by default, the
+// superset (archived included, mtime descending) with --all.
+func (c *cliApp) listSessions(all bool) ([]storage.SessionInfo, error) {
+	if all {
+		return c.store.ListSessionsAll(c.ns)
+	}
+	return c.store.ListSessions(c.ns)
+}
+
+// resolveSessionArg resolves a number-or-prefix argument against the
+// freshest listing (§17.5). A pure-digit argument is a 1-based number;
+// numberOverArchived selects which rows it indexes — live (/resume,
+// /archive) or archived (/unarchive). A prefix matches ids in the
+// superset listing (archived rows included, so /resume on a parked
+// session can say "unarchive first" instead of "not found").
+// Unique hits return the row (Archived tells the caller which kind).
+func (c *cliApp) resolveSessionArg(arg string, numberOverArchived bool) (storage.SessionInfo, error) {
+	all, err := c.listSessions(true)
+	if err != nil {
+		return storage.SessionInfo{}, err
+	}
+	if n, err := strconv.Atoi(arg); err == nil && strconv.Itoa(n) == arg {
+		var numbered []storage.SessionInfo
+		for _, info := range all {
+			if info.Archived == numberOverArchived {
+				numbered = append(numbered, info)
+			}
+		}
+		if n < 1 || n > len(numbered) {
+			kind := "live"
+			if numberOverArchived {
+				kind = "archived"
+			}
+			hint := ""
+			if numberOverArchived {
+				hint = " --all"
+			}
+			return storage.SessionInfo{}, fmt.Errorf("session number %d is out of range — the listing has %d %s session(s) (run /sessions%s)",
+				n, len(numbered), kind, hint)
+		}
+		return numbered[n-1], nil
+	}
+	var hits []storage.SessionInfo
+	for _, info := range all {
+		if strings.HasPrefix(info.ID, arg) {
+			hits = append(hits, info)
+		}
+	}
+	switch len(hits) {
+	case 0:
+		// The project-scoping hint rides every miss: the listing only
+		// ever sees this project's namespace, so "not found" always
+		// means "not found HERE" (Q1=B).
+		return storage.SessionInfo{}, fmt.Errorf("no session in this project starts with %q — sessions can only be resumed from the project directory they belong to", arg)
+	case 1:
+		return hits[0], nil
+	default:
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "multiple sessions start with %q — use a longer prefix or the full id:", arg)
+		for _, info := range hits {
+			fmt.Fprintf(&sb, "\n  %s  %s", info.ID, sessionListTitle(info.Title))
+		}
+		return storage.SessionInfo{}, fmt.Errorf("%s", sb.String())
+	}
+}
+
+// archiveOpError maps the Archiver's storage errors to CLI wording.
+func archiveOpError(err error) error {
+	var held *jsonl.LockHeldError
+	if errors.As(err, &held) {
+		return fmt.Errorf("%s (is serve or another CLI running?)", held)
+	}
+	if errors.Is(err, storage.ErrSessionNotFound) {
+		return fmt.Errorf("session no longer exists")
+	}
+	return err
+}
+
+// shortSessionID renders a 27-char session id as a stable prefix for
+// humans; /resume and friends accept any unambiguous prefix.
+func shortSessionID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12] + "…"
+}
+
+// sessionListTitle pads or truncates the listing title column. The
+// truncation is RUNE-safe: titles are user input and often CJK — a
+// byte slice would split a multi-byte character and print mojibake.
+// (The padding counts runes, not display columns — East Asian wide
+// characters still misalign the column; accepted, the id and model
+// columns carry the alignment.)
+func sessionListTitle(title string) string {
+	const width = 24
+	if title == "" {
+		title = "（无标题）"
+	}
+	if runes := []rune(title); len(runes) > width {
+		title = string(runes[:width-1]) + "…"
+	}
+	return fmt.Sprintf("%-*s", width, title)
+}
+
+// sessionListModel renders the meta column (provider/model).
+func sessionListModel(meta storage.SessionMeta) string {
+	if meta.Provider == "" && meta.Model == "" {
+		return "-"
+	}
+	return meta.Provider + "/" + meta.Model
 }
 
 // bind switches to a session: existing records print as history; every
@@ -714,9 +946,9 @@ func recordsAfter(records []storage.Record, itemID string) []storage.Record {
 // wiring (§15.1: Q1=B scopes -session and /resume to the current
 // project's ns), so a wiring regression is testable without invoking
 // main itself.
-func setupCLI(ag *agent.Agent, defaultMeta storage.SessionMeta, validateMeta func(storage.SessionMeta) error, resumeID string) (*cliApp, error) {
+func setupCLI(ag *agent.Agent, store *jsonl.Store, defaultMeta storage.SessionMeta, validateMeta func(storage.SessionMeta) error, resumeID string) (*cliApp, error) {
 	ns := projects.ProjectID(ag.CWD())
-	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}, ns: ns, defaultMeta: defaultMeta, validateMeta: validateMeta}
+	cli := &cliApp{agent: ag, printer: &spinnerPrinter{}, ns: ns, defaultMeta: defaultMeta, validateMeta: validateMeta, store: store}
 	if resumeID != "" {
 		if err := cli.resume(resumeID); err != nil {
 			return nil, err

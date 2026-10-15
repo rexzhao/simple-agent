@@ -528,7 +528,7 @@ func TestNewCommandSwitchesSession(t *testing.T) {
 // directories: two project namespaces under one root, a session
 // materialized in project A, and agents whose CWD points at one of
 // them. No real provider or user config is involved.
-func setupCLIFixture(t *testing.T, sessionIn string) (*agent.Agent, *agent.Agent, string) {
+func setupCLIFixture(t *testing.T, sessionIn string) (*agent.Agent, *agent.Agent, *jsonl.Store, string) {
 	t.Helper()
 	root := t.TempDir()
 	projectA := t.TempDir()
@@ -549,7 +549,7 @@ func setupCLIFixture(t *testing.T, sessionIn string) (*agent.Agent, *agent.Agent
 		return ag
 	}
 	if sessionIn == "" {
-		return newAgent(projectA), newAgent(projectB), ""
+		return newAgent(projectA), newAgent(projectB), store, ""
 	}
 	// Create the session under project A's ns through A's agent.
 	agA := newAgent(projectA)
@@ -563,7 +563,7 @@ func setupCLIFixture(t *testing.T, sessionIn string) (*agent.Agent, *agent.Agent
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return agA, newAgent(projectB), session.ID()
+	return agA, newAgent(projectB), store, session.ID()
 }
 
 // TestCLIResumeScopedToCurrentProject pins the Q1=B wiring end to end
@@ -573,10 +573,10 @@ func setupCLIFixture(t *testing.T, sessionIn string) (*agent.Agent, *agent.Agent
 // the same scope, and a wiring regression (ns derived as anything but
 // the current project) fails the same-project case.
 func TestCLIResumeScopedToCurrentProject(t *testing.T) {
-	agA, agB, id := setupCLIFixture(t, "session")
+	agA, agB, store, id := setupCLIFixture(t, "session")
 
 	// Same project: the -session path resumes.
-	cli, err := setupCLI(agA, testSessionMeta, nil, id)
+	cli, err := setupCLI(agA, store, testSessionMeta, nil, id)
 	if err != nil {
 		t.Fatalf("same-project resume: %v", err)
 	}
@@ -586,7 +586,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	cli.closeSession()
 
 	// Cross project: a clean not-found with the explaining message.
-	_, err = setupCLI(agB, testSessionMeta, nil, id)
+	_, err = setupCLI(agB, store, testSessionMeta, nil, id)
 	if err == nil {
 		t.Fatal("cross-project resume succeeded — Q1=B scoping is broken")
 	}
@@ -595,7 +595,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	}
 
 	// The /resume command is scoped the same way: same project works.
-	cli, err = setupCLI(agA, testSessionMeta, nil, "")
+	cli, err = setupCLI(agA, store, testSessionMeta, nil, "")
 	if err != nil {
 		t.Fatalf("fresh setup: %v", err)
 	}
@@ -614,7 +614,7 @@ func TestCLIResumeScopedToCurrentProject(t *testing.T) {
 	// A fresh session (no resume id) lands in the CURRENT project's ns.
 	// The wiring mutant (ns derived from anything but CWD) makes the
 	// same-project resume above fail, so this is a positive control.
-	fresh, err := setupCLI(agA, testSessionMeta, nil, "")
+	fresh, err := setupCLI(agA, store, testSessionMeta, nil, "")
 	if err != nil {
 		t.Fatalf("fresh setup (positive control): %v", err)
 	}
