@@ -29,6 +29,7 @@ import {
 } from "./newsession";
 import { NewSessionDialog } from "./components/new-session-dialog";
 import { ConfirmDeleteDialog } from "./components/confirm-delete-dialog";
+import { ApprovalCard } from "./components/approval-card";
 import type { ProjectsResponse } from "./types";
 
 // ---- projects sidebar (own poll, like the log page) ----
@@ -178,6 +179,10 @@ export default function App() {
             10,
             e,
             blockedHint,
+            // Retry exhaustion means the closing window did NOT
+            // self-heal: someone else holds the session open (another
+            // tab, another client) — say so instead of "try again".
+            "the session is open elsewhere — close it there first",
             "the operation did not go through — try again in a moment",
           );
           if (step.kind === "done") {
@@ -244,6 +249,9 @@ export default function App() {
     },
     [runOp],
   );
+
+  // ---- the approval card's transient hints (C6c) ----
+  const [approvalHint, setApprovalHint] = useState("");
 
   // ---- deep-link probe (the log view's unknown-id handling) ----
   // The SSE stream cannot read status codes; a deep link to a deleted
@@ -444,8 +452,17 @@ export default function App() {
               {notice && <span className="text-accent-foreground">{notice}</span>}
               {routeHint && <span className="text-destructive">{routeHint}</span>}
               {opHint && <span className="text-destructive">{opHint}</span>}
+              {approvalHint && <span className="text-accent-foreground">{approvalHint}</span>}
             </div>
             <div className="aui-root relative flex min-h-0 flex-1 flex-col items-center justify-start">
+              {snap?.approval && sessionID && (
+                <ApprovalCard
+                  sessionID={sessionID}
+                  approval={snap.approval}
+                  onCollapse={() => store?.collapseApproval()}
+                  onHint={hint => setApprovalHint(hint)}
+                />
+              )}
               <Thread autoFocus />
             </div>
           </div>

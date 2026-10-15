@@ -35,9 +35,20 @@ export type Snap = {
   // slot). It overlays the matching tool-call part of the last
   // assistant message with its executing state.
   tool: { callID: string; name: string; args: string; awaitingApproval: boolean } | null;
+  // The approval card (§16.3): pending while the tool slot blocks on
+  // the host's decision, outcome set by the resolved event until the
+  // tool completes. item is the future tool.result's identity — the
+  // same id POST /approval takes.
+  approval: {
+    item: string;
+    name: string;
+    args: string;
+    outcome: string | null;
+  } | null;
 };
 
 const initialSnap: Snap = {
+  approval: null,
   version: 0,
   session: "",
   records: [],
@@ -135,6 +146,13 @@ export class SessionStore {
     };
   }
 
+  // collapseApproval drops the card locally: the approval is gone
+  // (the POST answered approval_unknown — handled or never existed)
+  // and no resolved event is coming to clear it.
+  collapseApproval() {
+    if (this.snap.approval) this.commit({ approval: null });
+  }
+
   // detach stops the stream but keeps the folded state — switching back
   // resumes from the head. The server releases its refs when the
   // connection drops (the lazy-open/evict cycle).
@@ -210,6 +228,13 @@ export class SessionStore {
           running: !!frame.running,
           live,
           tool: frame.tool && frame.tool.call_id ? { callID: frame.tool.call_id, name: frame.tool.name || "", args: frame.tool.args || "", awaitingApproval: !!frame.tool.awaiting_approval } : null,
+          // The snapshot restores a PENDING card from the awaiting
+          // tool slot (a reconnect must not lose the decision); a
+          // resolved-outcome display is transient and does not
+          // survive a reconnect (the tool result will land).
+          approval: frame.tool && frame.tool.awaiting_approval && frame.tool.item
+            ? { item: frame.tool.item, name: frame.tool.name || "", args: frame.tool.args || "", outcome: null }
+            : null,
           steered: frame.steered || [],
           connected: true,
           verified: frame.d ? frame.d === head : this.snap.verified,
@@ -238,6 +263,8 @@ export class SessionStore {
           // A settled run has no tool in flight (the server's Running
           // slot exists only inside a run).
           tool: running ? this.snap.tool : null,
+          // ...and no approval either: the wait died with the run.
+          approval: running ? this.snap.approval : null,
           // Absent compacting = no change (same rule as running):
           // notice-bearing frames omit positional fields on purpose,
           // and !!undefined would clobber a live compacting=true.
@@ -292,6 +319,9 @@ export class SessionStore {
       case "tool_result": {
         if (this.snap.tool && frame.call_id === this.snap.tool.callID) {
           this.commit({ tool: null });
+          // The tool the card was about is done — the outcome line
+          // has nowhere to live anymore.
+          if (this.snap.approval) this.commit({ approval: null });
         }
         const live = this.snap.live;
         if (!live || !frame.call_id) break;
@@ -310,6 +340,24 @@ export class SessionStore {
         const live = this.snap.live;
         if (!live || (frame.item && frame.item !== live.id)) break;
         this.commit({ live: { ...live, failed: true } });
+        break;
+      }
+      case "tool_approval_pending": {
+        if (!frame.item) break;
+        this.commit({
+          approval: { item: frame.item, name: frame.name || "", args: frame.args || "", outcome: null },
+        });
+        break;
+      }
+      case "tool_approval_resolved": {
+        // The outcome display rides the card until the tool completes
+        // (tool_result clears it) or a new pending replaces it. An
+        // unmatched resolution (a reconnect gap ate the pending) is
+        // not an error — there is nothing to collapse.
+        if (!frame.item || !this.snap.approval || this.snap.approval.item !== frame.item) break;
+        this.commit({
+          approval: { ...this.snap.approval, outcome: frame.outcome || "" },
+        });
         break;
       }
       case "steer_queued": {

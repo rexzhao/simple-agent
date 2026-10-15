@@ -159,19 +159,20 @@ function assert(cond, what) {
 }
 
 // s8: the shared retry step — done on success, retry while under the
-// attempt budget, hint at the boundary (the flow TERMINATES) and for
-// non-retryable codes.
+// attempt budget; AT the budget the retry-exhaustion hint names the
+// real cause (the session is open elsewhere), non-retryable codes map
+// through blockedHint with a generic fallback.
 {
-  const s8done = opStep(0, 10, null, deleteBlockedHint, "fallback");
-  const s8retry = opStep(3, 10, { status: 409, code: "session_open" }, deleteBlockedHint, "fallback");
-  const s8boundary = opStep(9, 10, { status: 409, code: "session_open" }, deleteBlockedHint, "fallback");
-  const s8run = opStep(0, 10, { status: 409, code: "run_active" }, deleteBlockedHint, "fallback");
-  const s8unknown = opStep(0, 10, { status: 500, code: "" }, deleteBlockedHint, "fallback");
+  const s8done = opStep(0, 10, null, deleteBlockedHint, "exhausted", "fallback");
+  const s8retry = opStep(3, 10, { status: 409, code: "session_open" }, deleteBlockedHint, "exhausted", "fallback");
+  const s8boundary = opStep(9, 10, { status: 409, code: "session_open" }, deleteBlockedHint, "exhausted", "fallback");
+  const s8run = opStep(0, 10, { status: 409, code: "run_active" }, deleteBlockedHint, "exhausted", "fallback");
+  const s8unknown = opStep(0, 10, { status: 500, code: "" }, deleteBlockedHint, "exhausted", "fallback");
   assert(s8done.kind === "done", "s8: success is done");
   assert(s8retry.kind === "retry", "s8: retryable code under budget retries");
   assert(
-    s8boundary.kind === "hint" && s8boundary.hint === "fallback",
-    "s8: at the attempt budget the flow terminates with the fallback hint",
+    s8boundary.kind === "hint" && s8boundary.hint === "exhausted",
+    "s8: at the attempt budget the flow terminates with the exhaustion hint",
   );
   assert(s8run.kind === "hint" && s8run.hint.includes("stop it"), "s8: run_active hints immediately");
   assert(s8unknown.kind === "hint" && s8unknown.hint === "fallback", "s8: unknown errors surface the fallback");

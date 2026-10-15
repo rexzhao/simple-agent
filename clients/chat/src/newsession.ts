@@ -134,10 +134,18 @@ export function opStep(
   maxAttempts: number,
   e: CodeError | null,
   blockedHint: (e: CodeError) => string | null,
+  retryExhaustedHint: string,
   fallback: string,
 ): OpStep {
   if (!e) return { kind: "done" };
-  if (refusalRetryable(e.code) && attempt + 1 < maxAttempts) return { kind: "retry" };
+  if (refusalRetryable(e.code)) {
+    // Under the budget: the closing window may self-heal. AT the
+    // budget: the code did NOT clear — someone else holds the
+    // session open, and the user needs to know that (not a generic
+    // "try again").
+    if (attempt + 1 < maxAttempts) return { kind: "retry" };
+    return { kind: "hint", hint: retryExhaustedHint };
+  }
   return { kind: "hint", hint: blockedHint(e) ?? fallback };
 }
 
@@ -154,4 +162,44 @@ export function stateProbeHint(e: CodeError): string | null {
   if (e.code === "session_archived")
     return "this session is archived — restore it from the sidebar";
   return null;
+}
+
+// ---- C6c: the approval card ----
+
+// ApprovalErrorAction is what a failed POST /approval means for the
+// card: collapse it (the approval is gone — nothing to answer),
+// hold it and wait (someone else answered; the resolved EVENT is
+// coming — resubmitting would just race), or surface a hint.
+export type ApprovalErrorAction =
+  | { kind: "collapse"; hint: string }
+  | { kind: "wait"; hint: string }
+  | { kind: "hint"; hint: string };
+
+export function approvalErrorAction(e: CodeError): ApprovalErrorAction {
+  // Session-level codes first (§16.3): the approval route resolves
+  // the session before the approval itself.
+  if (e.status === 404 && e.code === "unknown_session")
+    return { kind: "collapse", hint: "the session is gone" };
+  if (e.status === 409 && e.code === "session_closing")
+    return { kind: "hint", hint: "the session is closing — retry in a moment" };
+  if (e.code === "approval_unknown")
+    return { kind: "collapse", hint: "the approval was already handled — closing" };
+  if (e.code === "approval_resolved")
+    return { kind: "wait", hint: "answered elsewhere — waiting for the resolution" };
+  if (e.status >= 500) return { kind: "hint", hint: "server error — try again" };
+  return { kind: "hint", hint: "could not submit the decision — try again" };
+}
+
+// approvalButtonsDisabled: both buttons lock while a decision is in
+// flight (one POST decides; a second would race the first) and stay
+// locked once resolved (the card is an outcome display by then).
+export function approvalButtonsDisabled(submitting: boolean, outcome: string | null): boolean {
+  return submitting || outcome !== null;
+}
+
+// truncateArgs renders the card's argument preview: one line, cut on
+// a rune boundary, expandable in the UI.
+export function truncateArgs(args: string, max = 160): string {
+  if ([...args].length <= max) return args;
+  return [...args].slice(0, max).join("") + "…";
 }

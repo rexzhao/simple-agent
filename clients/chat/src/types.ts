@@ -49,6 +49,7 @@ export type Frame = {
   name?: string;
   args?: string;
   is_err?: boolean;
+  outcome?: string; // tool_approval_resolved: approved / denied / cancelled
   d?: string;
   n?: number;
   compacting?: boolean;

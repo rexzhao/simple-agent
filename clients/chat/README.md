@@ -61,6 +61,22 @@ preflights for loopback origins, so a direct connection works too.
   defaults autoScroll OFF — classic chat behavior wanted).
   `tooltip-icon-button.tsx` uses the Base UI `delay` prop name.
 
+Tool approval (C6c, §16.3): when the server's policy hook returns
+Ask, the run blocks on a decision — the chat client renders the
+approval card above the composer (tool name, arguments truncated with
+an expand toggle, approve / deny-with-optional-reason wired to
+POST /api/s/{id}/approval). The card state is the store's
+`snap.approval`: restored from the snapshot's awaiting tool slot on
+reconnect, driven by the `tool_approval_pending` /
+`tool_approval_resolved` events (approved / denied / cancelled each
+render a visible outcome line), and cleared when the tool completes
+or the run settles. `approval_unknown` collapses the card;
+`approval_resolved` holds it and waits for the event (no resubmit);
+session-level codes map first. The buttons lock while a decision is
+in flight and stay locked once resolved. Pinned by
+`internal/web/testdata/approval_check.mjs` (TestApprovalFixture) and
+the wire encoding by `TestApprovalEventFrames`.
+
 Session management (C6a+C6b): the sidebar's "+" (or an exact `/new`
 in the composer — `/newfoo` sends as an ordinary message) opens the
 new-session dialog — project (defaults to the current session's),

@@ -156,6 +156,7 @@ type Frame struct {
 	Name    string `json:"name,omitempty"`
 	Args    string `json:"args,omitempty"`
 	Err     bool   `json:"is_err,omitempty"`
+	Outcome string `json:"outcome,omitempty"` // tool_approval_resolved: approved / denied / cancelled
 	Est     int    `json:"est,omitempty"`
 	Limit   int    `json:"limit,omitempty"`
 	Try     int    `json:"try,omitempty"`
@@ -271,6 +272,12 @@ func encodeEventFrame(event model.Event) (Frame, bool) {
 		f.Type, f.Item, f.Text = string(e.Type()), e.ItemID, e.Text
 	case model.SteerWithdrawnEvent:
 		f.Type, f.Item = string(e.Type()), e.ItemID
+	case model.ToolApprovalPendingEvent:
+		// The approval card's payload (§16.3): the item is the future
+		// tool.result's identity — the same id POST /approval takes.
+		f.Type, f.Item, f.Name, f.Args = string(e.Type()), e.ItemID, e.Name, e.Arguments
+	case model.ToolApprovalResolvedEvent:
+		f.Type, f.Item, f.Outcome = string(e.Type()), e.ItemID, e.Outcome
 	default:
 		return Frame{}, false
 	}

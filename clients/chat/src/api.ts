@@ -67,6 +67,18 @@ export const getProjectsAll = () =>
 export const archiveSession = (id: string) =>
   request<unknown>(`/api/s/${id}/archive`, "POST", {});
 
+export const postApproval = (
+  id: string,
+  item: string,
+  allow: boolean,
+  reason?: string,
+) =>
+  request<unknown>(`/api/s/${id}/approval`, "POST", {
+    item,
+    allow,
+    reason: reason ?? "",
+  });
+
 export const unarchiveSession = (id: string) =>
   request<unknown>(`/api/s/${id}/archive`, "DELETE");
 

@@ -29,6 +29,7 @@ const emptySnapshot: Snap = {
   verified: null,
   notice: "",
   tool: null,
+  approval: null,
 };
 const emptySnap = () => emptySnapshot;
 

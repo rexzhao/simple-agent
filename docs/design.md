@@ -1480,10 +1480,12 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
   型 ReasoningLevels 非空才显示）；提交 → POST → 用返回 id 导航。
 - **归档区**：侧栏底部折叠区；归档/恢复按钮在会话项的上下文菜单。
 - **删除二次确认**：onDelete 已有事件，接浏览器 confirm。
-- **审批卡**（B2 待办）：消费 `tool_approval_pending/resolved` 事件
-  与快照 `awaiting_approval`（B2 7a 已落 wire）——渲染批准/拒绝按钮，
-  回答走 POST /api/s/{id}/approval。**推荐放进 C**（C 本就在改 chat
-  页面；7a 的 wire 已就绪只差 UI）。
+- **审批卡**（C6c 已落地）：消费 `tool_approval_pending/resolved` 事件
+  与快照 `awaiting_approval`——渲染批准/拒绝按钮，回答走 POST
+  /api/s/{id}/approval。**wire 事件帧在 C6c 补齐**（B2 7a 只落了
+  `ToolWire.awaiting_approval` 快照标志；事件从未过
+  encodeEventFrame——其 default 分支静默丢弃，C6c 用
+  TestApprovalEventFrames 钉住精确 JSON 后补上）。
 
 ### 17.7 公开 API 收敛（B2 待办）
 
@@ -1532,7 +1534,7 @@ rename 后自动失效（新文件 mtime 不同）——**无需额外失效逻�
 | C5w | web 归档端点（POST/DELETE /api/s/{id}/archive）+ 409 session_archived 映射 | 端点测试：归档/取消 round-trip、打开归档→409 码、锁竞争→session_locked | C5 | 同 C5 |
 | C6a | chat 新建对话框 + 删除二次确认 | 对话框提交→POST→导航；tsc | C3、C4 | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地）
 | C6b | chat 侧栏归档区（归档/恢复按钮 + 折叠区） | UI 消费 SessionInfo.Archived；tsc | C5、C5w | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md，webui.md 只覆盖 log 视图并已指向该 README） |（已落地）
-| C6c | chat **审批卡**（若 (b) 通过） | UI 消费 tool_approval_pending/resolved + 快照 awaiting_approval；回答走 /approval；tsc | 无（wire 已在 B2 落地） | webui.md |
+| C6c | chat **审批卡**（若 (b) 通过） | UI 消费 tool_approval_pending/resolved + 快照 awaiting_approval；回答走 /approval；tsc | 无（wire 事件编码在本步补齐——B2 只落了 ToolWire.awaiting_approval 标志） | webui.md（无需改动：聊天 UI 的文档在 clients/chat/README.md） |（已落地）
 | C7 | CLI：/sessions、/archive、/unarchive、/resume 序号+前缀+精确匹配收紧 | /resumefoo stderr 断言（B2 待办）；序号/前缀/歧义用例 | C5 | README |
 | C8 | web 项目注册/注销端点 + 注册表文件锁 + CLI project add 走锁 | 并发注册/注销测试；注销有打开会话→409；缓存自动失效验证 | C4 | multi-session |
 | C9 | **公开 API 收敛**（17.7 清单，按 C 代码的实际用法） | 全部 C 测试不改断言通过 + 收敛项的调用方迁移 | C1–C8 | README API 面 |
