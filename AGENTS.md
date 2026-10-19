@@ -187,4 +187,4 @@ gofmt 临时文件检查、多个 -run）用一次 codemode 批量执行
 ## 7. 参考
 
 - `docs/design.md`（权威设计，冲突时先改文档再改代码）、`docs/development.md`（构建/测试）
-- `docs/multi-session.md`、`docs/webui.md`（服务端/页面协议）、`docs/mailbox.md`（邮箱插件设计）
+- `docs/multi-session.md`、`docs/webui.md`（服务端/页面协议）

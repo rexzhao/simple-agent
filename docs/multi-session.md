@@ -383,7 +383,7 @@ OpenIn(projectID, sessionID string) (Session, error)
   root 锁）、serve.go 重接线
 - **P2**：页面（列表、切换代际守卫、hash 路由、active/run 区分）
 - **后置**（本轮不做）：页面/CLI 侧创建会话与项目、按会话选模型、
-  console `/list` `/tail`、mailbox 通知的多会话路由
+  console `/list` `/tail`
 
 ## 9. 测试
 

@@ -1599,17 +1599,13 @@ C8→C4；C9→C1–C8。其余顺序（如 C1 在 C5 前）只是建议（避�
   §15.5 补一句"（C 阶段 0 修订：互斥机制见 §17.3）"；其余既有段落
   不改。
 
-## 18. 里程碑 D：mailbox 客户端（P1）
+## 18. 里程碑 D：mailbox 客户端（已取消）
 
-**设计文档：`docs/mailbox.md`（阶段 0 已刷新，2026-10-15）**——协议
-对接（一连接一会话）、serve 多会话生命周期（sessionhost 钩子）、
-项目身份（host-id 派生，修正 mailbox.json 旧记载）、投递确认、
-审批交互、CLI/serve flag、验证与迁移步骤（D1–D6）全部在那里；
-本章只是索引，不复制内容。与既有里程碑的关系：
+用户于 2026-10-19 指示删除 mailbox 功能，里程碑 D 取消。已落地的
+D0（设计刷新）与 D1（frames/client/test server）由删除提交移除，
+历史中仍可查（`1d84b9a`、`fd1a000`）。**Steer 能力保留**：它是
+正交的 agent 能力（里程碑 A/B 落地），不随 mailbox 删除。
 
-- **Steer 已就绪**（里程碑 A/B 落地）：mailbox 的 mid-run 注入零新
-  agent 能力，§mailbox.md:3 即既有实现的引用
-- **sessionhost 钩子复用**：OnOpened/OnClosed/OnEvicted 驱动连接
-  生命周期；插件不持 Lease（不阻止驱逐）
-- **C 的裁定沿用**：归档会话不注册不投递；标题规则维持现状
-  （邮件注入首行为标题，接受）
+注：AGENTS.md 中的 `mailbox_send` / `mailbox_reply` / `/mailbox start service`
+等是 agent 之间的协作工具（外部 mailboxd），与本节删除的 sai mailbox
+客户端同名不同物，不属于删除范围。
