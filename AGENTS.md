@@ -158,6 +158,10 @@ gofmt 临时文件检查、多个 -run）用一次 codemode 批量执行
   不删改别人正在用的文件/分支。
 - 临时测试、临时构建产物放系统临时目录，不要写进仓库；
   `clients/chat/dist`、`.render-dist` 等已在 gitignore 内。
+- **跑完测试/验证后清理自己造的临时目录**：overlay 变异副本、临时构建/dist
+  目录、浏览器截图目录（`sai-ui-shots-*`）、`mktemp -d` 的目录，用完即删；
+  删前确认不是他人正在用的（不确定就留着并说明）。**只清本轮自己造的，
+  不追溯清理历史遗留。**
 - **不要 kill 不是自己启动的进程**（本机常有用户在跑的 `sai.exe` / `sai-dbg.exe`）。
   自己起的服务自己收；优先用**独立副本的 server root**，避免撞 root 锁影响他人。
 - **全套测试与 -race 属重负载**：开跑前用 `tasklist | grep -iE 'go.exe|\.test\.exe'`
