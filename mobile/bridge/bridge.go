@@ -124,7 +124,7 @@ func (c *Client) Connect(addr, route, token string) string {
 		}
 		return conn, err
 	}
-	remote, err := host.NewRemoteWithDialer(dial, c.post.submit)
+	remote, err := host.NewRemoteWithToken(dial, c.post.submit, token)
 	if err != nil {
 		// relay 上有多个执行端、又没指定 route：把候选列表报给界面去选
 		var needsChoice *relay.NeedsChoice

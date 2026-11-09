@@ -12,9 +12,23 @@ func NewRemote(conn wire.Conn, post func(func())) (*Remote, error) {
 	return newRemote(conn, nil, post)
 }
 
+// NewRemoteToken 与 NewRemote 相同，但握手时带上执行端的 token（`--listen` 直连）。
+func NewRemoteToken(conn wire.Conn, post func(func()), token string) (*Remote, error) {
+	return newRemoteToken(conn, nil, post, token)
+}
+
 // NewRemoteWithDial 连上执行端，并在断线时自动重连（3s 起，指数退避到 30s）。
 func NewRemoteWithDial(addr string, post func(func())) (*Remote, error) {
 	return newRemoteWithDialer(func() (wire.Conn, error) { return wire.Dial(addr) }, post)
+}
+
+// NewRemoteWithToken 与 NewRemoteWithDialer 相同，但握手时带上执行端的 token。
+func NewRemoteWithToken(dial func() (wire.Conn, error), post func(func()), token string) (*Remote, error) {
+	conn, err := dial()
+	if err != nil {
+		return nil, err
+	}
+	return newRemoteToken(conn, dial, post, token)
 }
 
 // NewRemoteWithDialer 用自定义拨号函数构造展示端（测试可注入进程内管道）。
@@ -31,6 +45,14 @@ func newRemoteWithDialer(dial func() (wire.Conn, error), post func(func())) (*Re
 }
 
 func newRemote(conn wire.Conn, dial func() (wire.Conn, error), post func(func())) (*Remote, error) {
+	return newRemoteToken(conn, dial, post, "")
+}
+
+// newRemoteToken 与 newRemote 相同，但握手时带上执行端要求的 token。
+//
+// token 必须在**构造时**给出：构造过程里就会发出第一条 hello，
+// 之后再 SetToken 就晚了（那条 hello 已经被执行端拒掉）。
+func newRemoteToken(conn wire.Conn, dial func() (wire.Conn, error), post func(func()), token string) (*Remote, error) {
 	if post == nil {
 		post = func(fn func()) { fn() }
 	}
@@ -64,10 +86,11 @@ func newRemote(conn wire.Conn, dial func() (wire.Conn, error), post func(func())
 	if marker, ok := conn.(wire.Handshaken); ok && marker.Handshaken() {
 		handshaken = true
 	}
+	remote.mgr.SetToken(token)
 	if !handshaken {
 		remote.mgr.submit(mItem{packet: wire.Packet{Kind: msgHello, Body: mustEncode(wire.Hello{
 			Protocol: wire.Protocol, Role: "viewer", Purpose: "control",
-			Credentials: wire.Credentials{Kind: "none"},
+			Credentials: wire.Credentials{Kind: "none", Token: token},
 		})}})
 	}
 	remote.mgr.submit(mItem{packet: wire.Packet{Kind: msgCatalog}})
@@ -125,6 +148,18 @@ func (r *Remote) publishAttach() {
 	r.mu.Unlock()
 	if r.mgr != nil {
 		r.mgr.setAttach(specs)
+	}
+}
+
+// SetToken 设置连接执行端时使用的握手口令（`--connect` 直连执行端时用）。
+//
+// 与 relay 的 token 是两套：relay 那套在拨号时由 relay.OpenViewerDialer 带上，
+// 这里这套用于**执行端自己的**握手校验。
+//
+// 必须在建立连接之前调用（`NewRemote*` 返回后、首条 hello 发出前）。
+func (r *Remote) SetToken(token string) {
+	if r.mgr != nil {
+		r.mgr.SetToken(token)
 	}
 }
 
@@ -226,7 +261,12 @@ func (r *Remote) Close() error {
 // NewRemoteDeferred 构造一个**尚未连接**的 Remote（展示端还没选执行端时用）：
 // 内部用占位连接顶一下，随后 DropConn + RetryNow 才真正按 dial 建立连接。
 func NewRemoteDeferred(dial func() (wire.Conn, error), post func(func())) (*Remote, error) {
-	remote, err := newRemote(wire.NullConn(), dial, post)
+	return NewRemoteDeferredToken(dial, post, "")
+}
+
+// NewRemoteDeferredToken 与 NewRemoteDeferred 相同，但握手带上执行端的 token。
+func NewRemoteDeferredToken(dial func() (wire.Conn, error), post func(func()), token string) (*Remote, error) {
+	remote, err := newRemoteToken(wire.NullConn(), dial, post, token)
 	if err != nil {
 		return nil, err
 	}

@@ -436,8 +436,11 @@ func Help() string {
                      与 --listen 不同：它让本进程**变成**展示端，而不是"额外提供服务"
   --relay ADDR       把本进程作为执行端注册到 relay（断线会自动重连并重新注册）
   --route HOSTID     展示端经 relay 转发（与 --connect 一起用：--connect RELAY --route ID）
-  --token TOKEN      relay 的固定口令：relay / 执行端 / 展示端三处必须写成同一个值。
-                     它只保护 relay 这一段（--listen 直连仍是开放的），也不加密流量
+  --token TOKEN      访问口令，同时用于两处（写同一个值即可）：
+                     ① relay 这一段：relay / 执行端 / 展示端三处必须一致；
+                     ② 直连执行端（--listen）：展示端 --connect 时也要带同一个口令。
+                     不带 --token 时 --listen 仍是无认证的（只建议在回环/隧道里用）。
+                     注意：它不加密流量，只做口令校验
   --headless         不创建窗口，只作为执行端运行（配合 --listen / --relay）
   --name NAME        执行端在 relay 上的名字（默认主机名；同名会被 relay 拒绝）
   --net-log          打印网络收发日志（每个包的 kind/字节数，排查连接用）

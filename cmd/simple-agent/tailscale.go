@@ -11,6 +11,12 @@ import (
 	"simple-agent/internal/tsnetx"
 )
 
+// defaultListenAddr 是"只给了 --tailscale、没给 --listen"时使用的监听地址。
+//
+// 绑回环而不是 0.0.0.0：远程访问由 tailnet 提供，主机上不必再开一个
+// 局域网端口（那会绕过 tailscale 的加密与访问控制）。
+const defaultListenAddr = "127.0.0.1:7801"
+
 // tailscaleTransport 是启用内置 tailscale 后的网络底座。
 //
 // 全部字段为 nil 表示"没启用"——调用方保持普通 TCP 行为。
@@ -31,7 +37,10 @@ type tailscaleTransport struct {
 //   - 没启用：返回零值，一切走普通 TCP（默认行为，零影响）；
 //   - 启用成功：返回可注入的 dialer/listener；
 //   - 启用失败：打日志并退回普通网络——网络叠加层失败不该让程序整体不可用。
-func startTailscale(cfg *config.Config, opts remoteOptions, role tsnetx.Role) tailscaleTransport {
+// openBrowser 表示"允许自动打开系统浏览器完成登录"：
+// 只有有桌面的场景（GUI）才为真；headless 与 relay 传 false，
+// 它们会把登录 URL 打在日志里让用户自己访问。
+func startTailscale(cfg *config.Config, opts remoteOptions, role tsnetx.Role, openBrowser bool) tailscaleTransport {
 	enabled := opts.tailscale || cfg.Tailscale.Enabled()
 	if !enabled {
 		return tailscaleTransport{}
@@ -48,6 +57,7 @@ func startTailscale(cfg *config.Config, opts remoteOptions, role tsnetx.Role) ta
 		Ephemeral:     ts.Ephemeral,
 		AdvertiseTags: ts.Tags,
 		Verbose:       ts.Verbose,
+		OpenBrowser:   openBrowser,
 	}
 	server, err := tsnetx.New(tsnetCfg)
 	if err != nil {

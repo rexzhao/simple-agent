@@ -41,7 +41,7 @@ func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Se
 		cfgPathForLog(cfg), selection.ProviderID, selection.Model, cfg.DataDir)
 
 	post := serialPost()
-	local := host.NewLocal(headlessHostConfig(cfg, runtime, selection, catalog, blobs, post))
+	local := host.NewLocal(headlessHostConfig(cfg, runtime, selection, catalog, blobs, post, relayToken))
 	defer local.Close()
 
 	if startup := local.StartupError(); startup != "" {
@@ -52,13 +52,17 @@ func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Se
 	local.Subscribe(turnLogger())
 
 	// 执行端自带的 tailscale（可选）：监听与注册 relay 都走它
-	ts := startTailscale(cfg, opts, tsnetx.RoleExecutor)
+	ts := startTailscale(cfg, opts, tsnetx.RoleExecutor, false)
 	if ts.stop != nil {
 		defer ts.stop()
 	}
 
 	var stopListener func()
-	if listenAddr != "" {
+	// 指定 --tailscale 就默认对外监听（用户开 tailscale 就是要让别处连进来）。
+	if listenAddr != "" || opts.tailscale {
+		if listenAddr == "" {
+			listenAddr = defaultListenAddr
+		}
 		stop, _, err := listenHeadless(listenAddr, local, post, ts)
 		if err != nil {
 			log.Printf("headless：监听失败：%v", err)
@@ -116,7 +120,7 @@ func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Se
 // （典型是 allow_shell 没传 → 工具列表里根本不注册 bash/pwsh，而系统提示仍然
 // 写着"可以执行命令"，模型只能拿回「未知工具」）。
 func headlessHostConfig(cfg *config.Config, runtime *appRuntime, selection providers.Selection,
-	catalog *store.Catalog, blobs *store.Blobs, post func(func())) host.Config {
+	catalog *store.Catalog, blobs *store.Blobs, post func(func()), token string) host.Config {
 	return host.Config{
 		Catalog:      catalog,
 		Blobs:        blobs,
@@ -136,6 +140,9 @@ func headlessHostConfig(cfg *config.Config, runtime *appRuntime, selection provi
 		MaxOutputFor:  func(sel providers.Selection) int { return maxOutputFor(runtime.registry, sel) },
 		// 模型列表随 catalog 发给展示端：headless 也要给，否则远程端切不了模型。
 		Models: providerChoices(runtime.registry),
+		// 执行端自己的 token：`--listen` 直连时校验展示端握手带来的口令。
+		// 与 relay 的 token 是两套，互不影响。
+		Token: token,
 	}
 }
 

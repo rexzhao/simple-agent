@@ -39,6 +39,9 @@ type Options struct {
 	Selection     providers.Selection
 	SystemPrompt  string
 	AllowShell    bool
+	// Token 是执行端自己的访问口令（`--listen` 直连时校验展示端的握手口令）。
+	// 与 relay 的 token 是两套：这里保护"直连执行端"这一跳。
+	Token string
 	Workspace     string
 	MaxToolRounds int
 	// ContextWindow 是初始模型的上下文窗口（用于自动压缩；0 = 未知，按 32k）
@@ -606,6 +609,7 @@ func NewApp(rt Runtime, opts Options) *App {
 		Selection:          opts.Selection,
 		SystemPrompt:       opts.SystemPrompt,
 		AllowShell:         opts.AllowShell,
+		Token:              opts.Token,
 		Workspace:          opts.Workspace,
 		MaxToolRounds:      opts.MaxToolRounds,
 		ContextWindow:      opts.ContextWindow,

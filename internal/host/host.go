@@ -41,6 +41,11 @@ type Config struct {
 	Selection     providers.Selection
 	SystemPrompt  string
 	AllowShell    bool
+	// Token 是执行端自己的访问口令（`--listen` 模式下由 `--token` 指定）。
+	//
+	// 与 relay 的 token 是两套：relay 保护"经过 relay 这一跳"，这里保护
+	// "直连执行端这一跳"。为空表示不校验（保持原来的开放行为）。
+	Token         string
 	Workspace     string
 	MaxToolRounds int
 	ContextWindow int

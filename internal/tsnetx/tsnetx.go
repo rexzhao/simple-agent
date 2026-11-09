@@ -31,7 +31,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tailscale.com/tsnet"
@@ -71,6 +73,11 @@ type Config struct {
 	AdvertiseTags []string
 	// Verbose 打开 tsnet 自己的详细日志。
 	Verbose bool
+	// OpenBrowser 在没有 authkey、需要交互式登录时，自动用系统浏览器打开登录页。
+	//
+	// headless 场景（服务器、无桌面环境）应设为 false——那里没有浏览器可开，
+	// 强行调用只会失败并留下噪音日志；用户会从日志里拿到 URL 自己访问。
+	OpenBrowser bool
 }
 
 // stateDir 解析出最终的状态目录。
@@ -156,6 +163,12 @@ type Server struct {
 	dir string
 	// once 保证 Close 幂等。
 	once sync.Once
+	// authURL 是最近一次拿到的登录地址（交互式登录时才有）。
+	authURL atomic.Pointer[string]
+	// openedOnce 保证浏览器只自动打开一次（登录循环每 5 秒会重复给同一个 URL）。
+	openedOnce sync.Once
+	// OpenBrowser 为真时，拿到登录 URL 后自动打开系统浏览器。
+	OpenBrowser bool
 }
 
 // New 创建 tsnet 节点并**在后台开始登录**。
@@ -168,6 +181,13 @@ func New(cfg Config) (*Server, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("无法创建 tailscale 状态目录 %s：%w", dir, err)
 	}
+	self := &Server{dir: dir, OpenBrowser: cfg.OpenBrowser}
+	// 诊断：确认 authkey 真的传到这里（只打前缀，避免泄漏）
+	if cfg.AuthKey != "" {
+		log.Printf("tailscale：使用 authkey（%s…，长度 %d）", safePrefix(cfg.AuthKey), len(cfg.AuthKey))
+	} else {
+		log.Printf("tailscale：没有 authkey")
+	}
 	srv := &tsnet.Server{
 		Hostname:  cfg.hostname(),
 		AuthKey:   cfg.AuthKey,
@@ -175,22 +195,91 @@ func New(cfg Config) (*Server, error) {
 		Ephemeral: cfg.Ephemeral,
 		UserLogf:  func(format string, args ...any) { log.Printf("tailscale: "+format, args...) },
 	}
+	self.srv = srv
+	// 接管 tsnet 自己的日志：**登录 URL 就在这里面**（tsnet 的 printAuthURLLoop
+	// 每 5 秒打一行 "go to: https://login.tailscale.com/a/xxx"）。
+	// 不接管的话这条 URL 会被丢掉，用户只能自己去 tailnet 后台或手动看 tsnet 日志。
+	srv.Logf = func(format string, args ...any) {
+		message := fmt.Sprintf(format, args...)
+		if url := extractAuthURL(message); url != "" {
+			self.noteAuthURL(url)
+		}
+		if cfg.Verbose {
+			log.Printf("tailscale: %s", message)
+		}
+	}
 	if cfg.ControlURL != "" {
 		srv.ControlURL = cfg.ControlURL
 	}
 	if len(cfg.AdvertiseTags) > 0 {
 		srv.AdvertiseTags = cfg.AdvertiseTags
 	}
-	if cfg.Verbose {
-		srv.Logf = func(format string, args ...any) { log.Printf("tailscale: "+format, args...) }
-	}
 	if cfg.AuthKey == "" && !hasState(dir) {
-		// 没 key 也没历史身份：登录会一直挂起。提前说清楚，
+		// 没 key 也没历史身份：需要交互式登录。说清楚接下来会发生什么，
 		// 否则用户只会看到"连不上"而不知道为什么。
-		log.Printf("tailscale：%s 没有授权密钥、也没有已保存的身份（%s）——"+
-			"这次登录会一直等人工授权；请设置 TS_AUTHKEY 或配置里的 ts_authkey", cfg.Role, dir)
+		log.Printf("tailscale：%s 没有授权密钥、也没有已保存的身份（%s）", cfg.Role, dir)
+		if cfg.OpenBrowser {
+			log.Printf("tailscale：正在向 Tailscale 申请登录链接，拿到后会自动打开浏览器…")
+		} else {
+			log.Printf("tailscale：正在向 Tailscale 申请登录链接，随后请用日志里的 URL 在浏览器完成授权")
+		}
 	}
-	return &Server{srv: srv, dir: dir}, nil
+	return self, nil
+}
+
+// noteAuthURL 记下登录地址，并按配置自动打开浏览器（只开一次）。
+func (s *Server) noteAuthURL(url string) {
+	if previous := s.authURL.Load(); previous != nil && *previous == url {
+		return
+	}
+	value := url
+	s.authURL.Store(&value)
+	log.Printf("tailscale：需要在浏览器完成登录：%s", url)
+	if !s.OpenBrowser {
+		return
+	}
+	s.openedOnce.Do(func() {
+		if err := openBrowser(url); err != nil {
+			log.Printf("tailscale：自动打开浏览器失败（%v），请手动访问上面的 URL", err)
+			return
+		}
+		log.Printf("tailscale：已尝试在浏览器中打开登录页（授权完成后本进程会自动上线）")
+	})
+}
+
+// AuthURL 返回当前待完成的登录地址（已有身份或已登录时为空）。
+func (s *Server) AuthURL() string {
+	if value := s.authURL.Load(); value != nil {
+		return *value
+	}
+	return ""
+}
+
+// safePrefix 只暴露密钥的前缀，用于日志确认（绝不打印完整密钥）。
+func safePrefix(key string) string {
+	if len(key) <= 16 {
+		return "***"
+	}
+	return key[:16]
+}
+
+// extractAuthURL 从一条日志里找出 tailscale 的登录地址。
+//
+// tsnet 的原文形如：
+//
+//	To start this tsnet server, restart with TS_AUTHKEY set, or go to: https://login.tailscale.com/a/xxx
+func extractAuthURL(message string) string {
+	const marker = "https://login.tailscale.com/"
+	index := strings.Index(message, marker)
+	if index < 0 {
+		return ""
+	}
+	rest := message[index:]
+	// URL 以空白结尾
+	if end := strings.IndexAny(rest, " \t\r\n"); end >= 0 {
+		rest = rest[:end]
+	}
+	return strings.TrimSpace(rest)
 }
 
 // hasState 报告状态目录里是否已有节点身份（tsnet 会写 tailscaled.state）。

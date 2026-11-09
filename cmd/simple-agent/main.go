@@ -67,7 +67,7 @@ func main() {
 		// relay 也能自带 tailscale（比如部署在装不了客户端的机器上）
 		relayCfg := relayTailscaleConfig(opts)
 		os.Exit(runRelayServer(listenAddr, opts.relayToken,
-			startTailscale(&relayCfg, opts, tsnetx.RoleRelay)))
+			startTailscale(&relayCfg, opts, tsnetx.RoleRelay, false)))
 	}
 
 	// 单实例锁必须**最先**获取：配置加载会创建 data_dir，M5 之后还会打开会话
@@ -178,7 +178,7 @@ func main() {
 	if connectAddr != "" {
 		// 展示端也能自带 tailscale：手机/笔记本不装客户端时，用自己的节点身份连 relay。
 		// 状态目录与执行端分开（viewer / executor），互不干扰。
-		tsViewer := startTailscale(&cfg, opts, tsnetx.RoleViewer)
+		tsViewer := startTailscale(&cfg, opts, tsnetx.RoleViewer, true)
 		if tsViewer.stop != nil {
 			defer tsViewer.stop()
 		}
@@ -212,7 +212,9 @@ func main() {
 				pinned.Unlock()
 				executors = &relayExecutors{addr: connectAddr, current: pinned, token: opts.relayToken}
 			}
-			remote, remoteErr := host.NewRemote(conn, post)
+			// 直连执行端时 `--token` 同时是执行端的访问口令：握手要带上，
+			// 否则执行端会拒绝（表现是"连上了但立刻断开"）。
+			remote, remoteErr := host.NewRemoteToken(conn, post, opts.relayToken)
 			if remoteErr != nil {
 				showFatal(locale.Tr("dialog.config.title"), remoteErr.Error())
 				return
@@ -223,7 +225,7 @@ func main() {
 			}
 		case errors.As(openErr, &needsChoice):
 			// relay（可能 0 个执行端）：界面直接进选择列表，选中后 RetryNow 重连
-			remote, remoteErr := host.NewRemoteDeferred(dial, post)
+			remote, remoteErr := host.NewRemoteDeferredToken(dial, post, opts.relayToken)
 			if remoteErr != nil {
 				showFatal(locale.Tr("dialog.config.title"), remoteErr.Error())
 				return
@@ -250,6 +252,10 @@ func main() {
 		Selection:     selection,
 		SystemPrompt:  systemPrompt(cfg),
 		AllowShell:    cfg.AllowShell,
+		// --token 同时用于"直连执行端的认证"与"注册 relay 的认证"。
+		// 两个场景用同一个口令更方便（用户只记一个），语义上也一致：
+		// 都是"能出示口令的人可以操作这个执行端"。
+		Token:         opts.relayToken,
 		Workspace:     cfg.Workspace,
 		MaxToolRounds: cfg.MaxToolRounds,
 		ContextWindow: windowFor(registry, selection),
@@ -282,9 +288,16 @@ func main() {
 	})
 
 	var stopListener func()
-	if listenAddr != "" {
+	// 只要指定了 --tailscale，就默认对外监听——用户开 tailscale 的目的就是
+	// 让别的设备连进来，不应该再要求他额外写一个 --listen。
+	//
+	// 没给 --listen 时用默认端口（只绑回环 + tailnet，见 tailscaleTransport.listen）。
+	if listenAddr != "" || opts.tailscale {
+		if listenAddr == "" {
+			listenAddr = defaultListenAddr
+		}
 		// 有界面的执行端也能自带 tailscale：监听同时覆盖主机回环与 tailnet
-		tsGUI := startTailscale(&cfg, opts, tsnetx.RoleExecutor)
+		tsGUI := startTailscale(&cfg, opts, tsnetx.RoleExecutor, true)
 		if tsGUI.stop != nil {
 			defer tsGUI.stop()
 		}
@@ -302,7 +315,7 @@ func main() {
 	if opts.relay != "" {
 		// 执行端自带 tailscale：注册 relay 走 tailnet，目标机器不需要装客户端。
 		// 节点身份存在 <data_dir>/tailscale/executor，重启后还是同一个节点。
-		tsExecutor := startTailscale(&cfg, opts, tsnetx.RoleExecutor)
+		tsExecutor := startTailscale(&cfg, opts, tsnetx.RoleExecutor, true)
 		if tsExecutor.stop != nil {
 			defer tsExecutor.stop()
 		}

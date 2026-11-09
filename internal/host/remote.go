@@ -5,6 +5,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"simple-agent/internal/conversation"
 	"simple-agent/internal/driver"
@@ -390,6 +391,11 @@ type execServer struct {
 	closeOne sync.Once
 	// maxOut 是队列上限（按包数），满了直接断开该展示端（丢包会破坏有序前提）。
 	maxOut int
+	// rejected 表示握手被拒（token 不对）。一旦为真，**后续所有包一律丢弃并断开连接**。
+	//
+	// 只 return 是不够的：loop 会继续读下一个包，展示端在被拒后仍会发 catalog /
+	// attach / cmd——那些包会照常生效，等于认证被绕过。
+	rejected bool
 }
 
 // execItem 是执行端发送队列的一项：普通包，或一条待切块的逻辑大消息。
@@ -465,14 +471,41 @@ func (s *execServer) run(fn func()) {
 }
 
 func (s *execServer) handle(packet wire.Packet) {
+	if s.rejected {
+		return
+	}
 	switch packet.Kind {
 	case msgHello:
 		var hello wire.Hello
 		_ = wire.Decode(packet.Body, &hello)
+		// 执行端自己的 token（--listen 模式下由 `--token` 指定）。
+		//
+		// 与 relay 的 token 是**两套**：relay 保护"经过 relay 这一跳"，
+		// 这里保护"直连执行端这一跳"。两者互不影响——展示端连 relay 时用
+		// relay 的 token，直连执行端时用执行端的 token。
+		if !s.local.authorize(hello.Credentials.Token) {
+			// 先回一条带原因的 welcome（展示端能显示"token 不正确"而不是干等），
+			// 然后**关掉连接**：不关的话后续 catalog/attach/cmd 会被继续处理，
+			// 认证等于形同虚设。
+			s.rejected = true
+			_ = s.send(msgWelcome, wire.Welcome{
+				Protocol: wire.Protocol, Error: "执行端拒绝了连接：token 不正确",
+			})
+			// 让发送队列有机会把这条 welcome 写出去，再断开
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				s.close()
+			}()
+			return
+		}
 		capability := []string{"bulk"}
 		// 权限随握手告诉展示端：展示端不读执行端的配置，猜不出来。
 		if s.local.AllowShell() {
 			capability = append(capability, "allow_shell")
+		}
+		if s.local.RequireToken() {
+			// 告诉展示端"这个执行端要认证"，界面可以据此给出更准确的提示
+			capability = append(capability, "require_token")
 		}
 		_ = s.send(msgWelcome, wire.Welcome{
 			Protocol: wire.Protocol, HostID: s.local.epoch, HostName: "local",

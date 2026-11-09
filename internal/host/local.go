@@ -2,6 +2,7 @@ package host
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -98,6 +99,19 @@ func (l *Local) Info() HostInfo {
 // AllowShell 返回执行端的命令执行权限（握手时告诉展示端，避免界面按自己的
 // 本地配置猜）。
 func (l *Local) AllowShell() bool { return l.cfg.AllowShell }
+
+// RequireToken 报告执行端是否要求展示端出示 token（--listen 模式下配置了才为真）。
+func (l *Local) RequireToken() bool { return l.cfg.Token != "" }
+
+// authorize 校验展示端握手带来的 token（未配置时恒为通过）。
+//
+// 用定长比较，避免通过响应时间逐字节试探。
+func (l *Local) authorize(token string) bool {
+	if l.cfg.Token == "" {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(l.cfg.Token)) == 1
+}
 
 func (l *Local) Sessions() []SessionRef {
 	out := make([]SessionRef, 0, len(l.sessions))

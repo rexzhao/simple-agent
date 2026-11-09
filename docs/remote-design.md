@@ -842,9 +842,23 @@ viewer ──wire──▶ relay ──wire──▶ executor
   执行端注册（`relay.register`）与展示端路由（`relay.route`）都要带同一个 token，
   中间的 `relay.list` 也要带。展示端的 hello 探测用 `wire.Hello.Credentials.Token`
   携带，relay 在回执行端列表**之前**校验（否则未认证的人发一条 hello 就能拿到列表）。
-- **token 的边界（用户决定）**：它只保护 relay 这一段；直连（`--listen`）仍无认证。
-  也**不加密流量**——它的作用是"别人扫到端口也连不上"，不是防中间人。
-  需要更强保证时用隧道（Tailscale/WireGuard）。
+- **执行端 token（已实现）**：`--listen` 模式下同样可以用 `--token` 指定口令，
+  保护**直连执行端**这一跳（与 relay 那套互相独立，但建议用同一个值，用户只记一个）：
+
+  ```powershell
+  # 执行端：直连也要口令
+  simple-agent --listen 127.0.0.1:7801 --token 口令
+  # 展示端：--connect 时带同一个口令
+  simple-agent --connect 127.0.0.1:7801 --token 口令
+  ```
+
+  校验点在 `execServer.handle` 的 `hello` 分支：token 不对就回
+  `Welcome{Error}` 并**关闭连接**（关键：只回错误不关闭的话，后续
+  `catalog`/`attach`/`cmd` 仍会被处理，认证等于被绕过——这条是被单测抓出来的）。
+  未配置 `--token` 时保持原来的开放行为。
+- **token 的边界（用户决定）**：覆盖 relay 与直连执行端两跳，但**不加密流量**——
+  它的作用是"别人扫到端口也连不上"，不是防中间人。需要更强保证时用隧道
+  （Tailscale/WireGuard）。
 - **更强的认证（未实现）**：`Hello.Credentials{Kind}` 支持 `token` / `mTLS` 指纹；
   服务端侧是 `execHost` 的 `Authenticator` 接口，在 `Hello` 之后、`Welcome` 之前调用，
   失败直接 `Welcome{Error}`。位置已经留好。

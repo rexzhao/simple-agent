@@ -48,6 +48,11 @@ type connManager struct {
 	done chan struct{}
 	// attachSent 表示"这条连接上已经用当前 attach 计划发过 attach 请求"。
 	attachSent bool
+	// token 是执行端要求的握手口令（`--connect` 直连执行端时用）。
+	//
+	// 必须存在管理器里：**断线重连时的 hello 是本管理器发出的**，
+	// 那条 hello 不带 token 就会被执行端拒绝，表现为"一直重连中"。
+	token string
 	backoff    time.Duration
 }
 
@@ -121,6 +126,9 @@ func (m *connManager) start(conn wire.Conn) {
 	go m.writeLoop(conn, m.connID, m.out)
 	go m.run()
 }
+
+// SetToken 设置握手口令（构造后调用；必须在启动前设置）。
+func (m *connManager) SetToken(token string) { m.token = token }
 
 // submit 非阻塞提交一条命令（返回 false 表示管理器忙/已关闭）。
 func (m *connManager) submit(item mItem) bool {
@@ -383,7 +391,7 @@ func (m *connManager) adopt(conn wire.Conn) {
 	// 绝不能让管理器 goroutine 卡在 out 上（整个 actor 会停摆）。
 	hello := mItem{packet: wire.Packet{Kind: msgHello, Body: mustEncode(wire.Hello{
 		Protocol: wire.Protocol, Role: "viewer", Purpose: "control",
-		Credentials: wire.Credentials{Kind: "none"},
+		Credentials: wire.Credentials{Kind: "none", Token: m.token},
 	})}}
 	if !m.tryEnqueue(hello) {
 		_ = conn.Close()
