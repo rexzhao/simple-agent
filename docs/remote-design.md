@@ -798,13 +798,11 @@ simple-agent --listen 127.0.0.1:7801
 所以"本地能正常跑、同时让远端 viewer 连过来"用 `--listen`；
 "本机只想当展示端去连别人的执行端"才用 `--connect`（用户决定见 §11.2 第 2 条）。
 
-监听非回环地址时没有认证（v1 的决定），建议配合隧道或内置 tailscale：
+监听非回环地址时默认没有认证，建议同时用 `--token` 给直连加一道口令（见 §9）：
 
 ```powershell
-simple-agent --listen 127.0.0.1:7801 --tailscale --ts-authkey tskey-auth-xxx
+simple-agent --listen 0.0.0.0:7801 --token 口令
 ```
-
-启用 tailscale 后会**同时**监听主机回环与 tailnet，本机调试不受影响。
 
 ### 7.2 relay 形态
 
@@ -858,7 +856,7 @@ viewer ──wire──▶ relay ──wire──▶ executor
   未配置 `--token` 时保持原来的开放行为。
 - **token 的边界（用户决定）**：覆盖 relay 与直连执行端两跳，但**不加密流量**——
   它的作用是"别人扫到端口也连不上"，不是防中间人。需要更强保证时用隧道
-  （Tailscale/WireGuard）。
+  （WireGuard / SSH 端口转发等）。
 - **更强的认证（未实现）**：`Hello.Credentials{Kind}` 支持 `token` / `mTLS` 指纹；
   服务端侧是 `execHost` 的 `Authenticator` 接口，在 `Hello` 之后、`Welcome` 之前调用，
   失败直接 `Welcome{Error}`。位置已经留好。

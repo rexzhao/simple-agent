@@ -32,14 +32,6 @@ type remoteOptions struct {
 	// relayToken 是 relay 的固定口令（relay 启动时 --token 指定；
 	// 执行端注册、展示端连接都要带同一个）。
 	relayToken string
-	// tailscale 是内置 tsnet 的开关（默认关闭，全部走普通 TCP）。
-	tailscale bool
-	// tsAuthKey 是 tailnet 认证密钥；也可用环境变量 TS_AUTHKEY（优先）。
-	tsAuthKey string
-	// tsHostname 是节点名（默认 主机名-角色）。
-	tsHostname string
-	// tsStateDir 是身份/状态目录（默认 <data_dir>/tailscale/<角色>）。
-	tsStateDir string
 }
 
 // parseRemoteOptions 解析 --listen/--connect/--relay/--route/--headless，
@@ -92,23 +84,6 @@ func parseRemoteOptions(args *[]string) remoteOptions {
 				opts.relayToken = (*args)[i+1]
 				i++
 			}
-		case "--tailscale", "--ts":
-			opts.tailscale = true
-		case "--ts-authkey":
-			if i+1 < len(*args) {
-				opts.tsAuthKey = (*args)[i+1]
-				i++
-			}
-		case "--ts-hostname":
-			if i+1 < len(*args) {
-				opts.tsHostname = (*args)[i+1]
-				i++
-			}
-		case "--ts-state":
-			if i+1 < len(*args) {
-				opts.tsStateDir = (*args)[i+1]
-				i++
-			}
 		default:
 			rest = append(rest, (*args)[i])
 		}
@@ -120,12 +95,12 @@ func parseRemoteOptions(args *[]string) remoteOptions {
 // startListener 让当前进程同时作为执行端对外服务（默认只监听回环）。
 //
 // 每条连接一个 goroutine；协议层不关心底层是直连还是 relay。
-func startListener(addr string, app *uiapp.App, post func(func()), ts tailscaleTransport) (func(), error) {
+func startListener(addr string, app *uiapp.App, post func(func())) (func(), error) {
 	local, ok := app.Host().(*host.Local)
 	if !ok {
 		return nil, fmt.Errorf("当前进程不是执行端，无法监听")
 	}
-	listener, err := ts.listen(addr)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
