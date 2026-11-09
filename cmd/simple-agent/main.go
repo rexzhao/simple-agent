@@ -20,6 +20,7 @@ import (
 	"simple-agent/internal/relay"
 	"simple-agent/internal/store"
 	"simple-agent/internal/tools"
+	"simple-agent/internal/tsnetx"
 	"simple-agent/internal/uiapp"
 	"simple-agent/internal/uistate"
 	"simple-agent/internal/wire"
@@ -63,7 +64,10 @@ func main() {
 
 	// relay 子命令：只做转发，不需要配置/会话/单实例锁
 	if opts.relayServer {
-		os.Exit(runRelayServer(listenAddr, opts.relayToken))
+		// relay 也能自带 tailscale（比如部署在装不了客户端的机器上）
+		relayCfg := relayTailscaleConfig(opts)
+		os.Exit(runRelayServer(listenAddr, opts.relayToken,
+			startTailscale(&relayCfg, opts, tsnetx.RoleRelay)))
 	}
 
 	// 单实例锁必须**最先**获取：配置加载会创建 data_dir，M5 之后还会打开会话
@@ -165,13 +169,19 @@ func main() {
 		// 无界面时的提示写进会话即可；Remote 通知仍可经 relay 到达展示端
 		os.Exit(runHeadless(&cfg, &appRuntime{
 			registry: registry, provider: provider, allowShell: cfg.AllowShell,
-		}, selection, listenAddr, opts.relay, opts.name, opts.relayToken, opts.netLog, catalog, blobs))
+		}, selection, listenAddr, opts.relay, opts.name, opts.relayToken, opts.netLog, catalog, blobs, opts))
 	}
 
 	// 展示端：先连上执行端，拿到 Remote 之后把它注入 uiapp（界面代码不变）。
 	var remoteHost host.Host
 	var executors uiapp.ExecutorSource
 	if connectAddr != "" {
+		// 展示端也能自带 tailscale：手机/笔记本不装客户端时，用自己的节点身份连 relay。
+		// 状态目录与执行端分开（viewer / executor），互不干扰。
+		tsViewer := startTailscale(&cfg, opts, tsnetx.RoleViewer)
+		if tsViewer.stop != nil {
+			defer tsViewer.stop()
+		}
 		// 一条连接、一次握手分辨执行端/relay；直连时没有额外探测超时。
 		// 自动选中的执行端**固定下来**：重连只连它，绝不悄悄换成另一台机器。
 		pinned := &pinnedHost{hostID: opts.route}
@@ -182,7 +192,7 @@ func main() {
 			if target == "" {
 				return nil, errNoExecutorChosen
 			}
-			conn, chosen, dialErr := relay.OpenViewerToken(connectAddr, target, opts.relayToken)
+			conn, chosen, dialErr := relay.OpenViewerDialer(connectAddr, target, opts.relayToken, tsViewer.dialer)
 			if dialErr == nil && chosen != "" {
 				pinned.Lock()
 				pinned.hostID = chosen
@@ -192,7 +202,7 @@ func main() {
 		}
 		// 先亲手连一次：如果对面是 relay 且没指定执行端，就进入"选择执行端"界面，
 		// 而不是 fatal 退出（用户的需求正是在这里选）。
-		conn, chosen, openErr := relay.OpenViewerToken(connectAddr, pinned.hostID, opts.relayToken)
+		conn, chosen, openErr := relay.OpenViewerDialer(connectAddr, pinned.hostID, opts.relayToken, tsViewer.dialer)
 		var needsChoice *relay.NeedsChoice
 		switch {
 		case openErr == nil:
@@ -273,7 +283,12 @@ func main() {
 
 	var stopListener func()
 	if listenAddr != "" {
-		stop, err := startListener(listenAddr, app, post)
+		// 有界面的执行端也能自带 tailscale：监听同时覆盖主机回环与 tailnet
+		tsGUI := startTailscale(&cfg, opts, tsnetx.RoleExecutor)
+		if tsGUI.stop != nil {
+			defer tsGUI.stop()
+		}
+		stop, err := startListener(listenAddr, app, post, tsGUI)
 		if err != nil {
 			showFatal(locale.Tr("dialog.config.title"), err.Error())
 			return
@@ -285,10 +300,16 @@ func main() {
 	// 执行端注册到 relay（有界面也可以）：断线自动重连并重新注册
 	stopRelay := make(chan struct{})
 	if opts.relay != "" {
+		// 执行端自带 tailscale：注册 relay 走 tailnet，目标机器不需要装客户端。
+		// 节点身份存在 <data_dir>/tailscale/executor，重启后还是同一个节点。
+		tsExecutor := startTailscale(&cfg, opts, tsnetx.RoleExecutor)
+		if tsExecutor.stop != nil {
+			defer tsExecutor.stop()
+		}
 		if local, ok := app.Host().(*host.Local); ok {
-			go relay.RunExecutor(opts.relay, relay.Executor{
+			go relay.RunExecutorDialer(opts.relay, relay.Executor{
 				HostID: hostID(opts.name), Token: opts.relayToken,
-			}, stopRelay, func(conn wire.Conn) {
+			}, tsExecutor.dialer, stopRelay, func(conn wire.Conn) {
 				_ = host.Serve(conn, local, post)
 			})
 			defer close(stopRelay)

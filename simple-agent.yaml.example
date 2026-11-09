@@ -67,3 +67,22 @@ providers:
   #       context_window: 64000
   #     - id: deepseek-reasoner
   #       context_window: 64000
+
+# ---- 内置 Tailscale（可选）----
+#
+# 启用后本进程自己就是 tailnet 上的一个节点：对面设备不需要安装 Tailscale
+# 客户端也能连（执行端 / 展示端 / relay 都适用）。
+#
+# 身份（tailnet 里的那台设备 + 100.x.y.z）保存在 state_dir 里，
+# **必须持久化、且每个角色分开**：换目录等于换一台新节点。
+# 目录里已有身份时，auth_key 可以不填，重启后仍是同一个节点。
+#
+# tailscale:
+#   enable: true
+#   hostname: my-pc          # 默认「主机名-角色」
+#   auth_key: tskey-auth-xxx # 或用环境变量 TS_AUTHKEY（优先）
+#   state_dir: /var/lib/simple-agent/tailscale/executor
+#   # control_url: https://headscale.example.com
+#   # ephemeral: true
+#   # tags: [tag:simple-agent]
+#   # verbose: true

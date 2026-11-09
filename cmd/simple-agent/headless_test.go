@@ -56,7 +56,7 @@ func TestHeadlessLifecycle(t *testing.T) {
 	}
 	sess := local.Active().ID
 
-	stop, addr, err := listenHeadless("127.0.0.1:0", local, post)
+	stop, addr, err := listenHeadless("127.0.0.1:0", local, post, tailscaleTransport{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,6 +16,7 @@ import (
 	"simple-agent/internal/host"
 	"simple-agent/internal/providers"
 	"simple-agent/internal/relay"
+	"simple-agent/internal/tsnetx"
 	"simple-agent/internal/store"
 	"simple-agent/internal/wire"
 )
@@ -25,7 +26,8 @@ import (
 // 生命周期：启动 → 监听（可选注册到 relay）→ 等待 SIGINT/SIGTERM →
 // 停掉在跑的回合 → Sync → 关闭监听 → 退出。启动失败返回非 0。
 func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Selection,
-	listenAddr, relayAddr, name, relayToken string, netLog bool, catalog *store.Catalog, blobs *store.Blobs) int {
+	listenAddr, relayAddr, name, relayToken string, netLog bool, catalog *store.Catalog, blobs *store.Blobs,
+	opts remoteOptions) int {
 	host.EnableNetLog(netLog)
 	// headless 在 main 的界面语言解析之前就退出了：这里自己设置一次，
 	// 否则新建会话的默认标题会显示成 locale key（session.defaultTitle）。
@@ -49,9 +51,15 @@ func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Se
 	// 每回合结束打一行摘要（session / 耗时 / 是否成功）
 	local.Subscribe(turnLogger())
 
+	// 执行端自带的 tailscale（可选）：监听与注册 relay 都走它
+	ts := startTailscale(cfg, opts, tsnetx.RoleExecutor)
+	if ts.stop != nil {
+		defer ts.stop()
+	}
+
 	var stopListener func()
 	if listenAddr != "" {
-		stop, _, err := listenHeadless(listenAddr, local, post)
+		stop, _, err := listenHeadless(listenAddr, local, post, ts)
 		if err != nil {
 			log.Printf("headless：监听失败：%v", err)
 			return 1
@@ -62,9 +70,9 @@ func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Se
 
 	stopRelay := make(chan struct{})
 	if relayAddr != "" {
-		go relay.RunExecutor(relayAddr, relay.Executor{
+		go relay.RunExecutorDialer(relayAddr, relay.Executor{
 			HostID: hostID(name), Token: relayToken,
-		}, stopRelay, func(conn wire.Conn) {
+		}, ts.dialer, stopRelay, func(conn wire.Conn) {
 			_ = host.Serve(conn, local, post)
 			log.Printf("headless：展示端已断开（观察者剩余 %d）", local.ObserverCountForTest())
 		})
@@ -132,8 +140,8 @@ func headlessHostConfig(cfg *config.Config, runtime *appRuntime, selection provi
 }
 
 // listenHeadless 起一个 TCP 监听，每条连接交给 host.Serve。
-func listenHeadless(addr string, local *host.Local, post func(func())) (func(), string, error) {
-	listener, err := net.Listen("tcp", addr)
+func listenHeadless(addr string, local *host.Local, post func(func()), ts tailscaleTransport) (func(), string, error) {
+	listener, err := ts.listen(addr)
 	if err != nil {
 		return nil, "", err
 	}
@@ -195,14 +203,14 @@ func turnLogger() func(host.Change) {
 }
 
 // runRelayServer 运行 relay 子命令（只转发，不看会话协议）。
-func runRelayServer(listenAddr, token string) int {
+func runRelayServer(listenAddr, token string, ts tailscaleTransport) int {
 	// relay 是控制台工具：有 SIMPLE_AGENT_DATA 时也落一份日志，方便排查转发问题
 	closeLog, _ := setupLogging(os.Getenv("SIMPLE_AGENT_DATA"), "relay")
 	defer closeLog()
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:7900"
 	}
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := ts.listen(listenAddr)
 	if err != nil {
 		log.Printf("relay：监听失败：%v", err)
 		return 1

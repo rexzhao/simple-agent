@@ -34,7 +34,15 @@ func OpenViewer(addr, route string) (wire.Conn, string, error) {
 
 // OpenViewerToken 与 OpenViewer 相同，但带上 relay 的固定 token。
 func OpenViewerToken(addr, route, token string) (wire.Conn, string, error) {
-	conn, err := wire.Dial(addr)
+	return OpenViewerDialer(addr, route, token, nil)
+}
+
+// OpenViewerDialer 与 OpenViewerToken 相同，但可以指定底层拨号方式。
+//
+// dialer 为 nil 时走普通 TCP；启用 Tailscale 时传入 tsnet 的拨号函数即可，
+// 上层不需要知道"这一跳是直连还是走 tailnet"。
+func OpenViewerDialer(addr, route, token string, dialer Dialer) (wire.Conn, string, error) {
+	conn, err := dialer.Dial(addr)
 	if err != nil {
 		return nil, "", err
 	}
@@ -73,7 +81,7 @@ func OpenViewerToken(addr, route, token string) (wire.Conn, string, error) {
 			target = list[0].HostID
 		}
 		_ = conn.Close()
-		viewerConn, dialErr := DialViewerToken(addr, target, token)
+		viewerConn, dialErr := DialViewerDialer(addr, target, token, dialer)
 		return viewerConn, target, dialErr
 	default:
 		_ = conn.Close()
@@ -90,7 +98,12 @@ func DialViewer(addr, hostID string) (wire.Conn, error) {
 
 // DialViewerToken 与 DialViewer 相同，但带上 relay 的固定 token。
 func DialViewerToken(addr, hostID, token string) (wire.Conn, error) {
-	conn, err := wire.Dial(addr)
+	return DialViewerDialer(addr, hostID, token, nil)
+}
+
+// DialViewerDialer 与 DialViewerToken 相同，但可以指定底层拨号方式。
+func DialViewerDialer(addr, hostID, token string, dialer Dialer) (wire.Conn, error) {
+	conn, err := dialer.Dial(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +140,12 @@ func ListExecutors(addr string) ([]Executor, error) {
 
 // ListExecutorsToken 与 ListExecutors 相同，但带上 relay 的固定 token。
 func ListExecutorsToken(addr, token string) ([]Executor, error) {
-	conn, err := wire.Dial(addr)
+	return ListExecutorsDialer(addr, token, nil)
+}
+
+// ListExecutorsDialer 与 ListExecutorsToken 相同，但可以指定底层拨号方式。
+func ListExecutorsDialer(addr, token string, dialer Dialer) ([]Executor, error) {
+	conn, err := dialer.Dial(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +190,12 @@ func ProbeExecutors(addr string, timeout time.Duration) ([]Executor, error) {
 
 // ProbeExecutorsToken 与 ProbeExecutors 相同，但带上 relay 的固定 token。
 func ProbeExecutorsToken(addr string, timeout time.Duration, token string) ([]Executor, error) {
-	conn, err := wire.Dial(addr)
+	return ProbeExecutorsDialer(addr, timeout, token, nil)
+}
+
+// ProbeExecutorsDialer 与 ProbeExecutorsToken 相同，但可以指定底层拨号方式。
+func ProbeExecutorsDialer(addr string, timeout time.Duration, token string, dialer Dialer) ([]Executor, error) {
+	conn, err := dialer.Dial(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +239,14 @@ func ProbeExecutorsToken(addr string, timeout time.Duration, token string) ([]Ex
 // 连接断了（relay 重启/网络抖动）会退避重连并重新注册；重连期间展示端自己按
 // 直连同样的语义处理断线（既有 remoteHost 逻辑）。
 func RunExecutor(addr string, info Executor, stop <-chan struct{}, serve func(wire.Conn)) {
+	RunExecutorDialer(addr, info, nil, stop, serve)
+}
+
+// RunExecutorDialer 与 RunExecutor 相同，但可以指定底层拨号方式。
+//
+// 启用 Tailscale 的执行端用它注册 relay：断线重连也走同一个 dialer，所以
+// "重启后还是同一个节点"这件事由 tsnet 的状态目录保证，而不是这里。
+func RunExecutorDialer(addr string, info Executor, dialer Dialer, stop <-chan struct{}, serve func(wire.Conn)) {
 	delay := time.Second
 	for {
 		select {
@@ -223,7 +254,7 @@ func RunExecutor(addr string, info Executor, stop <-chan struct{}, serve func(wi
 			return
 		default:
 		}
-		conn, err := wire.Dial(addr)
+		conn, err := dialer.Dial(addr)
 		if err != nil {
 			delay = nextBackoff(delay)
 			sleep(delay, stop)

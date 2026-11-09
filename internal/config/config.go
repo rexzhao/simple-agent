@@ -41,6 +41,47 @@ type Config struct {
 	Language string `toml:"language" yaml:"language"`
 	// Providers 覆盖内置提供商（同 ID 覆盖，新 ID 新增）。
 	Providers map[string]ProviderOverride `toml:"providers" yaml:"providers"`
+	// Tailscale 是可选的 tsnet 配置：启用后程序自己就是 tailnet 上的一个节点，
+	// 目标设备**不需要**安装 Tailscale 客户端。
+	Tailscale TailscaleConfig `toml:"tailscale" yaml:"tailscale"`
+}
+
+// TailscaleConfig 是内置 Tailscale（tsnet）节点的配置。
+//
+// 全部可选：Enable 为 false 时一切照旧走普通 TCP。
+type TailscaleConfig struct {
+	// Enable 打开内置 tailscale。
+	Enable bool `toml:"enable" yaml:"enable"`
+	// Hostname 是节点在 tailnet 里显示的名字（默认 主机名-角色）。
+	Hostname string `toml:"hostname" yaml:"hostname"`
+	// AuthKey 是 tailnet 认证密钥（tskey-...）。也可以只用环境变量 TS_AUTHKEY，
+	// 避免把密钥写进配置文件。
+	//
+	// 状态目录里已有身份时可以不填（重启复用同一个节点）。
+	AuthKey string `toml:"auth_key" yaml:"auth_key"`
+	// StateDir 是节点身份/状态目录（默认 <data_dir>/tailscale/<角色>）。
+	//
+	// **必须持久化，且每个角色分开**：换目录等于换一台新节点。
+	StateDir string `toml:"state_dir" yaml:"state_dir"`
+	// ControlURL 指向自建的 headscale（为空时用官方控制面）。
+	ControlURL string `toml:"control_url" yaml:"control_url"`
+	// Ephemeral 让节点离线后自动从 tailnet 移除（一次性调试用）。
+	Ephemeral bool `toml:"ephemeral" yaml:"ephemeral"`
+	// Tags 是节点的标签（advertise-tags，需在 ACL 里预授权）。
+	Tags []string `toml:"tags" yaml:"tags"`
+	// Verbose 打开 tsnet 的详细日志（排障用）。
+	Verbose bool `toml:"verbose" yaml:"verbose"`
+}
+
+// Enabled 报告是否启用了 tsnet。
+func (t TailscaleConfig) Enabled() bool { return t.Enable }
+
+// AuthKeyOrEnv 返回实际使用的认证密钥（环境变量优先，便于密钥不落盘）。
+func (t TailscaleConfig) AuthKeyOrEnv() string {
+	if key := strings.TrimSpace(os.Getenv("TS_AUTHKEY")); key != "" {
+		return key
+	}
+	return strings.TrimSpace(t.AuthKey)
 }
 
 // ProviderOverride 覆盖某个提供商的字段。
@@ -398,6 +439,13 @@ func Help() string {
   --headless         不创建窗口，只作为执行端运行（配合 --listen / --relay）
   --name NAME        执行端在 relay 上的名字（默认主机名；同名会被 relay 拒绝）
   --net-log          打印网络收发日志（每个包的 kind/字节数，排查连接用）
+  --tailscale        启用内置 tailscale（tsnet）：本进程自己成为 tailnet 节点，
+                     对面设备**不需要**安装 Tailscale 客户端。执行端/展示端/relay 都可用
+  --ts-authkey KEY   tailnet 认证密钥（也可用环境变量 TS_AUTHKEY，优先）。
+                     不填时复用状态目录里已有的身份；两者都没有会等人工授权
+  --ts-hostname NAME 节点在 tailnet 里的名字（默认「主机名-角色」，如 pc-executor）
+  --ts-state DIR     节点身份目录（默认 <data_dir>/tailscale/<角色>）。
+                     必须持久化：换目录等于换一台新节点
   relay              子命令：simple-agent relay --listen 0.0.0.0:7900 --token 口令，只做帧转发
   --allow-shell        启用 bash/pwsh 工具（默认关闭）
   --no-shell           关闭命令执行
