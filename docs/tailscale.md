@@ -17,7 +17,11 @@
 ## 1. 用法
 
 ```powershell
-# 执行端：注册 relay 走 tailnet（对面机器不用装客户端）
+# 桌面端：本地正常用 + 同时让 tailnet 里的设备连进来（最常用）
+# 本地界面、会话、数据目录锁都不受影响；手机走 tailnet 连进来
+simple-agent --listen 127.0.0.1:7801 --tailscale --ts-authkey tskey-auth-xxx
+
+# 执行端（无界面）：注册 relay 走 tailnet（对面机器不用装客户端）
 simple-agent --headless --relay 100.x.y.z:7900 --tailscale --ts-authkey tskey-auth-xxx
 
 # 展示端：经 relay 连执行端，自己也是 tailnet 节点
@@ -26,6 +30,12 @@ simple-agent --connect 100.x.y.z:7900 --route my-pc --tailscale --ts-authkey tsk
 # relay 自己挂在 tailnet 上（只对 tailnet 可见，不占主机端口）
 simple-agent relay --listen :7900 --token 口令 --tailscale --ts-authkey tskey-auth-xxx
 ```
+
+第一条值得单独说明：`--listen` 只是"额外开一个监听口"，**不会**把本地模式变成纯执行端
+（详见 `docs/remote-design.md` §7.1）。启用 tailscale 后它同时监听主机回环与 tailnet：
+
+- 本机调试继续用 `127.0.0.1:7801`
+- tailnet 里的设备用 `<节点名>:7801` 或 `100.x.y.z:7801`
 
 也可以用配置文件（`simple-agent.yaml`）：
 

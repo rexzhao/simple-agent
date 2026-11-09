@@ -769,6 +769,43 @@ type CommandResult struct {
 - 展示端：`--connect host:port`；
 - 这就是 §1 的 `wire.Conn`（TCP 之上跑"包 + 分块"，不引入 HTTP）。
 
+#### `--listen` 与本地模式**并存**（易被误解，单独说明）
+
+`--listen` 不是"切换成纯执行端"，它只是**额外开一个监听口**：
+
+```powershell
+simple-agent --listen 127.0.0.1:7801
+```
+
+上面这条命令启动后：
+
+| 能力 | 状态 |
+| --- | --- |
+| 本地界面、本地会话、数据目录锁、单实例锁 | 照常（走的仍是 `host.Local`） |
+| 远端展示端连进来 | 可以：`--connect 127.0.0.1:7801` |
+| 两边看到的数据 | **同一份**（监听器把每条连接交给 `host.Serve(conn, local, post)`，挂到同一个 `Local`） |
+
+实测验证：本地实例监听 + 另一个 `--connect` 实例，`netstat` 显示两端 `ESTABLISHED`，
+远端发的消息本地界面实时可见。
+
+**与 `--connect` 的区别**（这两个容易混）：
+
+| 参数 | 作用 | 与本地模式的关系 |
+| --- | --- | --- |
+| `--listen ADDR` | 本进程**额外**对外提供执行端服务 | **并存**，本地功能不受影响 |
+| `--connect ADDR` | 本进程**变成**展示端 | **互斥**：不建会话、不写日志、不拿数据目录锁 |
+
+所以"本地能正常跑、同时让远端 viewer 连过来"用 `--listen`；
+"本机只想当展示端去连别人的执行端"才用 `--connect`（用户决定见 §11.2 第 2 条）。
+
+监听非回环地址时没有认证（v1 的决定），建议配合隧道或内置 tailscale：
+
+```powershell
+simple-agent --listen 127.0.0.1:7801 --tailscale --ts-authkey tskey-auth-xxx
+```
+
+启用 tailscale 后会**同时**监听主机回环与 tailnet，本机调试不受影响。
+
 ### 7.2 relay 形态
 
 ```
