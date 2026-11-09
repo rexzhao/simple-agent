@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  执行端与 relay 走裸 TCP（不是 HTTP），Android 的"明文流量"策略只对 HTTP 生效，
+  裸 TCP 不受 cleartextTrafficPermitted 限制。这里保留配置是为了以后加 HTTP
+  类能力（图片 URL 预览等）时有一个明确的白名单入口。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

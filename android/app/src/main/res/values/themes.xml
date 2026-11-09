@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose 自己画界面，主题只需要给窗口一个底色，避免启动时白屏闪一下。 -->
+    <style name="Theme.SimpleAgent" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#101418</item>
+        <item name="android:navigationBarColor">#101418</item>
+        <item name="android:windowBackground">#101418</item>
+    </style>
+</resources>

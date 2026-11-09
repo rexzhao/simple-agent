@@ -1,0 +1,69 @@
+# simple-agent 配置示例（YAML）
+#
+# 复制为 simple-agent.yaml 后按需修改：
+#   · 当前目录的 simple-agent.yaml 优先；
+#   · 其次是用户配置目录（Windows: %APPDATA%\simple-agent\simple-agent.yaml）。
+# 配置优先级（后者覆盖前者）：内置默认 → 本文件 → 环境变量 → 命令行参数。
+# 旧版的 simple-agent.toml 仍然能读（按扩展名选择解析器）。
+
+# 启动时使用的提供商与模型。留空则用第一个「有凭据」的提供商。
+# 想用本地 Ollama（默认不会自动选中）：填 ollama 与模型名。
+# active_provider: deepseek
+# active_model: deepseek-chat
+
+# 界面语言：auto（默认，跟随系统）/ zh / en。
+# dsh 里已有的文案直接用它的中英两套；其余按同样风格翻译。
+# language: auto
+
+# 追加在默认系统提示之后的内容。
+# system_prompt: "回答尽量简短，先给结论。"
+
+# 是否允许执行命令（bash / pwsh）。默认 false；也能用 --allow-shell 或
+# SIMPLE_AGENT_ALLOW_SHELL=1 打开。
+allow_shell: false
+
+# 一次用户输入内最多几轮工具调用（0 表示不限）。防止模型无限调用工具。
+max_tool_rounds: 12
+
+# 工具的工作区根目录。默认是启动时的当前目录；所有路径都不能逃出这里。
+# workspace: F:/work/my-project
+
+# 会话数据目录。默认按平台取（Windows 用 %APPDATA%\simple-agent）。
+# data_dir: D:/simple-agent-data
+
+# 覆盖或新增提供商。只写想改的字段即可，其余保持内置值。
+providers:
+  # 示例：用公司/内网网关（OpenAI 兼容）
+  # paperhub:
+  #   label: PaperHub
+  #   base_url: https://tc-paperhub.diezhi.net/v1
+  #   api_key_env: PAPERHUB_API_KEY
+  #   # 这家厂商所有模型共用的请求体参数（模型自身的同名参数优先）
+  #   # extra_body:
+  #   #   reasoning_effort: low
+  #   models:
+  #     - id: deepseek-v4.1-flash
+  #       label: DeepSeek V4.1 Flash   # 可选：界面上的显示名
+  #       context_window: 128K
+  #       max_output: 64K
+  #       reasoning_efforts: [off, low, medium, high]
+  #       reasoning_effort: medium     # 其余键原样进请求体
+  #       vision: true                 # 支持图片输入（不写 = 不支持，禁止发图）
+  #     - id: glm-5.3
+  #       label: GLM-5.3
+  #       context_window: 200K
+  #       max_output: 128K
+  #       reasoning_efforts: [low, high, max]   # 始终思考，没有「关闭」
+  #
+  # 也支持旧的裸字符串写法（等价于只写 id）：
+  #   models:
+  #     - deepseek-chat
+
+  # 示例：覆盖内置提供商的部分字段
+  # deepseek:
+  #   base_url: https://api.deepseek.com/v1
+  #   models:
+  #     - id: deepseek-chat
+  #       context_window: 64000
+  #     - id: deepseek-reasoner
+  #       context_window: 64000
