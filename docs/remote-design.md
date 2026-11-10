@@ -862,6 +862,8 @@ viewer ──wire──▶ relay ──wire──▶ executor
   失败直接 `Welcome{Error}`。位置已经留好。
 - **加密**：在 `wire.Conn` 之下插一层（Noise/TLS 风格），上层包格式不变；
   relay 转发时是密文（端到端），relay 只看到路由头。
+- **现状的弱点与改进路线**见 `docs/relay-security.md`（挑战-应答、失败限流、
+  多凭据、TLS 四档，附工作量与建议顺序）。
 - **授权**：`Capability`（`Welcome`）与命令级权限（以后加 `cmd` 白名单：只读展示端
   只能发 `blob.get`/`loadOlder`）。现在所有已连上的展示端都是全权限（用户决定 1）。
 - **工具权限只由执行端决定**：`allow_shell`、工作区、`vision`、模型凭据都在执行端配置里；
