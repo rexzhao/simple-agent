@@ -89,6 +89,7 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
             onAddr = viewModel::updateAddr,
             onRoute = viewModel::updateRoute,
             onToken = viewModel::updateToken,
+            onFingerprint = viewModel::updateFingerprint,
             onConnect = viewModel::connect,
         )
         return
@@ -316,6 +317,7 @@ private fun ConnectScreen(
     onAddr: (String) -> Unit,
     onRoute: (String) -> Unit,
     onToken: (String) -> Unit,
+    onFingerprint: (String) -> Unit,
     onConnect: () -> Unit,
 ) {
     Column(
@@ -351,6 +353,15 @@ private fun ConnectScreen(
             label = { Text("relay token（没有就留空）") },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        // 传输加密：留空走明文；填了则只接受指纹完全一致的 relay 证书。
+        // 指纹由服务端 `--tls --tls-print-fingerprint` 打印（64 位十六进制，可带冒号）。
+        OutlinedTextField(
+            value = state.fingerprint,
+            onValueChange = onFingerprint,
+            label = { Text("证书指纹（启用 TLS 时填，留空则明文）") },
+            singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
         if (state.connectError.isNotEmpty()) {

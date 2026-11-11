@@ -29,6 +29,12 @@ data class ViewerState(
     val addr: String = "127.0.0.1:7900",
     val route: String = "",
     val token: String = "",
+    /**
+     * relay 证书指纹（传输加密）。留空表示不启用 TLS。
+     *
+     * 十六进制，可带冒号；服务端用 `--tls --tls-print-fingerprint` 打印出来。
+     */
+    val fingerprint: String = "",
     val sessions: List<SessionSummary> = emptyList(),
     val activeSessionId: String = "",
     val timeline: TimelineView = TimelineView(),
@@ -77,6 +83,9 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         ViewerState(
             addr = prefs.getString("addr", "")?.ifEmpty { null } ?: ViewerState().addr,
             route = prefs.getString("route", "") ?: "",
+            // token 与指纹也记住：手机上每次重敲这两串是灾难，而且指纹有 64 位十六进制
+            token = prefs.getString("token", "") ?: "",
+            fingerprint = prefs.getString("fingerprint", "") ?: "",
         ),
     )
     val uiState: StateFlow<ViewerState> = state.asStateFlow()
@@ -155,16 +164,26 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     fun updateAddr(value: String) = state.update { it.copy(addr = value) }
     fun updateRoute(value: String) = state.update { it.copy(route = value) }
     fun updateToken(value: String) = state.update { it.copy(token = value) }
+    fun updateFingerprint(value: String) = state.update { it.copy(fingerprint = value) }
 
     fun connect() {
         state.update { it.copy(connecting = true, connectError = "") }
         val current = state.value
-        // 记住这次填的地址/route：手机上没有键盘很麻烦，下次启动直接带出来
+        // 记住这次填的全部连接参数：手机输入很麻烦，指纹还是 64 位十六进制。
+        // token/指纹属于凭据，但存在应用私有 SharedPreferences 里（未 root 时
+        // 其它应用读不到），比每次手敲安全得多。
         prefs.edit()
             .putString("addr", current.addr.trim())
             .putString("route", current.route.trim())
+            .putString("token", current.token.trim())
+            .putString("fingerprint", current.fingerprint.trim())
             .apply()
-        core.connect(current.addr.trim(), current.route.trim(), current.token.trim())
+        core.connectTLS(
+            current.addr.trim(),
+            current.route.trim(),
+            current.token.trim(),
+            current.fingerprint.trim(),
+        )
     }
 
     fun disconnect() {

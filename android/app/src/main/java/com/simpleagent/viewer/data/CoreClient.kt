@@ -43,8 +43,17 @@ class CoreClient private constructor(
 
     /** 连上执行端/relay（后台拨号，结果经 [CoreEvent.Connected] 回来）。 */
     fun connect(addr: String, route: String, token: String) {
+        connectTLS(addr, route, token, "")
+    }
+
+    /**
+     * 与 [connect] 相同，但可以额外校验 relay 的证书指纹（传输加密）。
+     *
+     * fingerprint 为空表示不启用 TLS；非空时只接受指纹完全一致的证书。
+     */
+    fun connectTLS(addr: String, route: String, token: String, fingerprint: String) {
         io.execute {
-            val error = client.connect(addr, route, token)
+            val error = client.connectTLS(addr, route, token, fingerprint)
             main.post {
                 if (!closed.get()) onEvent(CoreEvent.Connected(error))
             }

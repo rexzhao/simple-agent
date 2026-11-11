@@ -21,6 +21,7 @@ class MainActivity : ComponentActivity() {
         intent?.getStringExtra("addr")?.let(viewModel::updateAddr)
         intent?.getStringExtra("route")?.let(viewModel::updateRoute)
         intent?.getStringExtra("token")?.let(viewModel::updateToken)
+        intent?.getStringExtra("fingerprint")?.let(viewModel::updateFingerprint)
 
         enableEdgeToEdge()
         setContent {

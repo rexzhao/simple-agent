@@ -113,6 +113,9 @@ func SetDialFunc(fn func(addr string) (net.Conn, error)) {
 	dialFunc = fn
 }
 
+// DialFunc 返回当前的拨号函数（用于"临时替换再还原"，例如移动端按连接切换 TLS）。
+func DialFunc() func(addr string) (net.Conn, error) { return dialFunc }
+
 // Dial 连接一个执行端（默认只允许回环/内网；对外监听由执行端显式指定）。
 func Dial(addr string) (Conn, error) {
 	conn, err := dialFunc(addr)

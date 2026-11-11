@@ -33,6 +33,7 @@ import (
 	"simple-agent/internal/markdown"
 	"simple-agent/internal/providers"
 	"simple-agent/internal/relay"
+	"simple-agent/internal/tlsx"
 	"simple-agent/internal/wire"
 )
 
@@ -68,6 +69,8 @@ type Client struct {
 	lastConnected bool
 	// lastError 是最近一次失败原因（BlobPath 这类阻塞操作把错误留在这里给界面看）。
 	lastError string
+	// restoreDial 恢复连接前的全局拨号函数（TLS 是进程级开关，断开时还原）。
+	restoreDial func()
 }
 
 // NewClient 创建一个尚未连接的展示端。
@@ -95,6 +98,16 @@ func NewClient(listener ChangeListener, lang string, cacheDir string) *Client {
 //
 // 返回空字符串表示成功，否则是给用户看的错误原因。
 func (c *Client) Connect(addr, route, token string) string {
+	return c.ConnectTLS(addr, route, token, "")
+}
+
+// ConnectTLS 与 Connect 相同，但可以额外校验 relay 的证书指纹（传输加密）。
+//
+// fingerprint 为空表示不启用 TLS（明文 TCP，与以前完全一样）；
+// 非空时只接受**指纹完全一致**的服务端证书，不做 CA 校验（等价于"只信任这一台"）。
+//
+// 十六进制，可带冒号/空格，大小写不敏感。
+func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 	if addr == "" {
 		return "请填写执行端或 relay 的地址（host:port）"
 	}
@@ -110,6 +123,24 @@ func (c *Client) Connect(addr, route, token string) string {
 	//
 	// 注意 OpenViewerToken 返回 (conn, 选中的 hostID, err)：首连时那个 hostID 要
 	// 记下来（relay 上有多个执行端时，重连必须连回同一台，不能随机换一台）。
+	// 传输加密（可选）：有指纹就走 TLS，否则保持明文。
+	// 拨号与重连共用同一个 tlsConfig，所以断线重连也仍然是加密的。
+	tlsConfig := tlsx.Config{Fingerprint: fingerprint}
+	if fingerprint != "" {
+		if _, err := tlsConfig.ClientConfig(); err != nil {
+			return "指纹格式不对：" + err.Error()
+		}
+	}
+	// 装到 wire 的拨号钩子上：relay.OpenViewerToken 内部用的是 wire.Dial。
+	// 断开时恢复，避免影响后续以明文连接。
+	previousDial := wire.DialFunc()
+	if fingerprint != "" {
+		wire.SetDialFunc(tlsConfig.Dial)
+	}
+	c.mu.Lock()
+	c.restoreDial = func() { wire.SetDialFunc(previousDial) }
+	c.mu.Unlock()
+
 	var pinnedMu sync.Mutex
 	pinnedRoute := route
 	dial := func() (wire.Conn, error) {
@@ -126,6 +157,7 @@ func (c *Client) Connect(addr, route, token string) string {
 	}
 	remote, err := host.NewRemoteWithToken(dial, c.post.submit, token)
 	if err != nil {
+		c.restoreDialNow()
 		// relay 上有多个执行端、又没指定 route：把候选列表报给界面去选
 		var needsChoice *relay.NeedsChoice
 		if errors.As(err, &needsChoice) {
@@ -157,7 +189,19 @@ func AttachForTest(client *Client, remote *host.Remote) {
 }
 
 // Disconnect 断开展示端（保留界面上的内容，用户可以继续看）。
+// restoreDialNow 恢复连接前的拨号函数（幂等）。
+func (c *Client) restoreDialNow() {
+	c.mu.Lock()
+	restore := c.restoreDial
+	c.restoreDial = nil
+	c.mu.Unlock()
+	if restore != nil {
+		restore()
+	}
+}
+
 func (c *Client) Disconnect() {
+	c.restoreDialNow()
 	c.mu.Lock()
 	remote := c.remote
 	c.remote = nil
@@ -178,6 +222,7 @@ func (c *Client) Close() {
 	remote := c.remote
 	c.remote = nil
 	c.mu.Unlock()
+	c.restoreDialNow()
 	if remote != nil {
 		_ = remote.Close()
 	}
