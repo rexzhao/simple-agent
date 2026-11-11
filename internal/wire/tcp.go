@@ -82,6 +82,17 @@ func (c *tcpConn) Close() error {
 	return err
 }
 
+// RemoteAddr 暴露对端地址（relay 按 IP 限流要用）。
+//
+// wire.Conn 接口本身不含地址（协议层抽象），但这里实现它之后，
+// relay 可以用接口断言拿到来源 IP。包装层（heartbeatConn）也要转发。
+func (c *tcpConn) RemoteAddr() net.Addr {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.RemoteAddr()
+}
+
 // DialFunc 是底层连接的建立方式（默认 net.Dial）。
 //
 // 抽成钩子是为了让上层能插入 TLS：wire 包本身不认识 TLS，
@@ -193,4 +204,15 @@ func (h *heartbeatConn) Recv() (Packet, error) {
 func (h *heartbeatConn) Close() error {
 	h.once.Do(func() { close(h.done) })
 	return h.inner.Close()
+}
+
+// RemoteAddr 转发内层的对端地址。
+//
+// 必须显式转发：heartbeatConn 是 wire.Conn 的实现，但接口里没有 RemoteAddr，
+// 不转发的话 relay 的接口断言会失败，按 IP 限流就形同虚设（曾经就是这样）。
+func (h *heartbeatConn) RemoteAddr() net.Addr {
+	if h.inner == nil {
+		return nil
+	}
+	return h.inner.RemoteAddr()
 }
