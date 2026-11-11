@@ -15,25 +15,45 @@
 
 ### 1.1 服务端（relay 或执行端监听）
 
+最简单：只加 `--tls`。证书会自动生成到 `<data_dir>/tls/`，重启复用（指纹稳定）。
+
 ```powershell
-# 第一次运行会自动生成自签证书，并把指纹打印出来
-simple-agent relay --listen 0.0.0.0:7900 --token 口令 `
-  --tls-cert ./tls/cert.pem --tls-key ./tls/key.pem
+simple-agent relay --listen 0.0.0.0:7900 --token 口令 --tls
 ```
 
 启动日志会给出客户端需要的东西：
 
 ```
-TLS：已启用服务端加密（证书 ./tls/cert.pem）
-TLS：证书指纹 12:07:b1:63:...:61:61
-TLS：客户端需要加 --tls-fingerprint 1207b163...6161
+TLS：已启用服务端加密（证书 /var/lib/simple-agent/tls/cert.pem）
+TLS：证书指纹 26:33:12:06:...:52:08:f3
+TLS：客户端需要加 --tls-fingerprint 26331206...5208f3
 ```
 
-只想看指纹（不启动服务）：
+想放在别的位置就用 `--tls-cert` / `--tls-key` 显式指定：
 
 ```powershell
-simple-agent --tls-cert ./tls/cert.pem --tls-key ./tls/key.pem --tls-print-fingerprint
+simple-agent relay --listen 0.0.0.0:7900 --token 口令 `
+  --tls-cert ./tls/cert.pem --tls-key ./tls/key.pem
 ```
+
+只想看指纹（不启动服务、不带路径也行）：
+
+```powershell
+simple-agent --tls --tls-print-fingerprint
+```
+
+输出：
+
+```
+证书：/home/me/.config/simple-agent/tls/cert.pem
+指纹：26:33:12:06:ea:77:9e:a8:7b:63:26:e0:59:94:51:2c:30:e4:45:b6:18:58:67:2b:48:d8:18:75:7c:52:08:f3
+原始：26331206ea779ea87b6326e05994512c30e445b61858672b48d818757c5208f3
+
+把指纹填到客户端：
+  simple-agent --connect HOST:PORT --tls-fingerprint 26331206...5208f3
+```
+
+再跑一次会复用同一份证书，指纹不变——客户端只需配一次。
 
 ### 1.2 客户端（展示端 / 执行端注册 relay）
 
@@ -99,7 +119,8 @@ tls:
 
 | 情况 | 行为 |
 | --- | --- |
-| 只给 `--tls-cert/--tls-key` | 监听用 TLS；拨号仍是明文（并提示"要加密拨号请加指纹"） |
+| `--tls`（不给路径） | 证书自动生成到 `<data_dir>/tls/`，重启复用；监听用 TLS |
+| 只给 `--tls-cert/--tls-key` | 同上，只是证书位置自选；拨号仍是明文（并提示"要加密拨号请加指纹"） |
 | 只给 `--tls-fingerprint` | 拨号用 TLS；监听仍是明文 |
 | 两者都给 | 监听与拨号都加密（同一进程既当服务端又当客户端时用） |
 | 证书准备失败 | **直接退出**，不降级成明文（否则用户会误以为已加密） |

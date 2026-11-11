@@ -43,16 +43,32 @@ import (
 
 // Config 是 TLS 的启用配置。零值 = 明文。
 type Config struct {
-	// CertFile / KeyFile 是服务端证书与私钥的 PEM 路径（启用服务端 TLS 时必填）。
+	// CertFile / KeyFile 是服务端证书与私钥的 PEM 路径。
 	//
-	// 都不存在时会自动生成自签证书（见 [Config.EnsureCert]）。
+	// 文件不存在时会自动生成自签证书（见 [Config.EnsureCert]）。
+	// 给了 [Config.DataDir] 而路径为空时，落在 `<DataDir>/tls/cert.pem` 与 `key.pem`，
+	// 这样 `--tls` 一个开关就能用，不必每次传两个路径。
 	CertFile string
 	// KeyFile 见 CertFile。
 	KeyFile string
+	// DataDir 用来推导默认证书位置（仅当 CertFile/KeyFile 为空时使用）。
+	DataDir string
 	// Fingerprint 是客户端侧要校验的服务端证书 SHA-256 指纹（十六进制，可带冒号）。
 	//
 	// 为空表示不启用客户端 TLS。
 	Fingerprint string
+}
+
+// resolvedCertPaths 返回实际使用的证书路径（未显式指定时落到 DataDir 下）。
+func (c Config) resolvedCertPaths() (certFile, keyFile string) {
+	if c.CertFile != "" && c.KeyFile != "" {
+		return c.CertFile, c.KeyFile
+	}
+	if c.DataDir == "" {
+		return c.CertFile, c.KeyFile
+	}
+	dir := filepath.Join(c.DataDir, "tls")
+	return filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 }
 
 // Enabled 报告是否配置了任意一侧的 TLS。
@@ -61,7 +77,13 @@ func (c Config) Enabled() bool {
 }
 
 // ServerTLS 报告是否应该用 TLS 监听。
-func (c Config) ServerTLS() bool { return c.CertFile != "" && c.KeyFile != "" }
+// ServerTLS 报告是否应该用 TLS 监听。
+//
+// 显式给了证书路径、或者给了 DataDir（用默认路径）都算启用。
+func (c Config) ServerTLS() bool {
+	certFile, keyFile := c.resolvedCertPaths()
+	return certFile != "" && keyFile != ""
+}
 
 // ClientTLS 报告是否应该用 TLS 拨号。
 func (c Config) ClientTLS() bool { return c.Fingerprint != "" }
@@ -74,9 +96,10 @@ func normalizedFingerprint(value string) string {
 
 // ServerConfig 构造服务端 TLS 配置（证书从文件加载）。
 func (c Config) ServerConfig() (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
+	certFile, keyFile := c.resolvedCertPaths()
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("加载 TLS 证书失败（%s / %s）：%w", c.CertFile, c.KeyFile, err)
+		return nil, fmt.Errorf("加载 TLS 证书失败（%s / %s）：%w", certFile, keyFile, err)
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -152,16 +175,17 @@ func (c Config) Dial(addr string) (net.Conn, error) {
 // 生成的是自签证书（自己签发自己），对"指纹校验"来说完全够用——
 // 我们不需要任何 CA 信任链。
 func (c Config) EnsureCert() (string, error) {
-	if c.CertFile == "" || c.KeyFile == "" {
-		return "", errors.New("需要同时指定证书与私钥路径")
+	certFile, keyFile := c.resolvedCertPaths()
+	if certFile == "" || keyFile == "" {
+		return "", errors.New("需要证书与私钥路径（或指定 DataDir 用默认位置）")
 	}
-	if fileExists(c.CertFile) && fileExists(c.KeyFile) {
-		return CertFingerprintFile(c.CertFile)
+	if fileExists(certFile) && fileExists(keyFile) {
+		return CertFingerprintFile(certFile)
 	}
-	if err := os.MkdirAll(filepath.Dir(c.CertFile), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(certFile), 0o700); err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(c.KeyFile), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(keyFile), 0o700); err != nil {
 		return "", err
 	}
 
@@ -202,15 +226,18 @@ func (c Config) EnsureCert() (string, error) {
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
 
-	if err := writeFileExclusive(c.CertFile, certPEM); err != nil {
+	if err := writeFileExclusive(certFile, certPEM); err != nil {
 		return "", err
 	}
-	if err := writeFileExclusive(c.KeyFile, keyPEM); err != nil {
+	if err := writeFileExclusive(keyFile, keyPEM); err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:]), nil
 }
+
+// CertPaths 返回实际使用的证书与私钥路径（日志/打印用）。
+func (c Config) CertPaths() (certFile, keyFile string) { return c.resolvedCertPaths() }
 
 // CertFingerprintFile 计算证书文件的 SHA-256 指纹（十六进制）。
 //

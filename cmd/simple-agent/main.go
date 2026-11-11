@@ -64,12 +64,15 @@ func main() {
 	// relay 子命令：只做转发，不需要配置/会话/单实例锁
 	if opts.relayServer {
 		// relay 也要能上 TLS（它就是那个需要被客户端验指纹的服务端）。
-		// 它不走完整配置加载（那样会创建/锁定 data_dir），所以只取 TLS 这几项。
+		// 它不走完整配置加载（那样会创建/锁定 data_dir），所以只取 TLS 这几项；
+		// DataDir 用来放自动生成的证书（--tls 不给路径时）。
 		relayTLSCfg := config.Config{TLS: config.TLSConfig{
+			Enable:      opts.tlsEnabled,
 			CertFile:    firstNonEmptyStr(opts.tlsCert, ""),
 			KeyFile:     firstNonEmptyStr(opts.tlsKey, ""),
 			Fingerprint: firstNonEmptyStr(opts.tlsFingerprint, ""),
 		}}
+		relayTLSCfg.DataDir = firstNonEmptyStr(os.Getenv("SIMPLE_AGENT_DATA"), config.DefaultDataDir())
 		if !setupTLS(&relayTLSCfg, opts) {
 			return
 		}

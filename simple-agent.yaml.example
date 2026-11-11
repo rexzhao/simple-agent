@@ -78,7 +78,9 @@ providers:
 # 打印出要填到客户端的指纹。
 #
 # tls:
-#   # 服务端（relay 或执行端监听）
+#   # 服务端开关：证书自动生成到 <data_dir>/tls/ 并复用（等价于命令行 --tls）
+#   enable: true
+#   # 想放到别的位置再填这两项（不填就用上面的默认位置）
 #   cert_file: /var/lib/simple-agent/tls/cert.pem
 #   key_file: /var/lib/simple-agent/tls/key.pem
 #   # 客户端（只填要连的那台 relay 的指纹；十六进制，可带冒号）

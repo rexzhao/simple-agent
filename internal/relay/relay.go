@@ -68,6 +68,17 @@ type Relay struct {
 	// 需要保护就用隧道或只在回环上监听。relay 只做固定口令比较，不做会话密钥、
 	// 不加密流量——它的作用是"别人扫到端口也连不上"，不是防止中间人。
 	Token string
+	// limit 按来源 IP 限制认证失败频率（防止 token 被穷举）。
+	//
+	// 懒初始化（见 limitOrCreate）：Relay 可能被零值构造，字段不能依赖 New()。
+	limitOnce sync.Once
+	limit     *limiter
+}
+
+// limitOrCreate 返回限流器（首次调用时创建）。
+func (r *Relay) limitOrCreate() *limiter {
+	r.limitOnce.Do(func() { r.limit = newLimiter() })
+	return r.limit
 }
 
 type executorLink struct {
@@ -155,6 +166,13 @@ func New() *Relay { return &Relay{executors: map[string]*executorLink{}, nextID:
 // Serve 处理一条来自执行端或展示端的连接（连接已握手）。
 func (r *Relay) Serve(conn wire.Conn) {
 	defer conn.Close()
+	// 先看这个 IP 是否在退避期：在的话直接断开，连 token 都不比较
+	// （省掉比较开销，也不给攻击者任何可用于探测的响应差异）。
+	ip := remoteIP(conn)
+	if !r.limitOrCreate().allow(ip) {
+		logRateLimited(ip)
+		return
+	}
 	// 客户端（relay.OpenViewerToken）会先发一条 hello 来分辨"对面是执行端还是
 	// relay"。relay 不是执行端：不回 welcome，而是回执行端列表作为探测应答。
 	//
@@ -173,15 +191,18 @@ func (r *Relay) Serve(conn wire.Conn) {
 		var hello wire.Hello
 		_ = wire.Decode(first.Body, &hello)
 		if !r.allowToken(hello.Credentials.Token) {
+			blocked, failures := r.limitOrCreate().fail(ip)
+			logAuthFailure(ip, failures, blocked)
 			_ = conn.Send(wire.Packet{Kind: MsgExecutors, Body: mustEncode(map[string]any{
 				"error": ErrBadToken.Error(),
 			})})
 			return
 		}
+		r.limitOrCreate().succeed(ip)
 		_ = conn.Send(wire.Packet{Kind: MsgExecutors, Body: mustEncode(r.List())})
 	}
 	// 配了 token 时，请求帧里的 token 也要对（注册/路由/列表查询三条路径共用）。
-	if !r.authorize(conn, packet) {
+	if !r.authorize(conn, packet, ip) {
 		return
 	}
 	switch packet.Kind {
@@ -215,7 +236,7 @@ func (r *Relay) allowToken(token string) bool {
 //
 // 失败时回一条明确的错误帧再断开：客户端要能把「token 不对」和「连不上」区分开，
 // 否则用户只会看到"一直重连中"。
-func (r *Relay) authorize(conn wire.Conn, packet wire.Packet) bool {
+func (r *Relay) authorize(conn wire.Conn, packet wire.Packet, ip string) bool {
 	if r.Token == "" {
 		return true
 	}
@@ -227,12 +248,14 @@ func (r *Relay) authorize(conn wire.Conn, packet wire.Packet) bool {
 		} else if packet.Kind == MsgRoute {
 			kind = MsgRouted
 		}
+		blocked, failures := r.limitOrCreate().fail(ip)
+		logAuthFailure(ip, failures, blocked)
 		_ = conn.Send(wire.Packet{Kind: kind, Body: mustEncode(map[string]any{
 			"error": ErrBadToken.Error(),
 		})})
-		log.Printf("relay：拒绝了一个 token 不正确/缺失的连接（%s）", packet.Kind)
 		return false
 	}
+	r.limitOrCreate().succeed(ip)
 	return true
 }
 

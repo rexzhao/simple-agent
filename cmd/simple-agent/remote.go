@@ -33,7 +33,9 @@ type remoteOptions struct {
 	// relayToken 是 relay 的固定口令（relay 启动时 --token 指定；
 	// 执行端注册、展示端连接都要带同一个）。
 	relayToken string
-	// tlsCert / tlsKey 是服务端证书与私钥（启用 TLS 监听时用）。
+	// tlsEnabled 是 --tls 开关：启用服务端 TLS，证书自动生成/复用。
+	tlsEnabled bool
+	// tlsCert / tlsKey 是服务端证书与私钥（给定时优先于自动生成）。
 	tlsCert string
 	tlsKey  string
 	// tlsFingerprint 是客户端要校验的服务端证书指纹（启用 TLS 拨号时用）。
@@ -92,6 +94,8 @@ func parseRemoteOptions(args *[]string) remoteOptions {
 				opts.relayToken = (*args)[i+1]
 				i++
 			}
+		case "--tls":
+			opts.tlsEnabled = true
 		case "--tls-cert":
 			if i+1 < len(*args) {
 				opts.tlsCert = (*args)[i+1]
