@@ -111,12 +111,11 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 	if addr == "" {
 		return "请填写执行端或 relay 的地址（host:port）"
 	}
-	c.mu.Lock()
-	if c.remote != nil {
-		c.mu.Unlock()
-		return "已经连接过了，请先断开"
-	}
-	c.mu.Unlock()
+	// 已经连着就直接重连：界面上点「连接」的意图很明确——用当前参数重新建立连接。
+	//
+	// 以前这里返回"已经连接过了，请先断开"，但连接页**没有断开按钮**
+	// （断开在侧边抽屉里），用户会卡在一个点不动也退不出的状态。
+	c.disconnectIfConnected()
 
 	// 连接与**断线重连**都走同一个拨号函数：relay 的 token、route 必须一起带过去，
 	// 否则重连会悄悄变成"未认证/未路由"。
@@ -198,6 +197,24 @@ func (c *Client) restoreDialNow() {
 	if restore != nil {
 		restore()
 	}
+}
+
+// disconnectIfConnected 如果当前连着，先干净地断开（供"重连"用）。
+//
+// 与 Disconnect 的区别：它不关闭 Client（closed 保持 false），
+// 调用方紧接着会重新 Connect。
+func (c *Client) disconnectIfConnected() {
+	c.mu.Lock()
+	remote := c.remote
+	c.remote = nil
+	c.mu.Unlock()
+	if remote == nil {
+		return
+	}
+	// 先还原拨号函数再关连接：关连接时 Remote 可能会尝试最后几次重连，
+	// 保持原来的拨号函数更安全（避免它用到即将被替换的 TLS 配置）。
+	c.restoreDialNow()
+	_ = remote.Close()
 }
 
 func (c *Client) Disconnect() {

@@ -98,7 +98,19 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         when (event) {
             is CoreEvent.Connected -> {
                 if (event.error.isNotEmpty()) {
-                    state.update { it.copy(connecting = false, connectError = event.error) }
+                    // 连接失败必须把 connected 也置回 false：
+                    // 否则"先连上、再重连失败"时会残留 connected=true，
+                    // 界面停在聊天页但实际没有连接（也回不到连接页）。
+                    state.update {
+                        it.copy(
+                            connecting = false,
+                            connected = false,
+                            connectError = event.error,
+                            sessions = emptyList(),
+                            activeSessionId = "",
+                            timeline = TimelineView(),
+                        )
+                    }
                     return
                 }
                 state.update { it.copy(connecting = false, connected = true, connectError = "") }

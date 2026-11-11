@@ -91,6 +91,7 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
             onToken = viewModel::updateToken,
             onFingerprint = viewModel::updateFingerprint,
             onConnect = viewModel::connect,
+            onDisconnect = viewModel::disconnect,
         )
         return
     }
@@ -319,6 +320,7 @@ private fun ConnectScreen(
     onToken: (String) -> Unit,
     onFingerprint: (String) -> Unit,
     onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -373,6 +375,15 @@ private fun ConnectScreen(
                     CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
                 } else {
                     Text("连接")
+                }
+            }
+            // 兜底：连接页也要能断开。
+            // 正常情况下"点连接"就会先断开再重连（bridge 层已处理），
+            // 但用户可能想停在连接页改参数，这时需要一个显式的断开入口
+            // （以前只有侧边抽屉里有，返回连接页后就找不到了）。
+            if (state.connected) {
+                androidx.compose.material3.OutlinedButton(onClick = onDisconnect) {
+                    Text("断开")
                 }
             }
         }
