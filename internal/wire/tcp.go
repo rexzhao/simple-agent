@@ -82,9 +82,29 @@ func (c *tcpConn) Close() error {
 	return err
 }
 
+// DialFunc 是底层连接的建立方式（默认 net.Dial）。
+//
+// 抽成钩子是为了让上层能插入 TLS：wire 包本身不认识 TLS，
+// 但"怎么建连接"和"帧怎么切"是两件正交的事。
+var dialFunc func(addr string) (net.Conn, error) = func(addr string) (net.Conn, error) {
+	return net.Dial("tcp", addr)
+}
+
+// SetDialFunc 替换底层拨号方式（进程启动时调用一次；传 nil 恢复默认）。
+//
+// 这样 wire.Dial 的所有调用点（relay 客户端、执行端直连等）都会自动走 TLS，
+// 不需要在每个调用点加参数。
+func SetDialFunc(fn func(addr string) (net.Conn, error)) {
+	if fn == nil {
+		dialFunc = func(addr string) (net.Conn, error) { return net.Dial("tcp", addr) }
+		return
+	}
+	dialFunc = fn
+}
+
 // Dial 连接一个执行端（默认只允许回环/内网；对外监听由执行端显式指定）。
 func Dial(addr string) (Conn, error) {
-	conn, err := net.Dial("tcp", addr)
+	conn, err := dialFunc(addr)
 	if err != nil {
 		return nil, err
 	}

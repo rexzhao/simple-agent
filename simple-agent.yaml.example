@@ -67,3 +67,19 @@ providers:
   #       context_window: 64000
   #     - id: deepseek-reasoner
   #       context_window: 64000
+
+# ---- 传输加密（可选，默认关闭）----
+#
+# 开启后 relay/执行端与展示端之间走 TLS。客户端不用 CA，只认写死的证书指纹：
+# 等价于"只信任这一台 relay"，比 CA 链更严格。
+#
+# 首次启用时如果证书文件不存在会自动生成自签证书，并用
+#   simple-agent --tls-cert <证书> --tls-key <私钥> --tls-print-fingerprint
+# 打印出要填到客户端的指纹。
+#
+# tls:
+#   # 服务端（relay 或执行端监听）
+#   cert_file: /var/lib/simple-agent/tls/cert.pem
+#   key_file: /var/lib/simple-agent/tls/key.pem
+#   # 客户端（只填要连的那台 relay 的指纹；十六进制，可带冒号）
+#   # fingerprint: 1207b163d52f2ed9dc4ff94334f683787c7a7fc7076dfbc3178eced586b86161

@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"simple-agent/internal/host"
+	"simple-agent/internal/tlsx"
 	"simple-agent/internal/uiapp"
 	"simple-agent/internal/wire"
 )
@@ -32,6 +33,13 @@ type remoteOptions struct {
 	// relayToken 是 relay 的固定口令（relay 启动时 --token 指定；
 	// 执行端注册、展示端连接都要带同一个）。
 	relayToken string
+	// tlsCert / tlsKey 是服务端证书与私钥（启用 TLS 监听时用）。
+	tlsCert string
+	tlsKey  string
+	// tlsFingerprint 是客户端要校验的服务端证书指纹（启用 TLS 拨号时用）。
+	tlsFingerprint string
+	// printFingerprint 打印证书指纹后退出（方便把指纹填到客户端）。
+	printFingerprint bool
 }
 
 // parseRemoteOptions 解析 --listen/--connect/--relay/--route/--headless，
@@ -84,6 +92,23 @@ func parseRemoteOptions(args *[]string) remoteOptions {
 				opts.relayToken = (*args)[i+1]
 				i++
 			}
+		case "--tls-cert":
+			if i+1 < len(*args) {
+				opts.tlsCert = (*args)[i+1]
+				i++
+			}
+		case "--tls-key":
+			if i+1 < len(*args) {
+				opts.tlsKey = (*args)[i+1]
+				i++
+			}
+		case "--tls-fingerprint", "--tls-fp":
+			if i+1 < len(*args) {
+				opts.tlsFingerprint = (*args)[i+1]
+				i++
+			}
+		case "--tls-print-fingerprint":
+			opts.printFingerprint = true
 		default:
 			rest = append(rest, (*args)[i])
 		}
@@ -100,7 +125,7 @@ func startListener(addr string, app *uiapp.App, post func(func())) (func(), erro
 	if !ok {
 		return nil, fmt.Errorf("当前进程不是执行端，无法监听")
 	}
-	listener, err := net.Listen("tcp", addr)
+	listener, err := tlsx.Listen(addr)
 	if err != nil {
 		return nil, err
 	}

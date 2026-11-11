@@ -41,6 +41,23 @@ type Config struct {
 	Language string `toml:"language" yaml:"language"`
 	// Providers 覆盖内置提供商（同 ID 覆盖，新 ID 新增）。
 	Providers map[string]ProviderOverride `toml:"providers" yaml:"providers"`
+	// TLS 是可选传输加密（默认关闭，走明文 TCP）。
+	TLS TLSConfig `toml:"tls" yaml:"tls"`
+}
+
+// TLSConfig 是传输加密配置。
+//
+// 默认全空 = 明文。启用后：
+//   - 服务端（relay / 执行端监听）用 cert_file + key_file，首次会自动生成自签证书；
+//   - 客户端（展示端 --connect）用 fingerprint 校验服务端证书。
+//
+// 客户端**不用 CA**：只认写死的 SHA-256 指纹，等价于"只信任这一台 relay"。
+type TLSConfig struct {
+	// CertFile / KeyFile 是服务端证书与私钥路径（PEM）。
+	CertFile string `toml:"cert_file" yaml:"cert_file"`
+	KeyFile  string `toml:"key_file" yaml:"key_file"`
+	// Fingerprint 是客户端要校验的服务端证书指纹（十六进制，可带冒号）。
+	Fingerprint string `toml:"fingerprint" yaml:"fingerprint"`
 }
 
 // ProviderOverride 覆盖某个提供商的字段。
@@ -403,6 +420,12 @@ func Help() string {
   --headless         不创建窗口，只作为执行端运行（配合 --listen / --relay）
   --name NAME        执行端在 relay 上的名字（默认主机名；同名会被 relay 拒绝）
   --net-log          打印网络收发日志（每个包的 kind/字节数，排查连接用）
+  --tls-cert FILE    开启传输加密（服务端）：证书 PEM 路径。
+  --tls-key FILE     私钥 PEM 路径。两个都不存在时会自动生成自签证书
+  --tls-fingerprint FP  开启传输加密（客户端）：只接受证书指纹完全一致的 relay
+                     （十六进制，可带冒号）。不做 CA 校验，等于"只信任这一台"
+  --tls-print-fingerprint  生成/读取证书并打印指纹后退出，方便填到客户端
+                     注意：默认不启用加密；加密与 --token 互不替代，建议同时用
   relay              子命令：simple-agent relay --listen 0.0.0.0:7900 --token 口令，只做帧转发
   --allow-shell        启用 bash/pwsh 工具（默认关闭）
   --no-shell           关闭命令执行

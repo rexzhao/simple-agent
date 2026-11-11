@@ -17,6 +17,7 @@ import (
 	"simple-agent/internal/providers"
 	"simple-agent/internal/relay"
 	"simple-agent/internal/store"
+	"simple-agent/internal/tlsx"
 	"simple-agent/internal/wire"
 )
 
@@ -136,7 +137,7 @@ func headlessHostConfig(cfg *config.Config, runtime *appRuntime, selection provi
 
 // listenHeadless 起一个 TCP 监听，每条连接交给 host.Serve。
 func listenHeadless(addr string, local *host.Local, post func(func())) (func(), string, error) {
-	listener, err := net.Listen("tcp", addr)
+	listener, err := tlsx.Listen(addr)
 	if err != nil {
 		return nil, "", err
 	}
@@ -205,7 +206,7 @@ func runRelayServer(listenAddr, token string) int {
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:7900"
 	}
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := tlsx.Listen(listenAddr)
 	if err != nil {
 		log.Printf("relay：监听失败：%v", err)
 		return 1

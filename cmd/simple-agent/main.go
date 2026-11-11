@@ -63,6 +63,16 @@ func main() {
 
 	// relay 子命令：只做转发，不需要配置/会话/单实例锁
 	if opts.relayServer {
+		// relay 也要能上 TLS（它就是那个需要被客户端验指纹的服务端）。
+		// 它不走完整配置加载（那样会创建/锁定 data_dir），所以只取 TLS 这几项。
+		relayTLSCfg := config.Config{TLS: config.TLSConfig{
+			CertFile:    firstNonEmptyStr(opts.tlsCert, ""),
+			KeyFile:     firstNonEmptyStr(opts.tlsKey, ""),
+			Fingerprint: firstNonEmptyStr(opts.tlsFingerprint, ""),
+		}}
+		if !setupTLS(&relayTLSCfg, opts) {
+			return
+		}
 		os.Exit(runRelayServer(listenAddr, opts.relayToken))
 	}
 
@@ -101,6 +111,13 @@ func main() {
 		lang = locale.Detect()
 	}
 	locale.SetCurrent(lang)
+
+	// 传输加密（默认关闭）。必须在**任何连接建立之前**装配：
+	// 它要装 wire 的拨号钩子，晚了第一条连接就已经是明文了。
+	// 返回 false 表示只打印了指纹、该退出。
+	if !setupTLS(&cfg, opts) {
+		return
+	}
 
 	registry := cfg.Registry()
 	selection, ok := registry.Initial()
