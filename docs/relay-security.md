@@ -171,6 +171,11 @@ cfg := &tls.Config{
 > `InsecureSkipVerify + VerifyPeerCertificate` 这套组合在本项目 Go 版本下可直接编译使用，
 > 全部在标准库，**不引入第三方依赖**。
 
+> **现成库的实测对比见 `docs/encryption-options.md`**：标准库 TLS（0 新依赖）与
+> `flynn/noise`（2 个依赖）都能在 android/arm64 与 darwin 上编译；后者天然按消息加密，
+> 但 TLS 的额外收益是"做了 TLS 之后 A 档的 HMAC 可以省掉"。更实际的完整工作量估算
+> （含证书生成与 TOFU）那里算的是约 240 行。
+
 ## 4. 建议顺序
 
 | 顺序 | 内容 | 收益 | 成本 |
