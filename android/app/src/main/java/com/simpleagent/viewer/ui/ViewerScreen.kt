@@ -2,7 +2,8 @@ package com.simpleagent.viewer.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -51,6 +52,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
@@ -228,15 +230,30 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
 
     // 用户一拖动列表就让输入框失焦（收起键盘）。
     // 手机上读长回答时键盘一直占着半屏很碍事；这是几乎所有聊天 App 的行为。
+    //
+    // 为什么不用 detectDragGestures：那套在 **Main pass** 上等事件，
+    // 而 LazyColumn 是子层级、会先拿到并消费掉拖拽 → 外层永远等不到，
+    // onDragStart 不触发（之前"滚动正常但键盘不收起"就是这个原因）。
+    // 这里在 **Initial pass**（父节点先看到）只做"检测"，不消费事件，
+    // 让 LazyColumn 照常滚动。
     val focusManager = LocalFocusManager.current
     val dragDetector = Modifier.pointerInput(Unit) {
-        detectDragGestures(
-            onDragStart = { focusManager.clearFocus() },
-            // 滚动本身交给 LazyColumn：这里只负责"察觉到用户开始拖动"
-            onDrag = { change, _ -> change.consume() },
-            onDragEnd = {},
-            onDragCancel = {},
-        )
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            var cleared = false
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                if (!change.pressed) break
+                // 超过触摸阈值才算"在拖动"，避免把点击链接/选中文本也当成滚动
+                if (!cleared &&
+                    (change.position - down.position).getDistance() > viewConfiguration.touchSlop
+                ) {
+                    cleared = true
+                    focusManager.clearFocus()
+                }
+            }
+        }
     }
 
     // 打开/切换会话时直接跳到末尾：用户期望看到"最新说了什么"。
