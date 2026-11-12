@@ -19,6 +19,9 @@ android {
 
     buildFeatures {
         compose = true
+        // 生成 BuildConfig：调试入口（一键自动发消息的按钮）只在 Debug 构建显示，
+        // 用 BuildConfig.DEBUG 判断，不要把这个按钮带进正式版。
+        buildConfig = true
     }
 
     compileOptions {

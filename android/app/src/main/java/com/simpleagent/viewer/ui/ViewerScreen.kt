@@ -20,8 +20,10 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Stop
+import com.simpleagent.viewer.BuildConfig
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -137,6 +139,16 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
                                 maxLines = 1,
                             )
                             StatusLine(state.timeline.runtime.modelLabel, state.timeline.runtime.allowShell)
+                        }
+                    },
+                    actions = {
+                        // 调试入口（只在 Debug 构建出现）：一键新建会话并发一条消息。
+                        // 手机上输入法经常把自动化的 input text 吞掉，"点一下自动发"最省事；
+                        // 同时也是整条链路（App → relay → 执行端 → 模型）的最快自检。
+                        if (BuildConfig.DEBUG) {
+                            IconButton(onClick = viewModel::debugSend) {
+                                Icon(Icons.Filled.BugReport, contentDescription = "调试：自动发一条消息")
+                            }
                         }
                     },
                 )

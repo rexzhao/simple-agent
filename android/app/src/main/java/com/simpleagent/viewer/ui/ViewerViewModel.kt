@@ -237,11 +237,65 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 调试用：一键"自检发送"。
+     *
+     * 做的事：没有活动会话就自动新建一个，然后发一条带时间戳的消息。
+     * 目的有两个：
+     *  1. 绕开手机输入法（中文/候选词经常把自动化的 input text 吞掉）；
+     *  2. 一键验证整条链路（App → relay → 执行端 → 模型 → 回来）。
+     *
+     * 界面上只在 Debug 构建显示（不污染正式版）。
+     */
+    fun debugSend() {
+        val current = state.value
+        if (!current.connected) {
+            state.update { it.copy(toast = "还没连接：先点「连接」") }
+            return
+        }
+        val text = "debug-" + android.text.format.DateFormat.format(
+            "HH:mm:ss", System.currentTimeMillis(),
+        ).toString()
+
+        if (current.activeSessionId.isNotEmpty()) {
+            send(text)
+            state.update { it.copy(toast = "调试发送：$text") }
+            return
+        }
+        // 没有会话：先建一个，等它出现在列表里再发
+        val before = current.sessions.map { it.id }.toSet()
+        val error = core.newSession("", "")
+        if (error.isNotEmpty()) {
+            state.update { it.copy(toast = error) }
+            return
+        }
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(400)
+            val sessions = core.sessions()
+            val created = sessions.lastOrNull { it.id !in before } ?: sessions.lastOrNull()
+            if (created == null) {
+                state.update { it.copy(toast = "调试发送失败：没有建出会话") }
+                return@launch
+            }
+            state.update { it.copy(sessions = sessions, activeSessionId = created.id) }
+            refreshTimeline()
+            send(text)
+            state.update { it.copy(toast = "调试发送：$text") }
+        }
+    }
+
     /** 发送消息：忙时自动转插话（与桌面一致）。 */
     fun send(text: String) {
         val current = state.value
         val id = current.activeSessionId
-        if (id.isEmpty()) return
+        if (id.isEmpty()) {
+            // 以前这里直接 return，界面毫无反应 —— 用户只会以为"点了没反应"。
+            // 现在明确提示：没有活动会话时应该先「新建」。
+            state.update {
+                it.copy(toast = "没有活动会话：请先在左侧菜单点「新建」")
+            }
+            return
+        }
         if (text.isBlank() && current.pendingAttachments.isEmpty()) return
 
         // 有待发附件时走"带附件发送"：执行端在忙时会拒收并提示
