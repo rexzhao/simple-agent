@@ -13,6 +13,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
@@ -173,32 +174,44 @@ fun CodeBlock(code: String, lang: String) {
     }
 }
 
-/** 把行内 span 转成 AnnotatedString（粗体/斜体/删除线/行内代码/链接）。 */
+/**
+ * 把行内 span 转成 AnnotatedString（粗体/斜体/删除线/行内代码/链接）。
+ *
+ * **结果按 spans 缓存**：滚动时每个可见条目都会重组，而 Text 只有在
+ * AnnotatedString 是同一个实例时才能跳过重新测量与排版。以前每帧都重建，
+ * 向上滚较远距离时会明显卡（一屏十几个段落 × 每段几十个 span）。
+ *
+ * spans 是 data class 列表，equals 可靠，可以直接作为 remember 的 key。
+ */
 @Composable
 fun spansToAnnotated(spans: List<SpanView>): AnnotatedString {
+    // 颜色是 @Composable 的，先在组合里取出来当 key 的一部分
     val muted = ViewerColors.muted
     val accent = ViewerColors.accent
-    return buildAnnotatedString {
-        spans.forEach { span ->
-            val start = length
-            append(span.text)
-            val end = length
-            if (end <= start) return@forEach
-            if (span.bold) addStyle(SpanStyle(fontWeight = FontWeight.SemiBold), start, end)
-            if (span.italic) addStyle(SpanStyle(fontStyle = FontStyle.Italic), start, end)
-            if (span.strike) addStyle(SpanStyle(textDecoration = TextDecoration.LineThrough), start, end)
-            if (span.code) {
-                addStyle(
-                    SpanStyle(fontFamily = FontFamily.Monospace, background = ViewerColors.codeBg),
-                    start,
-                    end,
-                )
-            }
-            if (span.link.isNotEmpty()) {
-                addStyle(SpanStyle(color = accent, textDecoration = TextDecoration.Underline), start, end)
-            }
-            if (span.imageUrl.isNotEmpty()) {
-                addStyle(SpanStyle(color = muted, fontStyle = FontStyle.Italic), start, end)
+    val codeBg = ViewerColors.codeBg
+    return remember(spans, muted, accent, codeBg) {
+        buildAnnotatedString {
+            spans.forEach { span ->
+                val start = length
+                append(span.text)
+                val end = length
+                if (end <= start) return@forEach
+                if (span.bold) addStyle(SpanStyle(fontWeight = FontWeight.SemiBold), start, end)
+                if (span.italic) addStyle(SpanStyle(fontStyle = FontStyle.Italic), start, end)
+                if (span.strike) addStyle(SpanStyle(textDecoration = TextDecoration.LineThrough), start, end)
+                if (span.code) {
+                    addStyle(
+                        SpanStyle(fontFamily = FontFamily.Monospace, background = codeBg),
+                        start,
+                        end,
+                    )
+                }
+                if (span.link.isNotEmpty()) {
+                    addStyle(SpanStyle(color = accent, textDecoration = TextDecoration.Underline), start, end)
+                }
+                if (span.imageUrl.isNotEmpty()) {
+                    addStyle(SpanStyle(color = muted, fontStyle = FontStyle.Italic), start, end)
+                }
             }
         }
     }

@@ -2,6 +2,7 @@ package com.simpleagent.viewer.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -50,6 +51,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -223,6 +226,19 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     val listState = rememberLazyListState()
     val itemCount = state.timeline.items.size
 
+    // 用户一拖动列表就让输入框失焦（收起键盘）。
+    // 手机上读长回答时键盘一直占着半屏很碍事；这是几乎所有聊天 App 的行为。
+    val focusManager = LocalFocusManager.current
+    val dragDetector = Modifier.pointerInput(Unit) {
+        detectDragGestures(
+            onDragStart = { focusManager.clearFocus() },
+            // 滚动本身交给 LazyColumn：这里只负责"察觉到用户开始拖动"
+            onDrag = { change, _ -> change.consume() },
+            onDragEnd = {},
+            onDragCancel = {},
+        )
+    }
+
     // 打开/切换会话时直接跳到末尾：用户期望看到"最新说了什么"。
     // 只在这个会话第一次有内容时做一次，之后交给下面的"贴底跟随"。
     var jumpedSession by remember { mutableStateOf("") }
@@ -262,7 +278,7 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
         { hash, ready -> viewModel.imagePath(hash, ready) }
     }
     val toggleExpanded: (String) -> Unit = remember(viewModel) { viewModel::toggleExpanded }
-    LazyColumn(state = listState, modifier = modifier) {
+    LazyColumn(state = listState, modifier = modifier.then(dragDetector)) {
         // 归档区在顶部：加载状态 / 到底提示 / 历史消息
         if (state.loadingOlder || state.archive.isNotEmpty()) {
             item(key = "archive-header") {
