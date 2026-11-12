@@ -237,6 +237,12 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
                 }
             }
     }
+    // 把回调提到列表外并记住：否则 items 的 lambda 每帧都是新实例，
+    // 会拖累 Compose 对每个条目的重组跳过判断（滚动时尤其明显）。
+    val imagePath: (String, (String) -> Unit) -> Unit = remember(viewModel) {
+        { hash, ready -> viewModel.imagePath(hash, ready) }
+    }
+    val toggleExpanded: (String) -> Unit = remember(viewModel) { viewModel::toggleExpanded }
     LazyColumn(state = listState, modifier = modifier) {
         // 归档区在顶部：加载状态 / 到底提示 / 历史消息
         if (state.loadingOlder || state.archive.isNotEmpty()) {
@@ -256,15 +262,18 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
             }
         }
         items(state.archive, key = { "arch:" + it.id }) { archived ->
-            ArchivedRow(archived, onImagePath = { hash, ready -> viewModel.imagePath(hash, ready) })
+            ArchivedRow(archived, onImagePath = imagePath)
         }
         items(state.timeline.items, key = { it.key }) { item ->
-            // 把单个条目交给 Timeline 的统一渲染（保持与桌面同一套分组语义）
-            Timeline(
-                view = state.timeline.copy(items = listOf(item)),
+            // 直接渲染单个条目：不再对每个 item 复制整个 TimelineView。
+            // 之前是 `Timeline(timeline.copy(items = listOf(item)))` ——
+            // 每帧为每个可见条目新建一个 TimelineView 对象，Compose 的
+            // 重组跳过完全失效，滚动时反复重组（真机卡顿的主因）。
+            TimelineItem(
+                item = item,
                 expanded = state.expanded,
-                onToggle = viewModel::toggleExpanded,
-                onImagePath = { hash, ready -> viewModel.imagePath(hash, ready) },
+                onToggle = toggleExpanded,
+                onImagePath = imagePath,
             )
         }
         item { Box(Modifier.size(1.dp)) }

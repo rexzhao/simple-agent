@@ -66,20 +66,46 @@ fun Timeline(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         view.items.forEach { item ->
-            when (item.kind) {
-                "content" -> item.message?.let { MessageRow(it, onImagePath) }
-                "process" -> item.process?.let {
-                    ProcessGroup(it, expanded = expanded.contains(item.key), onToggle = { onToggle(item.key) })
-                }
-                "notice" -> item.notice?.let { NoticeRow(it) }
-                "footer" -> item.footer?.let { FooterRow(it) }
-            }
+            TimelineItem(item, expanded, onToggle, onImagePath)
         }
         if (view.runtime.compacting) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
                 Text("正在压缩上下文…", fontSize = 12.sp, color = ViewerColors.muted)
             }
+        }
+    }
+}
+
+/**
+ * 渲染**单个**时间线条目（列表里逐条调用）。
+ *
+ * 为什么不复用 [Timeline]：以前列表里对每个 item 都调用
+ * `Timeline(view = timeline.copy(items = listOf(item)))` ——
+ * 那会为每一帧、每个可见条目都复制整个 TimelineView 对象，
+ * Compose 的重组跳过直接失效，滚动时反复重组（真机上的卡顿来源）。
+ *
+ * 这里只依赖 item 本身与"这个条目是否展开"，参数是稳定的值类型，
+ * 未变化的条目可以真正跳过重组。
+ */
+@Composable
+fun TimelineItem(
+    item: ItemView,
+    expanded: Set<String>,
+    onToggle: (String) -> Unit,
+    onImagePath: (String, (String) -> Unit) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+    ) {
+        when (item.kind) {
+            "content" -> item.message?.let { MessageRow(it, onImagePath) }
+            "process" -> item.process?.let {
+                ProcessGroup(it, expanded = expanded.contains(item.key), onToggle = { onToggle(item.key) })
+            }
+            "notice" -> item.notice?.let { NoticeRow(it) }
+            "footer" -> item.footer?.let { FooterRow(it) }
         }
     }
 }
