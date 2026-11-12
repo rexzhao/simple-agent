@@ -46,6 +46,11 @@ type Config struct {
 	// 与 relay 的 token 是两套：relay 保护"经过 relay 这一跳"，这里保护
 	// "直连执行端这一跳"。为空表示不校验（保持原来的开放行为）。
 	Token         string
+	// Name 是本机作为执行端对外显示的名字（握手时告诉展示端）。
+	//
+	// 为空时用操作系统的机器名：界面上"当前连的是哪台"就靠它，
+	// 以前写死成 "local" 会让展示端完全分不清连的是谁。
+	Name          string
 	Workspace     string
 	MaxToolRounds int
 	ContextWindow int

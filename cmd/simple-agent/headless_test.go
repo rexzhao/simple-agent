@@ -151,7 +151,7 @@ func TestHeadlessHostConfigCarriesAllowShell(t *testing.T) {
 		runtime := &appRuntime{allowShell: allow}
 		local := host.NewLocal(headlessHostConfig(cfg, runtime,
 			providers.Selection{ProviderID: "fake", Model: "m"}, nil, nil,
-			func(f func()) { f() }, ""))
+			func(f func()) { f() }, "", ""))
 		local.Close()
 
 		// 空会话不会自动创建（没有 catalog），这里断言的是配置透传后

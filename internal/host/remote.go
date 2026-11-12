@@ -3,6 +3,7 @@ package host
 import (
 	"errors"
 	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,15 @@ const (
 	msgBlobOK     = "blob.ok"
 	msgBlobError  = "blob.error"
 )
+
+// attachTailEvents 是首次 attach 时下发的**最近事件条数**上限。
+//
+// 不设上限（以前的做法）会让长会话的首次同步很慢：展示端连上后长时间空白，
+// 看起来像"没加载会话内容"。这里只给最近这一段，更早的历史由展示端
+// 滚到顶部时用 loadOlder 分页拉取（那本来就是为归档设计的能力）。
+//
+// 取 200：够渲染出"最近几轮对话"，又不至于让首屏等待变长。
+const attachTailEvents = 200
 
 // outQueueLimit 是每条连接的发送队列上限（按包数）。
 //
@@ -223,11 +233,15 @@ func (l *Local) Attach(sessionID, epoch string, generation, seq uint64) (AttachR
 			}, true
 		}
 	}
-	// 全量：从日志读全部事件（快照文件本身就是新的起点）
+	// 全量：从日志读最近的一段（快照文件本身就是新的起点）。
+	//
+	// 以前这里是**整个 JSONL 全量下发**：会话长了（几百条事件）就要传很久，
+	// 展示端连上后长时间空着，看起来像"没加载"。现在只给最近
+	// [attachTailEvents] 条，更早的历史由展示端滚到顶时用 loadOlder 分页拉。
 	if session.journal != nil {
 		if loaded, err := session.journal.Load(); err == nil {
 			return AttachResult{
-				Events: loaded.Events, Truncated: true,
+				Events: tailEvents(loaded.Events, attachTailEvents), Truncated: true,
 				ToSeq: l.currentEventSeq(sessionID), Snapshot: snapshot,
 			}, true
 		}
@@ -252,6 +266,31 @@ func (l *Local) RingInfoForTest(sessionID string) (int, uint64, uint64) {
 
 // Persistent 报告执行端是否有持久化日志。
 func (l *Local) Persistent() bool { return l.cfg.Catalog != nil }
+
+// tailEvents 返回事件切片的最后 limit 条（不足则原样返回）。
+//
+// 单独抽出来是为了可测：切尾逻辑错一位就会丢消息或重复消息。
+func tailEvents(events []store.Event, limit int) []store.Event {
+	if limit <= 0 || len(events) <= limit {
+		return events
+	}
+	return events[len(events)-limit:]
+}
+
+// displayName 返回执行端对外显示的名字。
+//
+// 优先用配置里的 Name（`--name`），否则取操作系统机器名。
+// 以前握手时写死 "local"，展示端界面上只能看到 "local"——
+// 同时连过两台机器就完全分不清了。
+func (l *Local) displayName() string {
+	if l.cfg.Name != "" {
+		return l.cfg.Name
+	}
+	if name, err := os.Hostname(); err == nil && name != "" {
+		return name
+	}
+	return "simple-agent"
+}
 
 // warnOnce 只打一次同样的启动警告。
 func (l *Local) warnOnce(text string) {
@@ -508,7 +547,7 @@ func (s *execServer) handle(packet wire.Packet) {
 			capability = append(capability, "require_token")
 		}
 		_ = s.send(msgWelcome, wire.Welcome{
-			Protocol: wire.Protocol, HostID: s.local.epoch, HostName: "local",
+			Protocol: wire.Protocol, HostID: s.local.epoch, HostName: s.local.displayName(),
 			Capability: capability,
 		})
 	case msgCatalog:
@@ -694,6 +733,9 @@ type Remote struct {
 	attachSpecs []map[string]any
 	// epoch 是执行端实例 id（握手时拿到；重启后会变，届时一律全量）。
 	epoch string
+	// hostName 是执行端自报的显示名（`--name` 或机器名，来自 welcome）。
+	// 界面靠它显示"我连的是哪台机器"；空表示对端没报（很老的执行端）。
+	hostName string
 	// allowShell 是执行端的 allow_shell（来自握手的能力标记）。
 	// 展示端不能用本地配置显示权限，否则标签会与执行端实际情况不符。
 	allowShell bool
@@ -798,6 +840,13 @@ func (r *Remote) handle(packet wire.Packet) {
 			return
 		}
 		r.epoch = payload.HostID
+		// 记下执行端自报的名字：界面要显示"我连的是哪台"。
+		// 以前只存 epoch，Info() 又写死 "remote"，于是展示端永远看不到真名。
+		if payload.HostName != "" {
+			r.mu.Lock()
+			r.hostName = payload.HostName
+			r.mu.Unlock()
+		}
 		r.applyCapability(payload.Capability)
 	case msgLogBegin:
 		var payload struct {
@@ -1097,7 +1146,13 @@ func (r *Remote) LastErrorForTest() string {
 func (r *Remote) Info() HostInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return HostInfo{ID: "remote", Name: "remote", AllowShell: r.allowShell}
+	// 优先用执行端握手时自报的名字（`--name` 或机器名）。
+	// 拿不到时才退回 "remote"（很老的执行端不发 HostName）。
+	name := r.hostName
+	if name == "" {
+		name = "remote"
+	}
+	return HostInfo{ID: name, Name: name, AllowShell: r.allowShell}
 }
 
 // applyCapability 记录握手带上来的执行端能力（目前只关心 allow_shell）。

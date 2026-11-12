@@ -40,7 +40,7 @@ func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Se
 		cfgPathForLog(cfg), selection.ProviderID, selection.Model, cfg.DataDir)
 
 	post := serialPost()
-	local := host.NewLocal(headlessHostConfig(cfg, runtime, selection, catalog, blobs, post, relayToken))
+	local := host.NewLocal(headlessHostConfig(cfg, runtime, selection, catalog, blobs, post, relayToken, name))
 	defer local.Close()
 
 	if startup := local.StartupError(); startup != "" {
@@ -109,7 +109,7 @@ func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Se
 // （典型是 allow_shell 没传 → 工具列表里根本不注册 bash/pwsh，而系统提示仍然
 // 写着"可以执行命令"，模型只能拿回「未知工具」）。
 func headlessHostConfig(cfg *config.Config, runtime *appRuntime, selection providers.Selection,
-	catalog *store.Catalog, blobs *store.Blobs, post func(func()), token string) host.Config {
+	catalog *store.Catalog, blobs *store.Blobs, post func(func()), token, name string) host.Config {
 	return host.Config{
 		Catalog:      catalog,
 		Blobs:        blobs,
@@ -132,6 +132,8 @@ func headlessHostConfig(cfg *config.Config, runtime *appRuntime, selection provi
 		// 执行端自己的 token：`--listen` 直连时校验展示端握手带来的口令。
 		// 与 relay 的 token 是两套，互不影响。
 		Token: token,
+		// 对外显示的名字：空则用机器名（展示端靠它区分"连的是哪台"）
+		Name: name,
 	}
 }
 

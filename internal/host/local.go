@@ -15,6 +15,7 @@ import (
 
 	"simple-agent/internal/conversation"
 	"simple-agent/internal/driver"
+	"simple-agent/internal/message"
 	"simple-agent/internal/providers"
 	"simple-agent/internal/store"
 	"simple-agent/internal/tools"
@@ -93,7 +94,13 @@ func defaultNewID() string {
 // ---- Host 接口 ----
 
 func (l *Local) Info() HostInfo {
-	return HostInfo{ID: "local", Name: "local", Local: true, AllowShell: l.cfg.AllowShell}
+	// ID 与 Name 都用执行端自己的名字（`--name` 或机器名）。
+	//
+	// 以前这里写死 "local"：握手时的 HostName 改了还不够——展示端后来
+	// 调用 Info() 拿到的仍是 "local"，界面上就一直是 local。
+	// ID 用显示名（而不是 epoch）：展示端要靠它区分"我连的是哪台"。
+	name := l.displayName()
+	return HostInfo{ID: name, Name: name, Local: true, AllowShell: l.cfg.AllowShell}
 }
 
 // AllowShell 返回执行端的命令执行权限（握手时告诉展示端，避免界面按自己的
@@ -164,6 +171,29 @@ func (l *Local) ObserverCountForTest() int {
 
 // CatalogForTest 返回会话目录（测试用）。
 func (l *Local) CatalogForTest() *store.Catalog { return l.cfg.Catalog }
+
+// AppendMessagesForPerfTest 往会话里追加一轮"用户问 + 助手答"（性能测试用）。
+//
+// 直接改 conversation，不走 driver：目的是快速造出长会话内容，
+// 用来量"重建 timeline"的代价，不关心事件流。
+func (l *Local) AppendMessagesForPerfTest(sessionID, userText, assistantText string) {
+	session := l.Session(sessionID)
+	if session == nil {
+		return
+	}
+	conv := session.Conversation()
+	next := len(conv.Entries())
+	_, _ = conv.AddMessage(message.Message{
+		MessageID: fmt.Sprintf("perf-u-%d", next),
+		Role:      message.RoleUser,
+		Parts:     []message.Part{message.NewTextPart(userText)},
+	}, conversation.StatusComplete)
+	_, _ = conv.AddMessage(message.Message{
+		MessageID: fmt.Sprintf("perf-a-%d", next+1),
+		Role:      message.RoleAgent,
+		Parts:     []message.Part{message.NewTextPart(assistantText)},
+	}, conversation.StatusComplete)
+}
 
 // SetBlobs 替换图片存储（演示/测试用，比如注入一个会失败的实现对账失败路径）。
 func (l *Local) SetBlobs(blobs BlobService) { l.blobs = blobs }

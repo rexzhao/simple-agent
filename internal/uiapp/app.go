@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -86,6 +87,10 @@ type Options struct {
 	ImageFetcher func(url string) ([]byte, error)
 	// Post 把函数投递到主线程（生产环境是 win.Update，测试里直接执行）。
 	Post func(func())
+	// Name 是本机作为执行端对外显示的名字（`--name`）。
+	//
+	// 为空时用操作系统机器名——展示端界面上要能看到"连的是哪台机器"。
+	Name string
 	// Title 是新会话的默认标题。
 	Title string
 	// Host 覆盖执行端（展示端接入 remoteHost 时用；nil = 进程内 Local）。
@@ -371,6 +376,11 @@ type App struct {
 	// uiapp 只通过它读状态、提交命令：driver / 日志 / blob / 工具都在 host 后面，
 	// 这样"展示端复现执行端状态"不需要第二套界面逻辑（见 docs/remote-design.md）。
 	host host.Host
+	// hostCancel 取消 host 变更订阅（换 host 或退出时必须调用，否则旧订阅会泄漏）。
+	hostCancel func()
+	// relay 是本机作为执行端注册到 relay 的运行状态（斜杠命令 /connect 管理）。
+	relayMu sync.Mutex
+	relay   relaySession
 	// lang 是界面语言（所有界面文字走 a.tr）。
 	lang locale.Lang
 
@@ -597,7 +607,7 @@ func NewApp(rt Runtime, opts Options) *App {
 	if opts.Host != nil {
 		app.host = opts.Host
 		app.syncSessions()
-		app.host.Subscribe(app.onHostChange)
+		app.hostCancel = app.host.Subscribe(app.onHostChange)
 		if errText := app.host.StartupError(); errText != "" && app.Current() != nil {
 			app.startupErr = errText
 			app.NotifyDisplay(errText)
@@ -609,6 +619,7 @@ func NewApp(rt Runtime, opts Options) *App {
 		Selection:          opts.Selection,
 		SystemPrompt:       opts.SystemPrompt,
 		AllowShell:         opts.AllowShell,
+		Name:               opts.Name,
 		Token:              opts.Token,
 		Workspace:          opts.Workspace,
 		MaxToolRounds:      opts.MaxToolRounds,
@@ -634,7 +645,9 @@ func NewApp(rt Runtime, opts Options) *App {
 	}
 	// 会话壳（界面状态）与执行端会话一一对应
 	app.syncSessions()
-	app.host.Subscribe(app.onHostChange)
+	// 保存取消函数：以前丢弃返回值，一旦将来要换 host 或重复订阅就会泄漏
+	// （旧订阅继续往已失效的界面状态里写）。
+	app.hostCancel = app.host.Subscribe(app.onHostChange)
 	app.startupErr = app.host.StartupError()
 	if app.startupErr != "" && app.Current() != nil {
 		// 有会话时：用显示型提示告诉用户"有些会话没恢复出来"（不写日志）
@@ -941,6 +954,12 @@ func (a *App) projectNameTaken(dir string) string {
 
 // Close 关闭执行端（刷盘 + 关文件）。
 func (a *App) Close() {
+	if a.hostCancel != nil {
+		a.hostCancel()
+		a.hostCancel = nil
+	}
+	// relay 注册也要停掉，否则进程退出前还在重连
+	a.stopRelayRegistration()
 	if a.host != nil {
 		_ = a.host.Close()
 	}
@@ -2036,6 +2055,8 @@ func (a *App) composer(c *ui.Context) {
 			}
 			// 任务清单：dsh 把它挂在 `conversation.input.dock`，即输入卡**正上方**
 			a.todoPanel(c, session, theme)
+			// 斜杠命令候选：输入框内容以 / 开头时浮在输入卡上方
+			a.slashHintsPanel(c, theme)
 			ui.Column(c).Background(theme.Background).Border(1, theme.Border).Radius(composerRadius).
 				Padding(10, 12).Gap(8).FillWidth().Children(func() {
 				// 待发送的图片（粘贴/拖入）
@@ -2429,6 +2450,18 @@ func (a *App) Send() {
 		return
 	}
 	text := strings.TrimSpace(a.draft)
+	// 斜杠命令：以 / 开头时先按命令解释，**不发给模型**。
+	// 未知命令会返回"未知命令"提示（不会把正文当命令吞掉——
+	// 命令表里没有的 /xxx 也给出提示，是想发正文的话可以加个空格前缀）。
+	if isSlashCommand(text) {
+		a.draft = ""
+		if message, ok := a.ExecSlashCommand(text); ok {
+			if message != "" {
+				a.NotifyDisplay(message)
+			}
+			return
+		}
+	}
 	// 等待回答时，输入框里的文字是 custom 答案（开放式问题靠这条作答）
 	if session.Busy() == driver.BusyAwaitingAnswer {
 		if text == "" {

@@ -74,6 +74,15 @@ class CoreClient private constructor(
 
     fun sessions(): List<SessionSummary> = decode(client.sessionsJSON(), emptyList())
 
+    /** relay 上在线的执行端（直连时为空）。 */
+    fun executors(): List<ExecutorChoice> = decode(client.executorsJSON(), emptyList())
+
+    /** 当前连着的执行端 id。 */
+    fun currentHostId(): String = client.currentHostID()
+
+    /** 切到另一个执行端（沿用上次连接的地址与凭据）。返回空字符串表示成功。 */
+    fun switchHost(hostId: String): String = client.switchHost(hostId)
+
     fun timeline(sessionId: String): TimelineView = decode(client.timelineJSON(sessionId), TimelineView())
 
     fun providers(): List<ProviderChoice> = decode(client.providersJSON(), emptyList())

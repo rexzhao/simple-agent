@@ -71,6 +71,17 @@ type Client struct {
 	lastError string
 	// restoreDial 恢复连接前的全局拨号函数（TLS 是进程级开关，断开时还原）。
 	restoreDial func()
+	// executors 是 relay 上当前在线的执行端（连接后可以切换目标）。
+	executors []relay.Executor
+	// conn 记住这次连接用的参数，切换执行端时复用。
+	conn connectParams
+}
+
+// connectParams 是"连到哪个 relay、带什么凭据"（切换执行端时复用）。
+type connectParams struct {
+	addr        string
+	token       string
+	fingerprint string
 }
 
 // NewClient 创建一个尚未连接的展示端。
@@ -157,16 +168,18 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 	remote, err := host.NewRemoteWithToken(dial, c.post.submit, token)
 	if err != nil {
 		c.restoreDialNow()
-		// relay 上有多个执行端、又没指定 route：把候选列表报给界面去选
+		// relay 上有多个执行端、又没指定 route：把候选列表留给界面选
 		var needsChoice *relay.NeedsChoice
 		if errors.As(err, &needsChoice) {
-			return formatNeedsChoice(needsChoice)
+			c.saveExecutors(needsChoice.Executors)
+			return "" // 不算失败：界面会弹出选择
 		}
 		return err.Error()
 	}
 
 	c.mu.Lock()
 	c.remote = remote
+	c.conn = connectParams{addr: addr, token: token, fingerprint: fingerprint}
 	c.mu.Unlock()
 
 	remote.Subscribe(func(change host.Change) { c.onHostChange(change) })
@@ -215,6 +228,63 @@ func (c *Client) disconnectIfConnected() {
 	// 保持原来的拨号函数更安全（避免它用到即将被替换的 TLS 配置）。
 	c.restoreDialNow()
 	_ = remote.Close()
+}
+
+// ---- 执行端选择 / 切换 ----
+
+// executorInfo 是"relay 上有哪些执行端"的一项（给界面渲染用）。
+type executorInfo struct {
+	HostID string `json:"host_id"`
+	Name   string `json:"name,omitempty"`
+}
+
+// ExecutorsJSON 返回 relay 上在线的执行端列表：[{"host_id","name"}]。
+//
+// 连上 relay 后界面用它渲染"切换执行端"；直连执行端时为空。
+func (c *Client) ExecutorsJSON() string {
+	c.mu.Lock()
+	list := make([]executorInfo, 0, len(c.executors))
+	for _, executor := range c.executors {
+		list = append(list, executorInfo{HostID: executor.HostID, Name: executor.Name})
+	}
+	c.mu.Unlock()
+	return encode(list)
+}
+
+// CurrentHostID 返回当前连着的执行端 id（直连或未连接时为空）。
+func (c *Client) CurrentHostID() string {
+	c.mu.Lock()
+	remote := c.remote
+	c.mu.Unlock()
+	if remote == nil {
+		return ""
+	}
+	return remote.Info().ID
+}
+
+// SwitchHost 在当前 relay 上切到另一个执行端。
+//
+// hostID 是被选中的执行端；内部用**上次连接时记下的**地址与凭据重连，
+// 所以界面上不需要让用户重填。返回空字符串表示成功。
+func (c *Client) SwitchHost(hostID string) string {
+	if hostID == "" {
+		return "没有选择执行端"
+	}
+	c.mu.Lock()
+	params := c.conn
+	c.mu.Unlock()
+	if params.addr == "" {
+		return "还没连接过，无法切换执行端"
+	}
+	// ConnectTLS 内部会先断开旧连接，再按同一个 relay 连到指定执行端
+	return c.ConnectTLS(params.addr, hostID, params.token, params.fingerprint)
+}
+
+// saveExecutors 记录候选执行端列表。
+func (c *Client) saveExecutors(list []relay.Executor) {
+	c.mu.Lock()
+	c.executors = append([]relay.Executor(nil), list...)
+	c.mu.Unlock()
 }
 
 func (c *Client) Disconnect() {
@@ -683,22 +753,6 @@ func (c *Client) setError(text string) {
 // tr 查界面语言对应的文案（Go 侧生成的提示要跟界面同一种语言）。
 func (c *Client) tr(key string, args ...any) string {
 	return c.lang.Tr(key, args...)
-}
-
-// formatNeedsChoice 把"relay 上有多个执行端"变成可读提示（含候选 id）。
-func formatNeedsChoice(choice *relay.NeedsChoice) string {
-	if len(choice.Executors) == 0 {
-		return "relay 上还没有执行端在线"
-	}
-	names := make([]string, 0, len(choice.Executors))
-	for _, executor := range choice.Executors {
-		if executor.Name != "" {
-			names = append(names, executor.Name+"("+executor.HostID+")")
-			continue
-		}
-		names = append(names, executor.HostID)
-	}
-	return fmt.Sprintf("relay 上有多个执行端，请指定 route：%v", names)
 }
 
 // encode 把视图模型编成 JSON（失败时返回一个带 error 字段的对象，界面能显示原因）。

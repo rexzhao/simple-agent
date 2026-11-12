@@ -57,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.simpleagent.viewer.data.ProviderChoice
+import com.simpleagent.viewer.data.ExecutorChoice
 import com.simpleagent.viewer.data.SessionSummary
 import kotlinx.coroutines.launch
 import android.net.Uri
@@ -105,12 +106,18 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
                 SessionDrawer(
                     sessions = state.sessions,
                     activeId = state.activeSessionId,
+                    executors = state.executors,
+                    currentHostId = state.currentHostId,
                     onSelect = {
                         viewModel.selectSession(it)
                         scope.launch { drawerState.close() }
                     },
                     onNew = {
                         viewModel.newSession()
+                        scope.launch { drawerState.close() }
+                    },
+                    onSwitchHost = {
+                        viewModel.switchHost(it)
                         scope.launch { drawerState.close() }
                     },
                     onDisconnect = viewModel::disconnect,
@@ -408,8 +415,11 @@ private fun ConnectScreen(
 private fun SessionDrawer(
     sessions: List<SessionSummary>,
     activeId: String,
+    executors: List<ExecutorChoice>,
+    currentHostId: String,
     onSelect: (String) -> Unit,
     onNew: () -> Unit,
+    onSwitchHost: (String) -> Unit,
     onDisconnect: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
@@ -425,6 +435,38 @@ private fun SessionDrawer(
             TextButton(onClick = onNew) { Text("新建", fontSize = 13.sp) }
         }
         HorizontalDivider(color = ViewerColors.muted.copy(alpha = 0.2f))
+        // 执行端切换：经 relay 连且有多台时才出现。
+        // 一台时也显示当前是哪台（让用户知道连的是哪个 host），但不给切换按钮。
+        if (executors.size > 1) {
+            Text(
+                text = "执行端",
+                fontSize = 12.sp,
+                color = ViewerColors.muted,
+                modifier = Modifier.padding(start = 20.dp, top = 12.dp, bottom = 4.dp),
+            )
+            executors.forEach { executor ->
+                val active = executor.hostId == currentHostId
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSwitchHost(executor.hostId) }
+                        .padding(horizontal = 20.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = if (executor.name.isNotBlank()) executor.name else executor.hostId,
+                        fontSize = 14.sp,
+                        color = if (active) ViewerColors.accent
+                        else androidx.compose.material3.MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (active) {
+                        Text("当前", fontSize = 11.sp, color = ViewerColors.accent)
+                    }
+                }
+            }
+            HorizontalDivider(color = ViewerColors.muted.copy(alpha = 0.2f))
+        }
         if (sessions.isEmpty()) {
             Text(
                 text = "还没有会话，点右上角「新建」开始。",

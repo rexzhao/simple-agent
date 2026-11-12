@@ -10,6 +10,13 @@ import kotlinx.serialization.Serializable
  * Kotlin 只负责画。所以这里**不要**加任何推断逻辑，字段原样来自 Go。
  */
 
+/** relay 上一个在线的执行端（用于界面切换）。 */
+@Serializable
+data class ExecutorChoice(
+    @SerialName("host_id") val hostId: String,
+    val name: String = "",
+)
+
 @Serializable
 data class SessionSummary(
     val id: String,

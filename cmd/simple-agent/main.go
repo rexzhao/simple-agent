@@ -266,6 +266,8 @@ func main() {
 		// 两个场景用同一个口令更方便（用户只记一个），语义上也一致：
 		// 都是"能出示口令的人可以操作这个执行端"。
 		Token:         opts.relayToken,
+		// 执行端对外显示的名字：空则用机器名（展示端界面靠它区分"连的是哪台"）
+		Name:          opts.name,
 		Workspace:     cfg.Workspace,
 		MaxToolRounds: cfg.MaxToolRounds,
 		ContextWindow: windowFor(registry, selection),

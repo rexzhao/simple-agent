@@ -10,6 +10,7 @@ import com.simpleagent.viewer.data.ArchivedMessage
 import com.simpleagent.viewer.data.AskView
 import com.simpleagent.viewer.data.CoreClient
 import com.simpleagent.viewer.data.CoreEvent
+import com.simpleagent.viewer.data.ExecutorChoice
 import com.simpleagent.viewer.data.ProviderChoice
 import com.simpleagent.viewer.data.SessionSummary
 import com.simpleagent.viewer.data.TimelineView
@@ -35,6 +36,14 @@ data class ViewerState(
      * 十六进制，可带冒号；服务端用 `--tls --tls-print-fingerprint` 打印出来。
      */
     val fingerprint: String = "",
+    /**
+     * relay 上在线的执行端（用于切换）。
+     *
+     * 只有经 relay 且 relay 上多于一台时才有意义；直连执行端时为空。
+     */
+    val executors: List<ExecutorChoice> = emptyList(),
+    /** 当前连着的执行端 id（直连时可能为空）。 */
+    val currentHostId: String = "",
     val sessions: List<SessionSummary> = emptyList(),
     val activeSessionId: String = "",
     val timeline: TimelineView = TimelineView(),
@@ -136,7 +145,26 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshAll() {
         refreshSessions()
         refreshProviders()
+        refreshExecutors()
         refreshTimeline()
+    }
+
+    /**
+     * 拉取 relay 上在线的执行端列表。
+     *
+     * 连上 relay 后界面用它渲染"切换执行端"；只有一台时也照常显示（让用户知道连的是谁）。
+     */
+    private fun refreshExecutors() {
+        val list = core.executors()
+        val hostId = core.currentHostId()
+        state.update { it.copy(executors = list, currentHostId = hostId) }
+    }
+
+    /** 切换到指定执行端（沿用上次连接的地址与凭据）。 */
+    fun switchHost(hostId: String) {
+        if (hostId == state.value.currentHostId) return
+        state.update { it.copy(connecting = true, connectError = "") }
+        core.switchHost(hostId)
     }
 
     private fun refreshSessions() {
