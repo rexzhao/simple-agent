@@ -218,15 +218,34 @@ private fun StatusLine(model: String, allowShell: Boolean) {
 
 @Composable
 private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifier: Modifier) {
+    // 列表状态按**会话**区分：换会话时必须从头开始，否则会沿用上一个会话的滚动位置
+    // （表现是打开新会话停在中段，而不是末尾）。
     val listState = rememberLazyListState()
     val itemCount = state.timeline.items.size
+
+    // 打开/切换会话时直接跳到末尾：用户期望看到"最新说了什么"。
+    // 只在这个会话第一次有内容时做一次，之后交给下面的"贴底跟随"。
+    var jumpedSession by remember { mutableStateOf("") }
+    LaunchedEffect(state.activeSessionId, itemCount) {
+        if (itemCount == 0) return@LaunchedEffect
+        if (jumpedSession == state.activeSessionId) return@LaunchedEffect
+        jumpedSession = state.activeSessionId
+        // 用 scrollToItem 而不是 animate：首屏动画反而像卡了一下
+        listState.scrollToItem(itemCount - 1)
+    }
+
     // 贴着底部时自动跟随（流式输出时不要一直把用户拽回底部）
     LaunchedEffect(itemCount, state.timeline.runtime.busy) {
-        if (itemCount > 0) {
-            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            val nearBottom = last >= itemCount - 3
-            if (nearBottom) listState.animateScrollToItem(itemCount - 1)
+        if (itemCount == 0) return@LaunchedEffect
+        // 首次加载完成前 visibleItemsInfo 还是空的：那种情况下"last=0"会让
+        // nearBottom 误判，于是永远不跟随。没有可见项时按"需要跟随"处理。
+        val visible = listState.layoutInfo.visibleItemsInfo
+        val nearBottom = if (visible.isEmpty()) {
+            true
+        } else {
+            (visible.lastOrNull()?.index ?: 0) >= itemCount - 3
         }
+        if (nearBottom) listState.scrollToItem(itemCount - 1)
     }
     // 滚到顶部时拉更早的历史（与桌面一致：按需分页，不一次全加载）
     LaunchedEffect(listState, state.activeSessionId) {
