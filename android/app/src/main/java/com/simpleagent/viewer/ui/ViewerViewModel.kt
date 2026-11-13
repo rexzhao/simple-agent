@@ -69,6 +69,15 @@ data class ViewerState(
     val hasMoreItems: Boolean = false,
     /** 当前加载的第一条 item 的 key（往前翻页的游标）。 */
     val firstItemKey: String = "",
+    /** 正在加载更早的 items（与 [loadingOlder] 区分：那个是归档）。 */
+    val loadingEarlier: Boolean = false,
+    /**
+     * 刚刚往列表头部插入了多少条（界面据此做滚动补偿）。
+     *
+     * 不做补偿的话：用户滚到顶部触发加载，新内容插到上面，当前视野会被
+     * 推下去几十条——看起来像是"突然跳走了"。
+     */
+    val justPrependCount: Int = 0,
     /** 一次性提示（Snackbar）。 */
     val toast: String = "",
     /** 待回答的提问（非空时弹面板）。 */
@@ -303,9 +312,11 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 流式输出期间取最后一页是安全的：新内容总在末尾，不会因为分页而丢。
         val page = core.timelinePage(id, "", timelinePageSize)
         val previous = state.value.timeline
-        // 已经展开过的过程组，其详情是单独拉的：合并时要把已加载的 steps 留住，
-        // 否则每次刷新都会把用户展开的内容退回折叠（体验上像是"自己收起来了"）。
-        val merged = mergeProcessDetails(page.items, previous.items)
+        // **保留已经翻页加载过的早期 items**：这次只拿回最后 60 条，
+        // 如果直接用新结果替换整个列表，用户向上翻出来的历史会全部消失。
+        // 做法：把旧列表里"不在本次结果里、且排在第一页之前"的部分留下来。
+        val keptEarlier = earlierPart(previous.items, page.items)
+        val merged = mergeProcessDetails(keptEarlier + page.items, previous.items)
         state.update {
             it.copy(
                 timeline = TimelineView(
@@ -318,10 +329,26 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 ),
                 connected = (page.runtime ?: it.timeline.runtime).connected,
                 asks = page.asks ?: it.timeline.asks,
-                hasMoreItems = page.hasMore,
-                firstItemKey = page.firstKey,
+                // 只有"已经翻到最早"时才更新 hasMoreItems；
+                // 否则会被最后一页的 has_more 覆盖成 true/false 而失真
+                hasMoreItems = if (keptEarlier.isEmpty()) page.hasMore else it.hasMoreItems,
+                firstItemKey = if (keptEarlier.isEmpty()) page.firstKey else it.firstItemKey,
             )
         }
+    }
+
+    /**
+     * 从旧列表里取出"第一页之前"的那部分（即之前翻页加载的历史）。
+     *
+     * 判定方式：找到新页第一条 item 在旧列表里的位置，它之前的就是要保留的。
+     * 找不到（首次加载 / 会话被清空）则返回空。
+     */
+    private fun earlierPart(old: List<ItemView>, fresh: List<ItemView>): List<ItemView> {
+        if (old.isEmpty() || fresh.isEmpty()) return emptyList()
+        val anchor = fresh.first().key
+        val index = old.indexOfFirst { it.key == anchor }
+        if (index <= 0) return emptyList()
+        return old.subList(0, index)
     }
 
     /**
@@ -384,7 +411,17 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectSession(id: String) {
         if (id == state.value.activeSessionId) return
-        state.update { it.copy(activeSessionId = id, timeline = TimelineView()) }
+        // 分页状态必须一起清：否则新会话会带着上一个会话的 firstItemKey 去翻页
+        state.update {
+            it.copy(
+                activeSessionId = id,
+                timeline = TimelineView(),
+                firstItemKey = "",
+                hasMoreItems = false,
+                loadingEarlier = false,
+                justPrependCount = 0,
+            )
+        }
         // 记住正在看的会话：重启 App 后直接回到这里
         prefs.edit().putString("activeSessionId", id).apply()
         refreshTimeline()
@@ -596,6 +633,48 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---- 更早的历史 ----
+
+    /**
+     * 加载更早的 items（滚到顶部时触发）。
+     *
+     * 与 [loadOlder] 的区别：那个拉的是**归档**（压缩后的旧消息，只读）；
+     * 这个拉的是**同一段会话里更早的 items**（分页尚未加载的部分）。
+     *
+     * 返回本次新插入的条数（界面用它做滚动锚定：如果不补偿，
+     * 往头部插入内容会让用户正在看的位置突然跳走）。
+     */
+    fun loadEarlierItems() {
+        val current = state.value
+        val id = current.activeSessionId
+        if (id.isEmpty() || current.loadingEarlier || !current.hasMoreItems) return
+        val cursor = current.firstItemKey
+        if (cursor.isEmpty()) return
+        state.update { it.copy(loadingEarlier = true) }
+        viewModelScope.launch {
+            val page = core.timelinePage(id, cursor, timelinePageSize)
+            state.update { st ->
+                if (st.activeSessionId != id) return@update st.copy(loadingEarlier = false)
+                if (page.items.isEmpty()) {
+                    return@update st.copy(loadingEarlier = false, hasMoreItems = false)
+                }
+                // 插到最前面；已展开的组保留已加载的详情
+                val merged = mergeProcessDetails(page.items + st.timeline.items, st.timeline.items)
+                st.copy(
+                    loadingEarlier = false,
+                    timeline = st.timeline.copy(items = merged),
+                    hasMoreItems = page.hasMore,
+                    firstItemKey = page.firstKey.ifEmpty { st.firstItemKey },
+                    // 让界面知道要补偿多少
+                    justPrependCount = page.items.size,
+                )
+            }
+        }
+    }
+
+    /** 界面做完滚动补偿后清零（避免重复补偿）。 */
+    fun consumePrependCount() {
+        state.update { if (it.justPrependCount == 0) it else it.copy(justPrependCount = 0) }
+    }
 
     /** 加载下一页归档（滚到顶部时触发）。 */
     fun loadOlder() {

@@ -70,6 +70,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.platform.LocalContext
 import com.simpleagent.viewer.data.ArchivedMessage
 import com.simpleagent.viewer.data.PartView
@@ -313,6 +314,28 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
                 }
             }
     }
+    // 滚到顶部时加载**同一段会话里更早的 items**（分页尚未加载的部分）。
+    // 与上面的归档加载是两件事：归档是压缩后的旧消息，这里是同一段会话的历史。
+    LaunchedEffect(listState, state.activeSessionId) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .collect { first ->
+                if (first == 0 && state.hasMoreItems && !state.loadingEarlier) {
+                    viewModel.loadEarlierItems()
+                }
+            }
+    }
+    // **滚动锚定**：往列表头部插入内容后，把视野拉回原来的位置。
+    //
+    // 不补偿的话：用户滚到顶部触发加载，几十条内容插到上面，当前看到的
+    // 那条被推到下面 —— 感觉像"突然跳走了"，完全没法连续阅读。
+    LaunchedEffect(state.justPrependCount) {
+        val added = state.justPrependCount
+        if (added <= 0) return@LaunchedEffect
+        // 必须先等 Compose 把新 item 排好版：否则 scrollToItem 用的是旧布局
+        withFrameNanos { }
+        listState.scrollToItem(listState.firstVisibleItemIndex + added)
+        viewModel.consumePrependCount()
+    }
     // 把回调提到列表外并记住：否则 items 的 lambda 每帧都是新实例，
     // 会拖累 Compose 对每个条目的重组跳过判断（滚动时尤其明显）。
     val imagePath: (String, (String) -> Unit) -> Unit = remember(viewModel) {
@@ -320,8 +343,8 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     }
     val toggleExpanded: (String) -> Unit = remember(viewModel) { viewModel::toggleExpanded }
     LazyColumn(state = listState, modifier = modifier.then(dragDetector)) {
-        // 归档区在顶部：加载状态 / 到底提示 / 历史消息
-        if (state.loadingOlder || state.archive.isNotEmpty()) {
+        // 顶部：正在加载更早的 items / 归档加载 / 到底提示
+        if (state.loadingEarlier || state.loadingOlder || state.archive.isNotEmpty()) {
             item(key = "archive-header") {
                 Row(
                     modifier = Modifier
@@ -329,10 +352,13 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
                         .padding(vertical = 10.dp),
                     horizontalArrangement = Arrangement.Center,
                 ) {
-                    if (state.loadingOlder) {
-                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                    } else if (!state.hasMoreHistory) {
-                        Text("已经是最早的内容了", fontSize = 11.sp, color = ViewerColors.muted)
+                    when {
+                        state.loadingEarlier || state.loadingOlder -> {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                        }
+                        !state.hasMoreHistory && !state.hasMoreItems -> {
+                            Text("已经是最早的内容了", fontSize = 11.sp, color = ViewerColors.muted)
+                        }
                     }
                 }
             }
