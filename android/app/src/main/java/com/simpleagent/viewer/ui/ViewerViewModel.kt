@@ -344,6 +344,12 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 firstItemKey = if (it.earlierPagesLoaded > 0) it.firstItemKey else page.firstKey,
             )
         }
+        android.util.Log.d(
+            "SimpleAgent",
+            "refreshTimeline：items=${merged.size} hasMore=${page.hasMore} " +
+                "firstKey=${page.firstKey.ifEmpty { "空" }} earlierPart=${keptEarlier.size} " +
+                "pages=${state.value.earlierPagesLoaded}",
+        )
     }
 
     /**
@@ -656,9 +662,23 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     fun loadEarlierItems() {
         val current = state.value
         val id = current.activeSessionId
-        if (id.isEmpty() || current.loadingEarlier || !current.hasMoreItems) return
+        if (id.isEmpty() || current.loadingEarlier || !current.hasMoreItems) {
+            // 诊断：这三种情况都会静默返回，界面看不出任何变化。
+            // 真机排障时靠这行日志判断到底是"没触发"还是"触发了但被守卫挡掉"。
+            android.util.Log.d(
+                "SimpleAgent",
+                "loadEarlierItems 跳过：id=${id.ifEmpty { "空" }} loading=${current.loadingEarlier} " +
+                    "hasMore=${current.hasMoreItems} cursor=${current.firstItemKey.ifEmpty { "空" }} " +
+                    "items=${current.timeline.items.size}",
+            )
+            return
+        }
         val cursor = current.firstItemKey
-        if (cursor.isEmpty()) return
+        if (cursor.isEmpty()) {
+            android.util.Log.d("SimpleAgent", "loadEarlierItems 跳过：游标为空")
+            return
+        }
+        android.util.Log.d("SimpleAgent", "loadEarlierItems 开始：cursor=$cursor items=${current.timeline.items.size}")
         state.update { it.copy(loadingEarlier = true) }
         viewModelScope.launch {
             val page = core.timelinePage(id, cursor, timelinePageSize)
