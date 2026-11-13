@@ -11,6 +11,8 @@ import com.simpleagent.viewer.data.AskView
 import com.simpleagent.viewer.data.CoreClient
 import com.simpleagent.viewer.data.CoreEvent
 import com.simpleagent.viewer.data.ExecutorChoice
+import com.simpleagent.viewer.data.ItemView
+import com.simpleagent.viewer.data.ProcessView
 import com.simpleagent.viewer.data.ProviderChoice
 import com.simpleagent.viewer.data.SessionSummary
 import com.simpleagent.viewer.data.TimelineView

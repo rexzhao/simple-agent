@@ -119,6 +119,18 @@ data class ProcessView(
 )
 
 /**
+ * 一个过程组的完整步骤（Go 侧 ProcessDetailJSON 的镜像）。
+ *
+ * 只在用户展开折叠的过程组时请求：折叠状态下 Go 侧不传 Steps。
+ */
+@Serializable
+data class ProcessDetailPage(
+    val key: String = "",
+    val steps: List<ProcessStep> = emptyList(),
+    val error: String = "",
+)
+
+/**
  * 一页时间线（Go 侧 TimelinePageJSON 的镜像）。
  *
  * 只有最后一页带 runtime/todos/asks —— 它们是"当前状态"，

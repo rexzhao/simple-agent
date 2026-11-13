@@ -101,10 +101,8 @@ class CoreClient private constructor(
 
     /** 取一个过程组的完整步骤（用户展开时调；折叠时 Go 侧不传 Steps）。 */
     fun processDetail(sessionId: String, key: String): List<ProcessStep> {
-        val body = client.processDetailJSON(sessionId, key)
-        val node = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return emptyList()
-        val steps = node["steps"] ?: return emptyList()
-        return runCatching { json.decodeFromJsonElement<List<ProcessStep>>(steps) }.getOrDefault(emptyList())
+        val page = decode(client.processDetailJSON(sessionId, key), ProcessDetailPage())
+        return page.steps
     }
 
     fun providers(): List<ProviderChoice> = decode(client.providersJSON(), emptyList())
