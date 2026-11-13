@@ -74,6 +74,9 @@ class CoreClient private constructor(
 
     fun sessions(): List<SessionSummary> = decode(client.sessionsJSON(), emptyList())
 
+    /** 当前是否连着（断线重连期间为 false）。 */
+    fun connected(): Boolean = client.connected()
+
     /** relay 上在线的执行端（直连时为空）。 */
     fun executors(): List<ExecutorChoice> = decode(client.executorsJSON(), emptyList())
 

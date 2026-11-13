@@ -25,6 +25,14 @@ import java.io.File
 data class ViewerState(
     val connecting: Boolean = false,
     val connected: Boolean = false,
+    /**
+     * 正在断线重连（已连过，但当前这一跳断了）。
+     *
+     * 与 [connected] 的区别：断线重连期间两边都是"未连接"，但界面表现不同——
+     * [reconnecting] 为真时**留在聊天页**并显示"重连中"，而不是把用户踢回连接页。
+     * 用户没做错什么，不该被迫重新点一遍连接。
+     */
+    val reconnecting: Boolean = false,
     val connectError: String = "",
     // 连接表单（恢复上次输入用）
     val addr: String = "127.0.0.1:7900",
@@ -189,7 +197,14 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun refreshConnection() {
-        // 连接状态从 timeline 的 runtime 里读（Go 侧已经算好）
+        // 断线/重连只靠 timeline 是看不出来的：timeline 的 runtime.connected
+        // 反映的是"会话状态"，而连接本身是否在线要问 Go 侧。
+        // 以前这里只 refreshTimeline()，导致断线后 connected 永远停在 true，
+        // 界面显示"已连接"但实际断了，用户只能手动重连。
+        val online = core.connected()
+        state.update {
+            if (it.connected == online) it else it.copy(connected = online, reconnecting = !online)
+        }
         refreshTimeline()
     }
 

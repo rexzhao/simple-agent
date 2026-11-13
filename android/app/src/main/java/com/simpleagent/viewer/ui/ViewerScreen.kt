@@ -91,7 +91,9 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
         }
     }
 
-    if (!state.connected) {
+    // 断线重连期间留在聊天页（显示"重连中"横幅），只有真正没连过/连接失败
+    // 才回到连接页。以前一断线就直接踢回连接页，用户不得不手动重连。
+    if (!state.connected && !state.reconnecting) {
         ConnectScreen(
             state = state,
             onAddr = viewModel::updateAddr,
@@ -103,8 +105,13 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
         )
         return
     }
-
-    ModalNavigationDrawer(
+    // 断线重连中：顶部显示一条不可关闭的横幅，内容区保持原样（可继续阅读）。
+    // 必须包一层 Column：Compose 的 setContent 里只能有一个根节点。
+    Column(modifier = Modifier.fillMaxSize()) {
+        if (state.reconnecting) {
+            ReconnectingBanner()
+        }
+        ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet(drawerContainerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface) {
@@ -204,6 +211,23 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
                     .padding(padding),
             )
         }
+        }
+    }
+}
+
+/** 断线重连中的顶部横幅（不可关闭：它表达的是当前状态，不是可忽略的提示）。 */
+@Composable
+private fun ReconnectingBanner() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(ViewerColors.warn.copy(alpha = 0.15f))
+            .padding(horizontal = 14.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
+        Text("连接已断开，正在重连…", fontSize = 12.sp, color = ViewerColors.warn)
     }
 }
 

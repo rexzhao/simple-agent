@@ -726,6 +726,22 @@ func (c *Client) connected() bool {
 	return remote != nil && remote.Connected()
 }
 
+// Connected 报告当前是否连着（断线重连期间为 false）。
+//
+// 界面每收到一次 "connection" 事件就来问一次：Go 侧的 Change 里带着
+// Connected，但 ChangeListener 只传 kind，所以这里补一个查询入口。
+//
+// 以前没有这个接口，Kotlin 侧的 connected 只在首次连接成功时被置为 true，
+// 断线后**永远不变成 false** —— 界面显示"已连接"但实际断了，用户只能手动重连。
+func (c *Client) Connected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remote == nil {
+		return false
+	}
+	return c.lastConnected
+}
+
 func (c *Client) setConnected(value bool) {
 	c.mu.Lock()
 	c.lastConnected = value
