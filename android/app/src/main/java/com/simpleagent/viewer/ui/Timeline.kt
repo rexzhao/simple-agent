@@ -277,6 +277,10 @@ private fun ProcessGroup(process: ProcessView, expanded: Boolean, onToggle: () -
                 color = ViewerColors.muted,
                 modifier = Modifier.weight(1f),
             )
+            // 折叠时也显示步数：详情没拉下来，但用户能知道这一组有多少内容。
+            if (!expanded && process.stepCount > 1) {
+                Text("${process.stepCount} 步", fontSize = 11.sp, color = ViewerColors.muted)
+            }
             if (process.streaming) {
                 CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
             }
@@ -292,6 +296,17 @@ private fun ProcessGroup(process: ProcessView, expanded: Boolean, onToggle: () -
                 modifier = Modifier.padding(start = 10.dp, end = 10.dp, bottom = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                // 详情是展开时才拉的（Go 侧折叠时不传 steps）：
+                // 还没到的时候显示"正在加载"，避免用户以为点开是空的。
+                if (process.steps.isEmpty() && !process.detail && process.stepCount > 0) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
+                        Text("正在加载…", fontSize = 12.sp, color = ViewerColors.muted)
+                    }
+                }
                 process.steps.forEach { step ->
                     when (step.kind) {
                         "reasoning" -> ReasoningStep(step)

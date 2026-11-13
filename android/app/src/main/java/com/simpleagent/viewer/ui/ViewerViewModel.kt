@@ -58,6 +58,15 @@ data class ViewerState(
     val providers: List<ProviderChoice> = emptyList(),
     /** 展开的过程组 key。 */
     val expanded: Set<String> = emptySet(),
+    /**
+     * 当前加载的 items 之前还有更多（用于滚到顶部时翻页）。
+     *
+     * 注意与 [hasMoreHistory] 区分：后者是**归档**（压缩后的旧消息），
+     * 这个是**同一段会话里更早的 items**（分页尚未加载的部分）。
+     */
+    val hasMoreItems: Boolean = false,
+    /** 当前加载的第一条 item 的 key（往前翻页的游标）。 */
+    val firstItemKey: String = "",
     /** 一次性提示（Snackbar）。 */
     val toast: String = "",
     /** 待回答的提问（非空时弹面板）。 */
@@ -100,6 +109,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     private var timelineRefreshJob: kotlinx.coroutines.Job? = null
     private var timelineRefreshPending = false
     private val timelineRefreshIntervalMs = 80L
+    /** 首屏与翻页时每次取多少条 item（Go 侧上限 500）。 */
+    private val timelinePageSize = 60
 
     private val state = MutableStateFlow(
         ViewerState(
@@ -284,13 +295,53 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshTimeline() {
         val id = state.value.activeSessionId
         if (id.isEmpty()) return
-        val timeline = core.timeline(id)
+        // 分页取最后一页：完整 timeline 在长会话里是几百 KB（实测 774KB），
+        // 全量传过来再反序列化就是打开会话时那几秒白屏。
+        //
+        // 流式输出期间取最后一页是安全的：新内容总在末尾，不会因为分页而丢。
+        val page = core.timelinePage(id, "", timelinePageSize)
+        val previous = state.value.timeline
+        // 已经展开过的过程组，其详情是单独拉的：合并时要把已加载的 steps 留住，
+        // 否则每次刷新都会把用户展开的内容退回折叠（体验上像是"自己收起来了"）。
+        val merged = mergeProcessDetails(page.items, previous.items)
         state.update {
             it.copy(
-                timeline = timeline,
-                connected = timeline.runtime.connected,
-                asks = timeline.asks,
+                timeline = TimelineView(
+                    sessionId = page.sessionId,
+                    title = page.title ?: it.timeline.title,
+                    items = merged,
+                    todos = page.todos ?: it.timeline.todos,
+                    asks = page.asks ?: it.timeline.asks,
+                    runtime = page.runtime ?: it.timeline.runtime,
+                ),
+                connected = (page.runtime ?: it.timeline.runtime).connected,
+                asks = page.asks ?: it.timeline.asks,
+                hasMoreItems = page.hasMore,
+                firstItemKey = page.firstKey,
             )
+        }
+    }
+
+    /**
+     * 把旧 items 里**已经加载过详情**的过程组内容补进新 items。
+     *
+     * Go 侧折叠的过程组不带 steps；用户点开时我们单独拉过一次。刷新回来后
+     * 如果直接用新 items，那份详情就没了 —— 表现为"展开的内容自己收起来了"。
+     */
+    private fun mergeProcessDetails(fresh: List<ItemView>, old: List<ItemView>): List<ItemView> {
+        if (fresh.isEmpty() || old.isEmpty()) return fresh
+        val loaded = HashMap<String, ProcessView>()
+        for (item in old) {
+            val process = item.process ?: continue
+            if (process.detail) loaded[process.key] = process
+        }
+        if (loaded.isEmpty()) return fresh
+        return fresh.map { item ->
+            val process = item.process ?: return@map item
+            val cached = loaded[process.key] ?: return@map item
+            // 正在流式的组用新数据（内容还在增长），已结束的用缓存的详情
+            if (process.streaming) return@map item
+            item.copy(process = process.copy(steps = cached.steps, detail = true))
         }
     }
 
@@ -591,10 +642,51 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun toggleExpanded(key: String) {
+        val willExpand = key !in state.value.expanded
         state.update { current ->
             val expanded = current.expanded.toMutableSet()
             if (!expanded.add(key)) expanded.remove(key)
             current.copy(expanded = expanded)
+        }
+        if (willExpand) {
+            loadProcessDetailIfNeeded(key)
+        }
+    }
+
+    /**
+     * 展开过程组时按需拉详情。
+     *
+     * Go 侧折叠的过程组不带 steps（懒加载：那些思考全文与工具输出往往几十 KB，
+     * 一屏十几个组就是上 MB）。这里在展开时才取，并写回 timeline.items。
+     *
+     * 已经加载过（detail=true）就跳过；正在流式的组本来就带详情，也跳过。
+     */
+    private fun loadProcessDetailIfNeeded(key: String) {
+        val current = state.value
+        val id = current.activeSessionId
+        if (id.isEmpty()) return
+        val item = current.timeline.items.firstOrNull { it.key == key } ?: return
+        val process = item.process ?: return
+        if (process.detail || process.streaming) return
+
+        viewModelScope.launch {
+            val steps = core.processDetail(id, key)
+            if (steps.isEmpty()) return@launch
+            state.update { st ->
+                // 会话可能在等待期间切走了：确认还是同一个会话再写回
+                if (st.activeSessionId != id) return@update st
+                st.copy(
+                    timeline = st.timeline.copy(
+                        items = st.timeline.items.map { candidate ->
+                            if (candidate.key != key) return@map candidate
+                            val existing = candidate.process ?: return@map candidate
+                            candidate.copy(
+                                process = existing.copy(steps = steps, detail = true),
+                            )
+                        },
+                    ),
+                )
+            }
         }
     }
 

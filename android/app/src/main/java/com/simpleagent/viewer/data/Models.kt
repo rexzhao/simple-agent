@@ -107,7 +107,33 @@ data class ProcessView(
     val title: String = "",
     val activity: String = "tools",
     val streaming: Boolean = false,
+    /**
+     * 这一组有多少步。
+     *
+     * 折叠时 [steps] 是空的（Go 侧懒加载），但步数照样能显示。
+     */
+    @SerialName("step_count") val stepCount: Int = 0,
+    /** [steps] 是否已带上（false 表示还没拉详情，展开时要请求）。 */
+    val detail: Boolean = false,
     val steps: List<ProcessStep> = emptyList(),
+)
+
+/**
+ * 一页时间线（Go 侧 TimelinePageJSON 的镜像）。
+ *
+ * 只有最后一页带 runtime/todos/asks —— 它们是"当前状态"，
+ * 翻历史页时不该用旧值覆盖界面。
+ */
+@Serializable
+data class TimelinePage(
+    @SerialName("session_id") val sessionId: String = "",
+    val items: List<ItemView> = emptyList(),
+    @SerialName("has_more") val hasMore: Boolean = false,
+    @SerialName("first_key") val firstKey: String = "",
+    val title: String? = null,
+    val runtime: RuntimeView? = null,
+    val todos: List<TodoView>? = null,
+    val asks: List<AskView>? = null,
 )
 
 @Serializable

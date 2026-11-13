@@ -3,6 +3,7 @@ package com.simpleagent.viewer.data
 import android.os.Handler
 import android.os.Looper
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -87,6 +88,24 @@ class CoreClient private constructor(
     fun switchHost(hostId: String): String = client.switchHost(hostId)
 
     fun timeline(sessionId: String): TimelineView = decode(client.timelineJSON(sessionId), TimelineView())
+
+    /**
+     * 取一页时间线（分页）。
+     *
+     * beforeKey 为空表示"最后一页"；否则返回该 key 之前的一页。
+     * 首屏用它只拿最后几十条——完整 timeline 在长会话里是几百 KB，
+     * 全量传过来再反序列化就是打开会话时那几秒白屏。
+     */
+    fun timelinePage(sessionId: String, beforeKey: String, limit: Int): TimelinePage =
+        decode(client.timelinePageJSON(sessionId, beforeKey, limit.toLong()), TimelinePage())
+
+    /** 取一个过程组的完整步骤（用户展开时调；折叠时 Go 侧不传 Steps）。 */
+    fun processDetail(sessionId: String, key: String): List<ProcessStep> {
+        val body = client.processDetailJSON(sessionId, key)
+        val node = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return emptyList()
+        val steps = node["steps"] ?: return emptyList()
+        return runCatching { json.decodeFromJsonElement<List<ProcessStep>>(steps) }.getOrDefault(emptyList())
+    }
 
     fun providers(): List<ProviderChoice> = decode(client.providersJSON(), emptyList())
 
