@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 )
 
@@ -50,6 +52,14 @@ func (p *poster) submit(fn func()) {
 }
 
 // loop 串行执行队列里的函数。
+//
+// **每个回调都必须 recover**：这是在一条 goroutine 上跑所有镜像修改与回调，
+// 任何一处 panic（host 层的解码、driver 的状态机、甚至 Kotlin 回调里抛出的
+// 异常穿过 JNI 回来）都会让整个 Go 运行时 abort ——Android 上表现为
+// SIGABRT + runtime.raise，进程直接消失，而且**拿不到任何 panic 原因**
+// （Go 的 fatal 信息默认不进 logcat）。真机上就是这么崩过两次。
+//
+// 现在 panic 只影响那一次回调：记一条日志，队列继续跑。
 func (p *poster) loop() {
 	for range p.run {
 		for {
@@ -62,10 +72,22 @@ func (p *poster) loop() {
 			p.queue = nil
 			p.mu.Unlock()
 			for _, fn := range batch {
-				fn()
+				runSafely(fn)
 			}
 		}
 	}
+}
+
+// runSafely 执行一个回调并把 panic 转成日志（不中断串行队列）。
+func runSafely(fn func()) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			// 带栈：下次真出问题时能直接看到是哪条路径
+			log.Printf("bridge：回调 panic（已忽略，队列继续）：%v\n%s",
+				recovered, debug.Stack())
+		}
+	}()
+	fn()
 }
 
 func (p *poster) close() {

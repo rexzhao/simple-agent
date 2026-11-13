@@ -114,6 +114,37 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     private val core = CoreClient.create(cacheDir.absolutePath) { event -> onCoreEvent(event) }
 
+    /**
+     * 启动时自动恢复上次的使用状态。
+     *
+     * 用户期望"打开 App 就接着用"：上次连着谁、正在看哪个项目，就该直接回来，
+     * 而不是每次都手点一遍连接再找会话。
+     *
+     * 只在**上次连接成功过**（autoConnect=true）时才自动连：如果上次是用户主动
+     * 断开的，就不该自作主张连回去。
+     */
+    private fun restoreLastSession() {
+        if (!prefs.getBoolean("autoConnect", false)) {
+            return
+        }
+        val current = state.value
+        if (current.addr.isEmpty()) {
+            return
+        }
+        // 记住的会话 id：连上后由 refreshSessions 决定是否还能用它
+        restoredSessionId = prefs.getString("activeSessionId", "") ?: ""
+        state.update { it.copy(connecting = true, connectError = "") }
+        core.connectTLS(
+            current.addr.trim(),
+            current.route.trim(),
+            current.token.trim(),
+            current.fingerprint.trim(),
+        )
+    }
+
+    // 启动时恢复的最后会话 id（连上后 refreshSessions 会尝试选中它）
+    private var restoredSessionId: String = ""
+
     // ---- 事件 ----
 
     private fun onCoreEvent(event: CoreEvent) {
@@ -185,8 +216,19 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshSessions() {
         val sessions = core.sessions()
         state.update { current ->
-            val active = current.activeSessionId.ifEmpty {
-                sessions.lastOrNull()?.id.orEmpty()
+            // 选哪个会话的顺序：
+            // 1. 当前已选的（用户正在看，别打断）
+            // 2. 上次退出时正在看的（重启 App 后接着用）
+            // 3. 最后一个（最新的会话）
+            val active = when {
+                current.activeSessionId.isNotEmpty() -> current.activeSessionId
+                restoredSessionId.isNotEmpty() && sessions.any { it.id == restoredSessionId } ->
+                    restoredSessionId
+                else -> sessions.lastOrNull()?.id.orEmpty()
+            }
+            // 恢复只做一次：之后用户自己切走就不该再被拉回去
+            if (restoredSessionId.isNotEmpty() && sessions.any { it.id == restoredSessionId }) {
+                restoredSessionId = ""
             }
             current.copy(sessions = sessions, activeSessionId = active)
         }

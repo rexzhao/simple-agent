@@ -93,6 +93,9 @@ func NewClient(listener ChangeListener, lang string, cacheDir string) *Client {
 		parsed = locale.Detect()
 	}
 	locale.SetCurrent(parsed)
+	// 把 Go 侧日志与崩溃信息落到文件里：Android 上 stderr 不进 logcat，
+	// 不这么做的话崩溃后拿不到任何 Go 侧原因（真机上已经吃过两次亏）。
+	setupLogging(cacheDir)
 	return &Client{
 		post:     newPoster(),
 		listener: listener,
