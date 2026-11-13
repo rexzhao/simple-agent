@@ -2,9 +2,11 @@ package wire
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -97,28 +99,49 @@ func (c *tcpConn) RemoteAddr() net.Addr {
 //
 // 抽成钩子是为了让上层能插入 TLS：wire 包本身不认识 TLS，
 // 但"怎么建连接"和"帧怎么切"是两件正交的事。
-var dialFunc func(addr string) (net.Conn, error) = func(addr string) (net.Conn, error) {
-	return net.Dial("tcp", addr)
+//
+// **必须用 atomic**：Android 端会在协程里切换拨号方式（连接/断开/重连），
+// 而 Dial 可能在另一条协程里同时执行。以前是裸全局变量，并发读写会触发
+// Go 的 fatal error（表现为 SIGABRT、runtime.raise，进程直接消失）。
+type dialHandler func(addr string) (net.Conn, error)
+
+func defaultDial(addr string) (net.Conn, error) { return net.Dial("tcp", addr) }
+
+var dialFunc atomic.Pointer[dialHandler]
+
+func init() {
+	handler := dialHandler(defaultDial)
+	dialFunc.Store(&handler)
 }
 
-// SetDialFunc 替换底层拨号方式（进程启动时调用一次；传 nil 恢复默认）。
+// SetDialFunc 替换底层拨号方式（传 nil 恢复默认）。
 //
 // 这样 wire.Dial 的所有调用点（relay 客户端、执行端直连等）都会自动走 TLS，
-// 不需要在每个调用点加参数。
+// 不需要在每个调用点加参数。全程无锁，可在运行期任意并发调用。
 func SetDialFunc(fn func(addr string) (net.Conn, error)) {
-	if fn == nil {
-		dialFunc = func(addr string) (net.Conn, error) { return net.Dial("tcp", addr) }
-		return
+	handler := dialHandler(defaultDial)
+	if fn != nil {
+		handler = dialHandler(fn)
 	}
-	dialFunc = fn
+	dialFunc.Store(&handler)
 }
 
 // DialFunc 返回当前的拨号函数（用于"临时替换再还原"，例如移动端按连接切换 TLS）。
-func DialFunc() func(addr string) (net.Conn, error) { return dialFunc }
+func DialFunc() func(addr string) (net.Conn, error) {
+	handler := dialFunc.Load()
+	if handler == nil {
+		return defaultDial
+	}
+	return func(addr string) (net.Conn, error) { return (*handler)(addr) }
+}
 
 // Dial 连接一个执行端（默认只允许回环/内网；对外监听由执行端显式指定）。
 func Dial(addr string) (Conn, error) {
-	conn, err := dialFunc(addr)
+	handler := dialFunc.Load()
+	if handler == nil {
+		return nil, errors.New("wire: 拨号函数未初始化")
+	}
+	conn, err := (*handler)(addr)
 	if err != nil {
 		return nil, err
 	}
