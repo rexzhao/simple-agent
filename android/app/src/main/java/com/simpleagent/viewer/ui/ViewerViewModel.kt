@@ -88,6 +88,11 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     // 连接参数记在本机（手机输入地址很麻烦，尤其是中文输入法打不出 ASCII 路径）
     private val prefs = app.getSharedPreferences("viewer", android.content.Context.MODE_PRIVATE)
 
+    // 流式刷新的节流状态（见 scheduleTimelineRefresh）
+    private var timelineRefreshJob: kotlinx.coroutines.Job? = null
+    private var timelineRefreshPending = false
+    private val timelineRefreshIntervalMs = 80L
+
     private val state = MutableStateFlow(
         ViewerState(
             addr = prefs.getString("addr", "")?.ifEmpty { null } ?: ViewerState().addr,
@@ -134,7 +139,9 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                     refreshTimeline()
                     refreshSessions()
                 }
-                "conversation", "runtime", "notice" -> refreshTimeline()
+                // 流式输出时这几个事件来得极密（每个 token 一次）。
+                // 每次都重建整条时间线 + 传整份 JSON 会直接卡死，所以节流。
+                "conversation", "runtime", "notice" -> scheduleTimelineRefresh()
             }
             is CoreEvent.ProtocolError -> state.update { it.copy(toast = event.message) }
         }
@@ -184,6 +191,29 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshConnection() {
         // 连接状态从 timeline 的 runtime 里读（Go 侧已经算好）
         refreshTimeline()
+    }
+
+    /**
+     * 节流版刷新：流式输出时 `conversation` 事件每个 token 来一次，
+     * 每次都重建整条时间线（长会话要序列化上百 KB）会直接卡住界面。
+     *
+     * 策略：最多每 [timelineRefreshIntervalMs] 刷一次，且**保证最后一次一定执行**
+     * （用 pending 标记 + 尾部补刷），否则流式结束后界面会停在中间状态。
+     */
+    private fun scheduleTimelineRefresh() {
+        if (timelineRefreshJob?.isActive == true) {
+            // 已经有排队的刷新：只标记"期间又来过新数据"，等它跑完再补一次
+            timelineRefreshPending = true
+            return
+        }
+        timelineRefreshJob = viewModelScope.launch {
+            refreshTimeline()
+            while (timelineRefreshPending) {
+                timelineRefreshPending = false
+                kotlinx.coroutines.delay(timelineRefreshIntervalMs)
+                refreshTimeline()
+            }
+        }
     }
 
     private fun refreshTimeline() {
