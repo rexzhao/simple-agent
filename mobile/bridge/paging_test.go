@@ -128,10 +128,11 @@ func TestTimelinePaging(t *testing.T) {
 	if page2.Runtime != nil {
 		t.Fatal("历史页不该带 runtime（会覆盖当前状态）")
 	}
-	// 第二页的最后一条必须紧邻第一页第一条
+	// 第二页的最后一条必须紧邻第一页第一条（下标 len-limit 的前一条）
 	firstOfPage1 := full.Items[len(full.Items)-limit].Key
-	if got := page2.Items[len(page2.Items)-1].Key; got != full.Items[len(full.Items)-2*limit].Key {
-		t.Fatalf("第二页末尾应紧邻第一页开头：期望 %s 实际 %s", full.Items[len(full.Items)-2*limit].Key, got)
+	wantLastOfPage2 := full.Items[len(full.Items)-limit-1].Key
+	if got := page2.Items[len(page2.Items)-1].Key; got != wantLastOfPage2 {
+		t.Fatalf("第二页末尾应紧邻第一页开头：期望 %s 实际 %s", wantLastOfPage2, got)
 	}
 	if firstOfPage1 == "" {
 		t.Fatal("first_key 不该为空")
