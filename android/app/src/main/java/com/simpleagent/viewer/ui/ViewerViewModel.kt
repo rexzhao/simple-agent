@@ -72,6 +72,13 @@ data class ViewerState(
     /** 正在加载更早的 items（与 [loadingOlder] 区分：那个是归档）。 */
     val loadingEarlier: Boolean = false,
     /**
+     * 用户已经往上翻了几页（0 表示还停在最后一页）。
+     *
+     * 这个字段决定"流式刷新时要不要重置分页游标"。不能用"保留了多少早期
+     * items"去反推——那个推导在边界上会失效，表现为翻一点就弹回最后一页。
+     */
+    val earlierPagesLoaded: Int = 0,
+    /**
      * 刚刚往列表头部插入了多少条（界面据此做滚动补偿）。
      *
      * 不做补偿的话：用户滚到顶部触发加载，新内容插到上面，当前视野会被
@@ -314,7 +321,6 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         val previous = state.value.timeline
         // **保留已经翻页加载过的早期 items**：这次只拿回最后 60 条，
         // 如果直接用新结果替换整个列表，用户向上翻出来的历史会全部消失。
-        // 做法：把旧列表里"不在本次结果里、且排在第一页之前"的部分留下来。
         val keptEarlier = earlierPart(previous.items, page.items)
         val merged = mergeProcessDetails(keptEarlier + page.items, previous.items)
         state.update {
@@ -329,10 +335,13 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 ),
                 connected = (page.runtime ?: it.timeline.runtime).connected,
                 asks = page.asks ?: it.timeline.asks,
-                // 只有"已经翻到最早"时才更新 hasMoreItems；
-                // 否则会被最后一页的 has_more 覆盖成 true/false 而失真
-                hasMoreItems = if (keptEarlier.isEmpty()) page.hasMore else it.hasMoreItems,
-                firstItemKey = if (keptEarlier.isEmpty()) page.firstKey else it.firstItemKey,
+                // **分页进度不能用"保留了多少早期 items"反推**：
+                // 那个推导在"刚翻完一页、列表恰好只剩一页"时会失效，
+                // 于是游标被重置回最后一页——表现就是翻一点就弹回去。
+                // 改成显式判定：只要用户翻过（earlierPagesLoaded > 0），
+                // 就保持用户翻到的位置不动。
+                hasMoreItems = if (it.earlierPagesLoaded > 0) it.hasMoreItems else page.hasMore,
+                firstItemKey = if (it.earlierPagesLoaded > 0) it.firstItemKey else page.firstKey,
             )
         }
     }
@@ -419,6 +428,7 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 firstItemKey = "",
                 hasMoreItems = false,
                 loadingEarlier = false,
+                earlierPagesLoaded = 0,
                 justPrependCount = 0,
             )
         }
@@ -664,6 +674,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                     timeline = st.timeline.copy(items = merged),
                     hasMoreItems = page.hasMore,
                     firstItemKey = page.firstKey.ifEmpty { st.firstItemKey },
+                    // 记录翻过页：之后刷新不再重置游标
+                    earlierPagesLoaded = st.earlierPagesLoaded + 1,
                     // 让界面知道要补偿多少
                     justPrependCount = page.items.size,
                 )
