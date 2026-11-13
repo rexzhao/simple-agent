@@ -114,11 +114,19 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     private val core = CoreClient.create(cacheDir.absolutePath) { event -> onCoreEvent(event) }
 
+    // 启动时恢复的最后会话 id（连上后 refreshSessions 会尝试选中它）。
+    // **必须声明在 init 之前**：Kotlin 的类体按声明顺序初始化，
+    // init 里会用到它，放后面会先看到未初始化值。
+    private var restoredSessionId: String = ""
+
+    init {
+        // 用户期望"打开 App 就接着用"：上次连着谁、正在看哪个会话，
+        // 直接恢复，而不是每次都手点一遍连接再找会话。
+        restoreLastSession()
+    }
+
     /**
      * 启动时自动恢复上次的使用状态。
-     *
-     * 用户期望"打开 App 就接着用"：上次连着谁、正在看哪个项目，就该直接回来，
-     * 而不是每次都手点一遍连接再找会话。
      *
      * 只在**上次连接成功过**（autoConnect=true）时才自动连：如果上次是用户主动
      * 断开的，就不该自作主张连回去。
@@ -142,9 +150,6 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    // 启动时恢复的最后会话 id（连上后 refreshSessions 会尝试选中它）
-    private var restoredSessionId: String = ""
-
     // ---- 事件 ----
 
     private fun onCoreEvent(event: CoreEvent) {
@@ -167,6 +172,9 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                     return
                 }
                 state.update { it.copy(connecting = false, connected = true, connectError = "") }
+                // 记住"上次连接成功过"：下次启动 App 自动连回去。
+                // 只在成功时记，连接失败不算（否则启动时会自动连一个连不上的地址）。
+                prefs.edit().putBoolean("autoConnect", true).apply()
                 refreshAll()
             }
             is CoreEvent.Changed -> when (event.kind) {
@@ -315,12 +323,17 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun disconnect() {
         core.disconnect()
-        state.update { it.copy(connected = false, sessions = emptyList(), activeSessionId = "", timeline = TimelineView()) }
+        // 用户主动断开 = 明确表示"不要连着"：清掉自动重连标记，
+        // 否则下次启动 App 又会自己连回去，违背用户意图。
+        prefs.edit().putBoolean("autoConnect", false).apply()
+        state.update { it.copy(connected = false, reconnecting = false, sessions = emptyList(), activeSessionId = "", timeline = TimelineView()) }
     }
 
     fun selectSession(id: String) {
         if (id == state.value.activeSessionId) return
         state.update { it.copy(activeSessionId = id, timeline = TimelineView()) }
+        // 记住正在看的会话：重启 App 后直接回到这里
+        prefs.edit().putString("activeSessionId", id).apply()
         refreshTimeline()
     }
 
