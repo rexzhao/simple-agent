@@ -127,6 +127,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     private var timelineRefreshJob: kotlinx.coroutines.Job? = null
     private var timelineRefreshPending = false
     private val timelineRefreshIntervalMs = 80L
+    /** 上次真正刷新的时间戳（配合 scheduleTimelineRefresh 做节流）。 */
+    private var lastTimelineRefreshAt = 0L
     /** 首屏与翻页时每次取多少条 item（Go 侧上限 500）。 */
     private val timelinePageSize = 60
 
@@ -295,16 +297,27 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
      * （用 pending 标记 + 尾部补刷），否则流式结束后界面会停在中间状态。
      */
     private fun scheduleTimelineRefresh() {
-        if (timelineRefreshJob?.isActive == true) {
-            // 已经有排队的刷新：只标记"期间又来过新数据"，等它跑完再补一次
-            timelineRefreshPending = true
+        // **用时间戳节流，不依赖 job 的 isActive**。
+        //
+        // 之前用 `timelineRefreshJob?.isActive == true` 判断：如果 refreshTimeline
+        // 执行很快（几十毫秒），job 在下一次事件到来时已经结束，isActive 为 false，
+        // 于是每次都新建 job —— 节流完全失效。实测 772ms 里刷了 27 次，
+        // 每次都在做同样的工作，白白占用 UI 线程。
+        val now = System.currentTimeMillis()
+        if (now - lastTimelineRefreshAt >= timelineRefreshIntervalMs) {
+            lastTimelineRefreshAt = now
+            refreshTimeline()
+            timelineRefreshPending = false
             return
         }
+        // 还在窗口内：记下"有新数据"，窗口结束时补刷一次，保证最终状态不丢
+        timelineRefreshPending = true
+        if (timelineRefreshJob?.isActive == true) return
         timelineRefreshJob = viewModelScope.launch {
-            refreshTimeline()
-            while (timelineRefreshPending) {
+            kotlinx.coroutines.delay(timelineRefreshIntervalMs)
+            if (timelineRefreshPending) {
                 timelineRefreshPending = false
-                kotlinx.coroutines.delay(timelineRefreshIntervalMs)
+                lastTimelineRefreshAt = System.currentTimeMillis()
                 refreshTimeline()
             }
         }

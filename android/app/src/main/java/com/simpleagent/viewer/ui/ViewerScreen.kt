@@ -327,6 +327,12 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
             val cannotScrollMore = !listState.canScrollBackward
             first == 0 && cannotScrollMore
         }.collect { atTopAndStuck ->
+            android.util.Log.d(
+                "SimpleAgent",
+                "到顶检测：stuck=$atTopAndStuck first=${listState.firstVisibleItemIndex} " +
+                    "canBack=${listState.canScrollBackward} hasMore=${state.hasMoreItems} " +
+                    "loading=${state.loadingEarlier} cursor=${state.firstItemKey.ifEmpty { "空" }}",
+            )
             if (atTopAndStuck && state.hasMoreItems && !state.loadingEarlier) {
                 viewModel.loadEarlierItems()
             }
@@ -361,8 +367,12 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     }
     val toggleExpanded: (String) -> Unit = remember(viewModel) { viewModel::toggleExpanded }
     LazyColumn(state = listState, modifier = modifier.then(dragDetector)) {
-        // 顶部：正在加载更早的 items / 归档加载 / 到底提示
-        if (state.loadingEarlier || state.loadingOlder || state.archive.isNotEmpty()) {
+        // 顶部：正在加载 / 还有更多 / 到底提示。
+        // 只要还有更早的内容就显示这一行，用户才知道"往上滑还有东西"——
+        // 否则内容拉取期间顶部是空的，看起来像卡住了。
+        if (state.loadingEarlier || state.loadingOlder || state.archive.isNotEmpty() ||
+            state.hasMoreItems || state.hasMoreHistory
+        ) {
             item(key = "archive-header") {
                 Row(
                     modifier = Modifier
@@ -372,9 +382,22 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
                 ) {
                     when {
                         state.loadingEarlier || state.loadingOlder -> {
-                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(14.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                                Text("正在加载更早的内容…", fontSize = 11.sp, color = ViewerColors.muted)
+                            }
                         }
-                        !state.hasMoreHistory && !state.hasMoreItems -> {
+                        // 还有更多但不正在加载：给个静态提示，用户知道"往上滑还能看"
+                        state.hasMoreItems || state.hasMoreHistory -> {
+                            Text("↑ 继续下拉加载更早的内容", fontSize = 11.sp, color = ViewerColors.muted)
+                        }
+                        else -> {
                             Text("已经是最早的内容了", fontSize = 11.sp, color = ViewerColors.muted)
                         }
                     }
