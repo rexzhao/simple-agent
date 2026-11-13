@@ -340,6 +340,65 @@ func (c *Client) TimelineJSON(sessionID string) string {
 	return encode(c.buildTimeline(sessionID))
 }
 
+// TimelinePageJSON 返回时间线的一页（按 item 分页，用于首屏与向上翻页）。
+//
+// 为什么要分页：实测一个 713 条目的会话，完整 TimelineJSON 是 774KB / 1001 个
+// item。首屏全量传给 Kotlin 再反序列化，长会话打开就是几秒白屏。
+// 只传最后 60 条是 46KB —— 体积降 94%。
+//
+// beforeKey 为空表示"最后一页"；否则返回该 key **之前**的那一页
+// （用户滚到顶部时用第一页的第一个 key 作为游标继续往前翻）。
+//
+// 返回 {session_id, items, has_more, first_key, title, runtime, todos, asks}。
+// 只有最后一页带 runtime/todos/asks：它们是"当前状态"，翻历史页时不该覆盖。
+func (c *Client) TimelinePageJSON(sessionID, beforeKey string, limit int) string {
+	if limit <= 0 || limit > 500 {
+		limit = 60
+	}
+	view := c.buildTimeline(sessionID)
+	total := len(view.Items)
+	if total == 0 {
+		return encode(map[string]any{
+			"session_id": sessionID, "items": []ItemView{}, "has_more": false,
+		})
+	}
+
+	// 定位这一页的结束位置：默认取末尾，有游标时取该 key 的下标
+	end := total
+	if beforeKey != "" {
+		for index, item := range view.Items {
+			if item.Key == beforeKey {
+				end = index
+				break
+			}
+		}
+	}
+	start := end - limit
+	if start < 0 {
+		start = 0
+	}
+	if end < start {
+		end = start
+	}
+
+	page := map[string]any{
+		"session_id": view.SessionID,
+		"items":      view.Items[start:end],
+		"has_more":   start > 0,
+	}
+	if start < total {
+		page["first_key"] = view.Items[start].Key
+	}
+	// 当前状态只跟最后一页走：翻历史页时不能用旧状态覆盖界面
+	if beforeKey == "" {
+		page["title"] = view.Title
+		page["runtime"] = view.Runtime
+		page["todos"] = view.Todos
+		page["asks"] = view.Asks
+	}
+	return encode(page)
+}
+
 // ProcessDetailJSON 返回一个过程组的完整步骤（用户展开时才调）。
 //
 // 懒加载的另一半：timeline 里折叠的过程组只带 StepCount，点开时到这里
