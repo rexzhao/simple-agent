@@ -316,13 +316,31 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     }
     // 滚到顶部时加载**同一段会话里更早的 items**（分页尚未加载的部分）。
     // 与上面的归档加载是两件事：归档是压缩后的旧消息，这里是同一段会话的历史。
+    //
+    // 这里监听的是"滚动位置 + 列表是否撑满"，而不是单纯的 firstVisibleItemIndex：
+    // 内容不足一屏时下标恒为 0，单纯的 snapshotFlow 只在第一次发射，之后
+    // 再也不会有新值 —— 表现就是"只加载一页就停了，再也翻不动"。
     LaunchedEffect(listState, state.activeSessionId) {
-        snapshotFlow { listState.firstVisibleItemIndex }
-            .collect { first ->
-                if (first == 0 && state.hasMoreItems && !state.loadingEarlier) {
-                    viewModel.loadEarlierItems()
-                }
+        snapshotFlow {
+            // 把"到顶"与"列表不能继续下滑"一起作为信号
+            val first = listState.firstVisibleItemIndex
+            val cannotScrollMore = !listState.canScrollBackward
+            first == 0 && cannotScrollMore
+        }.collect { atTopAndStuck ->
+            if (atTopAndStuck && state.hasMoreItems && !state.loadingEarlier) {
+                viewModel.loadEarlierItems()
             }
+        }
+    }
+    // 加载完成后如果仍然到顶（内容还没撑满一屏），继续拉下一页。
+    // 这条专门处理"列表总高度不足一屏"的情况：那时滚动位置不会变化，
+    // 上面的 snapshotFlow 不会再次发射。
+    LaunchedEffect(state.loadingEarlier, state.hasMoreItems, state.earlierPagesLoaded) {
+        if (state.loadingEarlier || !state.hasMoreItems) return@LaunchedEffect
+        withFrameNanos { }
+        if (listState.firstVisibleItemIndex == 0 && !listState.canScrollForward) {
+            viewModel.loadEarlierItems()
+        }
     }
     // **滚动锚定**：往列表头部插入内容后，把视野拉回原来的位置。
     //

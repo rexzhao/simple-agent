@@ -384,20 +384,30 @@ func (c *Client) TimelinePageJSON(sessionID, beforeKey string, limit int) string
 
 	// 定位这一页的结束位置：默认取末尾，有游标时取该 key 的下标
 	end := total
+	found := beforeKey == ""
 	if beforeKey != "" {
 		for index, item := range view.Items {
 			if item.Key == beforeKey {
 				end = index
+				found = true
 				break
 			}
 		}
 	}
+	if !found {
+		// 游标对不上（该 item 已不在当前 timeline 里，例如会话被压缩/重建）。
+		// **不能静默返回最后一页**：那样客户端会以为翻页成功、拿到重复内容，
+		// 游标原地打转，表现为"滚到某处就再也不加载了"。
+		return encode(map[string]any{
+			"session_id": view.SessionID,
+			"items":      []ItemView{},
+			"has_more":   false,
+			"error":      "游标已失效（会话内容已变化）",
+		})
+	}
 	start := end - limit
 	if start < 0 {
 		start = 0
-	}
-	if end < start {
-		end = start
 	}
 
 	page := map[string]any{
