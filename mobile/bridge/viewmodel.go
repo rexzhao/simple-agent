@@ -122,7 +122,17 @@ type ProcessView struct {
 	Activity string `json:"activity"`
 	// Streaming 表示这一组还在进行（决定是否显示进行中的动画）。
 	Streaming bool `json:"streaming"`
-	// Steps 是展开后的内容。
+	// StepCount 是这一组有多少步（**折叠时也要知道**：界面显示"思考 · 5 步"）。
+	//
+	// 有了它，折叠状态下 Steps 可以不传，界面仍然能显示步数。
+	StepCount int `json:"step_count"`
+	// Detail 表示 Steps 是否已带上。
+	//
+	// **懒加载的核心**：默认折叠的过程组不带 Steps（思考全文、工具参数与输出
+	// 全文往往几十 KB，一屏十几个组就是上 MB）。用户点开时才通过
+	// ProcessDetailJSON 单独取这一个组。
+	Detail bool `json:"detail"`
+	// Steps 是展开后的内容（Detail 为真时才有值）。
 	Steps []ProcessStep `json:"steps,omitempty"`
 }
 

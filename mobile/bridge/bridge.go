@@ -28,11 +28,13 @@ import (
 	"sort"
 	"sync"
 
+	"simple-agent/internal/driver"
 	"simple-agent/internal/host"
 	"simple-agent/internal/locale"
 	"simple-agent/internal/markdown"
 	"simple-agent/internal/providers"
 	"simple-agent/internal/relay"
+	"simple-agent/internal/timeline"
 	"simple-agent/internal/tlsx"
 	"simple-agent/internal/wire"
 )
@@ -336,6 +338,29 @@ func (c *Client) SessionsJSON() string {
 // TimelineJSON 返回一个会话的完整可渲染内容（见 TimelineView）。
 func (c *Client) TimelineJSON(sessionID string) string {
 	return encode(c.buildTimeline(sessionID))
+}
+
+// ProcessDetailJSON 返回一个过程组的完整步骤（用户展开时才调）。
+//
+// 懒加载的另一半：timeline 里折叠的过程组只带 StepCount，点开时到这里
+// 单独取那一个组。返回 {"key","steps":[...]}；找不到返回 {"error":...}。
+func (c *Client) ProcessDetailJSON(sessionID, key string) string {
+	session := c.currentSession(sessionID)
+	if session == nil {
+		return encode(map[string]any{"error": "会话不存在"})
+	}
+	conv := session.Conversation()
+	idle := session.Busy() == driver.BusyIdle
+	for _, item := range timeline.Build(conv.Entries(), idle) {
+		if item.Key != key || item.Kind != timeline.KindProcess {
+			continue
+		}
+		return encode(map[string]any{
+			"key":   key,
+			"steps": c.processSteps(item, !idle),
+		})
+	}
+	return encode(map[string]any{"error": "过程组不存在（可能已被新内容顶掉）"})
 }
 
 // ProvidersJSON 返回执行端公布的模型列表：[{"provider_id","label","models":[…]}]

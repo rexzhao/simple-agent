@@ -124,7 +124,11 @@ func (c *Client) itemView(item timeline.Item, conv *conversation.Conversation, i
 		}
 	case timeline.KindProcess:
 		view.Kind = "process"
-		view.Process = c.processView(item, !idle)
+		// 正在流式的组带完整详情：用户此刻正看着它，实时内容必须能显示。
+		// 已结束的历史组只给摘要（StepCount），点开时才单独拉 —— 这是
+		// 首屏从 1690KB 降到几十 KB 的关键。
+		streaming := !idle
+		view.Process = c.processView(item, streaming, streaming)
 	case timeline.KindTurnFooter:
 		view.Kind = "footer"
 		view.Footer = footerOf(item)
@@ -219,13 +223,31 @@ func (c *Client) partView(part message.Part) (PartView, bool) {
 }
 
 // processView 生成一个过程组（折叠面板）。
-func (c *Client) processView(item timeline.Item, streaming bool) *ProcessView {
+// processView 生成过程组视图。
+//
+// withDetail 为假时**不填 Steps**，只给 StepCount —— 这是懒加载的关键：
+// 过程组的 Steps 里装着思考全文 + 工具参数/输出全文，一屏十几个组就是上 MB
+// （实测长会话 1690KB JSON 里绝大部分在这），而它们默认是折叠的。
+// 用户点开时再由 ProcessDetailJSON 单独取这一个组。
+func (c *Client) processView(item timeline.Item, streaming, withDetail bool) *ProcessView {
 	view := &ProcessView{
 		Key:       item.Key,
 		Title:     timeline.GroupTitle(item.Refs, streaming, c.lang),
 		Activity:  activityName(timeline.GroupActivity(item.Refs, streaming)),
 		Streaming: streaming,
 	}
+	steps := c.processSteps(item, streaming)
+	view.StepCount = len(steps)
+	if withDetail {
+		view.Steps = steps
+		view.Detail = true
+	}
+	return view
+}
+
+// processSteps 把过程组的 refs 展开成步骤列表（含思考与工具卡片）。
+func (c *Client) processSteps(item timeline.Item, streaming bool) []ProcessStep {
+	var steps []ProcessStep
 	// 工具结果按 id 索引，便于把 use/result 合成一张卡片
 	results := map[string]timeline.Ref{}
 	for _, ref := range item.Refs {
@@ -248,7 +270,7 @@ func (c *Client) processView(item timeline.Item, streaming bool) *ProcessView {
 			if strings.TrimSpace(text) == "" {
 				continue
 			}
-			view.Steps = append(view.Steps, ProcessStep{Kind: "reasoning", Text: text, Done: true})
+			steps = append(steps, ProcessStep{Kind: "reasoning", Text: text, Done: true})
 		case render.MediaToolUse:
 			data, ok := partData(part)
 			if !ok {
@@ -266,7 +288,7 @@ func (c *Client) processView(item timeline.Item, streaming bool) *ProcessView {
 			} else {
 				step.Pending = !streaming
 			}
-			view.Steps = append(view.Steps, step)
+			steps = append(steps, step)
 		case render.MediaToolResult:
 			data, ok := partData(part)
 			if !ok {
@@ -283,10 +305,10 @@ func (c *Client) processView(item timeline.Item, streaming bool) *ProcessView {
 				ToolTitle: toolTitle(stringField(data, "name")),
 			}
 			applyToolResult(&step, part)
-			view.Steps = append(view.Steps, step)
+			steps = append(steps, step)
 		}
 	}
-	return view
+	return steps
 }
 
 // applyToolResult 把结果写进工具卡片。
