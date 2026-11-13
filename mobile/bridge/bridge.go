@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"simple-agent/internal/driver"
 	"simple-agent/internal/host"
@@ -77,6 +78,13 @@ type Client struct {
 	executors []relay.Executor
 	// conn 记住这次连接用的参数，切换执行端时复用。
 	conn connectParams
+	// pendingChange 是攒着还没发的高频变化（见 emit）。
+	//
+	// 流式输出时 "conversation" 每个 token 来一次，每一次都跨 JNI 回调 +
+	// Kotlin 侧重建 timeline。这里把窗口内的同类事件合并成一次回调。
+	pendingChange map[string]string // kind → sessionID
+	// flushStop 关闭时通知 flushLoop 退出。
+	flushStop chan struct{}
 }
 
 // connectParams 是"连到哪个 relay、带什么凭据"（切换执行端时复用）。
@@ -98,13 +106,18 @@ func NewClient(listener ChangeListener, lang string, cacheDir string) *Client {
 	// 把 Go 侧日志与崩溃信息落到文件里：Android 上 stderr 不进 logcat，
 	// 不这么做的话崩溃后拿不到任何 Go 侧原因（真机上已经吃过两次亏）。
 	setupLogging(cacheDir)
-	return &Client{
-		post:     newPoster(),
-		listener: listener,
-		lang:     parsed,
-		blobDir:  cacheDir,
-		parser:   markdown.NewParser(),
+	retainLogging()
+	client := &Client{
+		post:        newPoster(),
+		listener:    listener,
+		lang:        parsed,
+		blobDir:     cacheDir,
+		parser:      markdown.NewParser(),
+		flushStop:   make(chan struct{}),
 	}
+	// 高频事件合并器：见 emit 的说明
+	go client.flushLoop()
+	return client
 }
 
 // Connect 连上执行端或 relay。
@@ -313,12 +326,18 @@ func (c *Client) Close() {
 	c.closed = true
 	remote := c.remote
 	c.remote = nil
+	flushStop := c.flushStop
 	c.mu.Unlock()
+	if flushStop != nil {
+		close(flushStop)
+	}
 	c.restoreDialNow()
 	if remote != nil {
 		_ = remote.Close()
 	}
 	c.post.close()
+	// 关掉日志句柄：不关的话 Windows 上临时目录删不掉（测试里很常见）
+	releaseLogging()
 }
 
 // ---- 读（全部返回 JSON，不阻塞）----
@@ -752,7 +771,81 @@ func (c *Client) onHostChange(change host.Change) {
 }
 
 // emit 触发一次回调（在 Go 的串行投递器上执行）。
+//
+// **高频事件要合并**：流式输出时 "conversation" 每个 token 来一次。每次回调
+// 都会让 Kotlin 侧重建整条 timeline（长会话序列化上百 KB），不合并会把界面压垮。
+//
+// 策略：按 kind 合并——同一 kind 在 [changeFlushInterval] 窗口内只回调一次；
+// 不同 kind 各自独立（保留语义：runtime 变化不会被当成 conversation）。
+// 其余低频事件（sessions / models / connection / cmdResult）立即发，
+// 它们关系到界面结构，延迟会让用户觉得"点了没反应"。
 func (c *Client) emit(kind, sessionID string) {
+	if !isHighFrequencyChange(kind) {
+		c.emitNow(kind, sessionID)
+		return
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	if c.pendingChange == nil {
+		c.pendingChange = map[string]string{}
+	}
+	// 同一 kind 只保留最后一次的 sessionID：合并窗口内的中间状态不需要重放
+	c.pendingChange[kind] = sessionID
+	c.mu.Unlock()
+}
+
+// isHighFrequencyChange 判断这个变化是否会被流式输出高频触发。
+func isHighFrequencyChange(kind string) bool {
+	switch kind {
+	case "conversation", "runtime", "notice":
+		return true
+	}
+	return false
+}
+
+// changeFlushInterval 是高频事件的最小回调间隔。
+//
+// 60ms ≈ 16 帧：比一帧略长，避免每帧都重建；又短到肉眼察觉不出延迟。
+const changeFlushInterval = 60 * time.Millisecond
+
+// flushLoop 定期把攒下的高频事件发出去（每个 Client 一条）。
+//
+// 用 ticker 而不是"攒够 N 个再发"：流式输出的节奏不稳定，按时间合并才能
+// 保证"最多每 changeFlushInterval 一次"这个上限。
+func (c *Client) flushLoop() {
+	ticker := time.NewTicker(changeFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.flushStop:
+			return
+		case <-ticker.C:
+			c.flushPending()
+		}
+	}
+}
+
+// flushPending 把当前攒下的高频事件各发一次。
+func (c *Client) flushPending() {
+	c.mu.Lock()
+	if len(c.pendingChange) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	batch := c.pendingChange
+	c.pendingChange = nil
+	c.mu.Unlock()
+
+	for kind, sessionID := range batch {
+		c.emitNow(kind, sessionID)
+	}
+}
+
+// emitNow 立即触发一次回调。
+func (c *Client) emitNow(kind, sessionID string) {
 	c.mu.Lock()
 	listener := c.listener
 	closed := c.closed

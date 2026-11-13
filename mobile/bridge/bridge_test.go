@@ -172,7 +172,19 @@ func TestTimelineJSON(t *testing.T) {
 		t.Fatal("回合结束后应可以发送")
 	}
 
-	// 变更通知至少推过 sessions / conversation / runtime
+	// 变更通知至少推过 sessions / conversation / runtime。
+	// conversation 是高频事件，会被合并窗口延迟（见 bridge.emit），
+	// 所以这里要等一小会儿再断言——这是有意的行为改变，不是丢通知。
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		changes.mu.Lock()
+		joined := strings.Join(changes.events, ",")
+		changes.mu.Unlock()
+		if strings.Contains(joined, "conversation|") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	changes.mu.Lock()
 	joined := strings.Join(changes.events, ",")
 	changes.mu.Unlock()
