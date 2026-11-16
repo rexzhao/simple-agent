@@ -51,6 +51,10 @@ crates/app       driver 接线：状态变化 -> 事件；启动时 replay      
 
 ### 3.2 事件清单
 
+> **注意**：本节描述的是**当前实现**。事件模型的重构（Round/Turn 概念、
+> `message.input`/`message.output`、单条 `tool.result`、显式边界事件）
+> 见 `docs/session-log-model.md`。那里也说明了旧事件如何继续被重放兼容。
+
 | type | data | 说明 |
 |---|---|---|
 | `session.created` | `{context_id, remote_context_id?, title?, created_at}` | 必须是文件第一行（除快照外）。`remote_context_id` 只存这里（A2A 服务端分配的 id，与本地 `context_id` 分开） |

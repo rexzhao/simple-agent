@@ -367,12 +367,12 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     }
     val toggleExpanded: (String) -> Unit = remember(viewModel) { viewModel::toggleExpanded }
     LazyColumn(state = listState, modifier = modifier.then(dragDetector)) {
-        // 顶部：正在加载 / 还有更多 / 到底提示。
-        // 只要还有更早的内容就显示这一行，用户才知道"往上滑还有东西"——
-        // 否则内容拉取期间顶部是空的，看起来像卡住了。
-        if (state.loadingEarlier || state.loadingOlder || state.archive.isNotEmpty() ||
-            state.hasMoreItems || state.hasMoreHistory
-        ) {
+        // 顶部状态行：正在加载 / 还有更多 / 已到最早。
+        //
+        // **只要有内容就一直显示**：之前只在"还有更多"时才渲染，
+        // 于是翻到最早那一刻整行消失——用户看不到"已经是最早的内容了"，
+        // 只看到滑不动，会以为卡死。
+        if (state.timeline.items.isNotEmpty()) {
             item(key = "archive-header") {
                 Row(
                     modifier = Modifier
