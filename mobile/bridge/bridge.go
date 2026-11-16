@@ -359,55 +359,133 @@ func (c *Client) TimelineJSON(sessionID string) string {
 	return encode(c.buildTimeline(sessionID))
 }
 
-// TimelinePageJSON 返回时间线的一页（按 item 分页，用于首屏与向上翻页）。
+// itemSeqRange 返回一个渲染条目覆盖的事件序号区间。
 //
-// 为什么要分页：实测一个 713 条目的会话，完整 TimelineJSON 是 774KB / 1001 个
-// item。首屏全量传给 Kotlin 再反序列化，长会话打开就是几秒白屏。
-// 只传最后 60 条是 46KB —— 体积降 94%。
+// 条目可能引用多条消息（过程组把同一轮的多个 part 合在一起），
+// 取所有引用里最小的 first 与最大的 last——这样整条 item 的区间是完整的，
+// 分页切在它前后都不会把内容切成两半。
+func itemSeqRange(item timeline.Item) (uint64, uint64, bool) {
+	var first, last uint64
+	for _, ref := range item.Refs {
+		if ref.Chat == nil {
+			continue
+		}
+		refFirst, refLast := ref.Chat.SeqRange()
+		if refLast == 0 {
+			continue // 这条消息还没有 seq（内存里新建、尚未落盘）
+		}
+		if refFirst == 0 {
+			refFirst = refLast
+		}
+		if first == 0 || refFirst < first {
+			first = refFirst
+		}
+		if refLast > last {
+			last = refLast
+		}
+	}
+	if last == 0 {
+		// 回合结束行之类没有 refs 的条目：靠 TurnEntries 判断
+		for _, entry := range item.TurnEntries {
+			if entry == nil {
+				continue
+			}
+			entryFirst, entryLast := entry.SeqRange()
+			if entryLast == 0 {
+				continue
+			}
+			if entryFirst == 0 {
+				entryFirst = entryLast
+			}
+			if first == 0 || entryFirst < first {
+				first = entryFirst
+			}
+			if entryLast > last {
+				last = entryLast
+			}
+		}
+	}
+	if last == 0 {
+		return 0, 0, false
+	}
+	return first, last, true
+}
+
+// TimelinePageJSON 返回时间线的一页（**按事件 seq 分页**）。
 //
-// beforeKey 为空表示"最后一页"；否则返回该 key **之前**的那一页
-// （用户滚到顶部时用第一页的第一个 key 作为游标继续往前翻）。
+// 为什么不用 item key：item 是渲染产物，key 里含 part 索引，流式输出期间会变
+// （proc:xxx#1 ↔ xxx#0），游标因此不稳定——真机上表现为"翻到某处就再也翻不动"。
+// 日志的 seq 一旦写入永不变，是唯一可靠的游标。
 //
-// 返回 {session_id, items, has_more, first_key, title, runtime, todos, asks}。
+// beforeSeq 为 0 表示"最后一页"；否则返回 seq **小于** beforeSeq 的那一页。
+//
+// 分页保证**不切断一条消息**：页边界按 item 的 seq 区间对齐，
+// 一页里不会出现"某条消息一半在这页、一半在下页"。
+//
+// 返回 {session_id, items, has_more, seq_from, seq_to, title, runtime, todos, asks}。
 // 只有最后一页带 runtime/todos/asks：它们是"当前状态"，翻历史页时不该覆盖。
-func (c *Client) TimelinePageJSON(sessionID, beforeKey string, limit int) string {
+func (c *Client) TimelinePageJSON(sessionID string, beforeSeq uint64, limit int) string {
 	if limit <= 0 || limit > 500 {
 		limit = 60
 	}
-	view := c.buildTimeline(sessionID)
+	view, raw := c.buildTimelineWithRaw(sessionID)
 	total := len(view.Items)
-	if total == 0 {
+	if total == 0 || len(raw) != total {
 		return encode(map[string]any{
 			"session_id": sessionID, "items": []ItemView{}, "has_more": false,
 		})
 	}
 
-	// 定位这一页的结束位置：默认取末尾，有游标时取该 key 的下标
+	// 预计算每条 item 的 seq 区间（无 seq 的条目返回 ok=false，向前继承）
+	type span struct {
+		first, last uint64
+		valid       bool
+	}
+	spans := make([]span, total)
+	var carried uint64
+	for index := 0; index < total; index++ {
+		first, last, ok := itemSeqRange(raw[index])
+		if !ok {
+			// 没有 seq 的条目（例如还没落盘的回合结束行）沿用前一条的下界，
+			// 避免它变成一个"永远切不开"的孤岛
+			spans[index] = span{first: carried, last: carried, valid: carried > 0}
+			continue
+		}
+		spans[index] = span{first: first, last: last, valid: true}
+		carried = last
+	}
+
+	// 定位这一页的结束下标：默认末尾；有游标时取"最后一个 last < beforeSeq"的下一位置
 	end := total
-	found := beforeKey == ""
-	if beforeKey != "" {
-		for index, item := range view.Items {
-			if item.Key == beforeKey {
-				end = index
-				found = true
-				break
+	if beforeSeq > 0 {
+		end = 0
+		for index := 0; index < total; index++ {
+			if spans[index].valid && spans[index].last < beforeSeq {
+				end = index + 1
 			}
 		}
+		if end == 0 {
+			// 游标之前没有任何条目：已经到最早了
+			return encode(map[string]any{
+				"session_id": view.SessionID,
+				"items":      []ItemView{},
+				"has_more":   false,
+				"seq_from":   beforeSeq,
+				"seq_to":     beforeSeq,
+			})
+		}
 	}
-	if !found {
-		// 游标对不上（该 item 已不在当前 timeline 里，例如会话被压缩/重建）。
-		// **不能静默返回最后一页**：那样客户端会以为翻页成功、拿到重复内容，
-		// 游标原地打转，表现为"滚到某处就再也不加载了"。
-		return encode(map[string]any{
-			"session_id": view.SessionID,
-			"items":      []ItemView{},
-			"has_more":   false,
-			"error":      "游标已失效（会话内容已变化）",
-		})
-	}
+
+	// 从 end 往前数 limit 条，但**不切在一条消息中间**
 	start := end - limit
 	if start < 0 {
 		start = 0
+	}
+	if start > 0 {
+		// 若 start 落在某条消息的区间内部，往前退到它之前
+		for start > 0 && spans[start].valid && spans[start].first == spans[start-1].last {
+			start--
+		}
 	}
 
 	page := map[string]any{
@@ -415,11 +493,14 @@ func (c *Client) TimelinePageJSON(sessionID, beforeKey string, limit int) string
 		"items":      view.Items[start:end],
 		"has_more":   start > 0,
 	}
-	if start < total {
-		page["first_key"] = view.Items[start].Key
+	if start < total && spans[start].valid {
+		page["seq_from"] = spans[start].first
+	}
+	if end > 0 && spans[end-1].valid {
+		page["seq_to"] = spans[end-1].last
 	}
 	// 当前状态只跟最后一页走：翻历史页时不能用旧状态覆盖界面
-	if beforeKey == "" {
+	if beforeSeq == 0 {
 		page["title"] = view.Title
 		page["runtime"] = view.Runtime
 		page["todos"] = view.Todos

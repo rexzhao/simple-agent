@@ -13,17 +13,18 @@ import (
 	"simple-agent/mobile/bridge"
 )
 
-// pageView 是 TimelinePageJSON 的测试镜像。
+// pageView 是 TimelinePageJSON 的测试镜像（seq 游标版）。
 type pageView struct {
 	SessionID string              `json:"session_id"`
 	Items     []bridge.ItemView   `json:"items"`
 	HasMore   bool                `json:"has_more"`
-	FirstKey  string              `json:"first_key"`
+	SeqFrom   uint64              `json:"seq_from"`
+	SeqTo     uint64              `json:"seq_to"`
 	Runtime   *bridge.RuntimeView `json:"runtime"`
 }
 
-// 分页：最后一页只给尾部，且能靠 first_key 一路往前翻，不重不漏。
-func TestTimelinePaging(t *testing.T) {
+// 分页按 seq 切：最后一页给尾部，靠 seq_from 一路往前翻，不重不漏。
+func TestTimelinePagingBySeq(t *testing.T) {
 	if testing.Short() {
 		t.Skip("需要真实会话文件")
 	}
@@ -62,7 +63,6 @@ func TestTimelinePaging(t *testing.T) {
 	}
 	target := sessions[0].ID
 
-	// 接展示端，等同步完成
 	poster := &serialPoster{}
 	viewerConn, execConn := wire.PipePair()
 	go func() { _ = host.Serve(execConn, local, poster.post) }()
@@ -89,63 +89,67 @@ func TestTimelinePaging(t *testing.T) {
 		t.Skipf("样本太短（%d 条），不足以验证分页", len(full.Items))
 	}
 
-	// 第一页：最后 40 条
+	// 第一页
 	const limit = 40
-	firstPageJSON := client.TimelinePageJSON(target, "", limit)
+	firstJSON := client.TimelinePageJSON(target, 0, limit)
 	var page1 pageView
-	if err := json.Unmarshal([]byte(firstPageJSON), &page1); err != nil {
+	if err := json.Unmarshal([]byte(firstJSON), &page1); err != nil {
 		t.Fatalf("第一页解析失败：%v", err)
 	}
-	t.Logf("完整：%d KB / %d items；第一页：%d KB / %d items",
-		len(fullJSON)/1024, len(full.Items), len(firstPageJSON)/1024, len(page1.Items))
+	t.Logf("完整：%d KB / %d items；第一页：%d KB / %d items（seq %d..%d）",
+		len(fullJSON)/1024, len(full.Items), len(firstJSON)/1024,
+		len(page1.Items), page1.SeqFrom, page1.SeqTo)
 
-	if len(page1.Items) != limit {
-		t.Fatalf("第一页应有 %d 条，实际 %d", limit, len(page1.Items))
+	if len(page1.Items) == 0 {
+		t.Fatal("第一页不该为空")
 	}
 	if !page1.HasMore {
-		t.Fatal("第一页之后还有内容，has_more 应为 true")
+		t.Fatal("还有更早内容，has_more 应为 true")
 	}
 	if page1.Runtime == nil {
 		t.Fatal("第一页必须带 runtime（当前状态）")
 	}
-	// 第一页必须是**最后** limit 条
-	for i := 0; i < limit; i++ {
-		want := full.Items[len(full.Items)-limit+i].Key
-		if page1.Items[i].Key != want {
-			t.Fatalf("第一页第 %d 条 key 不符：期望 %s 实际 %s", i, want, page1.Items[i].Key)
-		}
+	// 第一页必须是最后若干条
+	if got := page1.Items[len(page1.Items)-1].Key; got != full.Items[len(full.Items)-1].Key {
+		t.Fatalf("第一页末条应为整个时间线末条，期望 %s 实际 %s",
+			full.Items[len(full.Items)-1].Key, got)
 	}
 
-	// 第二页：靠 first_key 往前翻，必须接上
-	secondPageJSON := client.TimelinePageJSON(target, page1.FirstKey, limit)
+	// 第二页：用 seq_from 往前翻
+	secondJSON := client.TimelinePageJSON(target, page1.SeqFrom, limit)
 	var page2 pageView
-	if err := json.Unmarshal([]byte(secondPageJSON), &page2); err != nil {
+	if err := json.Unmarshal([]byte(secondJSON), &page2); err != nil {
 		t.Fatalf("第二页解析失败：%v", err)
 	}
-	if len(page2.Items) != limit {
-		t.Fatalf("第二页应有 %d 条，实际 %d", limit, len(page2.Items))
+	if len(page2.Items) == 0 {
+		t.Fatal("第二页不该为空（还有更早内容）")
 	}
 	if page2.Runtime != nil {
 		t.Fatal("历史页不该带 runtime（会覆盖当前状态）")
 	}
-	// 第二页的最后一条必须紧邻第一页第一条（下标 len-limit 的前一条）
-	firstOfPage1 := full.Items[len(full.Items)-limit].Key
-	wantLastOfPage2 := full.Items[len(full.Items)-limit-1].Key
-	if got := page2.Items[len(page2.Items)-1].Key; got != wantLastOfPage2 {
-		t.Fatalf("第二页末尾应紧邻第一页开头：期望 %s 实际 %s", wantLastOfPage2, got)
+	if page2.SeqTo >= page1.SeqFrom+1 {
+		t.Fatalf("第二页的 seq_to（%d）应小于第一页的 seq_from（%d），否则会重复",
+			page2.SeqTo, page1.SeqFrom)
 	}
-	if firstOfPage1 == "" {
-		t.Fatal("first_key 不该为空")
+	// 两页内容不能重叠
+	firstKeys := map[string]bool{}
+	for _, item := range page1.Items {
+		firstKeys[item.Key] = true
+	}
+	for _, item := range page2.Items {
+		if firstKeys[item.Key] {
+			t.Fatalf("第二页与第一页出现重复条目：%s", item.Key)
+		}
 	}
 
-	// 一路翻到最早：累计条数必须等于总数，且无重复
+	// 一路翻到最早：累计条数等于总数、无重复
 	seen := map[string]bool{}
 	for _, item := range page1.Items {
 		seen[item.Key] = true
 	}
-	cursor := page1.FirstKey
+	cursor := page1.SeqFrom
 	pages := 1
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 200; i++ {
 		body := client.TimelinePageJSON(target, cursor, limit)
 		var page pageView
 		if err := json.Unmarshal([]byte(body), &page); err != nil {
@@ -158,13 +162,14 @@ func TestTimelinePaging(t *testing.T) {
 			}
 			seen[item.Key] = true
 		}
-		if !page.HasMore || len(page.Items) == 0 {
+		if !page.HasMore || len(page.Items) == 0 || page.SeqFrom >= cursor {
 			break
 		}
-		cursor = page.FirstKey
+		cursor = page.SeqFrom
 	}
 	if len(seen) != len(full.Items) {
-		t.Fatalf("翻完所有页应覆盖 %d 条，实际 %d 条（共 %d 页）", len(full.Items), len(seen), pages)
+		t.Fatalf("翻完所有页应覆盖 %d 条，实际 %d 条（共 %d 页）",
+			len(full.Items), len(seen), pages)
 	}
 	t.Logf("共 %d 页，覆盖全部 %d 条，无重复", pages, len(seen))
 }

@@ -253,6 +253,8 @@ func (st *replayState) apply(event store.Event) {
 		if !event.At.IsZero() {
 			added.CreatedAt = event.At
 		}
+		// 记录 seq 区间：分页游标用它（日志不可变，seq 稳定）
+		added.SetSeqRange(event.Seq, event.Seq)
 		st.appendedAt[data.Message.MessageID] = event.At
 
 	case store.TypeMessageOutput:
@@ -273,11 +275,15 @@ func (st *replayState) apply(event store.Event) {
 			if !event.At.IsZero() {
 				entry.SetFinishedAt(event.At)
 			}
+			entry.SetSeqRange(event.Seq, event.Seq)
 		} else if added, err := conv.AddMessage(data.Message, data.Status); err != nil {
 			out.Warnings = append(out.Warnings, err.Error())
-		} else if !event.At.IsZero() {
-			added.CreatedAt = event.At
-			added.SetFinishedAt(event.At)
+		} else {
+			if !event.At.IsZero() {
+				added.CreatedAt = event.At
+				added.SetFinishedAt(event.At)
+			}
+			added.SetSeqRange(event.Seq, event.Seq)
 		}
 		st.countMessage(data.Message.MessageID, data.Message.Role)
 		st.appendedAt[data.Message.MessageID] = event.At
@@ -299,7 +305,7 @@ func (st *replayState) apply(event store.Event) {
 			out.Warnings = append(out.Warnings, err.Error())
 			return
 		}
-		st.applyToolResult(data)
+		st.applyToolResult(data, event.Seq)
 
 	case store.TypeAskAnswered:
 		var data AskAnsweredData
@@ -421,7 +427,7 @@ func applyStatus(conv *conversation.Conversation, data MessageStatusData, out *R
 // (round, turn) 只作为"日志里已经有了明确标注"时的快速路径——
 // 不能用它作为唯一依据，因为工具执行是异步的，写结果时 driver 的当前
 // round/turn 可能已经变了（续轮、重置）。
-func (st *replayState) applyToolResult(data ToolResultData) {
+func (st *replayState) applyToolResult(data ToolResultData, seq uint64) {
 	messageID := st.findMessageByCallID(data.CallID)
 	if messageID == "" {
 		// 兜底：按 (round, turn) 找（call_id 缺失或 tool_use 已被压缩掉）
@@ -464,6 +470,8 @@ func (st *replayState) applyToolResult(data ToolResultData) {
 		Content:   message.DataPart{Data: fields},
 		MediaType: render.MediaToolResult,
 	})
+	// 工具结果也属于这条消息：扩展它的 seq 区间（分页时整条消息不能被切开）
+	entry.SetSeqRange(seq, seq)
 }
 
 // findMessageByCallID 在所有消息里找带指定 tool_use 的那一条（兜底用）。

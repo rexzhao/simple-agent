@@ -19,9 +19,18 @@ import (
 
 // buildTimeline 生成一个会话的完整可渲染内容。
 func (c *Client) buildTimeline(sessionID string) TimelineView {
+	view, _ := c.buildTimelineWithRaw(sessionID)
+	return view
+}
+
+// buildTimelineWithRaw 同时返回渲染视图与**原始条目**。
+//
+// 分页需要原始条目上的 seq 区间（渲染后的 ItemView 不含 seq），
+// 所以两者一起返回，避免调用方重复 Build 一次。
+func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timeline.Item) {
 	session := c.currentSession(sessionID)
 	if session == nil {
-		return TimelineView{SessionID: sessionID}
+		return TimelineView{SessionID: sessionID}, nil
 	}
 	conv := session.Conversation()
 	idle := session.Busy() == driver.BusyIdle
@@ -36,10 +45,11 @@ func (c *Client) buildTimeline(sessionID string) TimelineView {
 	}
 	view.Asks = c.asksOf(session)
 
-	for _, item := range timeline.Build(conv.Entries(), idle) {
+	raw := timeline.Build(conv.Entries(), idle)
+	for _, item := range raw {
 		view.Items = append(view.Items, c.itemView(item, conv, idle))
 	}
-	return view
+	return view, raw
 }
 
 // asksOf 把一个会话的待回答提问转成视图（含选中态）。

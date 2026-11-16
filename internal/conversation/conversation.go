@@ -83,13 +83,41 @@ type ChatEntry struct {
 	failureReason string
 	// finishedAt 是这条消息**完成**的时间（finalize/cancel/fail 时打点）。
 	// 回合耗时 = 最后一条消息的 finishedAt − 回合前那条 user 消息的 CreatedAt，
-	// 所以内存与重放（用 message.finalized 事件的 at）走同一套计算。
+	// 所以内存与重放（用 message.output 事件的 at）走同一套计算。
 	finishedAt time.Time
 	// tokens 是这条消息的输出 token 数（重放时为 0：事件里没有 usage）。
 	tokens int
 	// streamingPart 是流式增量合并的目标 part 下标；-1 表示应新建。
 	streamingPart int
+	// firstSeq / lastSeq 是这条消息在日志里覆盖的事件序号区间。
+	//
+	// 分页游标用它：日志一旦写入就不可变，seq 也因此稳定。
+	// 全 0 表示"还没有 seq"（内存里新建、尚未落盘）。
+	//
+	// 为什么是区间：一条消息横跨多个事件（input/output 本身 + 后续的 tool.result），
+	// 只记一个值无法表达"这条消息完整覆盖了哪段日志"。
+	firstSeq uint64
+	lastSeq  uint64
 }
+
+// SeqRange 返回这条消息覆盖的事件序号区间（全 0 表示未知）。
+func (e *ChatEntry) SeqRange() (first, last uint64) { return e.firstSeq, e.lastSeq }
+
+// SetSeqRange 记录这条消息覆盖的序号区间。
+//
+// 重放时由事件序号填入；实时路径要等事件真正落盘后才知道 seq，
+// 所以由 store 回填（见 driver 的 apply）。
+func (e *ChatEntry) SetSeqRange(first, last uint64) {
+	if first != 0 && (e.firstSeq == 0 || first < e.firstSeq) {
+		e.firstSeq = first
+	}
+	if last > e.lastSeq {
+		e.lastSeq = last
+	}
+}
+
+// LastSeq 返回这条消息覆盖的最大序号（0 表示未知）。
+func (e *ChatEntry) LastSeq() uint64 { return e.lastSeq }
 
 // FinishedAt 返回这条消息完成的时间（零值表示未知）。
 func (e *ChatEntry) FinishedAt() time.Time { return e.finishedAt }
