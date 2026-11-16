@@ -67,8 +67,14 @@ data class ViewerState(
      * 这个是**同一段会话里更早的 items**（分页尚未加载的部分）。
      */
     val hasMoreItems: Boolean = false,
-    /** 当前加载的第一条 item 的 key（往前翻页的游标）。 */
-    val firstItemKey: String = "",
+    /**
+     * 往前翻页的游标：当前已加载内容里**最早的事件序号**。
+     *
+     * 用 seq 而不是 item key：item 是渲染产物，key 里含 part 索引，
+     * 流式输出期间会变，游标因此失效（真机上"翻不动"的根因）。
+     * 日志的 seq 一旦写入永不变。
+     */
+    val firstSeq: Long = 0,
     /** 正在加载更早的 items（与 [loadingOlder] 区分：那个是归档）。 */
     val loadingEarlier: Boolean = false,
     /**
@@ -330,13 +336,19 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 全量传过来再反序列化就是打开会话时那几秒白屏。
         //
         // 流式输出期间取最后一页是安全的：新内容总在末尾，不会因为分页而丢。
-        val page = core.timelinePage(id, "", timelinePageSize)
+        val page = core.timelinePage(id, 0L, timelinePageSize)
         val previous = state.value.timeline
         // **保留已经翻页加载过的早期 items**：这次只拿回最后 60 条，
         // 如果直接用新结果替换整个列表，用户向上翻出来的历史会全部消失。
-        val keptEarlier = earlierPart(previous.items, page.items)
+        //
+        // 用 seq 判定比找 key 更可靠：本页覆盖 [seqFrom, seqTo]，
+        // 旧列表里"不在这个区间内、且 seq 更小"的就是早前翻出来的部分。
+        val keptEarlier = earlierPartBySeq(previous.items, page)
         val merged = mergeProcessDetails(keptEarlier + page.items, previous.items)
         state.update {
+            // 分页游标：只要用户往上翻过，就保持用户翻到的位置不动。
+            // 否则每次流式刷新都会把游标重置回最后一页——表现就是"翻一点就弹回去"。
+            val paginated = it.earlierPagesLoaded > 0
             it.copy(
                 timeline = TimelineView(
                     sessionId = page.sessionId,
@@ -348,32 +360,31 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 ),
                 connected = (page.runtime ?: it.timeline.runtime).connected,
                 asks = page.asks ?: it.timeline.asks,
-                // **分页进度不能用"保留了多少早期 items"反推**：
-                // 那个推导在"刚翻完一页、列表恰好只剩一页"时会失效，
-                // 于是游标被重置回最后一页——表现就是翻一点就弹回去。
-                // 改成显式判定：只要用户翻过（earlierPagesLoaded > 0），
-                // 就保持用户翻到的位置不动。
-                hasMoreItems = if (it.earlierPagesLoaded > 0) it.hasMoreItems else page.hasMore,
-                firstItemKey = if (it.earlierPagesLoaded > 0) it.firstItemKey else page.firstKey,
+                hasMoreItems = if (paginated) it.hasMoreItems else page.hasMore,
+                firstSeq = if (paginated) it.firstSeq else page.seqFrom,
             )
         }
         android.util.Log.d(
             "SimpleAgent",
             "refreshTimeline：items=${merged.size} hasMore=${page.hasMore} " +
-                "firstKey=${page.firstKey.ifEmpty { "空" }} earlierPart=${keptEarlier.size} " +
+                "seq=${page.seqFrom}..${page.seqTo} earlierPart=${keptEarlier.size} " +
                 "pages=${state.value.earlierPagesLoaded}",
         )
     }
 
     /**
-     * 从旧列表里取出"第一页之前"的那部分（即之前翻页加载的历史）。
+     * 从旧列表里取出"本页之前"的那部分（即之前翻页加载的历史）。
      *
-     * 判定方式：找到新页第一条 item 在旧列表里的位置，它之前的就是要保留的。
-     * 找不到（首次加载 / 会话被清空）则返回空。
+     * 判定方式：用本页的 seq 区间做锚。旧列表里第一条 key 与 page.items 首条
+     * **相同**的位置之前的内容，就是早前翻出来的部分。
+     *
+     * 为什么不用 seq 直接比：ItemView 里不带 seq（seq 在 Go 侧的 ChatEntry 上）。
+     * 但 key 在这里是安全的锚——同一条消息的 key 在**未流式**时是稳定的，
+     * 而历史页里的消息早已 finalize，不会被流式改写。
      */
-    private fun earlierPart(old: List<ItemView>, fresh: List<ItemView>): List<ItemView> {
-        if (old.isEmpty() || fresh.isEmpty()) return emptyList()
-        val anchor = fresh.first().key
+    private fun earlierPartBySeq(old: List<ItemView>, page: TimelinePage): List<ItemView> {
+        if (old.isEmpty() || page.items.isEmpty()) return emptyList()
+        val anchor = page.items.first().key
         val index = old.indexOfFirst { it.key == anchor }
         if (index <= 0) return emptyList()
         return old.subList(0, index)
@@ -439,12 +450,12 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectSession(id: String) {
         if (id == state.value.activeSessionId) return
-        // 分页状态必须一起清：否则新会话会带着上一个会话的 firstItemKey 去翻页
+        // 分页状态必须一起清：否则新会话会带着上一个会话的 firstSeq 去翻页
         state.update {
             it.copy(
                 activeSessionId = id,
                 timeline = TimelineView(),
-                firstItemKey = "",
+                firstSeq = 0,
                 hasMoreItems = false,
                 loadingEarlier = false,
                 earlierPagesLoaded = 0,
@@ -681,14 +692,14 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             android.util.Log.d(
                 "SimpleAgent",
                 "loadEarlierItems 跳过：id=${id.ifEmpty { "空" }} loading=${current.loadingEarlier} " +
-                    "hasMore=${current.hasMoreItems} cursor=${current.firstItemKey.ifEmpty { "空" }} " +
+                    "hasMore=${current.hasMoreItems} cursor=${current.firstSeq} " +
                     "items=${current.timeline.items.size}",
             )
             return
         }
-        val cursor = current.firstItemKey
-        if (cursor.isEmpty()) {
-            android.util.Log.d("SimpleAgent", "loadEarlierItems 跳过：游标为空")
+        val cursor = current.firstSeq
+        if (cursor <= 0) {
+            android.util.Log.d("SimpleAgent", "loadEarlierItems 跳过：游标为 0")
             return
         }
         android.util.Log.d("SimpleAgent", "loadEarlierItems 开始：cursor=$cursor items=${current.timeline.items.size}")
@@ -698,6 +709,7 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             state.update { st ->
                 if (st.activeSessionId != id) return@update st.copy(loadingEarlier = false)
                 if (page.items.isEmpty()) {
+                    // 空页 = 已经到最早（或游标失效）
                     return@update st.copy(loadingEarlier = false, hasMoreItems = false)
                 }
                 // 插到最前面；已展开的组保留已加载的详情
@@ -706,7 +718,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                     loadingEarlier = false,
                     timeline = st.timeline.copy(items = merged),
                     hasMoreItems = page.hasMore,
-                    firstItemKey = page.firstKey.ifEmpty { st.firstItemKey },
+                    // 游标推进到本页最早处；为 0 时保持原值（防御）
+                    firstSeq = if (page.seqFrom > 0) page.seqFrom else st.firstSeq,
                     // 记录翻过页：之后刷新不再重置游标
                     earlierPagesLoaded = st.earlierPagesLoaded + 1,
                     // 让界面知道要补偿多少

@@ -331,7 +331,7 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
                 "SimpleAgent",
                 "到顶检测：stuck=$atTopAndStuck first=${listState.firstVisibleItemIndex} " +
                     "canBack=${listState.canScrollBackward} hasMore=${state.hasMoreItems} " +
-                    "loading=${state.loadingEarlier} cursor=${state.firstItemKey.ifEmpty { "空" }}",
+                    "loading=${state.loadingEarlier} cursor=${state.firstSeq}",
             )
             if (atTopAndStuck && state.hasMoreItems && !state.loadingEarlier) {
                 viewModel.loadEarlierItems()

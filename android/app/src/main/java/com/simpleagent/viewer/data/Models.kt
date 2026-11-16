@@ -141,11 +141,14 @@ data class TimelinePage(
     @SerialName("session_id") val sessionId: String = "",
     val items: List<ItemView> = emptyList(),
     @SerialName("has_more") val hasMore: Boolean = false,
-    @SerialName("first_key") val firstKey: String = "",
+    /** 本页覆盖的事件序号区间；翻更早的页时用它当游标。 */
+    @SerialName("seq_from") val seqFrom: Long = 0,
+    @SerialName("seq_to") val seqTo: Long = 0,
     val title: String? = null,
     val runtime: RuntimeView? = null,
     val todos: List<TodoView>? = null,
     val asks: List<AskView>? = null,
+    val error: String = "",
 )
 
 @Serializable

@@ -96,8 +96,17 @@ class CoreClient private constructor(
      * 首屏用它只拿最后几十条——完整 timeline 在长会话里是几百 KB，
      * 全量传过来再反序列化就是打开会话时那几秒白屏。
      */
-    fun timelinePage(sessionId: String, beforeKey: String, limit: Int): TimelinePage =
-        decode(client.timelinePageJSON(sessionId, beforeKey, limit.toLong()), TimelinePage())
+    /**
+     * 取一页时间线（**按事件 seq 分页**）。
+     *
+     * beforeSeq = 0 表示"最后一页"；否则返回 seq 小于它的那一页。
+     *
+     * 为什么用 seq 而不是 item key：item 是渲染产物，key 里含 part 索引，
+     * 流式输出期间会变（proc:xxx#1 ↔ xxx#0），游标因此失效——真机上表现为
+     * "翻到某处就再也翻不动"。日志的 seq 一旦写入永不变。
+     */
+    fun timelinePage(sessionId: String, beforeSeq: Long, limit: Int): TimelinePage =
+        decode(client.timelinePageJSON(sessionId, beforeSeq, limit.toLong()), TimelinePage())
 
     /** 取一个过程组的完整步骤（用户展开时调；折叠时 Go 侧不传 Steps）。 */
     fun processDetail(sessionId: String, key: String): List<ProcessStep> {
