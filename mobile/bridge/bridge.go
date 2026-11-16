@@ -529,14 +529,18 @@ func (c *Client) ProcessDetailJSON(sessionID, key string) string {
 		return encode(map[string]any{"error": "会话不存在"})
 	}
 	conv := session.Conversation()
-	idle := session.Busy() == driver.BusyIdle
+	busy := session.Busy()
+	idle := busy == driver.BusyIdle
 	for _, item := range timeline.Build(conv.Entries(), idle) {
 		if item.Key != key || item.Kind != timeline.KindProcess {
 			continue
 		}
 		return encode(map[string]any{
-			"key":   key,
-			"steps": c.processSteps(item, !idle),
+			"key": key,
+			// streaming 传 item.Live（这一组自己是否还在流式），
+			// idle/busy 给 processSteps 判断"还没结果的工具是不是还在跑"。
+			// 以前这里传 !idle（会话级），会让历史组也当成在流式。
+			"steps": c.processSteps(item, item.Live, idle, busy),
 		})
 	}
 	return encode(map[string]any{"error": "过程组不存在（可能已被新内容顶掉）"})

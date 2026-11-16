@@ -34,7 +34,8 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 		return TimelineView{SessionID: sessionID}, nil
 	}
 	conv := session.Conversation()
-	idle := session.Busy() == driver.BusyIdle
+	busy := session.Busy()
+	idle := busy == driver.BusyIdle
 
 	// **缓存**：流式输出时每 60ms 就会重建一次，但很多次 entries 根本没变
 	// （同一条消息内部的 part 在长，条数不变）。
@@ -61,7 +62,7 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 
 	raw := timeline.Build(conv.Entries(), idle)
 	for _, item := range raw {
-		view.Items = append(view.Items, c.itemView(item, conv, idle))
+		view.Items = append(view.Items, c.itemView(item, conv, idle, busy))
 	}
 
 	c.mu.Lock()
@@ -216,7 +217,10 @@ func selectedOf(group *driver.AskGroup, questionIndex int) []int {
 }
 
 // itemView 把一条时间线条目转成视图。
-func (c *Client) itemView(item timeline.Item, conv *conversation.Conversation, idle bool) ItemView {
+//
+// idle / busy 描述的是**整个会话**此刻的状态，用于判断"某个还没结果的工具
+// 调用是不是真的还在跑"（见 processSteps 的 pending 判定）。
+func (c *Client) itemView(item timeline.Item, conv *conversation.Conversation, idle bool, busy driver.Busy) ItemView {
 	view := ItemView{Key: item.Key}
 	switch item.Kind {
 	case timeline.KindNotice:
@@ -234,7 +238,7 @@ func (c *Client) itemView(item timeline.Item, conv *conversation.Conversation, i
 		// 起来，几百轮之前的历史工具组全都跟着转圈。是否"活着"是每一组
 		// 自己的属性，由 timeline.Build 算好放在 item.Live 里。
 		live := item.Live
-		view.Process = c.processView(item, live, live)
+		view.Process = c.processView(item, live, live, idle, busy)
 	case timeline.KindRoundFooter:
 		view.Kind = "footer"
 		view.Footer = footerOf(item)
@@ -339,16 +343,38 @@ func (c *Client) partView(part message.Part) (PartView, bool) {
 // 过程组的 Steps 里装着思考全文 + 工具参数/输出全文，一屏十几个组就是上 MB
 // （实测长会话 1690KB JSON 里绝大部分在这），而它们默认是折叠的。
 // 用户点开时再由 ProcessDetailJSON 单独取这一个组。
-func (c *Client) processView(item timeline.Item, streaming, withDetail bool) *ProcessView {
+//
+// streaming 是**这一组自己的**进行状态（item.Live）；idle/busy 是会话的，
+// 用来判断某个还没结果的工具调用是不是真的还在跑。
+func (c *Client) processView(item timeline.Item, streaming, withDetail, idle bool, busy driver.Busy) *ProcessView {
+	steps := c.processSteps(item, streaming, idle, busy)
+
+	// 组标题上的转圈：只要这一组里有"还在等结果"的调用就该转，
+	// 不只是"消息还在流式"。
+	//
+	// 工具执行期间消息已 complete（item.Live=false），但工具确实在跑；
+	// 这时标题行如果不转，用户会以为整个回合卡死了。
+	active := streaming
+	if !active {
+		for _, step := range steps {
+			if step.Pending {
+				active = true
+				break
+			}
+		}
+	}
+
 	view := &ProcessView{
 		Key:       item.Key,
 		Title:     timeline.GroupTitle(item.Refs, streaming, c.lang),
 		Activity:  activityName(timeline.GroupActivity(item.Refs, streaming)),
-		Streaming: streaming,
+		Streaming: active,
 	}
-	steps := c.processSteps(item, streaming)
 	view.StepCount = len(steps)
-	if withDetail {
+	// 带详情（Steps）的条件跟 Streaming 一致，不用传进来的 streaming：
+	// 正在等工具结果的组也必须带 Steps，否则 Kotlin 侧看到
+	// `process.streaming == true` 就跳过拉详情，展开后一片空白。
+	if withDetail || active {
 		view.Steps = steps
 		view.Detail = true
 	}
@@ -356,7 +382,11 @@ func (c *Client) processView(item timeline.Item, streaming, withDetail bool) *Pr
 }
 
 // processSteps 把过程组的 refs 展开成步骤列表（含思考与工具卡片）。
-func (c *Client) processSteps(item timeline.Item, streaming bool) []ProcessStep {
+//
+// streaming 表示这一组还在流式（item.Live）；idle/busy 是会话状态。
+// 二者要分开：工具执行期间模型已经把 message 标成 complete，
+// 所以 item.Live 会是 false，但工具**确实还在跑**——这时仍要显示"等待结果"。
+func (c *Client) processSteps(item timeline.Item, streaming, idle bool, busy driver.Busy) []ProcessStep {
 	var steps []ProcessStep
 	// 工具结果按 id 索引，便于把 use/result 合成一张卡片
 	results := map[string]timeline.Ref{}
@@ -395,12 +425,18 @@ func (c *Client) processSteps(item timeline.Item, streaming bool) []ProcessStep 
 			if result, ok := results[id]; ok {
 				seen[id] = true
 				applyToolResult(&step, result.Part())
-			} else if streaming {
-				// 组还活着但还没有结果：确实在等工具返回。
+			} else if streaming || busy == driver.BusyRunningTools {
+				// 这个调用还没有结果，而且**确实可能还在跑**。
 				//
-				// 这里原先写的是 `!streaming`（反的）：组还在进行时反而不标
-				// Pending（界面显示"运行中"），组已经结束却标成"等待结果"。
-				// 两种情况都不对。已结束且没有结果的，属于数据异常
+				// 两种"还在跑"的情形：
+				//   streaming —— 这一组还在流式，结果随时可能来；
+				//   BusyRunningTools —— 模型已经输出完（message 是 complete，
+				//     所以 item.Live 为 false），但工具正在执行。
+				//
+				// 第二种最容易漏：工具执行期间消息状态已经是 complete，
+				// 只看 streaming 会让"等待结果"不显示，用户以为卡住了。
+				//
+				// 会话完全空闲（idle）时还没结果的，属于数据异常
 				// （例如崩溃恢复没补上 tool.result），不该谎称还在等。
 				step.Pending = true
 			}
