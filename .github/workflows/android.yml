@@ -91,6 +91,43 @@ jobs:
           # 在 CI 的干净环境里总报 "binary is out of date"（无害但误导）。
           # 真正能证明装对了的是下面的实际 bind。
 
+      # ---- 版本号 ----
+      # 从 tag 推导版本号，让"装的是什么版本"在手机上能看出来。
+      #
+      # 之前 build.gradle.kts 里写死 versionCode=1 / versionName=0.1.0，
+      # 结果 v0.1.1 ~ v0.1.5 全是一个版本，装上后分不清装的是哪个包。
+      #
+      # versionCode 必须是单调整数（Android 靠它判断"能不能覆盖安装"），
+      # 所以把 semver 编码成 major*1e6 + minor*1e4 + patch*1e2，留出两位
+      # 给未来的 pre-release 计数。
+      - name: 从 tag 推导版本号
+        run: |
+          # tag 触发时 github.ref 是 refs/tags/v0.1.5；手动触发时是分支名
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            echo "::warning::不是 tag 触发，版本号用 commit 短 sha（$GITHUB_SHA）"
+            TAG=""
+          fi
+
+          if [[ "$TAG" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            MAJOR=${BASH_REMATCH[1]}
+            MINOR=${BASH_REMATCH[2]}
+            PATCH=${BASH_REMATCH[3]}
+            CODE=$((MAJOR * 1000000 + MINOR * 10000 + PATCH * 100))
+            NAME="$MAJOR.$MINOR.$PATCH"
+          else
+            # 没有规范 tag：退化成 0.0.0 + commit 短 sha。
+            # versionCode 用 run number，保证同仓库内单调递增。
+            NAME="0.0.0-${GITHUB_SHA:0:7}"
+            CODE=$((GITHUB_RUN_NUMBER))
+            echo "::warning::tag 不是 vX.Y.Z 形式（'$TAG'），版本号降级为 $NAME"
+          fi
+
+          echo "版本名：$NAME / 版本码：$CODE"
+          echo "SIMPLE_AGENT_VERSION_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "SIMPLE_AGENT_VERSION_CODE=$CODE" >> "$GITHUB_ENV"
+
       # ---- 签名 ----
       # 用固定 keystore 签名，否则覆盖安装会报
       # INSTALL_FAILED_UPDATE_INCOMPATIBLE。
@@ -177,15 +214,25 @@ jobs:
       - name: 汇总
         run: |
           APK=build/app-debug.apk
+          # 从产物里读出真实版本号，确认版本号确实写进去了
+          AAPT2=$(find "$ANDROID_SDK_ROOT/build-tools" -name aapt2 -type f | sort -V | tail -1)
+          VERSION=$("$AAPT2" dump badging "$APK" 2>/dev/null \
+            | grep -o "versionName='[^']*'" | head -1 || true)
           echo "### Android 构建成功" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 版本：${SIMPLE_AGENT_VERSION_NAME:-?}（versionCode ${SIMPLE_AGENT_VERSION_CODE:-?}）" >> "$GITHUB_STEP_SUMMARY"
           echo "- APK 大小：$(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
           echo "- commit：\`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- 16 KB 对齐：通过" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 签名：与 mini 一致" >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "APK 内实际版本：$VERSION"
+          echo "（应为 versionName='${SIMPLE_AGENT_VERSION_NAME}' - 不一致说明环境变量没传进 Gradle）"
 
       - uses: actions/upload-artifact@v5
         with:
-          name: app-debug-${{ github.sha }}
+          # 名字里带版本号：下载列表里一眼能认出是哪个版本
+          name: simple-agent-${{ env.SIMPLE_AGENT_VERSION_NAME }}-${{ github.sha }}
           path: build/app-debug.apk
           if-no-files-found: error
           # debug 包带调试符号，体积偏大；保留 14 天够用

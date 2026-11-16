@@ -8,13 +8,26 @@ plugins {
 android {
     namespace = "com.simpleagent.viewer"
     compileSdk = 35
+
+    // 版本号：默认取下面的固定值，但允许用环境变量覆盖（CI 从 tag 推导）。
+    //
+    // 为什么不用 "读 git describe" 之类：构建产物要可复现，而"当前仓库里有
+    // 哪些 tag"在干净 clone 里可能不同（浅克隆、没有 tag）。环境变量是显式的，
+    // 谁传的、传了什么，在 CI 日志里一眼能看到。
+    //
+    // 版本号写死的后果是：v0.1.1 到 v0.1.5 装到手机上全都显示同一个版本，
+    // 分不清装的是哪个包 —— 所以要让 tag 说了算。
+    val envVersionName = System.getenv("SIMPLE_AGENT_VERSION_NAME")
+    val envVersionCode = System.getenv("SIMPLE_AGENT_VERSION_CODE")?.toIntOrNull()
+
     defaultConfig {
         applicationId = "com.simpleagent.viewer"
         // Android 8.0：gomobile 的 AAR 用 JNI，24 是它的默认下限
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        // 本地直接构建（没有环境变量）时用这组默认值。
+        versionCode = envVersionCode ?: 1
+        versionName = envVersionName ?: "0.1.0"
     }
 
     buildFeatures {
