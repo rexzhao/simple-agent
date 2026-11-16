@@ -43,6 +43,16 @@ const (
 	// 还挂着旧的一份——重放必须能重建出同样的清单。语义是**整体替换**
 	// （last-write-wins），不是增量。
 	TypeTodoWrite = "todo.write"
+	// 以下四个是"边界事件"：显式标记 Round / Turn 的开始与结束。
+	//
+	// 为什么显式记录：崩溃恢复要判定"哪些 Turn 没走完"，没有 turn.finished
+	// 的一律视为崩溃。靠"有没有 output"推导会误判自动续轮的 Turn（它没有 input）。
+	//
+	// 详见 docs/session-log-model.md §2.2。
+	TypeRoundStarted  = "round.started"
+	TypeRoundFinished = "round.finished"
+	TypeTurnStarted   = "turn.started"
+	TypeTurnFinished  = "turn.finished"
 )
 
 // SessionCreatedData 与 SessionRenamedData 由 catalog 读取（driver 那边也有同名类型，

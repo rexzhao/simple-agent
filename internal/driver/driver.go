@@ -124,9 +124,21 @@ type toolBuffer struct {
 	order int
 }
 
-// Turn 是一轮对话的进行中状态。
+// Round 是一轮对话（用户一次提问 → 全部工具执行完毕）的进行中状态。
+//
+// 注意：这里的 Round 是**大回合**；一次 Round 内会发起多次 LLM 请求
+// （每次是一个 Turn），见 docs/session-log-model.md。
 type Round struct {
 	messageID string
+	// id 是本轮的 roundId（全局自增，见 Driver.roundSeq）。
+	//
+	// 落盘到 round.started/finished 与各内容事件上，供展示端按轮分页与缓存。
+	id int
+	// turn 是本轮内当前进行到第几个 Turn（从 0 开始）。
+	//
+	// 一次 Round 内每发起一次 LLM 请求就是一个新 Turn（工具续轮也算）。
+	// 0 表示还在第一个 Turn，尚未进入工具续轮。
+	turn int
 	// startedAt 是本轮开始的时间（回合结束行算耗时用）。
 	startedAt time.Time
 	buffers   map[int]*toolBuffer
@@ -199,6 +211,17 @@ type Driver struct {
 	// 压缩，所以压缩快照里带上当时的累计值当基线（与 kept 一起重建，见 apply).
 	turns int
 	steps int
+
+	// roundSeq 是已经分配过的 Round 总数（= 最后一个 roundId）。
+	//
+	// 与 turns 的区别：turns 是"用户输入条数"（插话也各算一条），
+	// roundSeq 是"Round 个数"（一次提问算一个，插话不新增 Round）。
+	// 落盘到 round.started/finished 的 roundId 上。
+	roundSeq int
+	// roundStartedAt 是当前 Round 的开始时间（round.finished 算总耗时用）。
+	//
+	// 不能用 Round.startedAt：那个结构体每个 Turn 重建一次，只代表当前 Turn。
+	roundStartedAt time.Time
 }
 
 // Counts 是会话级累计计数（底部状态条显示用）。
@@ -424,7 +447,10 @@ func (d *Driver) Send(text string) ([]Effect, error) {
 	d.queued = nil
 	d.depth = 0
 	d.autoCompactUsed = false
-	turnEffects, err := d.startTurn()
+	// 新的 Round：分配 roundId，Turn 从 0 重新开始（插话不走这里，不新增 Round）
+	d.roundSeq++
+	d.roundStartedAt = time.Now()
+	turnEffects, err := d.startTurn(0)
 	if err != nil {
 		return nil, err
 	}
@@ -461,7 +487,10 @@ func (d *Driver) SendWithAttachments(text string, attachments []message.Part) ([
 	d.queued = nil
 	d.depth = 0
 	d.autoCompactUsed = false
-	turnEffects, err := d.startTurn()
+	// 新的 Round：分配 roundId，Turn 从 0 重新开始
+	d.roundSeq++
+	d.roundStartedAt = time.Now()
+	turnEffects, err := d.startTurn(0)
 	if err != nil {
 		return nil, err
 	}
@@ -587,15 +616,29 @@ func (d *Driver) deliverQueued() ([]Effect, bool) {
 	// 自动压缩的额度也随新输入重置（与 Send 的口径保持一致）。
 	d.depth = 0
 	d.autoCompactUsed = false
-	next, err := d.startTurn()
+	next, err := d.startTurn(d.nextTurnIndex())
 	if err != nil {
 		return append(effects, Changed{}), true
 	}
 	return append(effects, next...), true
 }
 
+// nextTurnIndex 返回当前 Round 内的下一个 Turn 序号。
+//
+// 续轮（工具执行完 / 插话投递完）都用它：同一个 Round 内 Turn 从 0 递增。
+// 当前没有进行中的 Round 时返回 0（理论上不会走到，防御性处理）。
+func (d *Driver) nextTurnIndex() int {
+	if d.round == nil {
+		return 0
+	}
+	return d.round.turn + 1
+}
+
 // startTurn 新建 agent 消息并发起流。
-func (d *Driver) startTurn() ([]Effect, error) {
+//
+// turnIndex 是这个 Turn 在所属 Round 内的序号（从 0 开始）。
+// 工具续轮/插话续轮会再次调用它，序号递增；新 Round 从 0 重新开始。
+func (d *Driver) startTurn(turnIndex int) ([]Effect, error) {
 	agentID, err := conversation.NewMessageID()
 	if err != nil {
 		return nil, err
@@ -608,6 +651,8 @@ func (d *Driver) startTurn() ([]Effect, error) {
 
 	round := &Round{
 		messageID:     entry.Message.MessageID,
+		id:            d.roundSeq,
+		turn:          turnIndex,
 		startedAt:     time.Now(),
 		buffers:       map[int]*toolBuffer{},
 		toolParts:     map[int]int{},
@@ -621,12 +666,21 @@ func (d *Driver) startTurn() ([]Effect, error) {
 	d.steps++
 
 	request := d.buildRequest()
-	effects := []Effect{
+	var effects []Effect
+	// 第一个 Turn 开始时才发 round.started：一次 Round 内有多个 Turn，
+	// 只有最开始那个需要标记 Round 的起点。
+	if round.turn == 0 {
+		effects = append(effects, recordRoundStarted(round.id))
+	}
+	effects = append(effects,
+		// Turn 边界：显式标记"这一轮请求开始了"。
+		// 崩溃恢复靠它判定"哪些 Turn 没走完"（没有 turn.finished 即中断）。
+		recordTurnStarted(round.id, round.turn),
 		// 流开始时写一条 streaming 空壳：进程若在生成中途被杀，重放会把它
 		// 标成「已中断」占位（用户明确要求的行为）
 		recordMessage(agent, conversation.StatusStreaming, ""),
 		StartStream{MessageID: round.messageID, Request: request},
-	}
+	)
 	// buildRequest 可能因为"模型不支持图片"而挂起一条一次性提示
 	effects = append(effects, d.takeDisplayNotice()...)
 	return append(effects, Changed{}), nil
@@ -1045,12 +1099,18 @@ func (d *Driver) finishStream(messageID, _ string) []Effect {
 	}
 
 	// 最终内容一次性写入（流式增量不落日志；参数非法产生的错误结果也在其中）
-	effects := []Effect{recordFinalized(*entry.Message, conversation.StatusComplete, "")}
+	effects := []Effect{
+		recordFinalized(*entry.Message, conversation.StatusComplete, ""),
+		// Turn 边界：这一次请求结束了（后面可能还有工具执行与续轮）
+		recordTurnFinished(round.id, round.turn, time.Since(round.startedAt)),
+	}
 
 	if len(calls) == 0 {
 		usage := round.usage
 		entry.SetFinishedAt(time.Now())
 		entry.SetTokens(usage.OutputTokens)
+		// 没有工具调用 → 整个 Round 结束
+		effects = append(effects, recordRoundFinished(round.id, time.Since(d.roundStartedAt)))
 		d.reset()
 		// 正常结束：记住真实用量，并检查是否该自动压缩（driver 决策，UI 只执行）
 		d.recordUsage(usage)
@@ -1196,6 +1256,13 @@ func (d *Driver) failStream(messageID, reason string) []Effect {
 		entry.SetFinishedAt(time.Now())
 		// 最终内容一次性写入（已含补齐的结果）
 		effects := []Effect{recordFinalized(*entry.Message, conversation.StatusFailed, reason)}
+		// 失败也是终点：Turn 与 Round 都要收尾，否则崩溃恢复会把它当成"未完成"
+		if d.round != nil {
+			effects = append(effects,
+				recordTurnFinished(d.round.id, d.round.turn, time.Since(d.round.startedAt)),
+				recordRoundFinished(d.round.id, time.Since(d.roundStartedAt)),
+			)
+		}
 		overflow := isContextOverflow(reason)
 		d.reset()
 		if overflow {
@@ -1439,7 +1506,7 @@ func (d *Driver) continueAfterTools() ([]Effect, error) {
 		d.reset()
 		return []Effect{recordNotice(conversation.NoticeWarn, text), Changed{}}, nil
 	}
-	effects, err := d.startTurn()
+	effects, err := d.startTurn(d.nextTurnIndex())
 	if err != nil {
 		d.reset()
 		return nil, err
@@ -1479,6 +1546,13 @@ func (d *Driver) Stop() []Effect {
 			entry.SetFinishedAt(time.Now())
 			// 最终内容一次性写入（已含补齐的结果，不要再单独记 tool.results）
 			effects = append(effects, recordFinalized(*entry.Message, conversation.StatusCancelled, ""))
+			// 用户主动停止也是终点：Turn 与 Round 都要收尾
+			if d.round != nil {
+				effects = append(effects,
+					recordTurnFinished(d.round.id, d.round.turn, time.Since(d.round.startedAt)),
+					recordRoundFinished(d.round.id, time.Since(d.roundStartedAt)),
+				)
+			}
 		case BusyRunningTools, BusyAwaitingAnswer:
 			// 这条消息在工具执行前已经 Complete 并落过日志，只需补结果
 			if changed {

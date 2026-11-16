@@ -40,6 +40,20 @@ type Replayed struct {
 	Turns int
 	Steps int
 
+	// RoundSeq 是日志里出现过的最大 roundId。
+	//
+	// 重放后从它继续自增，保证 roundId 在同一会话内单调不复用。
+	RoundSeq int
+	// CrashedRound 是"开始了但没有 finished 的 Round"（0 表示没有）。
+	//
+	// 崩溃恢复用它判定"要不要显示上次异常结束"并让用户选择重发。
+	CrashedRound int
+	// OpenTurn 是"开始了但没有 finished 的 Turn"（零值表示没有）。
+	//
+	// 与 CrashedRound 配合：Turn 中断意味着这次请求没走完；
+	// 若该 Turn 已经有 message.output，还需要补齐 tool.result。
+	OpenTurn TurnEventData
+
 	Conversation *conversation.Conversation
 
 	// PendingAsks 是重放时仍未作答的提问（面板要重新出现）。
@@ -285,6 +299,52 @@ func (st *replayState) apply(event store.Event) {
 		}
 		out.Title = data.Title
 
+	case store.TypeRoundStarted:
+		var data RoundEventData
+		if err := event.Decode(&data); err != nil {
+			out.Warnings = append(out.Warnings, err.Error())
+			return
+		}
+		// 记下最大的 roundId：后续新 Round 从这里继续自增，
+		// 保证同一会话内的 roundId 单调不复用。
+		if data.Round > out.RoundSeq {
+			out.RoundSeq = data.Round
+		}
+		out.CrashedRound = data.Round
+
+	case store.TypeRoundFinished:
+		var data RoundEventData
+		if err := event.Decode(&data); err != nil {
+			out.Warnings = append(out.Warnings, err.Error())
+			return
+		}
+		if data.Round > out.RoundSeq {
+			out.RoundSeq = data.Round
+		}
+		// 这一轮正常收尾了：清掉"崩溃中的 Round"标记
+		if out.CrashedRound == data.Round {
+			out.CrashedRound = 0
+		}
+
+	case store.TypeTurnStarted:
+		var data TurnEventData
+		if err := event.Decode(&data); err != nil {
+			out.Warnings = append(out.Warnings, err.Error())
+			return
+		}
+		// 有 turn.started 但没有对应的 turn.finished → 这个 Turn 被中断
+		out.OpenTurn = data
+
+	case store.TypeTurnFinished:
+		var data TurnEventData
+		if err := event.Decode(&data); err != nil {
+			out.Warnings = append(out.Warnings, err.Error())
+			return
+		}
+		if out.OpenTurn.Round == data.Round && out.OpenTurn.Turn == data.Turn {
+			out.OpenTurn = TurnEventData{} // 正常收尾
+		}
+
 	case store.TypeNotice:
 		var data NoticeData
 		if err := event.Decode(&data); err != nil {
@@ -466,6 +526,8 @@ func Restore(replayed Replayed, opts Options) *Driver {
 	d.title = replayed.Title
 	d.turns = replayed.Turns
 	d.steps = replayed.Steps
+	// roundId 从日志里的最大值继续，保证不复用
+	d.roundSeq = replayed.RoundSeq
 	d.opts.ReasoningEffort = replayed.ReasoningEffort
 	if replayed.HasSelection {
 		d.opts.Selection = replayed.Selection

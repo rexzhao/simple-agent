@@ -113,6 +113,50 @@ func record(kind string, data any) Effect {
 	return Record{Event: store.MustEvent(kind, data)}
 }
 
+// 以下四个是边界事件的载荷（见 docs/session-log-model.md §2.2）。
+
+// RoundEventData 是 round.started / round.finished 的载荷。
+type RoundEventData struct {
+	Round int `json:"round"`
+	// DurationMs 只出现在 round.finished 上（该轮总耗时）。
+	DurationMs int64 `json:"duration_ms,omitempty"`
+}
+
+// TurnEventData 是 turn.started / turn.finished 的载荷。
+type TurnEventData struct {
+	Round int `json:"round"`
+	Turn  int `json:"turn"`
+	// DurationMs 只出现在 turn.finished 上（这一次请求的耗时）。
+	DurationMs int64 `json:"duration_ms,omitempty"`
+}
+
+// recordRoundStarted 记录 Round 开始。
+func recordRoundStarted(roundID int) Effect {
+	return record(store.TypeRoundStarted, RoundEventData{Round: roundID})
+}
+
+// recordRoundFinished 记录 Round 结束（带总耗时）。
+func recordRoundFinished(roundID int, duration time.Duration) Effect {
+	return record(store.TypeRoundFinished, RoundEventData{
+		Round:      roundID,
+		DurationMs: duration.Milliseconds(),
+	})
+}
+
+// recordTurnStarted 记录 Turn 开始（请求即将发出）。
+func recordTurnStarted(roundID, turn int) Effect {
+	return record(store.TypeTurnStarted, TurnEventData{Round: roundID, Turn: turn})
+}
+
+// recordTurnFinished 记录 Turn 结束（带本次请求耗时）。
+func recordTurnFinished(roundID, turn int, duration time.Duration) Effect {
+	return record(store.TypeTurnFinished, TurnEventData{
+		Round:      roundID,
+		Turn:       turn,
+		DurationMs: duration.Milliseconds(),
+	})
+}
+
 // recordCreated 是会话开始时写的第一条事件。
 func recordCreated(contextID, title, workspace string) Effect {
 	return record(store.TypeSessionCreated, SessionCreatedData{
