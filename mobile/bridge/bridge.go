@@ -85,6 +85,11 @@ type Client struct {
 	pendingChange map[string]string // kind → sessionID
 	// flushStop 关闭时通知 flushLoop 退出。
 	flushStop chan struct{}
+	// timelineCache 按会话缓存上次的时间线构建结果（见 buildTimelineWithRaw）。
+	//
+	// 流式输出时每 60ms 就会重建一次，但很多次 entries 根本没变——
+	// 构建占 TimelineJSON 耗时的 61%，跳过它收益明确。
+	timelineCache map[string]*timelineCacheEntry
 }
 
 // connectParams 是"连到哪个 relay、带什么凭据"（切换执行端时复用）。

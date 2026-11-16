@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"strconv"
 	"strings"
 
 	"simple-agent/internal/conversation"
@@ -35,6 +36,19 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 	conv := session.Conversation()
 	idle := session.Busy() == driver.BusyIdle
 
+	// **缓存**：流式输出时每 60ms 就会重建一次，但很多次 entries 根本没变
+	// （同一条消息内部的 part 在长，条数不变）。
+	//
+	// 指纹必须覆盖**所有会影响输出的状态**：entries 结构、idle、
+	// 以及 asks/todos（它们变了但 message 没变，遗漏会导致界面不更新）。
+	fingerprint := timelineFingerprint(conv.Entries(), idle, session)
+	c.mu.Lock()
+	cached := c.timelineCache[sessionID]
+	c.mu.Unlock()
+	if cached != nil && cached.fingerprint == fingerprint {
+		return cached.view, cached.raw
+	}
+
 	view := TimelineView{
 		SessionID: session.ID,
 		Title:     session.Title,
@@ -49,7 +63,87 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 	for _, item := range raw {
 		view.Items = append(view.Items, c.itemView(item, conv, idle))
 	}
+
+	c.mu.Lock()
+	if c.timelineCache == nil {
+		c.timelineCache = map[string]*timelineCacheEntry{}
+	}
+	c.timelineCache[sessionID] = &timelineCacheEntry{
+		fingerprint: fingerprint, view: view, raw: raw,
+	}
+	c.mu.Unlock()
 	return view, raw
+}
+
+// timelineCacheEntry 是一次构建结果的缓存。
+type timelineCacheEntry struct {
+	fingerprint string
+	view        TimelineView
+	raw         []timeline.Item
+}
+
+// timelineFingerprint 生成一个能反映"时间线输出是否变化"的廉价指纹。
+//
+// 必须覆盖所有影响输出的状态，否则界面会停在旧数据上：
+//   - 条目数变化 → 结构变了
+//   - 最后两条的 part 数变化 → 那几条的渲染会变（流式增长、新增内容）
+//   - idle 变化 → 回合结束行可能出现/消失
+//   - asks / todos 变化 → 它们不体现在 message 里，但会改变输出
+func timelineFingerprint(entries []conversation.Entry, idle bool, session *host.Session) string {
+	var builder strings.Builder
+	builder.WriteString(strconv.Itoa(len(entries)))
+	builder.WriteByte('|')
+	if idle {
+		builder.WriteByte('1')
+	} else {
+		builder.WriteByte('0')
+	}
+	// 最后两条的 part 数：足够发现"最后一条在流式增长"或"刚追加了新条目"
+	for index := len(entries) - 1; index >= 0 && index >= len(entries)-2; index-- {
+		entry := entries[index]
+		if entry.Message == nil {
+			if entry.Notice != nil {
+				builder.WriteString("|n")
+			}
+			continue
+		}
+		builder.WriteByte('|')
+		builder.WriteString(strconv.Itoa(len(entry.Message.Message.Parts)))
+	}
+	// asks：待回答提问的**选中态**变化不会改 message，但界面必须更新
+	builder.WriteString("|a")
+	builder.WriteString(strconv.Itoa(len(session.AskGroups())))
+	for _, group := range session.AskGroups() {
+		builder.WriteByte(':')
+		builder.WriteString(group.CallID)
+		for index, question := range group.Questions {
+			// 每个问题：已答 + 自写内容 + 每个选项的选中态
+			if group.Answered(index) {
+				builder.WriteByte('1')
+			} else {
+				builder.WriteByte('0')
+			}
+			if group.CustomActive(index) {
+				builder.WriteByte('c')
+			}
+			builder.WriteString(group.Custom(index))
+			for optionIndex := range question.Options {
+				if group.Selected(index, optionIndex) {
+					builder.WriteByte('s')
+				} else {
+					builder.WriteByte('_')
+				}
+			}
+		}
+	}
+	// todos：任务清单变化同样不改 message
+	builder.WriteString("|t")
+	builder.WriteString(strconv.Itoa(len(session.Todos())))
+	for _, todo := range session.Todos() {
+		builder.WriteByte(':')
+		builder.WriteString(todo.Status)
+	}
+	return builder.String()
 }
 
 // asksOf 把一个会话的待回答提问转成视图（含选中态）。
