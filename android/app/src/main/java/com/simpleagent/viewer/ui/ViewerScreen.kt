@@ -44,6 +44,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -90,6 +91,22 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
             snackbar.showSnackbar(state.toast)
             viewModel.consumeToast()
         }
+    }
+
+    // 回到前台时主动对一次连接状态。
+    //
+    // App 在后台期间 Go 侧可能已经重连成功了，但 "connection" 事件在后台
+    // 被合并/丢弃，界面会一直挂着"连接已断开，正在重连…"的横幅不消失。
+    // 这里不依赖事件，直接问一次 Go 侧，最稳。
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                viewModel.syncConnection()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     // 断线重连期间留在聊天页（显示"重连中"横幅），只有真正没连过/连接失败

@@ -36,6 +36,16 @@ data class ViewerState(
      * 用户没做错什么，不该被迫重新点一遍连接。
      */
     val reconnecting: Boolean = false,
+    /**
+     * 本次运行是否**成功连接过**。
+     *
+     * 用来区分两种"当前没连上"：
+     * - 连过又掉了 → 是重连（显示横幅，留在聊天页）
+     * - 从没连上过 → 不是重连（回连接页报错，不该出现转圈横幅）
+     *
+     * 用户主动断开时清回 false：那是明确意图，不是异常。
+     */
+    val hasConnectedOnce: Boolean = false,
     val connectError: String = "",
     // 连接表单（恢复上次输入用）
     val addr: String = "127.0.0.1:7900",
@@ -197,10 +207,15 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                     // 连接失败必须把 connected 也置回 false：
                     // 否则"先连上、再重连失败"时会残留 connected=true，
                     // 界面停在聊天页但实际没有连接（也回不到连接页）。
+                    //
+                    // reconnecting 也要一并清掉：连接已经彻底失败，不该继续显示
+                    // "正在重连…"的转圈横幅（它会因为没人再发 connection 事件而
+                    // 永久卡住）。回连接页 + 显示失败原因才是正确的收场。
                     state.update {
                         it.copy(
                             connecting = false,
                             connected = false,
+                            reconnecting = false,
                             connectError = event.error,
                             sessions = emptyList(),
                             activeSessionId = "",
@@ -209,7 +224,15 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     return
                 }
-                state.update { it.copy(connecting = false, connected = true, connectError = "") }
+                state.update {
+                    it.copy(
+                        connecting = false,
+                        connected = true,
+                        reconnecting = false,
+                        hasConnectedOnce = true,
+                        connectError = "",
+                    )
+                }
                 // 记住"上次连接成功过"：下次启动 App 自动连回去。
                 // 只在成功时记，连接失败不算（否则启动时会自动连一个连不上的地址）。
                 prefs.edit().putBoolean("autoConnect", true).apply()
@@ -284,14 +307,37 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         state.update { it.copy(providers = core.providers()) }
     }
 
+    /**
+     * 主动向 Go 侧核对一次连接状态。
+     *
+     * 界面在**回到前台**时调用：App 在后台期间 Go 侧可能已经重连成功了，
+     * 而 "connection" 事件在后台被合并/丢弃，界面就会一直挂着
+     * "连接已断开，正在重连…" 的横幅。回到前台主动对一次账最省事。
+     */
+    fun syncConnection() = refreshConnection()
+
     private fun refreshConnection() {
         // 断线/重连只靠 timeline 是看不出来的：timeline 的 runtime.connected
         // 反映的是"会话状态"，而连接本身是否在线要问 Go 侧。
         // 以前这里只 refreshTimeline()，导致断线后 connected 永远停在 true，
         // 界面显示"已连接"但实际断了，用户只能手动重连。
+        //
+        // **不要用 `if (it.connected == online) it` 早退**：reconnecting 是该写的
+        // 另一个字段，早退会让"connected 已被别处改对、reconnecting 还停在 true"
+        // 的组合永远修不回来 —— 表现就是顶部"连接已断开，正在重连…"横幅不消失。
+        //
+        // reconnecting 只表示"曾经连上过、这一跳掉了"：
+        // 从没连上过（初次连接失败/用户主动断开）时它是 false，界面该回连接页
+        // 报错，而不是显示一个永远转圈的重连横幅。
         val online = core.connected()
-        state.update {
-            if (it.connected == online) it else it.copy(connected = online, reconnecting = !online)
+        state.update { current ->
+            // hasConnectedOnce 在一次成功连接后被置为 true，disconnect() 时清掉
+            val reconnecting = !online && current.hasConnectedOnce
+            if (current.connected == online && current.reconnecting == reconnecting) {
+                current
+            } else {
+                current.copy(connected = online, reconnecting = reconnecting)
+            }
         }
         refreshTimeline()
     }
@@ -350,6 +396,12 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             // 分页游标：只要用户往上翻过，就保持用户翻到的位置不动。
             // 否则每次流式刷新都会把游标重置回最后一页——表现就是"翻一点就弹回去"。
             val paginated = it.earlierPagesLoaded > 0
+            // **不要在这里改 connected**：连接状态的唯一权威来源是
+            // refreshConnection()（它读 core.connected()，并能同步维护
+            // reconnecting）。以前这里也从 page.runtime.connected 反写，
+            // 形成第二个写入者且不同步 reconnecting，
+            // 结果是 connected=true 与 reconnecting=true 并存，
+            // 顶部"正在重连"横幅再也不消失。
             it.copy(
                 timeline = TimelineView(
                     sessionId = page.sessionId,
@@ -359,7 +411,6 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                     asks = page.asks ?: it.timeline.asks,
                     runtime = page.runtime ?: it.timeline.runtime,
                 ),
-                connected = (page.runtime ?: it.timeline.runtime).connected,
                 asks = page.asks ?: it.timeline.asks,
                 hasMoreItems = if (paginated) it.hasMoreItems else page.hasMore,
                 firstSeq = if (paginated) it.firstSeq else page.seqFrom,
@@ -422,7 +473,12 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     fun updateFingerprint(value: String) = state.update { it.copy(fingerprint = value) }
 
     fun connect() {
-        state.update { it.copy(connecting = true, connectError = "") }
+        // 用户手动发起连接：把上一次遗留的重连横幅清掉。
+        // 这是"我动手了"的明确信号，界面应该显示 connecting，而不是同时
+        // 显示"正在重连…"——两个转圈会让人以为卡住了。
+        state.update {
+            it.copy(connecting = true, reconnecting = false, connectError = "")
+        }
         val current = state.value
         // 记住这次填的全部连接参数：手机输入很麻烦，指纹还是 64 位十六进制。
         // token/指纹属于凭据，但存在应用私有 SharedPreferences 里（未 root 时
@@ -446,7 +502,18 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 用户主动断开 = 明确表示"不要连着"：清掉自动重连标记，
         // 否则下次启动 App 又会自己连回去，违背用户意图。
         prefs.edit().putBoolean("autoConnect", false).apply()
-        state.update { it.copy(connected = false, reconnecting = false, sessions = emptyList(), activeSessionId = "", timeline = TimelineView()) }
+        // hasConnectedOnce 一并清掉：这是主动断开，不是"掉线重连"，
+        // 不该再被当成异常状态去显示重连横幅。
+        state.update {
+            it.copy(
+                connected = false,
+                reconnecting = false,
+                hasConnectedOnce = false,
+                sessions = emptyList(),
+                activeSessionId = "",
+                timeline = TimelineView(),
+            )
+        }
     }
 
     fun selectSession(id: String) {
