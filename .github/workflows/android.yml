@@ -1,0 +1,114 @@
+name: Android
+
+# 触发方式：
+#   - 手动（Actions 页面 → Run workflow）
+#   - 打 tag（v*）
+#
+# 不在 push 时跑：这个构建要 bind gomobile + 下 NDK，单次十几分钟，
+# 平时改 Go 代码没必要每次都出包。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+# 只读权限就够：产物走 artifact，不改仓库、不发 Release
+permissions:
+  contents: read
+
+concurrency:
+  # 同一分支/tag 上重复触发时取消旧的，避免排队等十几分钟
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- 环境 ----
+      # go.mod 要 1.27.3，用 go-version-file 让 action 自己读，
+      # 免得这里和 go.mod 各写一个版本号、改一处忘另一处。
+      #
+      # 不要加 check-latest：那会去取"最新补丁版"，反而可能装的不是
+      # go.mod 写的那个版本，与下面 GOTOOLCHAIN=local 的假设冲突。
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # android-actions/setup-android 会装 cmdline-tools 并接受 licenses。
+      # NDK 用 sdkmanager 单独装：默认镜像里没有。
+      - uses: android-actions/setup-android@v3
+
+      - name: 安装 NDK
+        run: |
+          # gomobile 需要 NDK；默认镜像里没有，用 sdkmanager 装。
+          # 版本与本地/持续集成保持一致（AGP 8.7 兼容 27.x）。
+          sdkmanager --install \
+            "ndk;27.0.12077973" \
+            "platforms;android-35" \
+            "build-tools;34.0.0"
+
+          # 不假设 ANDROID_SDK_ROOT 一定已导出：setup-android 设的是
+          # ANDROID_HOME/ANDROID_SDK_ROOT 之一，这里两个都兜一下。
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "SDK 目录：$SDK"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "已安装的 NDK：$(ls "$SDK/ndk")"
+
+      - name: 安装 gomobile
+        run: |
+          # 版本必须和 go.mod 里的 golang.org/x/mobile 一致，
+          # 否则 bind 出来的 AAR 与 gobind 生成代码不匹配。
+          VERSION=$(go list -m -f '{{.Version}}' golang.org/x/mobile)
+          echo "x/mobile 版本：$VERSION"
+          # GOTOOLCHAIN=local：不让 go 自作主张换工具链。
+          # 否则装到的是"用另一个 Go 版本编的" gomobile，与 setup-go 给的
+          # 环境不一致，后面 bind 出的 AAR 可能和 gobind 生成码对不上。
+          GOTOOLCHAIN=local go install "golang.org/x/mobile/cmd/gomobile@$VERSION"
+          GOTOOLCHAIN=local go install "golang.org/x/mobile/cmd/gobind@$VERSION"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: gomobile init
+        run: |
+          gomobile init
+          gomobile version
+
+      # ---- 构建 ----
+      # 复用仓库里的脚本而不是在 yml 里重写一遍 bind + gradle：
+      # 两套构建流程必然漂移（这个项目已经踩过"AAR 过期"的坑）。
+      # --no-pull：CI 里已经是目标 commit
+      # --no-install：没有设备可装
+      - name: 构建 APK
+        run: sh ./scripts/build-android.sh --no-pull --no-install
+
+      # 脚本里已接 check-16kb.py 自检（Android 15+ 的 16KB 页要求）。
+      # 这里再独立跑一次并留档，便于在 Actions 页面直接看到结果。
+      - name: 16 KB 对齐检查
+        run: python3 scripts/check-16kb.py android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: 汇总
+        run: |
+          APK=build/app-debug.apk
+          echo "### Android 构建成功" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- APK 大小：$(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- commit：\`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 16 KB 对齐：通过" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-${{ github.sha }}
+          path: build/app-debug.apk
+          if-no-files-found: error
+          # debug 包带调试符号，体积偏大；保留 14 天够用
+          retention-days: 14

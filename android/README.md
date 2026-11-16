@@ -33,7 +33,8 @@ markdown）在 `internal/` 里已经有实现且有测试。重写一份必然�
 | `internal/timeline/` | 会话分组语义（正文 / 过程组 / 回合结束行、过程组标题）。**桌面与 Android 共用** |
 | `android/app/src/main/java/.../data/` | Kotlin 侧镜像类型（`@Serializable`）与 `CoreClient` |
 | `android/app/src/main/java/.../ui/` | Compose 界面 |
-| `scripts/build-android.ps1` | 生成 `android/app/libs/bridge.aar` |
+| `scripts/build-android.sh` | 生成 AAR + APK（macOS / Linux；CI 也用它） |
+| `scripts/build-android.ps1` | 只生成 `android/app/libs/bridge.aar`（Windows） |
 
 ## 2. 构建
 
@@ -59,6 +60,17 @@ $env:ANDROID_HOME="F:\Android\Sdk"; $env:JAVA_HOME="F:\Android\Studio\jbr"
 
 Gradle 里已经接了 `bindGoKernel` 任务：`mobile/` 或 `internal/` 下的 `.go` 变化时
 会自动重新 bind，**不需要手动记着**（见下面「踩过的坑」）。
+
+### 在 GitHub Actions 上构建
+
+`.github/workflows/android.yml` 可以在不配本地环境的情况下出包：
+
+- 手动触发：仓库 Actions 页面 → Android → Run workflow
+- 打 tag（`v*`）时自动触发
+
+产物是 `app-debug-<sha>` artifact，在对应 workflow run 页面底部下载。
+workflow 调的就是 `scripts/build-android.sh --no-pull --no-install`，
+和本地构建走同一套逻辑。
 
 ## 3. 使用
 

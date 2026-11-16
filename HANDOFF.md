@@ -108,7 +108,7 @@ d958c12 阶段 1：重命名 Turn → Round
 
 ```bash
 # 一键构建 + 安装
-cd ~/sa/work && ./scripts/build-android-mac.sh
+cd ~/sa/work && ./scripts/build-android.sh
 # 只改了 Kotlin 时加 --no-aar 快很多（Go 改了必须重建 AAR）
 ```
 
@@ -244,7 +244,7 @@ Kotlin 只需一行拼接。这样兼顾"Kotlin 极简"和"传输量不增加"�
 pwsh -File scripts/check.ps1 -NoRace
 
 # 在 mini 上构建安装 APK
-ssh mini 'cd ~/sa/work && ./scripts/build-android-mac.sh'
+ssh mini 'cd ~/sa/work && ./scripts/build-android.sh'
 
 # 拉 Android 的 Go 日志
 adb shell run-as com.simpleagent.viewer cat cache/simpleagent/go.log | tail -100

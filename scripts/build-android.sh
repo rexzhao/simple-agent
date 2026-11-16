@@ -1,16 +1,19 @@
 #!/bin/sh
-# 在 macOS 上一键构建并安装 Android 客户端。
+# 一键构建 Android 客户端（macOS / Linux 都可用；Windows 用 build-android.ps1）。
 #
 # 用法（在仓库根目录）：
-#   ./scripts/build-android-mac.sh              # 拉代码 + 建 AAR + 建 APK + 装到手机
-#   ./scripts/build-android-mac.sh --no-pull    # 不拉代码（改的是本地未提交代码）
-#   ./scripts/build-android-mac.sh --no-aar     # 跳过 AAR（只改了 Kotlin 时快很多）
-#   ./scripts/build-android-mac.sh --no-install # 只构建，不安装
+#   ./scripts/build-android.sh              # 拉代码 + 建 AAR + 建 APK + 装到手机
+#   ./scripts/build-android.sh --no-pull    # 不拉代码（改的是本地未提交代码）
+#   ./scripts/build-android.sh --no-aar     # 跳过 AAR（只改了 Kotlin 时快很多）
+#   ./scripts/build-android.sh --no-install # 只构建，不安装（CI 用这个）
+#
+# GitHub Actions 的 android workflow 也调这个脚本（--no-pull --no-install），
+# 所以这里的步骤就是"官方构建流程"，别在 yml 里另写一套。
 #
 # 依赖（首次配置见 docs/android-dev-mac.md）：
-#   JDK 17        —— 路径记在 ~/.jdk-path
+#   JDK 17        —— JAVA_HOME，或 macOS 上记在 ~/.jdk-path
 #   Go 1.27+      —— ~/go-sdk/go/bin/go 或 PATH 里的 go
-#   gomobile      —— ~/go/bin/gomobile
+#   gomobile      —— ~/go/bin/gomobile 或 PATH 里
 #   Android SDK   —— ANDROID_HOME（默认 ~/android-sdk），需 platform-tools/platforms/build-tools
 #   Android NDK   —— ANDROID_HOME/ndk/<version>
 #
@@ -35,7 +38,9 @@ for arg in "$@"; do
     --no-aar) BUILD_AAR=0 ;;
     --no-install) INSTALL=0 ;;
     -h | --help)
-        sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+        # 打印从第 2 行到第一个非注释行之间的内容。
+        # 不用硬编码行号：注释块长度会变，写死就会截断。
+        sed -n '2,/^[^#]/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *)
@@ -72,9 +77,13 @@ else
     echo "找不到 go" >&2
     exit 1
 fi
-export GOTOOLCHAIN=auto # 项目要 1.27+，让 Go 自己下载
+# 允许 Go 在本地版本不满足 go.mod 时自动下载对应工具链。
+# CI 里 setup-go 已按 go.mod 装好，这里是给本机环境（可能只有系统 go）兜底。
+export GOTOOLCHAIN=auto
 
-GOMOBILE="$HOME/go/bin/gomobile"
+# gomobile：优先 $GOPATH/bin（CI 里 GOPATH 可能不是 ~/go），再试 PATH。
+GOMOBILE="$(go env GOPATH)/bin/gomobile"
+[ -x "$GOMOBILE" ] || GOMOBILE="$HOME/go/bin/gomobile"
 [ -x "$GOMOBILE" ] || GOMOBILE=$(command -v gomobile || true)
 [ -n "$GOMOBILE" ] || {
     echo "找不到 gomobile：$GO install golang.org/x/mobile/cmd/gomobile" >&2
@@ -82,10 +91,13 @@ GOMOBILE="$HOME/go/bin/gomobile"
 }
 
 export JAVA_HOME
-PATH="$JAVA_HOME/bin:$HOME/go/bin:$PATH"
+# 把 gomobile 所在目录也放进 PATH（bind 收尾要调 javac 与 gomobile 自身）
+PATH="$JAVA_HOME/bin:$(go env GOPATH)/bin:$HOME/go/bin:$PATH"
 
+# Android SDK：ANDROID_HOME 优先，退回 ANDROID_SDK_ROOT（CI 里常见后者），
+# 最后才用本机默认路径。
 if [ -z "$ANDROID_HOME" ]; then
-    ANDROID_HOME="$HOME/android-sdk"
+    ANDROID_HOME="${ANDROID_SDK_ROOT:-$HOME/android-sdk}"
 fi
 [ -d "$ANDROID_HOME" ] || {
     echo "找不到 Android SDK：$ANDROID_HOME" >&2

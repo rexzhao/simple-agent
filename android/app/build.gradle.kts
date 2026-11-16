@@ -107,7 +107,7 @@ val bindGoKernel = tasks.register<Exec>("bindGoKernel") {
         // Go 默认按 4 KB 页对齐 ELF 的 PT_LOAD 段，Android 15+ 的 16 KB 页
         // 设备会拒绝加载，安装后弹"此应用不符合 16 KB 对齐要求"。
         // 这个参数把对齐改成 16 KB；只影响段对齐，不影响功能。
-        // 改这里的同时要改 scripts/build-android-mac.sh 和 build-android.ps1，
+        // 改这里的同时要改 scripts/build-android.sh 和 build-android.ps1，
         // 三处都是 gomobile bind 的入口。
         "-ldflags=-extldflags=-Wl,-z,max-page-size=16384",
         // 先写临时文件再替换：gomobile 会先**清空** -o 指定的文件再写入，
