@@ -97,7 +97,7 @@ func TestBuildVsEncodeCost(t *testing.T) {
 	small := client.TimelinePageJSON(target, 0, 60)
 	start = time.Now()
 	for i := 0; i < rounds; i++ {
-		_ = json.Marshal(view)
+		_, _ = json.Marshal(view)
 	}
 	encodeOnly := time.Since(start) / rounds
 
