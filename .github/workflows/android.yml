@@ -91,6 +91,43 @@ jobs:
           # 在 CI 的干净环境里总报 "binary is out of date"（无害但误导）。
           # 真正能证明装对了的是下面的实际 bind。
 
+      # ---- 签名 ----
+      # 用固定 keystore 签名，否则覆盖安装会报
+      # INSTALL_FAILED_UPDATE_INCOMPATIBLE。
+      #
+      # AGP 默认用 ~/.android/debug.keystore，而 runner 每次都是新环境、
+      # 那个文件随机生成 —— 同一份代码在 CI 和本地构建出的签名不同。
+      # Secret 里放的是 base64 编码的 keystore 文件内容。
+      #
+      # 没有配置 Secret 时这一步跳过，退回默认（随机）签名：
+      # 那样能构建出包，但装到已有 App 的手机上会因签名不符失败。
+      - name: 准备签名 keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::warning::没有配置 ANDROID_DEBUG_KEYSTORE，将使用随机 debug 签名，装不上已有 App"
+            exit 0
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/debug.keystore"
+          # 传给 Gradle（见 android/app/build.gradle.kts 的 fromEnv 配置）
+          echo "SIMPLE_AGENT_KEYSTORE=$RUNNER_TEMP/debug.keystore" >> "$GITHUB_ENV"
+          echo "SIMPLE_AGENT_KEYSTORE_PASSWORD=android" >> "$GITHUB_ENV"
+          echo "SIMPLE_AGENT_KEY_ALIAS=androiddebugkey" >> "$GITHUB_ENV"
+          echo "SIMPLE_AGENT_KEY_PASSWORD=android" >> "$GITHUB_ENV"
+
+      # 打印构建将使用的签名指纹：装不上时先对比这里和手机上已装的包。
+      - name: 打印签名指纹
+        run: |
+          if [ -f "$RUNNER_TEMP/debug.keystore" ]; then
+            keytool -list -v \
+              -keystore "$RUNNER_TEMP/debug.keystore" \
+              -storepass android -alias androiddebugkey 2>/dev/null \
+              | grep -E "SHA1:|SHA256:" || true
+          else
+            echo "（使用随机 debug 签名，指纹每次构建都不同）"
+          fi
+
       # ---- 构建 ----
       # 复用仓库里的脚本而不是在 yml 里重写一遍 bind + gradle：
       # 两套构建流程必然漂移（这个项目已经踩过"AAR 过期"的坑）。
@@ -98,6 +135,26 @@ jobs:
       # --no-install：没有设备可装
       - name: 构建 APK
         run: sh ./scripts/build-android.sh --no-pull --no-install
+
+      # 校验产物签名确实是我们指定的那份（而不是 AGP 悄悄用了随机签名）
+      - name: 校验 APK 签名
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          echo "=== APK 实际签名 ==="
+          keytool -printcert -jarfile "$APK" 2>/dev/null \
+            | grep -E "SHA1:|SHA256:|Owner:" || echo "（读取失败）"
+          if [ -f "$RUNNER_TEMP/debug.keystore" ]; then
+            WANT=$(keytool -list -v -keystore "$RUNNER_TEMP/debug.keystore" \
+              -storepass android -alias androiddebugkey 2>/dev/null \
+              | grep "SHA256:" | tr -d ' ' | cut -d: -f2-)
+            GOT=$(keytool -printcert -jarfile "$APK" 2>/dev/null \
+              | grep "SHA256:" | tr -d ' ' | cut -d: -f2-)
+            if [ "$WANT" != "$GOT" ]; then
+              echo "::error::APK 签名与指定 keystore 不一致，装到手机上会签名冲突"
+              exit 1
+            fi
+            echo "签名一致 ✓"
+          fi
 
       # 脚本里已接 check-16kb.py 自检（Android 15+ 的 16KB 页要求）。
       # 这里再独立跑一次并留档，便于在 Actions 页面直接看到结果。

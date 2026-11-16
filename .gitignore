@@ -18,3 +18,9 @@
 /android/.idea
 *.iml
 *.hprof
+
+# 签名密钥：绝不能进版本库
+# （CI 用 GitHub Secrets 里的 ANDROID_DEBUG_KEYSTORE，见 .github/workflows/android.yml）
+*.keystore
+*.jks
+*.b64
