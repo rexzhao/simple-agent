@@ -229,13 +229,15 @@ func TestCompactRollsArchive(t *testing.T) {
 		t.Fatalf("当前文件应只剩快照：%#v", result.Events)
 	}
 
-	// 之后追加从 seq=1 开始
+	// 之后追加：seq 接着快照的序号往下，**不重置**
+	//（跨压缩单调递增，展示端缓存与分页游标才不失效）
 	if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"after": true})); err != nil {
 		t.Fatal(err)
 	}
 	result, _ = s.Load()
-	if last := result.Events[len(result.Events)-1]; last.Seq != 1 {
-		t.Fatalf("压缩后 seq 应从 1 开始，实际 %d", last.Seq)
+	lastSnapshotSeq := result.Events[0].Seq
+	if last := result.Events[len(result.Events)-1]; last.Seq <= lastSnapshotSeq {
+		t.Fatalf("压缩后 seq 应接着快照递增（快照 %d，实际最后 %d）", lastSnapshotSeq, last.Seq)
 	}
 
 	// 第二次滚动：编号 0002，并可以分页往回读
@@ -715,8 +717,15 @@ func TestCompactRecordsKeptFromSeq(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := store.KeptFromSeq(result.Events[0].Data); got != 2 {
-		t.Fatalf("kept_from_seq 应是压缩前最后一条事件的序号（2），实际 %d", got)
+	// kept_from_seq 现在等于**快照自己的 seq**（快照吸收了它之前的全部事件）。
+	// 消费方按 "event.Seq >= kept_from_seq 就跳过" 截断归档，
+	// 语义与旧实现一致（旧的是"快照前最后一条"，新的是"快照本身"）。
+	snapshotSeq := result.Events[0].Seq
+	if got := store.KeptFromSeq(result.Events[0].Data); got != snapshotSeq {
+		t.Fatalf("kept_from_seq 应等于快照的 seq（%d），实际 %d", snapshotSeq, got)
+	}
+	if snapshotSeq <= 2 {
+		t.Fatalf("快照应占用一个正常 seq（> 2，因为压缩前已有 3 条事件），实际 %d", snapshotSeq)
 	}
 }
 

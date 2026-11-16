@@ -397,14 +397,20 @@ func (s *JsonlStore) Compact(snapshot Event) error {
 	}
 
 	snapshot.Version = Version
-	snapshot.Seq = 0
+	// **快照占用一个正常的 seq**，不再是 0。
+	//
+	// 这样 seq 在整个会话生命周期内单调递增（跨压缩也不重置），
+	// 展示端可以直接用 seq 做缓存 key、跨压缩的游标也依然有效。
+	// 压缩后的第一条记录就是这个快照：读到它就知道"seq 小于 kept_from_seq
+	// 的历史已经不在当前上下文里了"。
+	snapshot.Seq = s.nextSeq
 	snapshot.At = snapshot.At.UTC()
 	// 记录「这份 base 对应哪一号归档」：崩溃在复制归档之后、rename 之前时，
 	// 归档已经存在而 base 还是旧的。重启后这个字段能识别出孤儿归档。
 	snapshot.Data = withArchivedAs(snapshot.Data, archiveSeq)
-	// kept_from_seq：base 里最后一条事件的序号。按需加载归档时用它截断，
-	// 避免和 kept 部分重复（D2）。
-	snapshot.Data = withKeptFromSeq(snapshot.Data, s.nextSeq-1)
+	// kept_from_seq：base 里最后一条被"吸收进快照"的事件序号。
+	// 按需加载归档时用它截断，避免和快照里的 kept 部分重复（D2）。
+	snapshot.Data = withKeptFromSeq(snapshot.Data, s.nextSeq)
 	line, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("编码快照失败：%w", err)
@@ -422,7 +428,11 @@ func (s *JsonlStore) Compact(snapshot Event) error {
 	if err := syncDir(s.dir); err != nil {
 		return err
 	}
-	s.nextSeq = 1 // seq=0 是快照本身
+	// **不重置 nextSeq**：快照已经占用了 s.nextSeq，接着往下分配即可。
+	//
+	// 以前这里是 `s.nextSeq = 1`（seq=0 留给快照），导致压缩后 seq 从头开始，
+	// 展示端的缓存 key 与分页游标在压缩那一刻全部失效。
+	s.nextSeq++
 	return s.openCurrent()
 }
 
