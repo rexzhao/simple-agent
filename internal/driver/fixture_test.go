@@ -24,7 +24,8 @@ func TestWriteFixture(t *testing.T) {
 	if path == "" {
 		t.Skip("没有指定 SIMPLE_AGENT_WRITE_FIXTURE")
 	}
-	const turns = 40
+	// 150 轮：足够产生上百条 item，才能验证多页分页
+	const turns = 150
 
 	conv := conversation.New("ctx-fixture")
 	d := driver.New(conv, driver.Options{
