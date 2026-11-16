@@ -137,18 +137,31 @@ jobs:
         run: sh ./scripts/build-android.sh --no-pull --no-install
 
       # 校验产物签名确实是我们指定的那份（而不是 AGP 悄悄用了随机签名）
+      #
+      # 用 apksigner 而不是 keytool -printcert -jarfile：
+      # 后者在 JDK 17 上读 APK（zip）经常直接失败（输出空），
+      # 会误报成"签名不一致"。apksigner 是 Android 官方校验工具，最可靠。
       - name: 校验 APK 签名
         run: |
           APK=android/app/build/outputs/apk/debug/app-debug.apk
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner -type f | sort -V | tail -1)
+          echo "apksigner: $APKSIGNER"
+
           echo "=== APK 实际签名 ==="
-          keytool -printcert -jarfile "$APK" 2>/dev/null \
-            | grep -E "SHA1:|SHA256:|Owner:" || echo "（读取失败）"
+          "$APKSIGNER" verify --print-certs "$APK" | grep -E "SHA-256 digest|SHA-1 digest|Signer #1 certificate DN"
+
           if [ -f "$RUNNER_TEMP/debug.keystore" ]; then
+            # keystore 里的期望指纹（keytool 输出 SHA256，去掉冒号和小写化）
             WANT=$(keytool -list -v -keystore "$RUNNER_TEMP/debug.keystore" \
               -storepass android -alias androiddebugkey 2>/dev/null \
-              | grep "SHA256:" | tr -d ' ' | cut -d: -f2-)
-            GOT=$(keytool -printcert -jarfile "$APK" 2>/dev/null \
-              | grep "SHA256:" | tr -d ' ' | cut -d: -f2-)
+              | grep "SHA256:" | sed 's/.*SHA256: *//' | tr -d ':' | tr 'A-F' 'a-f')
+            # APK 里的实际指纹（apksigner 输出 "Signer #1 certificate SHA-256 digest: <hex>"）
+            GOT=$("$APKSIGNER" verify --print-certs "$APK" \
+              | grep "SHA-256 digest" | head -1 | sed 's/.*digest: *//' | tr -d ': ' | tr 'A-F' 'a-f')
+
+            echo ""
+            echo "期望 SHA-256: $WANT"
+            echo "实际 SHA-256: $GOT"
             if [ "$WANT" != "$GOT" ]; then
               echo "::error::APK 签名与指定 keystore 不一致，装到手机上会签名冲突"
               exit 1
