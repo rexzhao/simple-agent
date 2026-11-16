@@ -46,8 +46,14 @@ jobs:
           java-version: "17"
 
       # android-actions/setup-android 会装 cmdline-tools 并接受 licenses。
-      # NDK 用 sdkmanager 单独装：默认镜像里没有。
+      #
+      # **不能留默认的 packages**：v3 默认是 "tools platform-tools"，
+      # 但 `tools` 是老版 SDK 的 legacy 包，早已从官方仓库移除，
+      # sdkmanager 会报 "Failed to find package 'tools'" 直接失败。
+      # 这里只装 platform-tools（adb 等），其余按需单独装。
       - uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
 
       - name: 安装 NDK
         run: |
