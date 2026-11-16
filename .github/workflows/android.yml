@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # ---- 环境 ----
       # go.mod 要 1.27.3，用 go-version-file 让 action 自己读，
@@ -35,12 +35,12 @@ jobs:
       #
       # 不要加 check-latest：那会去取"最新补丁版"，反而可能装的不是
       # go.mod 写的那个版本，与下面 GOTOOLCHAIN=local 的假设冲突。
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -87,7 +87,9 @@ jobs:
       - name: gomobile init
         run: |
           gomobile init
-          gomobile version
+          # 不跑 `gomobile version`：它靠读模块缓存校验自身版本，
+          # 在 CI 的干净环境里总报 "binary is out of date"（无害但误导）。
+          # 真正能证明装对了的是下面的实际 bind。
 
       # ---- 构建 ----
       # 复用仓库里的脚本而不是在 yml 里重写一遍 bind + gradle：
@@ -111,7 +113,7 @@ jobs:
           echo "- commit：\`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- 16 KB 对齐：通过" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: app-debug-${{ github.sha }}
           path: build/app-debug.apk
