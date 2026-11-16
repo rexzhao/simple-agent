@@ -131,12 +131,17 @@ func newReplayState() *replayState {
 	out := &Replayed{}
 	conv := conversation.New("")
 	out.Conversation = conv
+	// 索引挂到 out 上：restorePending 读的是 out.turnMessages，
+	// 而 replayState 与 Replayed 必须共享同一份（增量续传才不会丢）。
+	out.turnMessages = map[turnKey]string{}
+	out.appendedAt = map[string]time.Time{}
+	out.counted = map[string]bool{}
 	return &replayState{
 		out:          out,
 		conv:         conv,
-		appendedAt:   map[string]time.Time{},
-		counted:      map[string]bool{},
-		turnMessages: map[turnKey]string{},
+		appendedAt:   out.appendedAt,
+		counted:      out.counted,
+		turnMessages: out.turnMessages,
 	}
 }
 
@@ -518,12 +523,23 @@ func settleAsk(conv *conversation.Conversation, data AskAnsweredData) {
 	}
 }
 
-// restorePending 收尾：中间态判为已中断、补配对结果，并收集仍未作答的提问。
+// restorePending 收尾重放出来的中间态。
 //
-// 三件事都会产生 **repair 事件**（调用方必须在接受新事件之前写进日志）：
-//  1. 只有 appended(streaming) 没有 finalized → 补 finalized(cancelled)；
-//  2. 有 tool_use 没有结果 → 补 tool.results（「已中断」错误结果）；
-//  3. 不做其它猜测（内容一律不臆造）。
+// 新模型（docs/session-log-model.md §3）：崩溃判定看**有没有 turn.finished**，
+// 而不是看消息 status。Replayed.OpenTurn / CrashedRound 已经记录了
+// "最后一个 turn.finished 之后还剩什么"，这里据此决定补什么。
+//
+//	已落盘的内容                                动作
+//	──────────────────────────────────────────  ──────────────────────────
+//	有 output（含 tool_use），缺 tool.result     补 tool.result（is_error）
+//	只有 input，没有 output                      不补内容，标记待重发
+//	有 output 但缺 turn.finished                 补 turn.finished
+//	全部都有 turn.finished                       什么都不做
+//
+// **补 tool.result 与 turn.finished 无关**：只要 tool_use 缺配对结果，
+// 下次请求就会被 LLM 协议拒收，必须补。
+//
+// 所有修复都产生 **repair 事件**（调用方必须在接受新事件之前写进日志）。
 func restorePending(conv *conversation.Conversation, out *Replayed) []*AskGroup {
 	var groups []*AskGroup
 	for _, entry := range conv.Entries() {
@@ -579,7 +595,27 @@ func restorePending(conv *conversation.Conversation, out *Replayed) []*AskGroup 
 			}
 		}
 	}
+
+	// 有 output 但缺 turn.finished：内容已经完整，只差边界标记。
+	// 补上它，否则下次重放还会把它当成"中断"。
+	if out.OpenTurn.Round > 0 && turnHasOutput(conv, out.turnMessages, out.OpenTurn) {
+		out.Repairs = append(out.Repairs, store.MustEvent(store.TypeTurnFinished,
+			TurnEventData{Round: out.OpenTurn.Round, Turn: out.OpenTurn.Turn}))
+		out.Warnings = append(out.Warnings, "有一次请求已产出内容但缺少结束标记，已补记")
+		out.OpenTurn = TurnEventData{}
+	}
+
 	return groups
+}
+
+// turnHasOutput 判断某个 (round, turn) 是否已经有 message.output 落盘。
+func turnHasOutput(conv *conversation.Conversation, index map[turnKey]string, open TurnEventData) bool {
+	messageID := index[turnKey{Round: open.Round, Turn: open.Turn}]
+	if messageID == "" {
+		return false
+	}
+	_, ok := conv.Message(messageID)
+	return ok
 }
 
 // Restore 用重放结果构造一个可以继续工作的 driver。
