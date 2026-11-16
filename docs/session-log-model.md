@@ -73,14 +73,22 @@ type Counts struct { Turns, Steps int }
 | `message.output` | `{round, turn, message}` | LLM 输出。含该 Turn 的全部 parts（thinking / text / tool_use） |
 | `tool.result` | `{round, turn, call_id, name, output, is_error}` | 单条工具结果，**靠 `callId` 与 tool_use 关联** |
 
-**为什么拆成 part 级 / 单条工具结果**：
-- 每条事件写入后不再变更 → 可分页、可缓存
-- 状态只需记录"当前进行到哪一条"
-- `callId` 关联与 LLM 协议一致（Anthropic `tool_use_id` / OpenAI `tool_call_id`），并行工具完成顺序不影响配对
+**粒度原则：一条记录 = 一条完整的东西。**
 
-> **`message.output` 的粒度**：一条事件 = 一条消息（含多个 parts），而不是一个 part 一条事件。
-> 原因：LLM 协议里一次响应就是一个 assistant message，拆到 part 级会让重放组装多一层无谓的复杂度。
-> 若将来确实需要 part 级，可再拆（`{round, turn, message_id, part_index, part}`），届时按 `(message_id, part_index)` 排序即可。
+| 内容 | 记录粒度 |
+| --- | --- |
+| 一条用户消息 | 一条 `message.input` |
+| 一条 LLM 响应（含多个 parts） | 一条 `message.output` |
+| 一次工具调用的结果 | 一条 `tool.result` |
+
+**不拆到 part 级**。一次 LLM 响应在协议上就是一个 assistant message，拆细会让重放组装多一层无谓复杂度。
+
+**长内容的处理**：如果某个 output 或工具结果特别大（长输出、大文件内容），
+考虑改成**资源引用**（复用现有的 blob 机制，按 hash 存、按需拉取），
+而不是把全文塞进事件。这样事件本身保持小而稳定，分页与缓存都不受影响。
+
+> `callId` 关联与 LLM 协议一致（Anthropic `tool_use_id` / OpenAI `tool_call_id`），
+> 并行工具完成顺序不影响配对。
 
 ### 2.2 边界事件（显式标记，便于崩溃恢复）
 
@@ -113,7 +121,9 @@ type Counts struct { Turns, Steps int }
 | `message.appended`（streaming 空壳） | 违反"内容只写一次"；崩溃恢复改用 `turn.started/finished` 判定 |
 | `tool.results`（批量） | 拆成单条 `tool.result` |
 
-> **兼容性**：旧日志里仍有 `message.appended` / `tool.results`，重放必须继续认得。新代码不再写入。
+> **不做兼容**：旧日志（含 `message.appended` / `message.finalized` / 批量 `tool.results`）
+> 不需要继续支持。迁移时直接换掉事件模型，旧会话数据不保留。
+> 这省掉了双写与兼容层，也让新模型能干净地落地。
 
 ---
 
@@ -213,9 +223,29 @@ TimelinePageJSON(sessionID string, beforeSeq uint64, limit int) string
 得到：[Turn -2 ... Turn -1]（seq 1..30 之前），合并到头部
 ```
 
-缓存 key 用 `seq` 区间，不用 turnId——因为 `turnId` 在 compact 后会重置。
+缓存 key 用 `seq` 区间。
 
-**compact 的处理**：压缩会开新日志文件，seq 从 0 重新开始。缓存要用 `(文件代号, seq)` 或压缩后整体失效。
+**压缩后 seq 不重置**（关键设计）：
+
+```
+压缩前：seq 1..1696
+压缩后：快照（seq 1697，内容 = 压缩摘要 + 保留的条目）
+        后续事件：1698, 1699, ...
+```
+
+这样处理的原因：
+- 展示端缓存 key 可以直接用 `seq`，不必拼「第几个文件」
+- 分页游标跨压缩仍然有效，不会出现「压缩后游标失效」
+- 单调递增这个性质贯穿整个会话生命周期
+
+**代价**：`store` 层现在压缩后会 `nextSeq = 1`（`seq=0` 固定留给快照）。
+改成不重置需要：
+- 快照不再硬编码 `Seq = 0`，而是分配一个正常的值
+- `kept_from_seq` 的语义要跟着调整（它现在指「base 里最后一条事件的序号」）
+- 加载时能从快照读出「历史覆盖到哪个 seq 为止」
+
+**压缩后的第一条记录**就是「压缩后需要用到的那部分信息」（摘要 + 保留条目），
+读取方据此知道「seq < 这个值的历史已经不在当前上下文里了」。
 
 ---
 
@@ -265,25 +295,35 @@ OpenAI 接受连续 user；Anthropic 会把相邻同角色消息合并。这点�
 | --- | --- | --- |
 | 1 | 重命名：`driver.Turn` → `Round`；`d.steps` → `turn` | 低（机械，但涉及 driver/timeline/uiapp/bridge 与测试） |
 | 2 | 新增 `roundId` / `turnId` 并落盘；新增四个边界事件 | 中 |
-| 3 | 事件拆分：`tool.results` → 单条 `tool.result`；去掉 streaming 空壳 | 中（重放必须兼容旧日志） |
+| 3 | 事件拆分：`tool.results` → 单条 `tool.result`；去掉 streaming 空壳 | 中 |
 | 4 | 崩溃恢复改为基于 `turn.finished` | 中（替换现有空壳检测） |
-| 5 | 分页协议从 item key 改为 seq | 中 |
-| 6 | 展示端按 seq 缓存 | 小 |
-| 7 | （可选）`timeline.Build` 改增量 | 高 |
+| 5 | **压缩后 seq 不重置**（快照不再用 0） | 中（涉及 store 层与 kept_from_seq） |
+| 6 | 分页协议从 item key 改为 seq | 中 |
+| 7 | 展示端按 seq 缓存 | 小 |
+| 8 | （可选）`timeline.Build` 改增量 | 高 |
 
-**阶段 1-5 完成后**：分页稳定、崩溃恢复明确、"内容只写一次"成立。
-**阶段 7** 才是解决"计算量随会话长度线性增长"的终极方案，可等观察到瓶颈再做。
+**阶段 1-6 完成后**：分页稳定、崩溃恢复明确、"内容只写一次"成立、压缩后游标不失效。
+**阶段 8** 才是解决"计算量随会话长度线性增长"的终极方案，可等观察到瓶颈再做。
 
-### 6.1 兼容性要求
+### 6.1 不做兼容迁移
 
-- 旧日志里的 `message.appended` / `message.finalized` / 批量 `tool.results` 必须继续能被重放
-- `compact.snapshot` 里的 `Turns`/`Steps` 字段语义变化要有迁移策略（旧快照读出来当作 Inputs/Turns）
+旧日志不需要继续支持。迁移时直接换掉事件模型：
+
+- 不再写入 `message.appended` / `message.finalized` / 批量 `tool.results`
+- 不再读取旧格式（旧会话数据不保留）
+- 相关测试数据需要按新模型重新生成
+
+这消除了双写、版本分派、兼容层这些复杂度。
 
 ---
 
 ## 7. 未决问题
 
-1. **`Counts` 的字段命名**：`Turns`（用户输入数）与新的 `Turn`（请求次数）冲突，需要改名（建议 `Inputs` / `Turns`），但会影响快照兼容。
-2. **`turn.started` 的必要性**：如果 `message.output` 之前崩溃，`turn.started` 是唯一证据。但也可以靠"有 input 无 output"判定。保留更明确。
-3. **compact 后 `roundId` 重置**：重置是自然的（新文件），但展示端缓存要能识别"这是压缩后的新序列"。
-4. **`message.output` 是否要 part 级拆细**：当前设计是一条事件一条 message。若将来某个 part 特别大（长工具输出），可能需要进一步拆。
+1. **`Counts` 的字段命名**：现有 `Counts.Turns` 指"用户输入条数"，与新的 `Turn`（请求次数）冲突。
+   建议改为 `Inputs` / `Turns`。因为不做兼容迁移，可以直接改。
+
+2. **`turn.started` 的必要性**：如果 `message.output` 之前崩溃，`turn.started` 是唯一证据。
+   也可以靠"有 input 无 output"判定，但自动续轮的 Turn 没有 input，会误判。保留更明确。
+
+3. **`message.output` 是否要 part 级拆细**：当前设计一条事件一条 message。
+   若将来某个 part 特别大，优先考虑**资源引用**（blob hash）而不是拆事件。
