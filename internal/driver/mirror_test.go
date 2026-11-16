@@ -75,11 +75,11 @@ func TestStreamDeltaMatchesExecutor(t *testing.T) {
 	start := startStream(t, effects)
 
 	replayed, err := driver.Replay([]store.Event{
-		store.MustEvent(store.TypeMessageAppended, driver.MessageAppendedData{
+		store.MustEvent(store.TypeMessageInput, driver.MessageEventData{
 			Message: message.Message{MessageID: "u1", Role: message.RoleUser, Parts: []message.Part{
 				message.NewTextPart("看文件")}}, Status: conversation.StatusComplete,
 		}),
-		store.MustEvent(store.TypeMessageAppended, driver.MessageAppendedData{
+		store.MustEvent(store.TypeMessageInput, driver.MessageEventData{
 			Message: execEmptyShell(start.MessageID), Status: conversation.StatusStreaming,
 		}),
 	})
@@ -164,12 +164,12 @@ func anthropicSequence() []providers.Event {
 func takeoverMirror(t *testing.T, execConv *conversation.Conversation, messageID, userText string) *driver.Mirror {
 	t.Helper()
 	replayed, err := driver.Replay([]store.Event{
-		store.MustEvent(store.TypeMessageAppended, driver.MessageAppendedData{
+		store.MustEvent(store.TypeMessageInput, driver.MessageEventData{
 			Message: message.Message{MessageID: "u1", Role: message.RoleUser,
 				Parts: []message.Part{message.NewTextPart(userText)}},
 			Status: conversation.StatusComplete,
 		}),
-		store.MustEvent(store.TypeMessageAppended, driver.MessageAppendedData{
+		store.MustEvent(store.TypeMessageInput, driver.MessageEventData{
 			Message: execEmptyShell(messageID), Status: conversation.StatusStreaming,
 		}),
 	})

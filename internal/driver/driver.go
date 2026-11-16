@@ -436,6 +436,12 @@ func (d *Driver) Send(text string) ([]Effect, error) {
 		all = append(all, text)
 	}
 
+	// 新的 Round：**先分配 roundId**，再追加用户消息——
+	// message.input 事件要带上 roundId，所以不能等 startTurn 时才分配。
+	// 插话（Enqueue → deliverQueued）不走这里，复用当前 roundId。
+	d.roundSeq++
+	d.roundStartedAt = time.Now()
+
 	effects, err := d.appendUserTexts(all)
 	if err != nil {
 		return nil, err
@@ -447,9 +453,6 @@ func (d *Driver) Send(text string) ([]Effect, error) {
 	d.queued = nil
 	d.depth = 0
 	d.autoCompactUsed = false
-	// 新的 Round：分配 roundId，Turn 从 0 重新开始（插话不走这里，不新增 Round）
-	d.roundSeq++
-	d.roundStartedAt = time.Now()
 	turnEffects, err := d.startTurn(0)
 	if err != nil {
 		return nil, err
@@ -478,6 +481,10 @@ func (d *Driver) SendWithAttachments(text string, attachments []message.Part) ([
 	if text != "" || len(attachments) > 0 {
 		all = append(all, text)
 	}
+	// 同 Send：先分配 roundId（message.input 要带上它），再追加用户消息
+	d.roundSeq++
+	d.roundStartedAt = time.Now()
+
 	effects, err := d.appendUserTextsWithLastParts(all, attachments)
 	if err != nil {
 		return nil, err
@@ -487,9 +494,6 @@ func (d *Driver) SendWithAttachments(text string, attachments []message.Part) ([
 	d.queued = nil
 	d.depth = 0
 	d.autoCompactUsed = false
-	// 新的 Round：分配 roundId，Turn 从 0 重新开始
-	d.roundSeq++
-	d.roundStartedAt = time.Now()
 	turnEffects, err := d.startTurn(0)
 	if err != nil {
 		return nil, err
@@ -580,7 +584,36 @@ func (d *Driver) addUserMessageWithParts(userID, text string, extra []message.Pa
 	}
 	// 用户输入条数即轮数（状态条口径见 Counts）
 	d.turns++
-	return []Effect{recordMessage(user, conversation.StatusComplete, "")}, nil
+	// 用户输入归属当前 Round 的第 0 个 Turn（插话时是当前 turn）
+	return []Effect{recordMessageInput(d.roundSeq, d.currentTurnIndex(), user)}, nil
+}
+
+// currentTurnIndex 返回用户消息应归属的 Turn 序号。
+//
+// 新 Round 里用户提问属于 Turn 0；插话发生在某个 Turn 进行中，
+// 归属那个正在进行的 Turn（d.round.turn）。
+func (d *Driver) currentTurnIndex() int {
+	if d.round == nil {
+		return 0
+	}
+	return d.round.turn
+}
+
+// toolResultOrigin 返回"发起这次工具调用"的那个 (round, turn)。
+//
+// **不能用 d.round**：工具是异步执行的，写结果时 driver 的当前 round/turn
+// 可能已经进入下一轮或被重置。归属应由发起调用的那条消息决定，
+// 而 d.round.messageID 记的正是它——但前提是它还在。
+func (d *Driver) toolResultOrigin(messageID string) (int, int) {
+	if d.round != nil && d.round.messageID == messageID {
+		return d.round.id, d.round.turn
+	}
+	// driver 已经进入下一轮/重置：退回"当前 Round 的当前 Turn"，
+	// 重放时由 call_id 兜底配对（见 replay.applyToolResult）。
+	if d.round != nil {
+		return d.round.id, d.round.turn
+	}
+	return d.roundSeq, 0
 }
 
 // deliverQueued 把排队的插话一次性投递出去（每条一条 user 消息），然后开下一轮流。
@@ -675,10 +708,11 @@ func (d *Driver) startTurn(turnIndex int) ([]Effect, error) {
 	effects = append(effects,
 		// Turn 边界：显式标记"这一轮请求开始了"。
 		// 崩溃恢复靠它判定"哪些 Turn 没走完"（没有 turn.finished 即中断）。
+		//
+		// **不再写 streaming 空壳**：内容只在确定后写一次，
+		// 崩溃时这一轮直接丢弃，从上一个 turn 继续
+		//（见 docs/session-log-model.md §2.4、§3）。
 		recordTurnStarted(round.id, round.turn),
-		// 流开始时写一条 streaming 空壳：进程若在生成中途被杀，重放会把它
-		// 标成「已中断」占位（用户明确要求的行为）
-		recordMessage(agent, conversation.StatusStreaming, ""),
 		StartStream{MessageID: round.messageID, Request: request},
 	)
 	// buildRequest 可能因为"模型不支持图片"而挂起一条一次性提示
@@ -1100,7 +1134,7 @@ func (d *Driver) finishStream(messageID, _ string) []Effect {
 
 	// 最终内容一次性写入（流式增量不落日志；参数非法产生的错误结果也在其中）
 	effects := []Effect{
-		recordFinalized(*entry.Message, conversation.StatusComplete, ""),
+		recordMessageOutput(round.id, round.turn, *entry.Message, conversation.StatusComplete, ""),
 		// Turn 边界：这一次请求结束了（后面可能还有工具执行与续轮）
 		recordTurnFinished(round.id, round.turn, time.Since(round.startedAt)),
 	}
@@ -1255,7 +1289,7 @@ func (d *Driver) failStream(messageID, reason string) []Effect {
 		_ = d.conv.FailStream(messageID, reason)
 		entry.SetFinishedAt(time.Now())
 		// 最终内容一次性写入（已含补齐的结果）
-		effects := []Effect{recordFinalized(*entry.Message, conversation.StatusFailed, reason)}
+		effects := []Effect{recordMessageOutput(d.round.id, d.round.turn, *entry.Message, conversation.StatusFailed, reason)}
 		// 失败也是终点：Turn 与 Round 都要收尾，否则崩溃恢复会把它当成"未完成"
 		if d.round != nil {
 			effects = append(effects,
@@ -1357,7 +1391,8 @@ func (d *Driver) ToolResult(messageID string, outcome tools.ToolOutcome) ([]Effe
 		MediaType: render.MediaToolResult,
 	})
 
-	effects := []Effect{recordToolResults(messageID, resultRecords([]tools.ToolOutcome{outcome})), Changed{}}
+	resultRound, resultTurn := d.toolResultOrigin(messageID)
+	effects := append(recordToolResults(resultRound, resultTurn, resultRecords([]tools.ToolOutcome{outcome})), Changed{})
 
 	if d.round != nil && d.round.pendingToolResults > 0 {
 		d.round.pendingToolResults--
@@ -1388,10 +1423,11 @@ func (d *Driver) finishToolBatch(messageID string, entry *conversation.ChatEntry
 	if providers.SettleUnfinishedToolCalls(entry.Message, "工具未返回结果（执行被中断）") {
 		text := d.tr("notice.unpairedTools")
 		_, _ = d.conv.AddNotice(conversation.NoticeWarn, text)
-		effects = append(effects,
-			recordToolResults(messageID, partResultRecords(entry.Message)),
-			recordNotice(conversation.NoticeWarn, "部分工具未返回结果，已标记为失败。"),
-		)
+		// recordToolResults 返回 []Effect，必须先展开再追加后面的提示
+		// （Go 只允许展开参数出现在 append 的最后，所以分两步）
+		resultRound, resultTurn := d.toolResultOrigin(messageID)
+		effects = append(effects, recordToolResults(resultRound, resultTurn, partResultRecords(entry.Message))...)
+		effects = append(effects, recordNotice(conversation.NoticeWarn, "部分工具未返回结果，已标记为失败。"))
 	}
 	next, err := d.continueAfterTools()
 	if err != nil {
@@ -1545,7 +1581,7 @@ func (d *Driver) Stop() []Effect {
 			_ = d.conv.CancelStream(messageID)
 			entry.SetFinishedAt(time.Now())
 			// 最终内容一次性写入（已含补齐的结果，不要再单独记 tool.results）
-			effects = append(effects, recordFinalized(*entry.Message, conversation.StatusCancelled, ""))
+			effects = append(effects, recordMessageOutput(d.round.id, d.round.turn, *entry.Message, conversation.StatusCancelled, ""))
 			// 用户主动停止也是终点：Turn 与 Round 都要收尾
 			if d.round != nil {
 				effects = append(effects,
@@ -1556,7 +1592,8 @@ func (d *Driver) Stop() []Effect {
 		case BusyRunningTools, BusyAwaitingAnswer:
 			// 这条消息在工具执行前已经 Complete 并落过日志，只需补结果
 			if changed {
-				effects = append(effects, recordToolResults(messageID, partResultRecords(entry.Message)))
+				resultRound, resultTurn := d.toolResultOrigin(messageID)
+		effects = append(effects, recordToolResults(resultRound, resultTurn, partResultRecords(entry.Message))...)
 			}
 		}
 	}

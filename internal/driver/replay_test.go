@@ -222,12 +222,12 @@ func compareConversations(t *testing.T, live, replayed *conversation.Conversatio
 func TestReplayStreamingBecomesCancelled(t *testing.T) {
 	events := []store.Event{
 		store.MustEvent(store.TypeSessionCreated, driver.SessionCreatedData{ContextID: "ctx-1"}),
-		store.MustEvent(store.TypeMessageAppended, driver.MessageAppendedData{
+		store.MustEvent(store.TypeMessageInput, driver.MessageEventData{
 			Message: message.Message{MessageID: "m1", Role: message.RoleUser,
 				Parts: []message.Part{message.NewTextPart("hi")}},
 			Status: conversation.StatusComplete,
 		}),
-		store.MustEvent(store.TypeMessageAppended, driver.MessageAppendedData{
+		store.MustEvent(store.TypeMessageInput, driver.MessageEventData{
 			Message: message.Message{MessageID: "m2", Role: message.RoleAgent,
 				Parts: []message.Part{message.NewTextPart("半句")}},
 			Status: conversation.StatusStreaming,
@@ -429,11 +429,12 @@ func TestReplayTruncatesOnSeqGap(t *testing.T) {
 	}
 }
 
-// 回归（opus P0-3）：生成回复时崩溃 → 重放显示「已中断」占位。
+// 生成回复时崩溃 → **不留任何痕迹**，但 OpenTurn 非空表示"上次有请求没走完"。
 //
-// 这里用 driver **真实产生**的事件：启动流之后立刻取走到这一刻为止的 Record，
-// 不写 finalized —— 等价于进程在生成过程中被杀。
-func TestReplayCrashDuringStreamingShowsInterrupted(t *testing.T) {
+// 新模型（docs/session-log-model.md §3）：流式增量不落盘，内容只在确定后写一次。
+// 因此崩溃在流式过程中时，这一轮直接丢弃，从上一个 turn 继续——
+// 不写 streaming 空壳，也不会出现"半条消息"。
+func TestReplayCrashDuringStreamingLeavesNoTrace(t *testing.T) {
 	conv := conversation.New("ctx-crash")
 	d := driver.New(conv, driver.Options{
 		Selection: providers.Selection{ProviderID: "fake", Model: "m"},
@@ -453,31 +454,24 @@ func TestReplayCrashDuringStreamingShowsInterrupted(t *testing.T) {
 		t.Fatal("消息应已建立")
 	}
 	d.ApplyEvent(start.MessageID, providers.Event{Kind: providers.EventText, Text: "写到一半"})
-	// 进程被杀：不记录 finalized
+	// 进程被杀：不记录 turn.finished / message.output
 
 	replayed, err := driver.Replay(rec.events)
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry, ok := replayed.Conversation.Message(start.MessageID)
-	if !ok {
-		t.Fatal("应有「已中断」的占位消息")
-	}
-	if entry.Status() != conversation.StatusCancelled {
-		t.Fatalf("应标为 cancelled，实际 %v", entry.Status())
-	}
-	if len(replayed.Repairs) == 0 {
-		t.Fatal("应产生一条 finalized(cancelled) 的修复事件")
+
+	// 内容层面：只有用户那条 input，agent 的输出完全没落盘
+	if _, ok := replayed.Conversation.Message(start.MessageID); ok {
+		t.Fatal("流式崩溃不该留下 agent 消息（内容只在确定后写一次）")
 	}
 
-	// 修复事件写回日志后，再次重放不再产生新的修复（幂等）
-	replayed2 := appendAndReplay(t, rec.events, replayed.Repairs)
-	if len(replayed2.Repairs) != 0 {
-		t.Fatalf("修复应幂等，第二次仍有 %d 条", len(replayed2.Repairs))
-	}
-	entry2, _ := replayed2.Conversation.Message(start.MessageID)
-	if entry2.Status() != conversation.StatusCancelled {
-		t.Fatalf("第二次重放状态应稳定，实际 %v", entry2.Status())
+	// 状态层面：OpenTurn 非空 → 界面据此提示"上次异常结束"，让用户决定是否重发
+	if replayed.OpenTurn.Round == 0 && replayed.OpenTurn.Turn == 0 {
+		// round/turn 都从 1/0 开始，全零说明没记录到
+		if replayed.CrashedRound == 0 {
+			t.Fatal("应记录到一个未完成的 Turn（OpenTurn 或 CrashedRound）")
+		}
 	}
 }
 

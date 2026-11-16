@@ -70,6 +70,11 @@ type Replayed struct {
 	// （同一会话的多次 ApplyPersisted 必须共享，不能每次重建）。
 	appendedAt map[string]time.Time
 	counted    map[string]bool
+	// turnMessages 是 (round, turn) → agent 消息 ID 的索引。
+	//
+	// tool.result 只带 (round, turn, call_id)，重放时要靠它找回归属消息。
+	// 与 appendedAt/counted 一样，增量续传必须共享同一份。
+	turnMessages map[turnKey]string
 }
 
 // Replay 把事件流重建成会话状态。
@@ -109,6 +114,17 @@ type replayState struct {
 	appendedAt map[string]time.Time
 	// counted 保证同一条消息只记一次数（"appended" 与"finalized 兜底"可能都碰到它）。
 	counted map[string]bool
+	// turnMessages 记录每个 (round, turn) 对应的 agent 消息 ID。
+	//
+	// tool.result 事件只带 (round, turn, call_id)，要靠它找回归属的消息——
+	// 工具的产出 belongs to 发起它的那次请求。
+	turnMessages map[turnKey]string
+}
+
+// turnKey 是 (round, turn) 的复合键。
+type turnKey struct {
+	Round int
+	Turn  int
 }
 
 func newReplayState() *replayState {
@@ -116,20 +132,22 @@ func newReplayState() *replayState {
 	conv := conversation.New("")
 	out.Conversation = conv
 	return &replayState{
-		out:        out,
-		conv:       conv,
-		appendedAt: map[string]time.Time{},
-		counted:    map[string]bool{},
+		out:          out,
+		conv:         conv,
+		appendedAt:   map[string]time.Time{},
+		counted:      map[string]bool{},
+		turnMessages: map[turnKey]string{},
 	}
 }
 
 // newReplayStateFrom 在已有结果上继续累加（增量续传）。
 func newReplayStateFrom(replayed *Replayed) *replayState {
 	st := &replayState{
-		out:        replayed,
-		conv:       replayed.Conversation,
-		appendedAt: replayed.appendedAt,
-		counted:    replayed.counted,
+		out:          replayed,
+		conv:         replayed.Conversation,
+		appendedAt:   replayed.appendedAt,
+		counted:      replayed.counted,
+		turnMessages: replayed.turnMessages,
 	}
 	if st.appendedAt == nil {
 		st.appendedAt = map[string]time.Time{}
@@ -138,6 +156,10 @@ func newReplayStateFrom(replayed *Replayed) *replayState {
 	if st.counted == nil {
 		st.counted = map[string]bool{}
 		replayed.counted = st.counted
+	}
+	if st.turnMessages == nil {
+		st.turnMessages = map[turnKey]string{}
+		replayed.turnMessages = st.turnMessages
 	}
 	return st
 }
@@ -208,8 +230,8 @@ func (st *replayState) apply(event store.Event) {
 			out.ContextID = data.ContextID
 		}
 
-	case store.TypeMessageAppended:
-		var data MessageAppendedData
+	case store.TypeMessageInput:
+		var data MessageEventData
 		if err := event.Decode(&data); err != nil {
 			out.Warnings = append(out.Warnings, err.Error())
 			return
@@ -219,26 +241,26 @@ func (st *replayState) apply(event store.Event) {
 			out.Warnings = append(out.Warnings, addErr.Error())
 			return
 		}
-		// 计数：user 消息算一轮，agent 消息算一步（口径见 Counts）。
-		// 只在这里加——finalize/status/tool.results 都是给同一条消息补状态。
+		// 计数：user 消息算一轮（口径见 Counts）
 		st.countMessage(data.Message.MessageID, data.Message.Role)
-		// 用事件时间作为消息的创建时间：回合耗时 = 最后一条消息的完成时间 −
-		// 回合前那条 user 消息的创建时间，重放与实时因此一致（不再额外写事件）。
+		// 用事件时间作为创建时间：回合耗时 = 最后一条消息完成时间 −
+		// 回合前那条 user 消息的创建时间，重放与实时因此一致。
 		if !event.At.IsZero() {
 			added.CreatedAt = event.At
 		}
 		st.appendedAt[data.Message.MessageID] = event.At
-		if data.Status == conversation.StatusFailed {
-			_ = conv.SetFailureReason(data.Message.MessageID, data.Reason)
-		}
 
-	case store.TypeMessageFinalize:
-		var data MessageFinalizedData
+	case store.TypeMessageOutput:
+		var data MessageEventData
 		if err := event.Decode(&data); err != nil {
 			out.Warnings = append(out.Warnings, err.Error())
 			return
 		}
+		// 记下 (round, turn) → 消息 ID：后续 tool.result 靠它找归属
+		st.turnMessages[turnKey{Round: data.Round, Turn: data.Turn}] = data.Message.MessageID
+
 		if entry, ok := conv.Message(data.Message.MessageID); ok {
+			// 已存在（理论上不该有，因为不再写空壳）：覆盖内容
 			if err := conv.ReplaceContent(data.Message.MessageID, data.Message,
 				data.Status, data.Reason); err != nil {
 				out.Warnings = append(out.Warnings, err.Error())
@@ -252,9 +274,11 @@ func (st *replayState) apply(event store.Event) {
 			added.CreatedAt = event.At
 			added.SetFinishedAt(event.At)
 		}
-		// 这条消息可能**只经 finalized 出现**（appended 那行损坏/被截断）：
-		// countMessage 幂等，这里补一次不会重复计数。
 		st.countMessage(data.Message.MessageID, data.Message.Role)
+		st.appendedAt[data.Message.MessageID] = event.At
+		if data.Status == conversation.StatusFailed {
+			_ = conv.SetFailureReason(data.Message.MessageID, data.Reason)
+		}
 
 	case store.TypeMessageStatus:
 		var data MessageStatusData
@@ -264,13 +288,13 @@ func (st *replayState) apply(event store.Event) {
 		}
 		applyStatus(conv, data, out)
 
-	case store.TypeToolResults:
-		var data ToolResultsData
+	case store.TypeToolResult:
+		var data ToolResultData
 		if err := event.Decode(&data); err != nil {
 			out.Warnings = append(out.Warnings, err.Error())
 			return
 		}
-		appendToolResults(conv, data)
+		st.applyToolResult(data)
 
 	case store.TypeAskAnswered:
 		var data AskAnsweredData
@@ -386,44 +410,80 @@ func applyStatus(conv *conversation.Conversation, data MessageStatusData, out *R
 	}
 }
 
-// appendToolResults 把工具结果写回消息。
-func appendToolResults(conv *conversation.Conversation, data ToolResultsData) {
-	entry, ok := conv.Message(data.MessageID)
+// applyToolResult 把**单条**工具结果写回它所属的消息。
+//
+// 归属优先靠 call_id：工具结果一定带着它，而且 tool_use 就在目标消息里。
+// (round, turn) 只作为"日志里已经有了明确标注"时的快速路径——
+// 不能用它作为唯一依据，因为工具执行是异步的，写结果时 driver 的当前
+// round/turn 可能已经变了（续轮、重置）。
+func (st *replayState) applyToolResult(data ToolResultData) {
+	messageID := st.findMessageByCallID(data.CallID)
+	if messageID == "" {
+		// 兜底：按 (round, turn) 找（call_id 缺失或 tool_use 已被压缩掉）
+		messageID = st.turnMessages[turnKey{Round: data.Round, Turn: data.Turn}]
+	}
+	if messageID == "" {
+		return
+	}
+	entry, ok := st.conv.Message(messageID)
 	if !ok {
 		return
 	}
-	for _, result := range data.Results {
-		fields := map[string]any{
-			"id":       result.ID,
-			"name":     result.Name,
-			"output":   result.Output,
-			"is_error": result.IsError,
-		}
-		if len(result.Images) > 0 {
-			images := make([]any, 0, len(result.Images))
-			for _, image := range result.Images {
-				images = append(images, map[string]any{
-					"ref":        image.Ref,
-					"media_type": image.MediaType,
-					"width":      image.Width,
-					"height":     image.Height,
-				})
-			}
-			fields["images"] = images
-		}
-		part := message.Part{
-			Content:   message.DataPart{Data: fields},
-			MediaType: render.MediaToolResult,
-		}
-		if result.Pending {
-			data := part.Content.(message.DataPart).Data.(map[string]any)
-			data["pending"] = true
-			if len(result.Questions) > 0 {
-				data["questions"] = result.Questions
-			}
-		}
-		entry.AddPart(part)
+
+	result := data.ToolResultRecord
+	fields := map[string]any{
+		"id":       result.ID,
+		"name":     result.Name,
+		"output":   result.Output,
+		"is_error": result.IsError,
 	}
+	if len(result.Images) > 0 {
+		images := make([]any, 0, len(result.Images))
+		for _, image := range result.Images {
+			images = append(images, map[string]any{
+				"ref":        image.Ref,
+				"media_type": image.MediaType,
+				"width":      image.Width,
+				"height":     image.Height,
+			})
+		}
+		fields["images"] = images
+	}
+	if result.Pending {
+		fields["pending"] = true
+		if len(result.Questions) > 0 {
+			fields["questions"] = result.Questions
+		}
+	}
+	entry.AddPart(message.Part{
+		Content:   message.DataPart{Data: fields},
+		MediaType: render.MediaToolResult,
+	})
+}
+
+// findMessageByCallID 在所有消息里找带指定 tool_use 的那一条（兜底用）。
+func (st *replayState) findMessageByCallID(callID string) string {
+	if callID == "" {
+		return ""
+	}
+	for _, entry := range st.conv.Entries() {
+		if entry.Message == nil {
+			continue
+		}
+		for _, part := range entry.Message.Message.Parts {
+			if !isMedia(part, render.MediaToolUse) {
+				continue
+			}
+			payload, ok := partData(part)
+			if !ok {
+				continue
+			}
+			if id, _ := payload["id"].(string); id == callID {
+				return entry.Message.Message.MessageID
+			}
+		}
+	}
+	return ""
 }
 
 // settleAsk 用最终答案覆盖 pending 占位。
@@ -475,10 +535,13 @@ func restorePending(conv *conversation.Conversation, out *Replayed) []*AskGroup 
 
 		if status.IsStreaming() || status == conversation.StatusPending {
 			// 进程在生成回复时被杀：保留已写入的内容，标成「已中断」
+			//
+			// 新模型下不会再写 streaming 空壳，所以这条路径只对**旧日志**生效；
+			// 新日志的中断由 turn.finished 缺失来判定（见 reclaimOpenTurn）。
 			_ = conv.CancelStream(msg.Message.MessageID)
 			out.Warnings = append(out.Warnings, "有一条消息在生成过程中被中断，已标记为已中止")
-			out.Repairs = append(out.Repairs, store.MustEvent(store.TypeMessageFinalize,
-				MessageFinalizedData{
+			out.Repairs = append(out.Repairs, store.MustEvent(store.TypeMessageOutput,
+				MessageEventData{
 					Message: *msg.Message,
 					Status:  conversation.StatusCancelled,
 				}))
@@ -509,9 +572,11 @@ func restorePending(conv *conversation.Conversation, out *Replayed) []*AskGroup 
 		// 执行工具时崩溃：agent 消息已经 complete 并带 tool_use，但结果没写
 		if providers.SettleUnfinishedToolCalls(msg.Message, "已中断：进程在执行工具时退出。") {
 			out.Warnings = append(out.Warnings, "有工具调用没有结果，已补记为「已中断」")
-			results := partResultRecords(msg.Message)
-			out.Repairs = append(out.Repairs, store.MustEvent(store.TypeToolResults,
-				ToolResultsData{MessageID: msg.Message.MessageID, Results: results}))
+			// 拆成单条 tool.result 事件（与 recordToolResults 的写法一致）
+			for _, result := range partResultRecords(msg.Message) {
+				out.Repairs = append(out.Repairs, store.MustEvent(store.TypeToolResult,
+					ToolResultData{CallID: result.ID, ToolResultRecord: result}))
+			}
 		}
 	}
 	return groups

@@ -559,6 +559,9 @@ func TestToolResultImagesPersistAndReplay(t *testing.T) {
 	argEffects, _ := d.ApplyEvent(start.MessageID, providers.Event{Kind: providers.EventToolArgs, Index: 0, Delta: `{"file_path":"a.png"}`})
 	rec.apply(argEffects)
 	effects, _ = d.ApplyEvent(start.MessageID, providers.Event{Kind: providers.EventDone, StopReason: "tool_calls"})
+	// **必须记录**：message.output 就在这批 effects 里
+	//（新模型不再写 streaming 空壳，没有别的地方能留下这条消息）
+	rec.apply(effects)
 	run := runTools(t, effects)
 
 	ref := tools.ToolImageRef{

@@ -74,7 +74,7 @@ func TestToleratesTruncatedLastLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
-		if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": i})); err != nil {
+		if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": i})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -116,7 +116,7 @@ func TestCorruptMiddleLineTruncates(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 4; i++ {
-		if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": i})); err != nil {
+		if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": i})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -198,7 +198,7 @@ func TestCompactRollsArchive(t *testing.T) {
 	}
 	defer s.Close()
 	for i := 0; i < 3; i++ {
-		if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": i})); err != nil {
+		if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": i})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -230,7 +230,7 @@ func TestCompactRollsArchive(t *testing.T) {
 	}
 
 	// 之后追加从 seq=1 开始
-	if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"after": true})); err != nil {
+	if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"after": true})); err != nil {
 		t.Fatal(err)
 	}
 	result, _ = s.Load()
@@ -262,7 +262,7 @@ func TestStartupCleansStaleTmp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": 0})); err != nil {
+	if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": 0})); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -281,7 +281,7 @@ func TestStartupCleansStaleTmp(t *testing.T) {
 		t.Fatal("残留 tmp 应被清理")
 	}
 	result, _ := s2.Load()
-	if len(result.Events) != 1 || result.Events[0].Type != store.TypeMessageAppended {
+	if len(result.Events) != 1 || result.Events[0].Type != store.TypeMessageInput {
 		t.Fatalf("当前文件应保持旧内容：%#v", result.Events)
 	}
 }
@@ -293,7 +293,7 @@ func TestCompactReusesExistingArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": 0})); err != nil {
+	if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": 0})); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Compact(mustEvent(t, store.TypeCompactSnapshot, map[string]any{"summary": "一"})); err != nil {
@@ -308,7 +308,7 @@ func TestCompactReusesExistingArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	if err := s2.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": 1})); err != nil {
+	if err := s2.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": 1})); err != nil {
 		t.Fatal(err)
 	}
 	if err := s2.Compact(mustEvent(t, store.TypeCompactSnapshot, map[string]any{"summary": "二"})); err != nil {
@@ -341,9 +341,9 @@ func TestMemoryStoreMatchesJsonl(t *testing.T) {
 
 	kinds := []string{
 		store.TypeSessionCreated,
-		store.TypeMessageAppended,
+		store.TypeMessageInput,
 		store.TypeMessageStatus,
-		store.TypeToolResults,
+		store.TypeToolResult,
 		store.TypeSelectionChange,
 	}
 	for _, kind := range kinds {
@@ -495,7 +495,7 @@ func TestAppendAfterTruncatedLineKeepsNewEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": i})); err != nil {
+		if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": i})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -553,7 +553,7 @@ func TestAppendAfterCorruptMiddleKeepsNewEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
-		if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": i})); err != nil {
+		if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": i})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -604,7 +604,7 @@ func TestOrphanArchiveDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
-		if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": i})); err != nil {
+		if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": i})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -660,7 +660,7 @@ func TestLoadOlderReportsCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": i})); err != nil {
+		if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": i})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -704,7 +704,7 @@ func TestCompactRecordsKeptFromSeq(t *testing.T) {
 	}
 	defer s.Close()
 	for i := 0; i < 3; i++ {
-		if err := s.Append(mustEvent(t, store.TypeMessageAppended, map[string]any{"i": i})); err != nil {
+		if err := s.Append(mustEvent(t, store.TypeMessageInput, map[string]any{"i": i})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -887,7 +887,7 @@ func TestEventWithInvalidUTF8DoesNotPanic(t *testing.T) {
 			map[string]any{"call_id": "c1", "status": "ok", "output": "内容：" + gbk},
 		},
 	}
-	event := store.MustEvent(store.TypeToolResults, data) // 以前这里 panic
+	event := store.MustEvent(store.TypeToolResult, data) // 以前这里 panic
 	if len(event.Data) == 0 {
 		t.Fatal("事件数据为空")
 	}

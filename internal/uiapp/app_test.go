@@ -2115,7 +2115,7 @@ func TestStartupPrunesEmptySessions(t *testing.T) {
 		store.SessionCreatedData{ContextID: "full-1", Title: "有内容"})); err != nil {
 		t.Fatal(err)
 	}
-	if err := full.Append(store.MustEvent(store.TypeMessageAppended, map[string]any{
+	if err := full.Append(store.MustEvent(store.TypeMessageInput, map[string]any{
 		"message": map[string]any{
 			"messageId": "m1", "role": "ROLE_USER",
 			"parts": []any{map[string]any{"text": "你好"}},

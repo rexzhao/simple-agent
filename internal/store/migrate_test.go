@@ -21,13 +21,13 @@ func writeOldFormat(t *testing.T, dir string, snapshots int) []store.Event {
 		events = append(events, event)
 	}
 	for round := 0; round < snapshots; round++ {
-		add(store.TypeMessageAppended, map[string]any{"round": round, "role": "user"})
-		add(store.TypeMessageFinalize, map[string]any{"round": round, "role": "agent"})
+		add(store.TypeMessageInput, map[string]any{"round": round, "role": "user"})
+		add(store.TypeMessageOutput, map[string]any{"round": round, "role": "agent"})
 		add(store.TypeCompactSnapshot, map[string]any{
 			"summary": "摘要", "kept_from_seq": 0,
 		})
 	}
-	add(store.TypeMessageAppended, map[string]any{"round": 99, "role": "user"})
+	add(store.TypeMessageInput, map[string]any{"round": 99, "role": "user"})
 
 	path := filepath.Join(dir, "session.jsonl")
 	file, err := os.Create(path)

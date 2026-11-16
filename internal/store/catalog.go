@@ -138,7 +138,7 @@ func (c *Catalog) PruneEmpty() ([]string, error) {
 func hasContent(events []Event) bool {
 	for _, event := range events {
 		switch event.Type {
-		case TypeMessageAppended, TypeMessageFinalize, TypeToolResults,
+		case TypeMessageInput, TypeMessageOutput, TypeToolResult,
 			TypeAskRaised, TypeAskAnswered, TypeNotice:
 			return true
 		}

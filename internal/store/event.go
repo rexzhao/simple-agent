@@ -23,15 +23,25 @@ const Version = 1
 
 // 事件类型（与设计文档 §3.2 一致）。
 const (
-	TypeSessionCreated  = "session.created"
-	TypeMessageAppended = "message.appended"
-	TypeMessageFinalize = "message.finalized"
-	TypeMessageStatus   = "message.status"
-	TypeToolResults     = "tool.results"
-	TypeAskRaised       = "ask.raised"
-	TypeAskAnswered     = "ask.answered"
+	TypeSessionCreated = "session.created"
+	// TypeMessageInput 是用户输入（一条消息一条记录）。
+	//
+	// 取代旧的 message.appended：旧实现会在流开始时写一条 streaming 空壳，
+	// 结束时再写 finalized 覆盖，同一条消息落两次日志。现在内容只在确定后
+	// 写一次，空壳改用 turn.started/finished 表达（见 session-log-model.md）。
+	TypeMessageInput = "message.input"
+	// TypeMessageOutput 是 LLM 的一次完整输出（含 thinking / text / tool_use parts）。
+	TypeMessageOutput = "message.output"
+	TypeMessageStatus = "message.status"
+	// TypeToolResult 是单条工具结果（靠 call_id 与 tool_use 关联）。
+	//
+	// 取代旧的批量 tool.results：拆成单条后每条都不可变，
+	// 展示端可以按条缓存，分页也只需按 seq 切。
+	TypeToolResult     = "tool.result"
+	TypeAskRaised      = "ask.raised"
+	TypeAskAnswered    = "ask.answered"
 	TypeSelectionChange = "selection.changed"
-	TypeSessionRenamed  = "session.renamed"
+	TypeSessionRenamed = "session.renamed"
 	TypeCompactSnapshot = "compact.snapshot"
 	// TypeNotice 记录本地通知（例如「回答被截断」「达到轮数上限」）。
 	// 设计文档的事件清单里没有它；加了它是因为通知也会显示在会话里，

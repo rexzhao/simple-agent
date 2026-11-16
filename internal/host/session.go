@@ -781,8 +781,10 @@ func (s *Session) loadOlder(cursor string) (OlderPage, error) {
 			continue
 		}
 		switch event.Type {
-		case store.TypeMessageAppended:
-			var data driver.MessageAppendedData
+		case store.TypeMessageInput, store.TypeMessageOutput:
+			// 新模型下一条消息只写一条事件（不再有 appended + finalized 两次），
+			// 所以这里不需要去重："input 是用户消息，output 是 LLM 输出"。
+			var data driver.MessageEventData
 			if err := event.Decode(&data); err != nil {
 				continue
 			}
@@ -795,17 +797,6 @@ func (s *Session) loadOlder(cursor string) (OlderPage, error) {
 			}
 			entries = append(entries, OlderEntry{
 				Message: data.Message, Status: status, Reason: data.Reason, CreatedAt: event.At.Unix(),
-			})
-		case store.TypeMessageFinalize:
-			var data driver.MessageFinalizedData
-			if err := event.Decode(&data); err != nil {
-				continue
-			}
-			if keptIDs[data.Message.MessageID] {
-				continue
-			}
-			entries = append(entries, OlderEntry{
-				Message: data.Message, Status: data.Status, Reason: data.Reason, CreatedAt: event.At.Unix(),
 			})
 		}
 	}

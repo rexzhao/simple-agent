@@ -25,7 +25,7 @@ func TestRestoreTitleFromLocaleKey(t *testing.T) {
 	if err := log.Append(created); err != nil {
 		t.Fatal(err)
 	}
-	appended, err := store.NewEvent(store.TypeMessageAppended, map[string]any{
+	appended, err := store.NewEvent(store.TypeMessageInput, map[string]any{
 		"message": map[string]any{"messageId": "m1", "role": "ROLE_USER", "parts": []any{}},
 		"status":  "complete",
 	})

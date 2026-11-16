@@ -53,7 +53,7 @@ func TestIdleSnapshotClosesStaleStreaming(t *testing.T) {
 		t.Fatal("没有会话")
 	}
 
-	event, err := store.NewEvent(store.TypeMessageAppended, map[string]any{
+	event, err := store.NewEvent(store.TypeMessageInput, map[string]any{
 		"message": map[string]any{"messageId": "m1", "role": "ROLE_AGENT", "parts": []any{}},
 		"status":  string(conversation.StatusStreaming),
 	})

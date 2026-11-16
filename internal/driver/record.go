@@ -27,19 +27,20 @@ type SessionCreatedData struct {
 	Workspace string `json:"workspace,omitempty"`
 }
 
-// MessageAppendedData 是 message.appended 的载荷。
-type MessageAppendedData struct {
-	Message message.Message          `json:"message"`
-	Status  conversation.EntryStatus `json:"status"`
-	Reason  string                   `json:"reason,omitempty"`
-}
-
-// MessageFinalizedData 是 message.finalized 的载荷：携带最终的完整 parts。
+// MessageEventData 是 message.input / message.output 的载荷。
 //
-// 与 message.appended 的分工：开始流时写 appended(status=streaming)，结束时写
-// finalized。若只有 appended 而没有 finalized，说明进程在生成回复时崩了——
-// 重放要显示「已中断」占位（用户明确要求的行为），而不是当作什么都没发生。
-type MessageFinalizedData struct {
+// 一条事件 = 一条完整的消息（不拆 part 级）：
+//   - message.input：用户输入，status 恒为 complete
+//   - message.output：LLM 的一次完整输出（含 thinking / text / tool_use）
+//
+// 流式过程中的增量**不落盘**：崩溃时这一轮直接丢弃，从上一个 turn 继续
+// （见 docs/session-log-model.md §3）。
+type MessageEventData struct {
+	// Round/Turn 标明这条消息属于哪个回合的哪一次请求。
+	Round int `json:"round"`
+	Turn  int `json:"turn"`
+	// Role 是 user / agent（与 message.Message.Role 一致，方便只读日志时判断）。
+	Role    string                   `json:"role"`
 	Message message.Message          `json:"message"`
 	Status  conversation.EntryStatus `json:"status"`
 	Reason  string                   `json:"reason,omitempty"`
@@ -64,10 +65,16 @@ type ToolResultRecord struct {
 	Questions []tools.QuestionSpec `json:"questions,omitempty"`
 }
 
-// ToolResultsData 是 tool.results 的载荷。
-type ToolResultsData struct {
-	MessageID string             `json:"message_id"`
-	Results   []ToolResultRecord `json:"results"`
+// ToolResultData 是 tool.result 的载荷：**单条**工具结果。
+//
+// 取代旧的批量 tool.results：一条事件一条结果，写入后不再变更，
+// 展示端可按条缓存、分页只需按 seq 切。
+// 它与 tool_use 的关联靠 CallID（与 LLM 协议一致，并行工具完成顺序不影响配对）。
+type ToolResultData struct {
+	Round  int `json:"round"`
+	Turn   int `json:"turn"`
+	CallID string `json:"call_id"`
+	ToolResultRecord
 }
 
 // AskRaisedData 是 ask.raised 的载荷。
@@ -167,27 +174,39 @@ func recordCreated(contextID, title, workspace string) Effect {
 	})
 }
 
-// recordMessage 记录一条消息（用户消息、新建的 agent 消息、补齐后的结果）。
-func recordMessage(msg message.Message, status conversation.EntryStatus, reason string) Effect {
-	return record(store.TypeMessageAppended, MessageAppendedData{
-		Message: msg,
-		Status:  status,
-		Reason:  reason,
+// recordMessageInput 记录用户输入（一条消息一条记录）。
+func recordMessageInput(roundID, turn int, msg message.Message) Effect {
+	return record(store.TypeMessageInput, MessageEventData{
+		Round: roundID, Turn: turn, Role: "user",
+		Message: msg, Status: conversation.StatusComplete,
 	})
 }
 
-// recordFinalized 记录一条消息的最终内容与状态。
-func recordFinalized(msg message.Message, status conversation.EntryStatus, reason string) Effect {
-	return record(store.TypeMessageFinalize, MessageFinalizedData{
-		Message: msg,
-		Status:  status,
-		Reason:  reason,
+// recordMessageOutput 记录 LLM 的一次完整输出（含 thinking / text / tool_use）。
+//
+// 只在内容确定后写一次：流式增量不落盘，因此不会再出现"同一条消息两条事件"。
+func recordMessageOutput(roundID, turn int, msg message.Message, status conversation.EntryStatus, reason string) Effect {
+	return record(store.TypeMessageOutput, MessageEventData{
+		Round: roundID, Turn: turn, Role: "agent",
+		Message: msg, Status: status, Reason: reason,
 	})
 }
 
-// recordToolResults 记录工具结果（含补齐的合成结果）。
-func recordToolResults(messageID string, results []ToolResultRecord) Effect {
-	return record(store.TypeToolResults, ToolResultsData{MessageID: messageID, Results: results})
+// recordToolResults 把一批工具结果拆成**单条**事件（含补齐的合成结果）。
+//
+// 拆成单条的理由：每条写入后不再变更，展示端可按条缓存；
+// 分页按 seq 切时不会出现"半批结果"。
+//
+// round/turn 由调用方按**发起这次工具调用的那条消息**给出（见 driver 侧），
+// 不能用 driver 的当前 round/turn——工具是异步执行的，写结果时状态可能已经变了。
+func recordToolResults(roundID, turn int, results []ToolResultRecord) []Effect {
+	effects := make([]Effect, 0, len(results))
+	for _, result := range results {
+		effects = append(effects, record(store.TypeToolResult, ToolResultData{
+			Round: roundID, Turn: turn, CallID: result.ID, ToolResultRecord: result,
+		}))
+	}
+	return effects
 }
 
 // recordAskRaised 记录提问。
