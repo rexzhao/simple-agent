@@ -37,6 +37,12 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            // 16 KB 页大小支持（Android 15+）。AGP 8.5.1+ 会在未压缩存储 .so
+            // 时按 16 KB 边界对齐 zip 条目；useLegacyPackaging=false 是前提，
+            // 打开它 .so 才是未压缩 + 对齐的。
+            useLegacyPackaging = false
+        }
     }
 
     buildTypes {
@@ -49,6 +55,11 @@ android {
 dependencies {
     // Go 内核（由 scripts/build-android.ps1 生成，见下面 bindGoKernel 任务）
     implementation(files("libs/bridge.aar"))
+
+    // 强制升级 graphics-path：Compose UI 1.7.6 传递依赖的是 1.0.1，
+    // 该版本的 libandroidx.graphics.path.so 在 16 KB 页设备上会被
+    // Android 15 的兼容性检查报错（"未知错误"）。1.1.0 已按 16 KB 重新编译。
+    implementation("androidx.graphics:graphics-path:1.1.0")
 
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-compose:1.9.3")
@@ -93,6 +104,12 @@ val bindGoKernel = tasks.register<Exec>("bindGoKernel") {
         "bind",
         "-target=android/arm64,android/arm,android/amd64,android/386",
         "-androidapi=24",
+        // Go 默认按 4 KB 页对齐 ELF 的 PT_LOAD 段，Android 15+ 的 16 KB 页
+        // 设备会拒绝加载，安装后弹"此应用不符合 16 KB 对齐要求"。
+        // 这个参数把对齐改成 16 KB；只影响段对齐，不影响功能。
+        // 改这里的同时要改 scripts/build-android-mac.sh 和 build-android.ps1，
+        // 三处都是 gomobile bind 的入口。
+        "-ldflags=-extldflags=-Wl,-z,max-page-size=16384",
         // 先写临时文件再替换：gomobile 会先**清空** -o 指定的文件再写入，
         // 直接指向 libs/bridge.aar 的话，Gradle 有概率读到 0 字节的 AAR
         // （表现为 "zip file is empty"，或 APK 里没有 libgojni.so）。

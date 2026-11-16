@@ -1,0 +1,7 @@
+# Shell / Python 脚本必须是 LF：CRLF 会让 shebang 解析失败
+# （`/bin/sh\r: bad interpreter`），mini 上直接跑不起来。
+*.sh    text eol=lf
+*.ps1   text eol=crlf
+*.py    text eol=lf
+
+# Windows 下 autocrlf=true 会把一切转成 CRLF，这里显式钉住脚本的换行符。

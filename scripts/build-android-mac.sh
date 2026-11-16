@@ -20,6 +20,9 @@
 #      AAR（APK 里没有 libgojni.so，装上去直接崩）→ 先写临时文件再替换
 #   3. gomobile 收尾要调 javac，JDK 必须在 PATH 上
 #   4. 临时文件必须以 .aar 结尾（gomobile 校验扩展名）
+#   5. Go 默认按 4 KB 页对齐 ELF 的 PT_LOAD 段，Android 15+ 的 16 KB 页设备
+#      会拒绝加载并弹"不符合 16 KB 对齐要求"→ bind 时传
+#      -ldflags=-extldflags=-Wl,-z,max-page-size=16384
 
 set -e
 
@@ -120,9 +123,14 @@ if [ "$BUILD_AAR" = 1 ]; then
     TMP_AAR=android/app/libs/bridge-build.aar
     rm -f "$TMP_AAR"
     # 必须先写临时文件：见文件头注释的坑 2
+    # -ldflags 里的 max-page-size=16384：Go 默认按 4 KB 页对齐 PT_LOAD 段，
+    # Android 15+ 的 16 KB 页设备会拒绝加载（开机弹"此应用不符合 16 KB 对齐要求"）。
+    # 只改了对齐，不影响功能。
     if ! CGO_ENABLED=0 "$GOMOBILE" bind \
         -target=android/arm64,android/arm,android/amd64,android/386 \
-        -androidapi=24 -o "$TMP_AAR" ./mobile/bridge; then
+        -androidapi=24 \
+        -ldflags="-extldflags=-Wl,-z,max-page-size=16384" \
+        -o "$TMP_AAR" ./mobile/bridge; then
         rm -f "$TMP_AAR"
         echo "gomobile bind 失败" >&2
         exit 1
@@ -158,7 +166,23 @@ mkdir -p build
 cp -f "$APK" "$STABLE_APK"
 echo "APK：$STABLE_APK（$(du -h "$STABLE_APK" | cut -f1)）"
 
-# ---- 4. 安装 ----
+# ---- 4. 16 KB 页大小自检 ----
+# Android 15+ 的 16 KB 页设备会拒绝加载未按 16 KB 对齐的 .so（表现为安装后
+# 弹"此应用不符合 16 KB 对齐要求"）。这里在装之前把关，避免装上一个
+# 手机上直接跑不起来、或每次启动都弹警告的包。
+step "检查 16 KB 页大小对齐"
+if command -v python3 >/dev/null 2>&1; then
+    if ! python3 "$ROOT/scripts/check-16kb.py" "$APK"; then
+        echo "" >&2
+        echo "有 .so 未按 16 KB 对齐。若是 libgojni.so，检查 gomobile bind 是否" >&2
+        echo "带上了 -ldflags=-extldflags=-Wl,-z,max-page-size=16384。" >&2
+        exit 1
+    fi
+else
+    echo "跳过（没有 python3）" >&2
+fi
+
+# ---- 5. 安装 ----
 if [ "$INSTALL" = 1 ]; then
     step "安装到设备"
     if ! "$ADB" devices | tail -n +2 | grep -q "device$"; then

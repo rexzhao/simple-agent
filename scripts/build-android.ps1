@@ -54,7 +54,12 @@ try {
     # 临时文件名必须以 .aar 结尾（gomobile 会校验扩展名）。
     $temp = Join-Path $outDir "bridge-build.aar"
     Remove-Item $temp -ErrorAction SilentlyContinue
-    $output = & $gomobile bind "-target=$Target" "-androidapi=$Api" -o $temp ./mobile/bridge 2>&1
+    # -ldflags 里的 max-page-size=16384：Go 默认按 4 KB 页对齐 PT_LOAD 段，
+    # Android 15+ 的 16 KB 页设备会拒绝加载（开机弹"此应用不符合 16 KB 对齐要求"）。
+    # 只改对齐，不影响功能。
+    $output = & $gomobile bind "-target=$Target" "-androidapi=$Api" `
+        "-ldflags=-extldflags=-Wl,-z,max-page-size=16384" `
+        -o $temp ./mobile/bridge 2>&1
     $code = $LASTEXITCODE
     if ($output) { $output | ForEach-Object { Write-Host "  $_" } }
     if ($code -ne 0) {
