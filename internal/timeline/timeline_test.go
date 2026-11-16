@@ -141,3 +141,95 @@ func TestDurationAndTokens(t *testing.T) {
 		t.Fatalf("没有 token 记录时应为 0，实际 %d", got)
 	}
 }
+
+// 只有「最后一组、回合未结束、消息仍在流式」的过程组才算进行中。
+//
+// 回归测试：以前 mobile/bridge 用 `streaming := !idle`（整个会话是否空闲）
+// 来决定每个过程组是否显示转圈，结果会话一跑起来，几百轮之前的历史工具组
+// 全都跟着转圈。
+func TestOnlyLastProcessGroupIsLive(t *testing.T) {
+	conv := conversation.New("ctx")
+
+	// 第一轮：用户提问 + 两段过程（中间被正文隔开）—— 已成历史，不该 live
+	if _, err := conv.AddMessage(message.Message{
+		MessageID: "u1", Role: message.RoleUser,
+		Parts: []message.Part{message.NewTextPart("第一次")},
+	}, conversation.StatusComplete); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conv.AddMessage(message.Message{
+		MessageID: "a1", Role: message.RoleAgent,
+		Parts: []message.Part{
+			message.NewTextPart("想一想").WithMediaType(render.MediaReasoning),
+			message.NewDataPart(map[string]any{"id": "c1", "name": "read"}).
+				WithMediaType(render.MediaToolUse),
+			message.NewDataPart(map[string]any{"id": "c1", "name": "read", "output": "ok"}).
+				WithMediaType(render.MediaToolResult),
+			message.NewTextPart("中间回答"),
+			message.NewDataPart(map[string]any{"id": "c2", "name": "grep"}).
+				WithMediaType(render.MediaToolUse),
+			message.NewDataPart(map[string]any{"id": "c2", "name": "grep", "output": "hit"}).
+				WithMediaType(render.MediaToolResult),
+		},
+	}, conversation.StatusComplete); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第二轮：用户又提问（第一轮因此 Closed），然后正在流式输出
+	if _, err := conv.AddMessage(message.Message{
+		MessageID: "u2", Role: message.RoleUser,
+		Parts: []message.Part{message.NewTextPart("第二次")},
+	}, conversation.StatusComplete); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conv.AddMessage(message.Message{
+		MessageID: "a2", Role: message.RoleAgent,
+		Parts: []message.Part{
+			message.NewTextPart("再想想").WithMediaType(render.MediaReasoning),
+			message.NewDataPart(map[string]any{"id": "c3", "name": "shell"}).
+				WithMediaType(render.MediaToolUse),
+		},
+	}, conversation.StatusStreaming); err != nil {
+		t.Fatal(err)
+	}
+
+	// idle=false：会话正在跑（这正是触发 bug 的条件）
+	items := timeline.Build(conv.Entries(), false)
+
+	var liveKeys []string
+	var processCount int
+	for _, item := range items {
+		if item.Kind != timeline.KindProcess {
+			continue
+		}
+		processCount++
+		if item.Live {
+			liveKeys = append(liveKeys, item.Key)
+		}
+	}
+	if processCount != 3 {
+		t.Fatalf("应有 3 个过程组（历史 2 + 当前 1），实际 %d", processCount)
+	}
+	if len(liveKeys) != 1 {
+		t.Fatalf("只有最后一个过程组该转圈，实际 %d 个在转：%v", len(liveKeys), liveKeys)
+	}
+
+	// 活着的那一组必须是最后那个（含 c3 工具调用的第二轮）
+	last := items[len(items)-1]
+	if last.Kind != timeline.KindProcess {
+		t.Fatalf("最后一条应是过程组（回合没结束，不该有 footer），实际 %s", last.Kind)
+	}
+	if !last.Live {
+		t.Fatal("最后一个过程组应标记为进行中")
+	}
+	if len(last.Refs) == 0 || last.Refs[len(last.Refs)-1].Chat.Message.MessageID != "a2" {
+		t.Fatal("活着的应该是第二轮的过程组")
+	}
+
+	// 会话空闲后，一个都不该转圈
+	for _, item := range timeline.Build(conv.Entries(), true) {
+		if item.Kind == timeline.KindProcess && item.Live {
+			t.Fatalf("会话空闲后不该有过程组仍在转圈：%s", item.Key)
+		}
+	}
+}

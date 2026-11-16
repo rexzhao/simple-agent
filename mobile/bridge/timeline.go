@@ -228,11 +228,13 @@ func (c *Client) itemView(item timeline.Item, conv *conversation.Conversation, i
 		}
 	case timeline.KindProcess:
 		view.Kind = "process"
-		// 正在流式的组带完整详情：用户此刻正看着它，实时内容必须能显示。
-		// 已结束的历史组只给摘要（StepCount），点开时才单独拉 —— 这是
-		// 首屏从 1690KB 降到几十 KB 的关键。
-		streaming := !idle
-		view.Process = c.processView(item, streaming, streaming)
+		// 只有这一组自己还在进行时才带完整详情并显示转圈。
+		//
+		// 以前这里用 `streaming := !idle`（整个会话是否空闲），结果会话一跑
+		// 起来，几百轮之前的历史工具组全都跟着转圈。是否"活着"是每一组
+		// 自己的属性，由 timeline.Build 算好放在 item.Live 里。
+		live := item.Live
+		view.Process = c.processView(item, live, live)
 	case timeline.KindRoundFooter:
 		view.Kind = "footer"
 		view.Footer = footerOf(item)
@@ -265,6 +267,10 @@ func footerOf(item timeline.Item) *FooterView {
 // messageView 生成一条消息（正文 part + 图片等）。
 //
 // 过程类 part（思考/工具）不进这里——它们已经在过程组里了。
+//
+// idle 目前没有用到（正文是否需要特殊处理只取决于消息自身状态）。
+// 保留参数是为了不改调用签名，等下次真的需要时再用；不要拿它去判断
+// "是不是最后一条"——那是每个 item 自己的属性（见 timeline.Item.Live）。
 func (c *Client) messageView(item timeline.Item, conv *conversation.Conversation, idle bool) *MessageView {
 	if len(item.Refs) == 0 {
 		return nil
@@ -389,8 +395,14 @@ func (c *Client) processSteps(item timeline.Item, streaming bool) []ProcessStep 
 			if result, ok := results[id]; ok {
 				seen[id] = true
 				applyToolResult(&step, result.Part())
-			} else {
-				step.Pending = !streaming
+			} else if streaming {
+				// 组还活着但还没有结果：确实在等工具返回。
+				//
+				// 这里原先写的是 `!streaming`（反的）：组还在进行时反而不标
+				// Pending（界面显示"运行中"），组已经结束却标成"等待结果"。
+				// 两种情况都不对。已结束且没有结果的，属于数据异常
+				// （例如崩溃恢复没补上 tool.result），不该谎称还在等。
+				step.Pending = true
 			}
 			steps = append(steps, step)
 		case render.MediaToolResult:

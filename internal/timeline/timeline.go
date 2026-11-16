@@ -49,6 +49,12 @@ type Item struct {
 	Key    string
 	Notice *conversation.Notice
 	Refs   []Ref
+	// Live 表示这个**过程组自己**还在进行（决定界面是否显示转圈的动画）。
+	//
+	// 早先是拿"整个会话是否空闲"来当这个标志（`streaming := !idle`），
+	// 结果只要会话在跑，几百轮之前的每个历史工具组都跟着转圈。
+	// 真正该转圈的只有"最后一组、且回合还没结束、且消息还在流式"的那一个。
+	Live bool
 	// TurnStart / TurnEntries 只在回合结束行上有值：回合起点与该回合的所有 agent 消息。
 	TurnStart   time.Time
 	TurnEntries []*conversation.ChatEntry
@@ -140,7 +146,7 @@ func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 	var items []Item
 	var pending []Ref
 
-	flushGroup := func() {
+	flushGroup := func(last bool) {
 		if len(pending) == 0 {
 			return
 		}
@@ -149,6 +155,10 @@ func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 			Kind: KindProcess,
 			Key:  "proc:" + first.Chat.Message.MessageID + "#" + itoa(first.Index),
 			Refs: pending,
+			// 只有最后一个过程组可能"还在进行"：它后面没有正文、
+			// 回合还没结束（info.Closed 为假）、且这一组引用的消息
+			// 仍处于流式状态。其余情况一律已结束。
+			Live: last && !info.Closed && anyRefStreaming(pending),
 		})
 		pending = nil
 	}
@@ -164,7 +174,7 @@ func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 				continue
 			}
 			// 正文：结束当前过程组，正文自己留在组外
-			flushGroup()
+			flushGroup(false)
 			items = append(items, Item{
 				Kind: KindContent,
 				Key:  chat.Message.MessageID + "#" + itoa(index),
@@ -172,7 +182,8 @@ func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 			})
 		}
 	}
-	flushGroup()
+	// 末尾剩下的这一组是本回合的最后一组：只有它可能还在进行。
+	flushGroup(true)
 	// 回合结束行：只有**回合真的结束**时才显示（dsh 的 turn footer）。
 	// 工具轮之间、等待回答时回合还没结束，显示「已完成」会一闪一闪。
 	last := turn[len(turn)-1]
@@ -186,6 +197,25 @@ func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 		})
 	}
 	return items
+}
+
+// anyRefStreaming 报告这一组里是否还有消息在流式。
+//
+// 过程组可能跨多条消息（模型可以说一句、调个工具、再说一句）。
+// 只要组内任意一条还在流式，这一组就还可能长出新内容，界面就该继续转圈。
+//
+// 用"任意"而不是"最后一条"：正常时间线里消息按顺序追加，两者等价；
+// 但数据异常时（例如某条状态没落盘）"任意"不会漏判。
+func anyRefStreaming(refs []Ref) bool {
+	for _, ref := range refs {
+		if ref.Chat == nil {
+			continue
+		}
+		if ref.Chat.Status().IsStreaming() {
+			return true
+		}
+	}
+	return false
 }
 
 // IsEmptyTextPart 报告 part 是否为"空白的文本"（这类 part 不占位置）。
