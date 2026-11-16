@@ -85,7 +85,10 @@ func TestTimelinePagingBySeq(t *testing.T) {
 	if err := json.Unmarshal([]byte(fullJSON), &full); err != nil {
 		t.Fatal(err)
 	}
-	if len(full.Items) < 100 {
+	// 注意：首次 attach 只下发最近 attachTailEvents（200）条事件，
+	// 所以这里能看到的 item 数远少于日志总量——这正是分页存在的理由。
+	// 有 50 条以上就足够验证多页。
+	if len(full.Items) < 50 {
 		t.Skipf("样本太短（%d 条），不足以验证分页", len(full.Items))
 	}
 
