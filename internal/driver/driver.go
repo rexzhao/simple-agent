@@ -125,7 +125,7 @@ type toolBuffer struct {
 }
 
 // Turn 是一轮对话的进行中状态。
-type Turn struct {
+type Round struct {
 	messageID string
 	// startedAt 是本轮开始的时间（回合结束行算耗时用）。
 	startedAt time.Time
@@ -159,7 +159,7 @@ type Driver struct {
 
 	title string
 	busy  Busy
-	turn  *Turn
+	round  *Round
 	// queued 是回合进行中用户插话排队的内容（steer）。
 	//
 	// **不进 Conversation**：忙时若立刻追加 user 消息，会话顺序会变成
@@ -318,23 +318,23 @@ func (d *Driver) TakeRecords() []Effect {
 //
 // 迟到的流事件必须用它过滤（方案 §9 第 3 条）。
 func (d *Driver) OwnsStream(messageID string) bool {
-	return d.turn != nil && d.turn.messageID == messageID
+	return d.round != nil && d.round.messageID == messageID
 }
 
 // CurrentMessageID 返回当前轮的消息 id（无进行中的轮时为空）。
 func (d *Driver) CurrentMessageID() string {
-	if d.turn == nil {
+	if d.round == nil {
 		return ""
 	}
-	return d.turn.messageID
+	return d.round.messageID
 }
 
 // Usage 返回本轮用量。
 func (d *Driver) Usage() Usage {
-	if d.turn == nil {
+	if d.round == nil {
 		return Usage{}
 	}
-	return d.turn.usage
+	return d.round.usage
 }
 
 // CanSend 报告现在能否发送。
@@ -606,7 +606,7 @@ func (d *Driver) startTurn() ([]Effect, error) {
 		return nil, err
 	}
 
-	turn := &Turn{
+	round := &Round{
 		messageID:     entry.Message.MessageID,
 		startedAt:     time.Now(),
 		buffers:       map[int]*toolBuffer{},
@@ -614,8 +614,8 @@ func (d *Driver) startTurn() ([]Effect, error) {
 		reasoningPart: -1,
 		depth:         d.depth + 1,
 	}
-	d.turn = turn
-	d.depth = turn.depth
+	d.round = round
+	d.depth = round.depth
 	d.busy = BusyStreaming
 	// 每发起一次请求算一步（工具续轮、插话续轮都各算一步，见 Counts）
 	d.steps++
@@ -625,7 +625,7 @@ func (d *Driver) startTurn() ([]Effect, error) {
 		// 流开始时写一条 streaming 空壳：进程若在生成中途被杀，重放会把它
 		// 标成「已中断」占位（用户明确要求的行为）
 		recordMessage(agent, conversation.StatusStreaming, ""),
-		StartStream{MessageID: turn.messageID, Request: request},
+		StartStream{MessageID: round.messageID, Request: request},
 	}
 	// buildRequest 可能因为"模型不支持图片"而挂起一条一次性提示
 	effects = append(effects, d.takeDisplayNotice()...)
@@ -850,7 +850,7 @@ func (d *Driver) ApplyStreamDelta(messageID string, ev providers.Event) ([]Effec
 	if !d.OwnsStream(messageID) || (d.busy != BusyStreaming && !d.mirror) {
 		return nil, nil
 	}
-	turn := d.turn
+	round := d.round
 
 	switch ev.Kind {
 	case providers.EventText:
@@ -870,8 +870,8 @@ func (d *Driver) ApplyStreamDelta(messageID string, ev providers.Event) ([]Effec
 		if !ok {
 			return nil, nil
 		}
-		if turn.reasoningPart < 0 {
-			turn.reasoningPart = entry.AddPart(message.Part{
+		if round.reasoningPart < 0 {
+			round.reasoningPart = entry.AddPart(message.Part{
 				Content:   message.TextPart{Text: ev.Text},
 				MediaType: render.MediaReasoning,
 			})
@@ -881,13 +881,13 @@ func (d *Driver) ApplyStreamDelta(messageID string, ev providers.Event) ([]Effec
 			return []Effect{Changed{}}, nil
 		}
 		// 用按 part 追加的接口：不能挪用 streamingPart，否则正文与推理会互相串
-		if err := d.conv.AppendToPart(messageID, turn.reasoningPart, ev.Text); err != nil {
+		if err := d.conv.AppendToPart(messageID, round.reasoningPart, ev.Text); err != nil {
 			return nil, err
 		}
 		return []Effect{Changed{}}, nil
 
 	case providers.EventToolStart:
-		buf := turn.buffer(ev.Index)
+		buf := round.buffer(ev.Index)
 		// 同一 index 的 ToolStart 可能重复出现（有些网关每个分片都带 id/name），
 		// 按 index 合并而不是新建调用。
 		if ev.ID != "" && buf.id == "" {
@@ -899,19 +899,19 @@ func (d *Driver) ApplyStreamDelta(messageID string, ev providers.Event) ([]Effec
 		// 立刻落一个占位 part：界面上要能马上看到"正在调用什么"，
 		// 而不是等整轮结束才出现。
 		if entry, ok := d.conv.Message(messageID); ok {
-			d.ensureToolPart(entry, turn, ev.Index)
+			d.ensureToolPart(entry, round, ev.Index)
 		}
 		return []Effect{Changed{}}, nil
 
 	case providers.EventToolArgs:
-		buf := turn.buffer(ev.Index)
+		buf := round.buffer(ev.Index)
 		buf.args.WriteString(ev.Delta)
 		// 增量也落盘：标题要能像 dsh 一样边收边显示"正在读取 docs/plan.md"。
 		//
 		// 只落**前一部分**（界面摘要用到的 key 都在开头）：整段重写会让
 		// 复制量变成 O(n²)——write 写 100KB 文件时几千个增量累计几百 MB。
 		if entry, ok := d.conv.Message(messageID); ok {
-			partIndex := d.ensureToolPart(entry, turn, ev.Index)
+			partIndex := d.ensureToolPart(entry, round, ev.Index)
 			live := message.Part{
 				Content: message.DataPart{Data: map[string]any{
 					"id":           buf.id,
@@ -927,16 +927,16 @@ func (d *Driver) ApplyStreamDelta(messageID string, ev providers.Event) ([]Effec
 		return []Effect{Changed{}}, nil
 
 	case providers.EventToolEnd:
-		buf := turn.buffer(ev.Index)
+		buf := round.buffer(ev.Index)
 		buf.ended = true
 		return []Effect{Changed{}}, nil
 
 	case providers.EventUsage:
 		if ev.InputTokens > 0 {
-			turn.usage.InputTokens = ev.InputTokens
+			round.usage.InputTokens = ev.InputTokens
 		}
 		if ev.OutputTokens > 0 {
-			turn.usage.OutputTokens = ev.OutputTokens
+			round.usage.OutputTokens = ev.OutputTokens
 		}
 		return nil, nil
 
@@ -951,10 +951,10 @@ func (d *Driver) FinishStream(messageID string, ev providers.Event) []Effect {
 	if !d.OwnsStream(messageID) || d.busy != BusyStreaming {
 		return nil
 	}
-	turn := d.turn
+	round := d.round
 	switch ev.Kind {
 	case providers.EventDone:
-		turn.sawStop = true
+		round.sawStop = true
 		effects := d.finishStream(messageID, "")
 		if isTruncated(ev.StopReason) {
 			// 截断是用户必须知道的：否则只会看到一句没写完的回答
@@ -974,11 +974,11 @@ func (d *Driver) FinishStream(messageID string, ev providers.Event) []Effect {
 }
 
 // ensureToolPart 确保某个工具调用已经有对应的 part（没有就新建占位）。
-func (d *Driver) ensureToolPart(entry *conversation.ChatEntry, turn *Turn, index int) int {
-	if partIndex, ok := turn.toolParts[index]; ok {
+func (d *Driver) ensureToolPart(entry *conversation.ChatEntry, round *Round, index int) int {
+	if partIndex, ok := round.toolParts[index]; ok {
 		return partIndex
 	}
-	buf := turn.buffer(index)
+	buf := round.buffer(index)
 	// stream_index 是 **provider 给的下标**（Anthropic 是 content block 下标，
 	// 不是"第几个工具"）。镜像中途接管时要靠它把增量对回正确的 part，
 	// 不能按出现顺序重新编号——前面有一个 text 块时就会错位。
@@ -990,12 +990,12 @@ func (d *Driver) ensureToolPart(entry *conversation.ChatEntry, turn *Turn, index
 		Content:   message.DataPart{Data: data},
 		MediaType: render.MediaToolUse,
 	})
-	turn.toolParts[index] = partIndex
+	round.toolParts[index] = partIndex
 	return partIndex
 }
 
 // buffer 取（或新建）指定 index 的工具缓冲。
-func (t *Turn) buffer(index int) *toolBuffer {
+func (t *Round) buffer(index int) *toolBuffer {
 	buf, ok := t.buffers[index]
 	if !ok {
 		buf = &toolBuffer{order: t.nextOrder}
@@ -1026,14 +1026,14 @@ func (d *Driver) StreamClosed(messageID string) []Effect {
 
 // finishStream 正常结束：落盘推理与工具调用，决定下一步。
 func (d *Driver) finishStream(messageID, _ string) []Effect {
-	turn := d.turn
+	round := d.round
 	entry, ok := d.conv.Message(messageID)
 	if !ok {
 		d.reset()
 		return []Effect{Changed{}}
 	}
 
-	calls, parts := d.collectToolCalls(turn)
+	calls, parts := d.collectToolCalls(round)
 	for _, part := range parts {
 		entry.AddPart(part)
 	}
@@ -1048,7 +1048,7 @@ func (d *Driver) finishStream(messageID, _ string) []Effect {
 	effects := []Effect{recordFinalized(*entry.Message, conversation.StatusComplete, "")}
 
 	if len(calls) == 0 {
-		usage := turn.usage
+		usage := round.usage
 		entry.SetFinishedAt(time.Now())
 		entry.SetTokens(usage.OutputTokens)
 		d.reset()
@@ -1074,7 +1074,7 @@ func (d *Driver) finishStream(messageID, _ string) []Effect {
 
 	entry.SetFinishedAt(time.Now())
 	d.busy = BusyRunningTools
-	d.turn.pendingToolResults = len(calls)
+	d.round.pendingToolResults = len(calls)
 	return append(effects,
 		RunTools{MessageID: messageID, Calls: calls},
 		Changed{},
@@ -1085,13 +1085,13 @@ func (d *Driver) finishStream(messageID, _ string) []Effect {
 //
 // 参数是分片 JSON，必须累积到结束才解析；解析失败保留原文并在这里就标成
 // 带错误的调用（由调用方拿到错误结果，模型可自行纠正）。
-func (d *Driver) collectToolCalls(turn *Turn) ([]tools.Call, []message.Part) {
-	if len(turn.buffers) == 0 {
+func (d *Driver) collectToolCalls(round *Round) ([]tools.Call, []message.Part) {
+	if len(round.buffers) == 0 {
 		return nil, nil
 	}
 
-	order := make([]int, 0, len(turn.buffers))
-	for index := range turn.buffers {
+	order := make([]int, 0, len(round.buffers))
+	for index := range round.buffers {
 		order = append(order, index)
 	}
 	slices.Sort(order)
@@ -1100,7 +1100,7 @@ func (d *Driver) collectToolCalls(turn *Turn) ([]tools.Call, []message.Part) {
 	parts := make([]message.Part, 0, len(order)*2)
 
 	for _, index := range order {
-		buf := turn.buffers[index]
+		buf := round.buffers[index]
 		name := buf.name
 		if name == "" {
 			// 没有名字的调用无法执行：保留下来让历史配对完整
@@ -1108,7 +1108,7 @@ func (d *Driver) collectToolCalls(turn *Turn) ([]tools.Call, []message.Part) {
 		}
 		id := buf.id
 		if id == "" {
-			id = fmt.Sprintf("call_%s_%d", turn.messageID, index)
+			id = fmt.Sprintf("call_%s_%d", round.messageID, index)
 		}
 
 		raw := strings.TrimSpace(buf.args.String())
@@ -1132,13 +1132,13 @@ func (d *Driver) collectToolCalls(turn *Turn) ([]tools.Call, []message.Part) {
 		}
 		// part 在 ToolStart 时已经建好；这里只把最终参数补进去（也兼容没有
 		// ToolStart 的网关）。
-		if entry, ok := d.conv.Message(turn.messageID); ok {
-			partIndex := d.ensureToolPart(entry, turn, index)
+		if entry, ok := d.conv.Message(round.messageID); ok {
+			partIndex := d.ensureToolPart(entry, round, index)
 			final := message.Part{
 				Content:   message.DataPart{Data: data},
 				MediaType: render.MediaToolUse,
 			}
-			if err := d.conv.UpdatePart(turn.messageID, partIndex, final); err != nil {
+			if err := d.conv.UpdatePart(round.messageID, partIndex, final); err != nil {
 				parts = append(parts, final)
 			}
 		} else {
@@ -1184,9 +1184,9 @@ func (d *Driver) failStream(messageID, reason string) []Effect {
 	if entry, ok := d.conv.Message(messageID); ok {
 		// 已经产生的内容保留：推理与已收到的工具调用也要落盘，界面上才看得到
 		// 「模型打算做什么」。落盘后立刻补合成结果，避免历史里出现孤立的 tool_use。
-		if d.turn != nil {
+		if d.round != nil {
 			// 推理 part 在流式过程中已经落盘；这里只补上已收到的工具调用
-			_, parts := d.collectToolCalls(d.turn)
+			_, parts := d.collectToolCalls(d.round)
 			for _, part := range parts {
 				entry.AddPart(part)
 			}
@@ -1241,8 +1241,8 @@ func (d *Driver) ToolBatchDone(messageID string) []Effect {
 		d.reset()
 		return nil
 	}
-	if d.turn != nil {
-		d.turn.pendingToolResults = 0
+	if d.round != nil {
+		d.round.pendingToolResults = 0
 	}
 	return d.finishToolBatch(messageID, entry)
 }
@@ -1292,9 +1292,9 @@ func (d *Driver) ToolResult(messageID string, outcome tools.ToolOutcome) ([]Effe
 
 	effects := []Effect{recordToolResults(messageID, resultRecords([]tools.ToolOutcome{outcome})), Changed{}}
 
-	if d.turn != nil && d.turn.pendingToolResults > 0 {
-		d.turn.pendingToolResults--
-		if d.turn.pendingToolResults > 0 {
+	if d.round != nil && d.round.pendingToolResults > 0 {
+		d.round.pendingToolResults--
+		if d.round.pendingToolResults > 0 {
 			// 还有工具在跑：不推进回合，让界面先显示这一条已完成
 			return effects, nil
 		}
@@ -1307,9 +1307,9 @@ func (d *Driver) finishToolBatch(messageID string, entry *conversation.ChatEntry
 	var effects []Effect
 
 	// 有 pending 提问：进入等待回答
-	d.turn.asks = d.collectAsks(entry.Message)
-	if len(d.turn.asks) > 0 {
-		for _, group := range d.turn.asks {
+	d.round.asks = d.collectAsks(entry.Message)
+	if len(d.round.asks) > 0 {
+		for _, group := range d.round.asks {
 			effects = append(effects, recordAskRaised(messageID, group.CallID, group.Questions))
 		}
 		d.busy = BusyAwaitingAnswer
@@ -1335,10 +1335,10 @@ func (d *Driver) finishToolBatch(messageID string, entry *conversation.ChatEntry
 
 // AskGroups 返回本轮等待回答的提问组（同一轮可能有多个）。
 func (d *Driver) AskGroups() []*AskGroup {
-	if d.busy != BusyAwaitingAnswer || d.turn == nil {
+	if d.busy != BusyAwaitingAnswer || d.round == nil {
 		return nil
 	}
-	return d.turn.asks
+	return d.round.asks
 }
 
 // collectAsks 从消息里收集 pending 的调用，构造提问组。
@@ -1373,17 +1373,17 @@ func (d *Driver) DismissAsks() ([]Effect, error) {
 
 // settleAsks 把每个提问组的输出写回对应 pending 占位结果，然后继续。
 func (d *Driver) settleAsks(action AskAction, custom string) ([]Effect, error) {
-	if d.busy != BusyAwaitingAnswer || d.turn == nil {
+	if d.busy != BusyAwaitingAnswer || d.round == nil {
 		return nil, nil
 	}
-	entry, ok := d.conv.Message(d.turn.messageID)
+	entry, ok := d.conv.Message(d.round.messageID)
 	if !ok {
 		d.reset()
 		return nil, nil
 	}
 
-	outputs := make(map[string]string, len(d.turn.asks))
-	for _, group := range d.turn.asks {
+	outputs := make(map[string]string, len(d.round.asks))
+	for _, group := range d.round.asks {
 		outputs[group.CallID] = group.Output(action, custom)
 	}
 
@@ -1413,10 +1413,10 @@ func (d *Driver) settleAsks(action AskAction, custom string) ([]Effect, error) {
 	}
 
 	var effects []Effect
-	for _, group := range d.turn.asks {
-		effects = append(effects, recordAskAnswered(d.turn.messageID, group.CallID, group.Output(action, custom)))
+	for _, group := range d.round.asks {
+		effects = append(effects, recordAskAnswered(d.round.messageID, group.CallID, group.Output(action, custom)))
 	}
-	d.turn.asks = nil
+	d.round.asks = nil
 	next, err := d.continueAfterTools()
 	if err != nil {
 		return nil, err
@@ -1456,8 +1456,8 @@ func (d *Driver) continueAfterTools() ([]Effect, error) {
 // 投递出去会立刻开一轮新请求，与用户的意图相反（与决策 #14 同源）。
 func (d *Driver) Stop() []Effect {
 	messageID := ""
-	if d.turn != nil {
-		messageID = d.turn.messageID
+	if d.round != nil {
+		messageID = d.round.messageID
 	}
 	d.queued = nil
 
@@ -1465,8 +1465,8 @@ func (d *Driver) Stop() []Effect {
 	if entry, ok := d.conv.Message(messageID); ok {
 		// 先把已收到的工具调用落成 part（流式中停止时它们还在缓冲区里），
 		// 否则「未配对调用」根本不存在，补齐就成了空转——重放出来历史仍然带病。
-		if d.turn != nil && d.busy == BusyStreaming {
-			_, parts := d.collectToolCalls(d.turn)
+		if d.round != nil && d.busy == BusyStreaming {
+			_, parts := d.collectToolCalls(d.round)
 			for _, part := range parts {
 				entry.AddPart(part)
 			}
@@ -1518,7 +1518,7 @@ func (d *Driver) DeleteCurrentTurn() {
 }
 
 func (d *Driver) reset() {
-	d.turn = nil
+	d.round = nil
 	d.depth = 0
 	d.pendingCompact = nil
 	d.busy = BusyIdle

@@ -472,7 +472,7 @@ func Restore(replayed Replayed, opts Options) *Driver {
 	}
 	if len(replayed.PendingAsks) > 0 {
 		messageID := replayed.PendingAsks[0].MessageID
-		d.turn = &Turn{
+		d.round = &Round{
 			messageID:     messageID,
 			buffers:       map[int]*toolBuffer{},
 			reasoningPart: -1,

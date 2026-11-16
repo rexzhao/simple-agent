@@ -29,8 +29,8 @@ const (
 	KindContent Kind = "content"
 	// KindProcess 是折叠的过程组（思考 / 工具调用 / 工具结果，可能跨消息）。
 	KindProcess Kind = "process"
-	// KindTurnFooter 是回合结束行（「已完成，用时 22s」）。
-	KindTurnFooter Kind = "footer"
+	// KindRoundFooter 是回合结束行（「已完成，用时 22s」）。
+	KindRoundFooter Kind = "footer"
 )
 
 // Ref 指向某条消息里的一个 part。
@@ -69,16 +69,16 @@ func Build(entries []conversation.Entry, idle bool) []Item {
 	var items []Item
 	var turn []*conversation.ChatEntry
 
-	turnStart := time.Time{}
+	roundStart := time.Time{}
 	// userStart 是最近一条 user 消息的创建时间：它才是回合起点（耗时从用户发出算起）
 	userStart := time.Time{}
 	flushTurn := func(closed bool) {
 		if len(turn) == 0 {
 			return
 		}
-		items = append(items, turnItems(turn, TurnInfo{Closed: closed, StartedAt: turnStart})...)
+		items = append(items, roundItems(turn, RoundInfo{Closed: closed, StartedAt: roundStart})...)
 		turn = nil
-		turnStart = time.Time{}
+		roundStart = time.Time{}
 		userStart = time.Time{}
 	}
 	// flushPartialTurn 只把**已累积的过程段**冲出去（不带结束行），回合继续累积。
@@ -86,9 +86,9 @@ func Build(entries []conversation.Entry, idle bool) []Item {
 		if len(turn) == 0 {
 			return
 		}
-		items = append(items, turnItems(turn, TurnInfo{Closed: false, StartedAt: turnStart})...)
+		items = append(items, roundItems(turn, RoundInfo{Closed: false, StartedAt: roundStart})...)
 		turn = nil
-		// turnStart 保留：整个回合仍然从同一条 user 消息起算
+		// roundStart 保留：整个回合仍然从同一条 user 消息起算
 	}
 
 	for _, entry := range entries {
@@ -113,10 +113,10 @@ func Build(entries []conversation.Entry, idle bool) []Item {
 			items = append(items, Item{Kind: KindContent, Key: entry.ID(), Refs: refs})
 			continue
 		}
-		if turnStart.IsZero() {
-			turnStart = chat.CreatedAt
+		if roundStart.IsZero() {
+			roundStart = chat.CreatedAt
 			if !userStart.IsZero() {
-				turnStart = userStart // 耗时从用户发出那条消息算起
+				roundStart = userStart // 耗时从用户发出那条消息算起
 			}
 		}
 		turn = append(turn, chat)
@@ -126,8 +126,8 @@ func Build(entries []conversation.Entry, idle bool) []Item {
 	return items
 }
 
-// TurnInfo 是一个回合的边界信息（回合结束行用）。
-type TurnInfo struct {
+// RoundInfo 是一个回合的边界信息（回合结束行用）。
+type RoundInfo struct {
 	// Closed 表示回合真的结束了（后面已有新的 user 消息，或会话已空闲）。
 	// 工具轮之间、等待回答时都还没结束——那时不该显示「已完成」。
 	Closed bool
@@ -135,8 +135,8 @@ type TurnInfo struct {
 	StartedAt time.Time
 }
 
-// turnItems 把一个回合切成按顺序排列的条目：过程组与正文交替。
-func turnItems(turn []*conversation.ChatEntry, info TurnInfo) []Item {
+// roundItems 把一个回合切成按顺序排列的条目：过程组与正文交替。
+func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 	var items []Item
 	var pending []Ref
 
@@ -178,7 +178,7 @@ func turnItems(turn []*conversation.ChatEntry, info TurnInfo) []Item {
 	last := turn[len(turn)-1]
 	if info.Closed && last != nil && !last.Status().IsStreaming() {
 		items = append(items, Item{
-			Kind:        KindTurnFooter,
+			Kind:        KindRoundFooter,
 			Key:         last.Message.MessageID + "#footer",
 			Refs:        []Ref{{Chat: last}},
 			TurnStart:   info.StartedAt,

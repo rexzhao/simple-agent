@@ -24,8 +24,8 @@ const (
 	itemContent = timeline.KindContent
 	// itemProcess 是折叠的过程组（思考/工具调用，可能跨消息）。
 	itemProcess = timeline.KindProcess
-	// itemTurnFooter 是回合结束行（dsh 的「Completed in 22s ⌄」）。
-	itemTurnFooter = timeline.KindTurnFooter
+	// itemRoundFooter 是回合结束行（dsh 的「Completed in 22s ⌄」）。
+	itemRoundFooter = timeline.KindRoundFooter
 )
 
 // chatItem 是会话列表里的一行（timeline.Item 的别名，字段不必重复搬）。
@@ -39,7 +39,7 @@ func (a *App) buildChatItems(session *Session) []chatItem {
 	return timeline.Build(session.Conversation().Entries(), session.Busy() == driver.BusyIdle)
 }
 
-// renderTurnFooter 渲染回合结束行（dsh 的 turn footer）：
+// renderRoundFooter 渲染回合结束行（dsh 的 turn footer）：
 //
 //	已完成，用时 22s ⌄        ← 成功
 //	处理失败 ⌄                 ← 失败（展开看原因与建议）
@@ -49,7 +49,7 @@ func (a *App) buildChatItems(session *Session) []chatItem {
 // `message.turnProcess.{worked,took,failed}`。
 //
 // 文案与图标都走 locale / dsh 令牌；展开状态存在 App.expandedParts 里（key = footer）。
-func (a *App) renderTurnFooter(c *ui.Context, item chatItem) {
+func (a *App) renderRoundFooter(c *ui.Context, item chatItem) {
 	theme := c.Theme()
 	chat := item.Refs[0].Chat
 	if chat.Status().IsStreaming() {

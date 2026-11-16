@@ -1485,8 +1485,8 @@ func (a *App) renderChatItem(c *ui.Context, item chatItem) {
 			ui.Icon(c, noticeIcon(item.Notice.Level)).Size(13, 13).TextColor(color)
 			ui.Text(c, item.Notice.Text).FontSize(12).TextColor(color)
 		})
-	case itemTurnFooter:
-		a.renderTurnFooter(c, item)
+	case itemRoundFooter:
+		a.renderRoundFooter(c, item)
 	case itemContent:
 		a.renderContent(c, item.Refs)
 	case itemProcess:

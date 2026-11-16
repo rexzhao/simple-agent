@@ -74,7 +74,7 @@ func TestBuildNoFooterWhileBusy(t *testing.T) {
 	conv := buildConversation(t)
 	items := timeline.Build(conv.Entries(), false)
 	last := items[len(items)-1]
-	if last.Kind == timeline.KindTurnFooter {
+	if last.Kind == timeline.KindRoundFooter {
 		t.Fatal("会话还没空闲，不该出现回合结束行")
 	}
 }
@@ -131,7 +131,7 @@ func TestDurationAndTokens(t *testing.T) {
 	conv := buildConversation(t)
 	items := timeline.Build(conv.Entries(), true)
 	footer := items[len(items)-1]
-	if footer.Kind != timeline.KindTurnFooter {
+	if footer.Kind != timeline.KindRoundFooter {
 		t.Fatalf("最后一条应是回合结束行，实际 %s", footer.Kind)
 	}
 	if got := timeline.Duration(footer); got < 2*time.Second {

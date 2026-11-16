@@ -75,10 +75,10 @@ func (m *Mirror) ApplyPersisted(event store.Event) error {
 //   - 每个工具的缓冲区（id / name / 已经收到的参数前缀），否则接管后的第一个
 //     参数增量会用空 id/name 覆盖整个 part，工具卡片当场变成空白。
 func (d *Driver) beginMirrorTurn(messageID string) {
-	if d.turn != nil && d.turn.messageID == messageID {
+	if d.round != nil && d.round.messageID == messageID {
 		return
 	}
-	turn := &Turn{
+	round := &Round{
 		messageID:     messageID,
 		buffers:       map[int]*toolBuffer{},
 		toolParts:     map[int]int{},
@@ -89,7 +89,7 @@ func (d *Driver) beginMirrorTurn(messageID string) {
 		for index, part := range entry.Message.Parts {
 			switch part.MediaType {
 			case render.MediaReasoning:
-				turn.reasoningPart = index
+				round.reasoningPart = index
 			case render.MediaToolUse:
 				data, ok := partData(part)
 				if !ok {
@@ -101,8 +101,8 @@ func (d *Driver) beginMirrorTurn(messageID string) {
 					streamIndex = sequential
 				}
 				sequential++
-				turn.toolParts[streamIndex] = index
-				buf := turn.buffer(streamIndex)
+				round.toolParts[streamIndex] = index
+				buf := round.buffer(streamIndex)
 				buf.id, _ = data["id"].(string)
 				buf.name, _ = data["name"].(string)
 				if raw, _ := data["raw_args"].(string); raw != "" {
@@ -113,7 +113,7 @@ func (d *Driver) beginMirrorTurn(messageID string) {
 			}
 		}
 	}
-	d.turn = turn
+	d.round = round
 }
 
 // ReplaceInflight 用 snapshot 里的完整内容替换正在流式输出的消息 parts。
@@ -124,7 +124,7 @@ func (d *Driver) beginMirrorTurn(messageID string) {
 func (m *Mirror) ReplaceInflight(messageID string, parts []message.Part, status conversation.EntryStatus) error {
 	// 整份覆盖后，这一轮的增量元数据（reasoning/tool 下标与缓冲区）要重建；
 	// 先丢掉旧的 Turn，下一次 ApplyStreamDelta 会从新的 parts 里恢复。
-	m.drv.turn = nil
+	m.drv.round = nil
 	if _, ok := m.drv.conv.Message(messageID); ok {
 		// 重放收尾会把 streaming 空壳判成「已中断」，这里整份覆盖并恢复 streaming
 		return m.drv.conv.SetStreamingParts(messageID, parts)

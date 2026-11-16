@@ -129,7 +129,7 @@ func (c *Client) itemView(item timeline.Item, conv *conversation.Conversation, i
 		// 首屏从 1690KB 降到几十 KB 的关键。
 		streaming := !idle
 		view.Process = c.processView(item, streaming, streaming)
-	case timeline.KindTurnFooter:
+	case timeline.KindRoundFooter:
 		view.Kind = "footer"
 		view.Footer = footerOf(item)
 	case timeline.KindContent:
