@@ -252,6 +252,9 @@ func (r *Remote) Close() error {
 	}
 	r.closed = true
 	r.mu.Unlock()
+	// 显式把连接状态置 false：界面靠 Connected() 判断"连没连着"，
+	// 关闭后必须立刻反映为断开，不能等某个可能永远不来的事件。
+	r.connectedState.Store(false)
 	if r.mgr != nil {
 		r.mgr.close()
 	}

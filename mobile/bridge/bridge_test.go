@@ -253,3 +253,72 @@ func waitStream(t *testing.T, p *serialPoster, rt *fakeRuntime, n int) chan prov
 	t.Fatalf("第 %d 条流没有打开", n)
 	return nil
 }
+
+// 连上之后 Connected() 必须为 true。
+//
+// 回归测试：以前 Connected() 读的是一个只在 onHostChange 里更新的缓存字段
+// lastConnected，而首次连接成功时那条 connection 事件并不总是发
+// （Remote 构造里 connectedState.Store(true) 是静默的，
+// connManager 的 "connected" 消息类型至今没人发）。于是 Connected() 恒为
+// false，Android 侧据此判断"没连上、正在重连"，顶部横幅永远不消失。
+//
+// 注意这里**不能靠 connection 事件**：测试要证明的是"即使一条事件都没来，
+// 问 Connected() 也能拿到正确结果"。
+func TestConnectedIsTrueAfterAttach(t *testing.T) {
+	poster := &serialPoster{}
+	local := host.NewLocal(host.Config{
+		Runtime:       &fakeRuntime{},
+		Selection:     providers.Selection{ProviderID: "fake", Model: "m"},
+		SystemPrompt:  "你是助手",
+		Workspace:     t.TempDir(),
+		MaxToolRounds: 3,
+		ContextWindow: 200_000,
+		Post:          poster.post,
+	})
+	t.Cleanup(func() { _ = local.Close() })
+	if local.Active() == nil {
+		local.NewSession("")
+	}
+
+	viewerConn, execConn := wire.PipePair()
+	go func() { _ = host.Serve(execConn, local, poster.post) }()
+
+	client := bridge.NewClient(&listener{}, "zh", t.TempDir())
+	t.Cleanup(client.Close)
+
+	remote, err := host.NewRemote(viewerConn, poster.post)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.AttachForTest(client, remote)
+
+	// 连接是活的：Connected() 立刻应为 true，不等任何事件
+	if !client.Connected() {
+		t.Fatal("刚挂上连接，Connected() 应为 true —— 否则界面会以为在重连，横幅永不消失")
+	}
+
+	// 真的能通（防止"Connected 说连上了但其实是死的"）
+	waitFor(t, poster, func() bool {
+		var sessions []bridge.SessionSummary
+		if err := json.Unmarshal([]byte(client.SessionsJSON()), &sessions); err != nil {
+			return false
+		}
+		return len(sessions) > 0
+	})
+
+	if !client.Connected() {
+		t.Fatal("通信正常时 Connected() 仍为 false")
+	}
+
+	// 断开后必须变成 false —— 否则"断线重连"横幅该出现时不出现
+	_ = remote.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		poster.pump()
+		if !client.Connected() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("断开连接后 Connected() 应为 false")
+}

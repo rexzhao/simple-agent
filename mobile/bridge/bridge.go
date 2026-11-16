@@ -68,8 +68,6 @@ type Client struct {
 
 	// allowShell 来自执行端握手（展示端不读本地配置）。
 	allowShell bool
-	// 上一个已知的连接状态（用来说明"连接/断开"的迁移）。
-	lastConnected bool
 	// lastError 是最近一次失败原因（BlobPath 这类阻塞操作把错误留在这里给界面看）。
 	lastError string
 	// restoreDial 恢复连接前的全局拨号函数（TLS 是进程级开关，断开时还原）。
@@ -862,11 +860,13 @@ func (c *Client) submit(sessionID, kind string, payload []byte) string {
 func (c *Client) onHostChange(change host.Change) {
 	switch change.Kind {
 	case "connection":
-		// 连接状态变化：把 allow_shell 也刷一遍（握手拿到了）
+		// 连接状态变化：把 allow_shell 也刷一遍（握手拿到了）。
+		//
+		// 不再在这里缓存连接状态：界面要判断"连没连着"时会通过
+		// Connected() 直接问 remote（见那里的注释）。
 		if remote := c.host(); remote != nil {
 			c.setAllowShell(remote.Info().AllowShell)
 		}
-		c.setConnected(change.Connected)
 	case "models":
 		c.emit("providers", "")
 	}
@@ -1011,24 +1011,19 @@ func (c *Client) connected() bool {
 
 // Connected 报告当前是否连着（断线重连期间为 false）。
 //
-// 界面每收到一次 "connection" 事件就来问一次：Go 侧的 Change 里带着
-// Connected，但 ChangeListener 只传 kind，所以这里补一个查询入口。
+// 界面每收到一次 "connection" 事件就来问一次；回到前台时也会主动问。
 //
-// 以前没有这个接口，Kotlin 侧的 connected 只在首次连接成功时被置为 true，
-// 断线后**永远不变成 false** —— 界面显示"已连接"但实际断了，用户只能手动重连。
+// **必须直接问 remote，不能读缓存的 lastConnected**：
+// lastConnected 只在 onHostChange 收到 connection 事件时更新，而首次连接
+// 成功时那条事件并不总是发（Remote 构造里 connectedState.Store(true) 是
+// 静默的，connManager 里的 "connected" 消息类型至今没有人发）。于是
+// lastConnected 会一直停在初始值 false —— 界面据此判断"没连上、正在重连"，
+// 顶部横幅永远不消失。
+//
+// 和内部 connected() 保持一致：两者都问 remote.Connected()（原子读，
+// 由连接管理器维护），不引入第二份可能失真的状态。
 func (c *Client) Connected() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.remote == nil {
-		return false
-	}
-	return c.lastConnected
-}
-
-func (c *Client) setConnected(value bool) {
-	c.mu.Lock()
-	c.lastConnected = value
-	c.mu.Unlock()
+	return c.connected()
 }
 
 func (c *Client) isAllowShell() bool {
