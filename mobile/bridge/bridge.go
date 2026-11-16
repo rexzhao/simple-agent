@@ -419,14 +419,21 @@ func itemSeqRange(item timeline.Item) (uint64, uint64, bool) {
 //
 // beforeSeq 为 0 表示"最后一页"；否则返回 seq **小于** beforeSeq 的那一页。
 //
+// **参数用 int64 而不是 uint64**：gomobile 不支持 uint64，那样导出的方法
+// 会整个被跳过（Kotlin 侧编译报"找不到 timelinePageJSON"）。
+//
 // 分页保证**不切断一条消息**：页边界按 item 的 seq 区间对齐，
 // 一页里不会出现"某条消息一半在这页、一半在下页"。
 //
 // 返回 {session_id, items, has_more, seq_from, seq_to, title, runtime, todos, asks}。
 // 只有最后一页带 runtime/todos/asks：它们是"当前状态"，翻历史页时不该覆盖。
-func (c *Client) TimelinePageJSON(sessionID string, beforeSeq uint64, limit int) string {
+func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) string {
 	if limit <= 0 || limit > 500 {
 		limit = 60
+	}
+	before := uint64(0)
+	if beforeSeq > 0 {
+		before = uint64(beforeSeq)
 	}
 	view, raw := c.buildTimelineWithRaw(sessionID)
 	total := len(view.Items)
@@ -455,12 +462,12 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq uint64, limit int)
 		carried = last
 	}
 
-	// 定位这一页的结束下标：默认末尾；有游标时取"最后一个 last < beforeSeq"的下一位置
+	// 定位这一页的结束下标：默认末尾；有游标时取"最后一个 last < before"的下一位置
 	end := total
-	if beforeSeq > 0 {
+	if before > 0 {
 		end = 0
 		for index := 0; index < total; index++ {
-			if spans[index].valid && spans[index].last < beforeSeq {
+			if spans[index].valid && spans[index].last < before {
 				end = index + 1
 			}
 		}
@@ -470,8 +477,8 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq uint64, limit int)
 				"session_id": view.SessionID,
 				"items":      []ItemView{},
 				"has_more":   false,
-				"seq_from":   beforeSeq,
-				"seq_to":     beforeSeq,
+				"seq_from":   before,
+				"seq_to":     before,
 			})
 		}
 	}
@@ -500,7 +507,7 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq uint64, limit int)
 		page["seq_to"] = spans[end-1].last
 	}
 	// 当前状态只跟最后一页走：翻历史页时不能用旧状态覆盖界面
-	if beforeSeq == 0 {
+	if before == 0 {
 		page["title"] = view.Title
 		page["runtime"] = view.Runtime
 		page["todos"] = view.Todos

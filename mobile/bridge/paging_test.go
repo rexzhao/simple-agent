@@ -18,8 +18,9 @@ type pageView struct {
 	SessionID string              `json:"session_id"`
 	Items     []bridge.ItemView   `json:"items"`
 	HasMore   bool                `json:"has_more"`
-	SeqFrom   uint64              `json:"seq_from"`
-	SeqTo     uint64              `json:"seq_to"`
+	// 用 int64 与 Go 侧导出的签名一致（gomobile 不支持 uint64）
+	SeqFrom   int64               `json:"seq_from"`
+	SeqTo     int64               `json:"seq_to"`
 	Runtime   *bridge.RuntimeView `json:"runtime"`
 }
 
