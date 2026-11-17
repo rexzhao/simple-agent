@@ -37,11 +37,7 @@ class ChatScrollController(
     /** 上一次看到的列表 key 序列，用来判断"数据变了没有"。 */
     private var lastKeys: List<Any> = emptyList()
 
-    /** 用户正在看的那一条及其偏移。 */
-    private var anchorKey: Any? = null
-    private var anchorOffset = 0
-
-    /** 用户是否停在底部附近。 */
+    /** 用户是否停在底部附近（决定新增内容要不要跟随）。 */
     private var atBottom = true
 
     /**
@@ -61,27 +57,23 @@ class ChatScrollController(
             lastKeys = keys
 
             if (keys.isEmpty()) {
-                anchorKey = null
+                atBottom = true
                 return@collect
             }
 
             if (keys == previousKeys) {
-                // 数据没变：只更新"用户在看哪一条"
-                snap.firstKey?.let {
-                    anchorKey = it
-                    anchorOffset = snap.firstOffset
-                }
+                // 数据没变：唯一要做的是记住"用户在不在底部"。
+                // 这是滚动的副产品，不需要额外记录锚点 —— 锚点在数据
+                // 变化那一刻现取（见下面），记历史值没有用处。
                 atBottom = snap.lastIndex >= snap.count - 2
                 return@collect
             }
 
-            // 数据变了。**基准取当前这一帧的可见项**：
-            // 加载期间顶部提示在变（按钮 ↔ 转圈），历史锚点参照的坐标系已不同；
-            // 而"刚到达这一帧"看到的就是用户此刻真正在看的东西。
-            val baselineKey = snap.firstKey ?: anchorKey ?: return@collect
-            val baselineOffset = if (snap.firstKey != null) snap.firstOffset else anchorOffset
-
-            restore(baselineKey, baselineOffset)
+            // 数据变了：**基准就是此刻屏幕上第一个有效项**。
+            // 不依赖任何历史记录 —— 加载期间顶部提示在变、坐标系在漂，
+            // 历史值不可信；而"刚到达这一帧"的可见项就是用户真正在看的东西。
+            val baselineKey = snap.firstKey ?: return@collect
+            restore(baselineKey, snap.firstOffset)
         }
     }
 
