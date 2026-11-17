@@ -74,6 +74,48 @@ func (s *Session) Conversation() *conversation.Conversation {
 	return s.drv.Conversation()
 }
 
+// ApplyHistory 把一段**更早的**持久事件补进镜像（backfill 用）。
+//
+// 展示端的镜像只收到最近 attachTailEvents 条事件，翻页翻到最早时其实
+// 磁盘上还有更多。补拉回来的那批通过这里注入，之后时间线构建就能看到。
+//
+// 只在展示端（有 mirror）有意义；执行端有自己的 journal，不需要这个。
+// 事件必须按 seq 升序传入 —— 镜像假设顺序追加。
+func (s *Session) ApplyHistory(events []store.Event) int {
+	if s.mirror == nil {
+		return 0
+	}
+	applied := 0
+	for _, event := range events {
+		if err := s.mirror.ApplyPersisted(event); err != nil {
+			log.Printf("host：补入历史事件失败（seq=%d type=%s）：%v", event.Seq, event.Type, err)
+			continue
+		}
+		applied++
+	}
+	return applied
+}
+
+// OldestContentSeq 返回镜像里最早一条内容事件的 seq（0 表示还没有内容）。
+//
+// 翻页用它判断"是不是已经翻到本地镜像的边界"：到了才值得向执行端补拉。
+func (s *Session) OldestContentSeq() uint64 {
+	if s.mirror == nil {
+		return 0
+	}
+	var oldest uint64
+	for _, entry := range s.mirror.Conversation().Entries() {
+		if entry.Message == nil {
+			continue
+		}
+		first, _ := entry.Message.SeqRange()
+		if first > 0 && (oldest == 0 || first < oldest) {
+			oldest = first
+		}
+	}
+	return oldest
+}
+
 func (s *Session) Busy() driver.Busy {
 	if s.view != nil {
 		return driver.Busy(s.view.Busy)
@@ -810,6 +852,114 @@ func (s *Session) loadOlder(cursor string) (OlderPage, error) {
 		s.host.warn(s.ID, s.cfg.Tr("archive.corrupt", warning))
 	}
 	return OlderPage{Entries: entries, More: more, Next: next}, nil
+}
+
+// backfill 从磁盘日志里取 **seq < before** 的那一段历史事件。
+//
+// 为什么需要：首次 Attach 只下发最近 attachTailEvents 条（长会话首屏才不会卡）。
+// 展示端在本地镜像里翻页翻到最早时，磁盘上其实还有更多 —— 没有这个命令，
+// 界面就只能谎报"已经是最早的内容了"。
+//
+// 返回原始 store.Event：展示端用 driver.Mirror.ApplyPersisted 注入镜像，
+// 与 attach 下发的历史走同一条路径，不用再解析一遍。
+func (s *Session) backfill(before uint64, limit int) (BackfillData, error) {
+	if s.journal == nil {
+		return BackfillData{}, nil // 内存后端没有历史可补
+	}
+	if limit <= 0 || limit > 2000 {
+		limit = 300
+	}
+	loaded, err := s.journal.Load()
+	if err != nil {
+		return BackfillData{}, err
+	}
+
+	// 只保留能重建时间线的**内容事件**（状态事件对历史渲染没用，
+	// 传过去只会让展示端多做无用功）。
+	var picked []store.Event
+	var oldest uint64
+	for _, event := range loaded.Events {
+		if !isContentEvent(event.Type) {
+			continue
+		}
+		if oldest == 0 {
+			oldest = event.Seq
+		}
+		if before > 0 && event.Seq >= before {
+			// 进入展示端已有区间：后面的都不要了
+			break
+		}
+		picked = append(picked, event)
+	}
+
+	// hasMore 表示"**再往前还有内容**"，不是"碰到了游标"。
+	// 截断了（limit 放不下）就说明还有；否则看最早的候选是不是就从
+	// 日志开头开始 —— 不是就说明前面还有更早的。
+	hasMore := false
+	if len(picked) > limit {
+		picked = picked[len(picked)-limit:]
+		hasMore = true
+	}
+	if !hasMore && len(picked) > 0 && oldest != 0 && picked[0].Seq > oldest {
+		hasMore = true
+	}
+
+	return BackfillData{Events: picked, HasMore: hasMore, OldestSeq: oldest}, nil
+}
+
+// isContentEvent 报告该事件是否属于"重建时间线需要"的内容事件。
+func isContentEvent(kind string) bool {
+	switch kind {
+	case store.TypeMessageInput, store.TypeMessageOutput, store.TypeToolResult:
+		return true
+	}
+	return false
+}
+
+// ---- 测试辅助（生产代码不该调用）----
+
+// BackfillForTest 直接调 backfill（与展示端走同一条逻辑）。
+func BackfillForTest(s *Session, before uint64, limit int) (BackfillData, error) {
+	return s.backfill(before, limit)
+}
+
+// EventsForTest 返回会话日志里的全部事件（测试用来算游标）。
+func EventsForTest(s *Session) []store.Event {
+	if s.journal == nil {
+		return nil
+	}
+	loaded, err := s.journal.Load()
+	if err != nil {
+		return nil
+	}
+	return loaded.Events
+}
+
+// AppendUserMessageForTest 往会话里追加一条用户消息并落盘（测试用）。
+//
+// 会先确保会话已持久化（ensurePersisted），否则 journal 是 nil、事件写不进磁盘，
+// backfill 自然读不到东西。
+func AppendUserMessageForTest(s *Session, text string) error {
+	s.ensurePersisted(text)
+	msg := message.Message{
+		MessageID: s.cfg.NewID(),
+		Role:      message.RoleUser,
+		Parts:     []message.Part{message.NewTextPart(text)},
+	}
+	if _, err := s.Conversation().AddMessage(msg, conversation.StatusComplete); err != nil {
+		return err
+	}
+	event, err := store.NewEvent(store.TypeMessageInput, driver.MessageEventData{
+		Round: 1, Turn: 1, Role: string(message.RoleUser),
+		Message: msg, Status: conversation.StatusComplete,
+	})
+	if err != nil {
+		return err
+	}
+	if s.journal != nil {
+		return s.journal.Append(event)
+	}
+	return nil
 }
 
 // isDeltaEvent 判断 provider 事件是否属于"纯增量"（要转发给展示端的那几种）。

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"simple-agent/internal/providers"
+	"simple-agent/internal/store"
 )
 
 // 命令载荷是**跨进程**的（展示端 → 执行端），所以每个字段都必须有 json tag：
@@ -64,6 +65,33 @@ type NewSessionPayload struct {
 // LoadOlderPayload 是 "loadOlder" 命令的参数：展示端自己的翻页游标。
 type LoadOlderPayload struct {
 	Cursor string `json:"cursor,omitempty"`
+}
+
+// BackfillPayload 是 "backfill" 命令的参数：要 **seq < Before** 的更早事件。
+//
+// 为什么需要它：首次 attach 只下发最近 [attachTailEvents] 条事件（为了让
+// 长会话首屏不卡）。展示端在本地镜像里翻页翻到最早时，其实磁盘上还有更多，
+// 必须回头向执行端要 —— 否则界面会谎报"已经是最早的内容了"。
+type BackfillPayload struct {
+	// Before 是本次要取的区间的**上界（不含）**：返回 seq < Before 的事件。
+	// 用展示端当前的 firstSeq，天然不重不漏（seq 单调递增且不重置）。
+	Before uint64 `json:"before"`
+	// Limit 是最多返回多少条（按事件计）。执行端可以再截断。
+	Limit int `json:"limit,omitempty"`
+}
+
+// BackfillData 是 "backfill" 命令的结果。
+//
+// 直接传原始 store.Event：展示端用 driver.Mirror.ApplyPersisted 把它注入
+// 镜像，与 attach 下发的历史走同一条路径 —— 不必再定义一套平行结构，
+// 也不会出现"两个地方各自解析事件、字段理解不一致"的问题。
+type BackfillData struct {
+	// Events 是读到的那一段（按 seq 升序）。
+	Events []store.Event `json:"events"`
+	// HasMore 表示 Before 之前是否还有更多（false 表示真的到最早了）。
+	HasMore bool `json:"has_more"`
+	// OldestSeq 是执行端日志里最早的内容事件 seq（用于判定到底）。
+	OldestSeq uint64 `json:"oldest_seq,omitempty"`
 }
 
 // NewSessionData 是 "newSession" 命令的结果：新会话的 id。

@@ -189,7 +189,14 @@ func (r *Remote) ResetForNewHost() {
 	r.epoch = ""
 	r.models = nil
 	r.pendingBlob = map[string][]byte{}
+	// 切换执行端：旧机器的 backfill 回包不会再来了，唤醒所有等待方
+	// （否则那边会一直挂到超时）
+	waiters := r.backfillWaiters
+	r.backfillWaiters = map[string]chan BackfillData{}
 	r.mu.Unlock()
+	for _, wait := range waiters {
+		wait <- BackfillData{}
+	}
 	if r.mgr != nil {
 		r.mgr.resetPendingUnknown()
 	}

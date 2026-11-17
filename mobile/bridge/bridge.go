@@ -416,13 +416,58 @@ func itemSeqRange(item timeline.Item) (uint64, uint64, bool) {
 	return first, last, true
 }
 
+// backfillPageLimit 是每次向执行端补拉的历史事件条数。
+//
+// 太小会让长会话需要滚很多次才到顶；太大则单次回包变重（每条事件都带
+// 完整消息内容）。300 条大约相当于几十轮对话，滚一次能翻挺久。
+const backfillPageLimit = 300
+
+// ensureEarlierAvailable 在"已经翻到本地镜像最早"时，向执行端要更早的一批事件
+// 并注入镜像。
+func (c *Client) ensureEarlierAvailable(sessionID string, before uint64) {
+	session := c.currentSession(sessionID)
+	remote := c.host()
+	if session == nil || remote == nil {
+		return
+	}
+	// 本地镜像里最早的内容事件 seq（0 表示镜像里还没有内容）
+	oldest := session.OldestContentSeq()
+	if oldest != 0 && before > oldest {
+		return // 还没翻到边界，本地够用
+	}
+
+	data, err := remote.Backfill(sessionID, before, backfillPageLimit)
+	if err != nil {
+		// 补拉失败不该让翻页整体失败：界面会显示"已经是最早"，
+		// 但那比"转圈卡住"好；用户再滑一次会重试。
+		log.Printf("bridge：补拉更早内容失败（session=%s before=%d）：%v", sessionID, before, err)
+		return
+	}
+	if len(data.Events) == 0 {
+		return
+	}
+
+	applied := session.ApplyHistory(data.Events)
+	if applied > 0 {
+		// 注入改变 entries 结构：让缓存指纹失效，下次 build 会重建
+		c.invalidateTimeline(sessionID)
+		log.Printf("bridge：补拉了 %d 条更早事件（session=%s before=%d）",
+			applied, sessionID, before)
+	}
+}
+
+// invalidateTimeline 丢掉某个会话的时间线缓存（注入历史后必须失效）。
+func (c *Client) invalidateTimeline(sessionID string) {
+	c.mu.Lock()
+	delete(c.timelineCache, sessionID)
+	c.mu.Unlock()
+}
+
 // TimelinePageJSON 返回时间线的一页（**按事件 seq 分页**）。
 //
 // 为什么不用 item key：item 是渲染产物，key 里含 part 索引，流式输出期间会变
 // （proc:xxx#1 ↔ xxx#0），游标因此不稳定——真机上表现为"翻到某处就再也翻不动"。
 // 日志的 seq 一旦写入永不变，是唯一可靠的游标。
-//
-// beforeSeq 为 0 表示"最后一页"；否则返回 seq **小于** beforeSeq 的那一页。
 //
 // **参数用 int64 而不是 uint64**：gomobile 不支持 uint64，那样导出的方法
 // 会整个被跳过（Kotlin 侧编译报"找不到 timelinePageJSON"）。
@@ -439,6 +484,17 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) 
 	before := uint64(0)
 	if beforeSeq > 0 {
 		before = uint64(beforeSeq)
+	}
+	// 翻到本地镜像最早时，向执行端补拉更早的事件。
+	//
+	// **为什么必须补拉**：首次 attach 只下发最近 attachTailEvents 条事件
+	// （长会话首屏才不卡），本地镜像里就只有这一段。只在镜像里翻页时会
+	// 翻到"镜像的最早"，根本不是会话的最早 —— 界面于是谎报
+	// "已经是最早的内容了"。
+	//
+	// 只在"已经到镜像边界"时才走网络：正常翻页都在本地完成，不增加延迟。
+	if before > 0 {
+		c.ensureEarlierAvailable(sessionID, before)
 	}
 	view, raw := c.buildTimelineWithRaw(sessionID)
 	total := len(view.Items)

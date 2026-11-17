@@ -347,6 +347,17 @@ func (l *Local) dispatch(session *Session, cmd Command) CmdResult {
 			return CmdResult{Error: err.Error()}
 		}
 		return CmdResult{OK: true, Data: page}
+	case "backfill":
+		// 展示端翻到本地镜像最早时，回头要"seq < before"的更早事件。
+		var payload BackfillPayload
+		if len(cmd.Payload) > 0 {
+			_ = json.Unmarshal(cmd.Payload, &payload)
+		}
+		data, err := session.backfill(payload.Before, payload.Limit)
+		if err != nil {
+			return CmdResult{Error: err.Error()}
+		}
+		return CmdResult{OK: true, Data: data}
 	default:
 		return CmdResult{Error: "未知命令：" + cmd.Kind}
 	}
