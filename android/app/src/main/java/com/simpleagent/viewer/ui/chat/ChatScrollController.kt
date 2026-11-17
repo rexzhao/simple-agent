@@ -1,5 +1,6 @@
 package com.simpleagent.viewer.ui.chat
 
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.snapshotFlow
@@ -9,22 +10,31 @@ import kotlinx.coroutines.flow.collect
 /**
  * 聊天列表滚动位置的**唯一权威**。
  *
- * ## 为什么需要它
+ * ## 核心思路（一句话）
  *
- * 以前滚动逻辑散在 6 个 `LaunchedEffect` 里，每个都可能调 `scrollToItem`：
- * 加载更早内容、贴底跟随、首屏跳末尾、滚动补偿……谁后执行看运气。
- * 用户看到的就是"内容跳了，也不知道跳到哪"。
+ * **数据到了之后，把"用户正在看的那一条"重新放回原来的屏幕位置。**
  *
- * 这里把决策收进一个地方，外部不再调 `scrollToItem`。
+ * 就这一件事。所有复杂度都来自"怎么把这一件事做准"，而不是来自
+ * "要不要补偿""补偿多少"的各种规则。
  *
- * ## 核心不变式
+ * ## 具体做法
  *
- * **用户眼睛盯着的那条内容，必须留在屏幕上的原处。**
+ * 1. 记住锚点：用户在滚动时，记下**第一条可见的内容项**的 key，
+ *    以及它相对视口顶部的偏移（负值 = 顶部被裁掉多少）。
+ * 2. 数据变了之后，拿这个 key 在**完整列表**里查它的新下标 ——
+ *    列表是数据源给的，不依赖 LazyColumn 有没有把它渲染出来。
+ *    这就是为什么不需要"估算插入条数"：查一下 index 就有了。
+ * 3. `scrollToItem(newIndex, 原偏移)`，一条命令搞定。
  *
- * 内容变化时按这个顺序判断：
- *   1. 条目数变多、且原来那条仍在屏幕上 → 按 key 精确还原（连条目内偏移）
- *   2. 条目数变多、原来那条被挤出屏幕 → 一次性插了很多条，按"插入数量"平移
- *   3. 用户本来就在底部 → 说明追加的是新消息，跟到底部
+ * ## 为什么以前会跳
+ *
+ * 之前的实现只在 `LazyColumn` 的 `visibleItemsInfo` 里找锚点。
+ * 一次补拉插 60 条，锚点必然被挤出可见区 → 找不到 → 退化成
+ * "按插入条数估算"，而估算用的是插入**之后**读到的 firstIndex（通常是 0），
+ * 于是滚到了顶部。真机上"加载完跳到接近顶部"就是这么来的。
+ *
+ * 数据源本来就有完整列表，查 index 是 O(n) 的一次线性扫描，
+ * 比任何估算都准，也不需要维护"插了多少条"这类会失效的中间状态。
  */
 @Stable
 class ChatScrollController(
@@ -32,21 +42,37 @@ class ChatScrollController(
     /** 顶部状态行（"正在加载更早内容"）的 key。它不是内容，锚点要跳过。 */
     private val headerKey: Any = "chat-header",
 ) {
-    private var lastCount = 0
+    /** 上一次看到的列表快照，用来判断"数据变了"。 */
+    private var lastKeys: List<Any> = emptyList()
 
-    /** 用户正在看的那一条（key + 它被视口顶部裁掉的高度 + 当时的下标）。 */
+    /**
+     * 锚点：用户正在看的那一条。
+     *
+     * [offset] 是该条**顶部相对视口顶部**的偏移（≤0 表示顶部被裁掉）。
+     * 恢复时原样带回去，这样即使那一条是长消息、只露出下半截，也停在原处。
+     */
     private var anchorKey: Any? = null
     private var anchorOffset = 0
-    /**
-     * 锚点条目**在插入发生前**的列表下标。
-     *
-     * 锚点被挤出屏幕时，用它 + 插入条数 算新位置。
-     * 不能用插入后读到的 firstIndex（那已经是 0/1，会滚到顶部）。
-     */
-    private var anchorIndex = 0
 
     /** 用户是否停在底部附近。 */
     private var atBottom = true
+
+    /**
+     * 数据加载期间冻结锚点更新。
+     *
+     * 为什么：fetch 时顶部提示"按钮 → 转圈 → 已加载"会反复改变 header 高度，
+     * 内容区跟着上下位移。如果这期间继续用"第一条可见项"更新锚点，
+     * 记下来的偏移参照的是一个正在漂移的坐标系，等数据到了再拿它去恢复必然不准。
+     *
+     * 冻结后锚点保持"用户最后一次真正滚动时"看到的位置；
+     * 数据到位那一帧再用当时的可见项做基准（见 restoreAnchor 的注释）。
+     */
+    private var frozen = false
+
+    /** 外部（数据层）告知"开始加载" / "加载结束"。 */
+    fun setLoading(loading: Boolean) {
+        frozen = loading
+    }
 
     /**
      * 观察列表并维护滚动位置。**整个界面只调用一次**：
@@ -54,89 +80,116 @@ class ChatScrollController(
      * ```
      * LaunchedEffect(listState) { controller.observe() }
      * ```
+     *
+     * @param keysOf 返回"当前完整列表的 key 序列"。数据源变化后组件能立刻
+     *   从这里查到锚点的新下标，不依赖 LazyColumn 是否渲染了它。
      */
-    suspend fun observe() {
+    suspend fun observe(keysOf: () -> List<Any>) {
         snapshotFlow { readSnapshot() }.collect { snap ->
-            if (snap.count == 0) {
-                lastCount = 0
+            val keys = keysOf()
+            val previousKeys = lastKeys
+            lastKeys = keys
+
+            if (keys.isEmpty()) {
                 anchorKey = null
                 return@collect
             }
 
-            val previousCount = lastCount
-            val countGrew = snap.count > previousCount
-            val countChanged = snap.count != previousCount
-            lastCount = snap.count
-
-            // 情况 A：条目数没变 —— 纯滚动或布局微调，只更新锚点
-            if (!countChanged) {
-                if (snap.firstKey != null) {
+            // 数据没变：只更新锚点与贴底状态（纯滚动）
+            if (keys == previousKeys) {
+                // **加载期间冻结锚点**：此时 header 高度在变（按钮 ↔ 转圈），
+                // 内容区整体在漂，这期间记下的偏移不可靠。
+                if (!frozen && snap.firstKey != null) {
                     anchorKey = snap.firstKey
                     anchorOffset = snap.firstOffset
-                    anchorIndex = snap.firstIndex
                 }
                 atBottom = snap.lastIndex >= snap.count - 2
                 return@collect
             }
 
-            // 情况 B：条目数变少 —— 切会话/清空，不补偿（交给跳末尾逻辑）
-            if (!countGrew) return@collect
+            // **数据变了：此刻屏幕上第一个有效项就是基准**。
+            //
+            // 为什么不直接用之前记下的 anchorKey：
+            // fetch 期间顶部提示会从"按钮"变成"转圈"、再变成"已加载"，
+            // header 高度反复变化，内容区跟着上下位移。那段时间记下的
+            // anchorOffset 参照的是一个已经不存在的位置。
+            //
+            // 而"数据刚到位这一帧"的可见项，正好就是用户此刻真正在看的东西 ——
+            // 用它的 key 与偏移做基准，最准确，也不需要知道期间发生了什么。
+            val baselineKey = snap.firstKey ?: anchorKey
+            val baselineOffset = if (snap.firstKey != null) snap.firstOffset else anchorOffset
 
-            // 情况 C：条目数变多 —— 内容被插入，需要决定停在哪
-            settle(snap, previousCount)
+            restoreAnchor(keys, previousKeys, baselineKey, baselineOffset)
         }
     }
 
     /**
-     * 内容插入后的落位。
+     * 数据变化后的落位。**唯一要做的事**：把基准项放回原来的屏幕位置。
      *
-     * 三条路径，优先级从高到低：
-     *   1. 按 key 找到原来那条 → 精确还原它的位置与偏移（最理想）
-     *   2. 找不到（一次插入几十条，锚点被挤出屏幕）→ **按插入条数把锚点
-     *      的旧下标往后平移**，也就是"原来那条现在在哪"
-     *   3. 连锚点都没有（首屏）→ 不处理，交给跳末尾
-     *
-     * 唯独**用户本来就在底部**时例外 —— 那说明新增的是新消息，应该跟随。
+     * 三种情形，按优先级：
+     *   1. 用户原本在底部 → 跟随到新的末尾（新消息，用户想看）
+     *   2. 有基准项 → 在完整列表里查它的新下标，滚过去 + 恢复原偏移
+     *   3. 没有基准（首屏）→ 什么都不做
      */
-    private suspend fun settle(snap: Snapshot, previousCount: Int) {
+    private suspend fun restoreAnchor(
+        keys: List<Any>,
+        previousKeys: List<Any>,
+        baselineKey: Any?,
+        baselineOffset: Int,
+    ) {
         if (atBottom) {
-            // 用户原本在底部：新增的是新消息，跟随到底
-            listState.scrollToItem(snap.count - 1)
+            withFrameNanos { }
+            listState.scrollToItem((keys.size - 1).coerceAtLeast(0))
             return
         }
 
-        val key = anchorKey
-
-        // 路径 1：按 key 精确定位（最多等 5 帧让新布局生效）
-        if (key != null) {
-            var tries = 0
-            while (tries < 5) {
-                withFrameNanos { }
-                val live = readSnapshot()
-                val target = live.visibleFirstIndexOf(key)
-                if (target >= 0) {
-                    listState.scrollToItem(target, anchorOffset)
-                    return
-                }
-                tries++
-            }
+        val key = baselineKey ?: return
+        // **关键**：在完整列表里查下标，而不是在可见项里找。
+        // 一次插 60 条时锚点会被挤出屏幕，可见项里根本没有它；
+        // 但完整列表里它一定在。
+        val newIndex = keys.indexOf(key)
+        if (newIndex < 0) {
+            // 基准项在新列表里不存在（消息被删/切会话）：不动，交给用户
+            return
         }
 
-        // 路径 2：锚点被挤出屏幕。用**插入前记下的下标** + 插入条数，
-        // 算它现在应该在哪。
-        //
-        // **不能用 snap.firstIndex**：那是插入之后读到的，已经是新布局里
-        // 的第一个可见项（通常就是 0 或 1），拿它当目标就会滚到接近顶部 ——
-        // 真机上"加载完跳到接近顶部"就是这么来的。
-        val inserted = snap.count - previousCount
-        if (inserted <= 0) return
-        val target = (anchorIndex + inserted).coerceIn(0, snap.count - 1)
-        android.util.Log.d(
-            "SimpleAgent",
-            "滚动落位（平移）：插了 $inserted 条，锚点旧下标=$anchorIndex → $target " +
-                "offset=$anchorOffset（count $previousCount→${snap.count}）",
-        )
-        listState.scrollToItem(target, anchorOffset)
+        withFrameNanos { }
+        // 先按 index 对齐到视口顶部（offset=0 是 scrollToItem 唯一可靠的行为），
+        // 再由 nudgeTo 用像素级 scrollBy 补出精确偏移。
+        listState.scrollToItem(newIndex)
+        nudgeTo(key, baselineOffset)
+    }
+
+    /**
+     * 按实际布局把偏移校正到期望值。
+     *
+     * `scrollToItem(index, offset)` 在 offset 为负值时行为不稳定（会把目标
+     * 项夹到视口顶部，实测差 40~160px 收敛不了）。所以这里改用两步：
+     *   1. `scrollToItem(index)` 先把目标项对齐到视口顶部（offset=0）
+     *   2. `scrollBy(-expectedOffset)` 把整个列表再推一下，得到精确偏移
+     *
+     * 为什么第 2 步可靠：`scrollBy` 是像素级滚动，不受 item 边界约束。
+     */
+    private suspend fun nudgeTo(key: Any, expectedOffset: Int) {
+        repeat(3) {
+            withFrameNanos { }
+            val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == key }
+                ?: return  // 目标不在可见区：无法测量，放弃（位置已由 index 决定）
+            val drift = info.offset - expectedOffset
+            if (drift == 0) return
+            android.util.Log.d(
+                "SimpleAgent",
+                "滚动落位微调：key=$key offset ${info.offset} → $expectedOffset（漂 $drift）",
+            )
+            // `scrollBy(positive)` = 内容向"更新"方向滚（用户往上滑，看到后面的内容），
+            // 也就是 item 在屏幕上往上移动。
+            //
+            // drift = 当前偏移 - 目标偏移。drift > 0 表示目标项偏下，
+            // 需要让它往上走 drift 像素 → scrollBy(+drift)。
+            // 之前写成 -drift，结果每轮偏离翻倍（52 → 104 → 208），
+            // 是典型的符号写反。
+            listState.scrollBy(drift.toFloat())
+        }
     }
 
     /** 首次打开会话：跳到末尾。 */
@@ -149,31 +202,25 @@ class ChatScrollController(
     }
 
     /** 贴底跟随（发消息后调用）。 */
-    suspend fun scrollToBottom() {
-        jumpToBottom()
-    }
+    suspend fun scrollToBottom() = jumpToBottom()
 
     // ---- 内部 ----
 
     private fun readSnapshot(): Snapshot {
         val info = listState.layoutInfo
-        val firstContent = info.visibleItemsInfo.firstOrNull { it.key != headerKey }
+        // header 已经不在列表里（固定在列表上方），可见项全是内容
+        val firstContent = info.visibleItemsInfo.firstOrNull()
         return Snapshot(
             count = info.totalItemsCount,
             firstKey = firstContent?.key,
-            firstIndex = firstContent?.index ?: 0,
             firstOffset = firstContent?.offset ?: 0,
             lastIndex = info.visibleItemsInfo.lastOrNull()?.index ?: -1,
         )
     }
 
-    private fun Snapshot.visibleFirstIndexOf(key: Any): Int =
-        listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == key }?.index ?: -1
-
     internal data class Snapshot(
         val count: Int,
         val firstKey: Any?,
-        val firstIndex: Int,
         val firstOffset: Int,
         val lastIndex: Int,
     )

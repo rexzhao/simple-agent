@@ -308,7 +308,12 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     // 跳到哪"。现在只有 controller 一处能动滚动位置，其余地方
     // （包括下面的加载触发）只做判断，不碰滚动。
     val scrollController = remember(listState) { ChatScrollController(listState, ArchiveHeaderKey) }
-    LaunchedEffect(listState) { scrollController.observe() }
+    // 把完整列表的 key 序列喂给控制器：数据变化后它能在这里查到锚点的新下标，
+    // 不依赖 LazyColumn 是否把锚点渲染出来（一次补拉 60 条时它会被挤出屏幕）。
+    val latestItemKeys = rememberUpdatedState(state.timeline.items.map { it.key as Any })
+    LaunchedEffect(listState) {
+        scrollController.observe { latestItemKeys.value }
+    }
 
     // 打开/切换会话时跳到末尾：用户期望看到"最新说了什么"。
     // 只在这个会话第一次有内容时做一次。
