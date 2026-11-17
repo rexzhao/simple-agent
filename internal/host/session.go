@@ -110,10 +110,37 @@ func (s *Session) ApplyHistory(events []store.Event) int {
 	if applied == 0 {
 		return 0
 	}
+
+	fresh := replayed.Conversation.Entries()
+
 	s.historyMu.Lock()
-	// 补拉总是往更早的方向走：新来的这批整体排在已有历史之前。
-	s.history = append(replayed.Conversation.Entries(), s.history...)
-	s.historyMu.Unlock()
+	defer s.historyMu.Unlock()
+
+	// **按消息 id 去重**：翻页的 before 是逐步前移的，相邻两次补拉的区间
+	// 会在边界处重叠；而且用户来回滑动时会重复请求同一段。
+	// 不去重的话同一条消息会在时间线里出现两次 —— 更糟的是
+	// timeline.Build 会给同一个 ChatEntry 生成两套 Ref，
+	// 一旦其中一份的 Parts 被改写，Ref.Part() 就会越界 panic
+	// （真机上表现为 App 直接消失，日志只有一行 panic）。
+	seen := make(map[string]bool, len(s.history)+len(fresh))
+	for _, entry := range s.history {
+		if entry.Message != nil && entry.Message.Message != nil {
+			seen[entry.Message.Message.MessageID] = true
+		}
+	}
+	merged := make([]conversation.Entry, 0, len(fresh)+len(s.history))
+	// 新来的这批更早，整体排在已有历史之前
+	for _, entry := range fresh {
+		if entry.Message != nil && entry.Message.Message != nil {
+			id := entry.Message.Message.MessageID
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+		}
+		merged = append(merged, entry)
+	}
+	s.history = append(merged, s.history...)
 	return applied
 }
 

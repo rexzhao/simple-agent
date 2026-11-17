@@ -40,7 +40,23 @@ type Ref struct {
 }
 
 // Part 返回这个引用指向的 part。
-func (r Ref) Part() message.Part { return r.Chat.Message.Parts[r.Index] }
+//
+// **必须做边界检查**：Ref 由 timeline.Build 生成，而 ChatEntry 的内容
+// 可能在生成之后被改写（流式追加、镜像重放、backfill 把同一批事件
+// 重放到另一份 Conversation）。一旦 Parts 变短，裸下标就会
+// panic: index out of range —— 真机上表现为 App 直接消失，且日志里
+// 只有一行 panic（拿不到栈）。
+//
+// 返回零值 part 而不是崩溃：上层会把它渲染成空，比进程死掉好得多。
+func (r Ref) Part() message.Part {
+	if r.Chat == nil || r.Chat.Message == nil {
+		return message.Part{}
+	}
+	if r.Index < 0 || r.Index >= len(r.Chat.Message.Parts) {
+		return message.Part{}
+	}
+	return r.Chat.Message.Parts[r.Index]
+}
 
 // Item 是会话列表里的一行。
 type Item struct {
