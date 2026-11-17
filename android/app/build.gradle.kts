@@ -9,16 +9,32 @@ android {
     namespace = "com.simpleagent.viewer"
     compileSdk = 35
 
-    // 版本号：默认取下面的固定值，但允许用环境变量覆盖（CI 从 tag 推导）。
+    // 版本号：优先用环境变量（CI 从 tag 推导），其次自动推一个**单调递增**的值。
     //
-    // 为什么不用 "读 git describe" 之类：构建产物要可复现，而"当前仓库里有
-    // 哪些 tag"在干净 clone 里可能不同（浅克隆、没有 tag）。环境变量是显式的，
-    // 谁传的、传了什么，在 CI 日志里一眼能看到。
+    // 为什么不能写死：写死的后果是装到手机上全显示同一个版本，分不清装的是
+    // 哪个包；更糟的是 versionCode 比不上已装的包，adb install 会直接拒绝
+    // （INSTALL_FAILED_VERSION_DOWNGRADE）。
     //
-    // 版本号写死的后果是：v0.1.1 到 v0.1.5 装到手机上全都显示同一个版本，
-    // 分不清装的是哪个包 —— 所以要让 tag 说了算。
+    // 本地构建（没设环境变量）时用"距 2026-01-01 的天数×10000 + 当天分钟数"。
+    // 只要当前时间比上一个包晚，code 就更大 —— 满足安卓"覆盖安装"的要求。
+    // CI 用同一套公式（见 .github/workflows/android.yml），两边出的包才能互相覆盖。
     val envVersionName = System.getenv("SIMPLE_AGENT_VERSION_NAME")
     val envVersionCode = System.getenv("SIMPLE_AGENT_VERSION_CODE")?.toIntOrNull()
+
+    val autoVersionName = envVersionName ?: run {
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd.HHmm")
+            .format(java.util.Date())
+        "0.1.8-dev.$stamp"
+    }
+    val autoVersionCode = envVersionCode ?: run {
+        // 距 2026-01-01 的天数 × 10000 + 当天分钟数（0..1439），
+        // 保证"后构建的包 code 更大"。上限约 3.6e9，int 放得下。
+        val base = java.time.LocalDate.of(2026, 1, 1)
+        val now = java.time.LocalDate.now()
+        val days = java.time.temporal.ChronoUnit.DAYS.between(base, now).toInt()
+        val minuteOfDay = java.time.LocalTime.now().let { it.hour * 60 + it.minute }
+        days * 10000 + minuteOfDay
+    }
 
     defaultConfig {
         applicationId = "com.simpleagent.viewer"
@@ -26,8 +42,8 @@ android {
         minSdk = 24
         targetSdk = 35
         // 本地直接构建（没有环境变量）时用这组默认值。
-        versionCode = envVersionCode ?: 1
-        versionName = envVersionName ?: "0.1.0"
+        versionCode = autoVersionCode
+        versionName = autoVersionName
     }
 
     buildFeatures {

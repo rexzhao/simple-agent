@@ -92,39 +92,44 @@ jobs:
           # 真正能证明装对了的是下面的实际 bind。
 
       # ---- 版本号 ----
-      # 从 tag 推导版本号，让"装的是什么版本"在手机上能看出来。
+      # 从 tag 推导版本名，versionCode 用**日期编码**（与本地构建一致）。
       #
-      # 之前 build.gradle.kts 里写死 versionCode=1 / versionName=0.1.0，
-      # 结果 v0.1.1 ~ v0.1.5 全是一个版本，装上后分不清装的是哪个包。
+      # 两条约束，必须同时满足：
+      #  1. versionCode 单调递增 —— Android 靠它判断能否覆盖安装，
+      #     比已装的小会直接报 INSTALL_FAILED_VERSION_DOWNGRADE。
+      #  2. **本地构建和 CI 构建必须可比** —— 否则"CI 出的包装不上"
+      #     或者"本地包装不上"，来回踩坑。
       #
-      # versionCode 必须是单调整数（Android 靠它判断"能不能覆盖安装"），
-      # 所以把 semver 编码成 major*1e6 + minor*1e4 + patch*1e2，留出两位
-      # 给未来的 pre-release 计数。
-      - name: 从 tag 推导版本号
+      # 所以两边用同一套编码：天数×10000 + 当天分钟数。
+      # semver 只体现在 versionName（给人看的），不参与 versionCode 排序 ——
+      # 否则 v0.1.8(=10800) 会比本地日期编码(约 3200000)小，装不上去。
+      - name: 推导版本号
         run: |
-          # tag 触发时 github.ref 是 refs/tags/v0.1.5；手动触发时是分支名
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
           else
-            echo "::warning::不是 tag 触发，版本号用 commit 短 sha（$GITHUB_SHA）"
             TAG=""
           fi
 
           if [[ "$TAG" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            MAJOR=${BASH_REMATCH[1]}
-            MINOR=${BASH_REMATCH[2]}
-            PATCH=${BASH_REMATCH[3]}
-            CODE=$((MAJOR * 1000000 + MINOR * 10000 + PATCH * 100))
-            NAME="$MAJOR.$MINOR.$PATCH"
+            NAME="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
           else
-            # 没有规范 tag：退化成 0.0.0 + commit 短 sha。
-            # versionCode 用 run number，保证同仓库内单调递增。
-            NAME="0.0.0-${GITHUB_SHA:0:7}"
-            CODE=$((GITHUB_RUN_NUMBER))
-            echo "::warning::tag 不是 vX.Y.Z 形式（'$TAG'），版本号降级为 $NAME"
+            # 手动触发 / 非规范 tag：用时间戳当名字，仍能看出是哪次构建
+            NAME="0.1.8-dev.$(date -u +%Y%m%d.%H%M)"
+            [ -n "$TAG" ] && echo "::warning::tag '$TAG' 不是 vX.Y.Z 形式，版本名降级为 $NAME"
           fi
 
-          echo "版本名：$NAME / 版本码：$CODE"
+          # 与 android/app/build.gradle.kts 的 autoVersionCode 保持同一公式。
+          #
+          # 注意时区：那边用的是本地时间，这里也必须用本地 —— 用 UTC 会让
+          # CI 与本地在同一天算出不同的 DAYS（差一天 = 差 10000），
+          # 谁大谁小就随机了。runner 默认 UTC，所以先把时区设成和开发机一致。
+          export TZ=Asia/Shanghai
+          DAYS=$(( ( $(date +%s) - $(date -d '2026-01-01' +%s) ) / 86400 ))
+          MINUTE=$(( 10#$(date +%H) * 60 + 10#$(date +%M) ))
+          CODE=$(( DAYS * 10000 + MINUTE ))
+
+          echo "版本名：$NAME / 版本码：$CODE（DAYS=$DAYS MINUTE=$MINUTE）"
           echo "SIMPLE_AGENT_VERSION_NAME=$NAME" >> "$GITHUB_ENV"
           echo "SIMPLE_AGENT_VERSION_CODE=$CODE" >> "$GITHUB_ENV"
 
