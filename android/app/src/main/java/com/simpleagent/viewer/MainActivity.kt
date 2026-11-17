@@ -24,9 +24,17 @@ class MainActivity : ComponentActivity() {
         intent?.getStringExtra("fingerprint")?.let(viewModel::updateFingerprint)
 
         enableEdgeToEdge()
+        // 调试入口：`adb shell am start -e screen scrolllab`
+        // 打开滚动组件的独立验证页（不接真实数据），用来单独确认组件行为。
+        // 只在 Debug 构建里生效，正式包里这段会被裁掉。
+        val screen = intent?.getStringExtra("screen")
         setContent {
             ViewerTheme {
-                ViewerScreen(viewModel = viewModel)
+                if (BuildConfig.DEBUG && screen == "scrolllab") {
+                    com.simpleagent.viewer.ui.chat.ScrollLabScreen()
+                } else {
+                    ViewerScreen(viewModel = viewModel)
+                }
             }
         }
     }
