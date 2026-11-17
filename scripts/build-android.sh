@@ -77,9 +77,28 @@ else
     echo "找不到 go" >&2
     exit 1
 fi
-# 允许 Go 在本地版本不满足 go.mod 时自动下载对应工具链。
-# CI 里 setup-go 已按 go.mod 装好，这里是给本机环境（可能只有系统 go）兜底。
+# Go 版本策略。这里有个坑值得记下来：
+#
+# GOTOOLCHAIN=auto 让 go 按 go.mod 的 go 指令自动获取足够新的工具链，
+# 本机 go 太旧时能自愈。但 **gomobile 内部会再调一次 `go mod tidy`**，
+# 那次调用拿到的工具链未必和外面一致 —— 实测出现过"外面 1.27.3、
+# 里面 1.27.0"的情况，于是 bind 报：
+#     module requires go >= 1.27.1 (running go 1.27.0)
+#
+# 处理办法：
+#  1. 先用 auto 让 go 把足够新的工具链解析/下载好，问出它最终用的 GOROOT。
+#  2. 把那个 GOROOT 显式导出，并把 GOTOOLCHAIN 锁成 local。
+#     这样 gomobile 内部的 `go mod tidy` 也只会用这一个 —— 它没法再挑。
 export GOTOOLCHAIN=auto
+GO_GOROOT=$("$GO" env GOROOT)
+if [ -n "$GO_GOROOT" ] && [ -x "$GO_GOROOT/bin/go" ]; then
+    export GOROOT="$GO_GOROOT"
+    GO="$GO_GOROOT/bin/go"
+    PATH="$GO_GOROOT/bin:$PATH"
+    export PATH
+fi
+export GOTOOLCHAIN=local
+echo "Go：$("$GO" version)（GOROOT=$GO_GOROOT）"
 
 # gomobile：优先 $GOPATH/bin（CI 里 GOPATH 可能不是 ~/go），再试 PATH。
 GOMOBILE="$(go env GOPATH)/bin/gomobile"
