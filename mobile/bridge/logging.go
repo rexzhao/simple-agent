@@ -44,7 +44,16 @@ func setupLogging(dir string) string {
 	}
 	path := filepath.Join(dir, "go.log")
 	if logFilePath == path && logFile != nil {
-		return logFilePath // 已经是这个文件，不用重开
+		// 同一个文件，不用重开日志句柄。
+		//
+		// **但要确认 crash 输出还连着**：Close() → releaseLogging() 会把
+		// crashFile 关掉并 SetCrashOutput(nil)。如果之后又 NewClient 指向
+		// 同一个目录，这里提前返回就再也不会重设 —— 结果真机上 panic
+		// 只留下第一行 "panic: ..."，没有栈，排查只能靠猜（已经踩过）。
+		if crashFile == nil {
+			rearmCrashOutputLocked(path)
+		}
+		return logFilePath
 	}
 	// 换目录：先把旧的关掉
 	closeLogFileLocked()
@@ -68,17 +77,33 @@ func setupLogging(dir string) string {
 	log.SetOutput(io.MultiWriter(file, stderrWriter{}))
 
 	// **关键**：fatal error（如 concurrent map write、out of memory、
-	// all goroutines asleep）不经过 log 包，是 runtime 直接写到 fd 2 的。
-	// SetCrashOutput 让这些信息（含完整 goroutine 栈）落到同一个文件里。
-	// 单独开一个句柄：SetCrashOutput 可能在崩溃时异步写，不能和 log 共用。
-	crash, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err == nil {
-		_ = debug.SetCrashOutput(crash, debug.CrashOptions{})
-		crashFile = crash
-	}
+	// all goroutines asleep）与未捕获的 panic 不经过 log 包，是 runtime
+	// 直接写到 fd 2 的。SetCrashOutput 让这些信息（含完整 goroutine 栈）
+	// 落到同一个文件里。
+	rearmCrashOutputLocked(path)
 
 	log.Printf("bridge：Go 日志开始写入 %s", path)
 	return logFilePath
+}
+
+// rearmCrashOutputLocked 把 panic/fatal 的完整栈接到 path（调用方持有 logSetupMu）。
+//
+// 单独开一个句柄：SetCrashOutput 可能在崩溃时异步写，不能和 log 包共用。
+//
+// 之所以抽成函数：Close() 会把句柄关掉（为了 Windows 上能删临时目录），
+// 之后再 NewClient 指向同一目录时，setupLogging 会因"路径没变"提前返回，
+// 必须能单独把这件事重新做一遍。否则真机上 panic 只剩一行、没有栈。
+func rearmCrashOutputLocked(path string) {
+	if crashFile != nil {
+		return // 已经连着
+	}
+	crash, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("bridge：无法打开崩溃日志 %s：%v", path, err)
+		return
+	}
+	_ = debug.SetCrashOutput(crash, debug.CrashOptions{})
+	crashFile = crash
 }
 
 // closeLogFileLocked 关闭当前日志文件（调用方持有 logSetupMu）。

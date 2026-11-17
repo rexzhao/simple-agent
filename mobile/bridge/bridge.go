@@ -25,6 +25,8 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
+	"log"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"time"
@@ -930,9 +932,27 @@ func (c *Client) flushLoop() {
 		case <-c.flushStop:
 			return
 		case <-ticker.C:
-			c.flushPending()
+			c.flushPendingSafely()
 		}
 	}
+}
+
+// flushPendingSafely 调 flushPending，并兜住 panic。
+//
+// 这条 goroutine 会穿过 JNI 调用 Kotlin 的变更回调。那里抛出的异常、
+// 或者本身逻辑的越界，都会让整个 Go 运行时 abort —— Android 上表现为
+// 进程直接消失。以前这里没有 recover，日志里只能看到一行
+// "panic: runtime error: index out of range"，拿不到栈，也分不清是哪个回调。
+//
+// 现在 panic 只影响这一轮刷新：记一条带完整栈的日志，ticker 继续跑。
+func (c *Client) flushPendingSafely() {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("bridge：高频事件刷新 panic（已忽略，循环继续）：%v\n%s",
+				recovered, debug.Stack())
+		}
+	}()
+	c.flushPending()
 }
 
 // flushPending 把当前攒下的高频事件各发一次。
