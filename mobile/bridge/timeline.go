@@ -36,13 +36,16 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 	conv := session.Conversation()
 	busy := session.Busy()
 	idle := busy == driver.BusyIdle
+	// 用"补拉历史 + 镜像"拼接后的 entries：镜像里只有最近 attachTailEvents 条，
+	// 翻页补拉回来的更早内容不在 conv 里，直接读 conv 会看不到它们。
+	entries := session.EntriesWithHistory()
 
 	// **缓存**：流式输出时每 60ms 就会重建一次，但很多次 entries 根本没变
 	// （同一条消息内部的 part 在长，条数不变）。
 	//
 	// 指纹必须覆盖**所有会影响输出的状态**：entries 结构、idle、
 	// 以及 asks/todos（它们变了但 message 没变，遗漏会导致界面不更新）。
-	fingerprint := timelineFingerprint(conv.Entries(), idle, session)
+	fingerprint := timelineFingerprint(entries, idle, session)
 	c.mu.Lock()
 	cached := c.timelineCache[sessionID]
 	c.mu.Unlock()
@@ -60,7 +63,7 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 	}
 	view.Asks = c.asksOf(session)
 
-	raw := timeline.Build(conv.Entries(), idle)
+	raw := timeline.Build(entries, idle)
 	for _, item := range raw {
 		view.Items = append(view.Items, c.itemView(item, conv, idle, busy))
 	}

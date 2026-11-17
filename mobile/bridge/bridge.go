@@ -430,7 +430,7 @@ func (c *Client) ensureEarlierAvailable(sessionID string, before uint64) {
 	if session == nil || remote == nil {
 		return
 	}
-	// 本地镜像里最早的内容事件 seq（0 表示镜像里还没有内容）
+	// 本地能看到的最早内容事件 seq（0 表示还没有内容）
 	oldest := session.OldestContentSeq()
 	if oldest != 0 && before > oldest {
 		return // 还没翻到边界，本地够用
@@ -586,10 +586,10 @@ func (c *Client) ProcessDetailJSON(sessionID, key string) string {
 	if session == nil {
 		return encode(map[string]any{"error": "会话不存在"})
 	}
-	conv := session.Conversation()
 	busy := session.Busy()
 	idle := busy == driver.BusyIdle
-	for _, item := range timeline.Build(conv.Entries(), idle) {
+	// 同样要带补拉的历史：否则点开"更早那段"里的过程组会找不到
+	for _, item := range timeline.Build(session.EntriesWithHistory(), idle) {
 		if item.Key != key || item.Kind != timeline.KindProcess {
 			continue
 		}

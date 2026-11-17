@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"simple-agent/internal/conversation"
@@ -49,6 +50,13 @@ type Session struct {
 	keptFromSeq uint64
 	// archiveCursor 是"加载更早历史"的游标。
 	archiveCursor *store.ArchiveCursor
+	// history 是 backfill 补拉进来的**更早**条目（展示端专用）。
+	//
+	// 镜像只收到最近 attachTailEvents 条事件，翻页翻到最早时向执行端补拉，
+	// 结果存这里，构建时间线时拼在镜像 entries 前面。
+	// **不能塞进 mirror**：那段 API 是追加到末尾的，会让时间线顺序错乱。
+	historyMu sync.Mutex
+	history   []conversation.Entry
 
 	// summaryCancel 是当前摘要请求的取消函数（停止/解压时用）。
 	summaryCancel context.CancelFunc
@@ -74,36 +82,69 @@ func (s *Session) Conversation() *conversation.Conversation {
 	return s.drv.Conversation()
 }
 
-// ApplyHistory 把一段**更早的**持久事件补进镜像（backfill 用）。
+// ApplyHistory 把一段**更早的**持久事件补进会话（backfill 用）。
 //
 // 展示端的镜像只收到最近 attachTailEvents 条事件，翻页翻到最早时其实
-// 磁盘上还有更多。补拉回来的那批通过这里注入，之后时间线构建就能看到。
+// 磁盘上还有更多。补拉回来的那批通过这里记住，之后构建时间线时
+// 拼在镜像 entries **前面**。
 //
-// 只在展示端（有 mirror）有意义；执行端有自己的 journal，不需要这个。
-// 事件必须按 seq 升序传入 —— 镜像假设顺序追加。
+// **为什么不做成 Mirror.ApplyPersisted**：那是追加到会话末尾的，
+// 而这些事件在时间上更早 —— 追加会让时间线顺序变成"新的、老的、新的"，
+// 分页的 seq 区间也就乱了（真机表现为 seq_from 比 seq_to 还大）。
+//
+// 只保留内容事件（调用方保证），并按 seq 去重/升序排好。
 func (s *Session) ApplyHistory(events []store.Event) int {
-	if s.mirror == nil {
+	replayed, err := driver.Replay(nil)
+	if err != nil {
+		log.Printf("host：补入历史失败（重放器初始化）：%v", err)
 		return 0
 	}
 	applied := 0
 	for _, event := range events {
-		if err := s.mirror.ApplyPersisted(event); err != nil {
+		if err := driver.ApplyPersisted(&replayed, event); err != nil {
 			log.Printf("host：补入历史事件失败（seq=%d type=%s）：%v", event.Seq, event.Type, err)
 			continue
 		}
 		applied++
 	}
+	if applied == 0 {
+		return 0
+	}
+	s.historyMu.Lock()
+	// 补拉总是往更早的方向走：新来的这批整体排在已有历史之前。
+	s.history = append(replayed.Conversation.Entries(), s.history...)
+	s.historyMu.Unlock()
 	return applied
 }
 
-// OldestContentSeq 返回镜像里最早一条内容事件的 seq（0 表示还没有内容）。
+// historyEntries 返回补拉进来的更早条目（可能为空）。
+func (s *Session) historyEntries() []conversation.Entry {
+	s.historyMu.Lock()
+	defer s.historyMu.Unlock()
+	return s.history
+}
+
+// OldestContentSeq 返回当前**能看到**的最早内容事件 seq（0 表示还没有内容）。
 //
-// 翻页用它判断"是不是已经翻到本地镜像的边界"：到了才值得向执行端补拉。
+// 包括 backfill 补拉进来的那段：那个更早，所以优先用它。
+// 翻页用它判断"是不是已经翻到边界"：到了才值得向执行端补拉。
 func (s *Session) OldestContentSeq() uint64 {
+	var oldest uint64
+	for _, entry := range s.historyEntries() {
+		if entry.Message == nil {
+			continue
+		}
+		first, _ := entry.Message.SeqRange()
+		if first > 0 && (oldest == 0 || first < oldest) {
+			oldest = first
+		}
+	}
+	if oldest != 0 {
+		return oldest
+	}
 	if s.mirror == nil {
 		return 0
 	}
-	var oldest uint64
 	for _, entry := range s.mirror.Conversation().Entries() {
 		if entry.Message == nil {
 			continue
@@ -114,6 +155,21 @@ func (s *Session) OldestContentSeq() uint64 {
 		}
 	}
 	return oldest
+}
+
+// EntriesWithHistory 返回"补拉的历史 + 镜像当前内容"，按时间顺序拼好。
+//
+// 构建时间线必须用这个而不是 Conversation().Entries()：镜像里只有最近
+// attachTailEvents 条，补拉回来的更早内容在 history 里。
+func (s *Session) EntriesWithHistory() []conversation.Entry {
+	history := s.historyEntries()
+	current := s.Conversation().Entries()
+	if len(history) == 0 {
+		return current
+	}
+	merged := make([]conversation.Entry, 0, len(history)+len(current))
+	merged = append(merged, history...)
+	return append(merged, current...)
 }
 
 func (s *Session) Busy() driver.Busy {
