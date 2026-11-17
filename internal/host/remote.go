@@ -1032,10 +1032,16 @@ func (r *Remote) Backfill(sessionID string, before uint64, limit int) (BackfillD
 		r.forgetBackfill(cmd.CmdID)
 		return BackfillData{}, err
 	}
+	// 超时按请求量估算：小请求（比如只探 1 条判断存在性）不该等 20 秒 ——
+	// 旧版执行端不认识 backfill 命令时根本不回包，界面会一直卡着。
+	timeout := backfillTimeout
+	if limit <= 4 {
+		timeout = 3 * time.Second
+	}
 	select {
 	case data := <-wait:
 		return data, nil
-	case <-time.After(backfillTimeout):
+	case <-time.After(timeout):
 		r.forgetBackfill(cmd.CmdID)
 		return BackfillData{}, errors.New("拉取更早内容超时")
 	}

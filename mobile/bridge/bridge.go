@@ -90,6 +90,12 @@ type Client struct {
 	// 流式输出时每 60ms 就会重建一次，但很多次 entries 根本没变——
 	// 构建占 TimelineJSON 耗时的 61%，跳过它收益明确。
 	timelineCache map[string]*timelineCacheEntry
+	// exhausted 记录哪些会话已经翻到执行端日志的真正开头。
+	//
+	// has_more 不能只靠本地判断（镜像只有 attachTailEvents 条），
+	// 所以默认按"还有"处理；补拉返回空或 HasMore=false 时记在这里，
+	// 之后就不再谎报"还有更多"。
+	exhausted map[string]bool
 }
 
 // connectParams 是"连到哪个 relay、带什么凭据"（切换执行端时复用）。
@@ -444,6 +450,8 @@ func (c *Client) ensureEarlierAvailable(sessionID string, before uint64) {
 		return
 	}
 	if len(data.Events) == 0 {
+		// 执行端说没有了：记住这个会话已经到底，别再让界面反复请求。
+		c.markExhausted(sessionID)
 		return
 	}
 
@@ -454,12 +462,40 @@ func (c *Client) ensureEarlierAvailable(sessionID string, before uint64) {
 		log.Printf("bridge：补拉了 %d 条更早事件（session=%s before=%d）",
 			applied, sessionID, before)
 	}
+	// 执行端明确说没有更多了（即使这次给了内容）
+	if !data.HasMore {
+		c.markExhausted(sessionID)
+	}
+}
+
+// markExhausted 记录某个会话已经翻到执行端日志的真正开头。
+func (c *Client) markExhausted(sessionID string) {
+	c.mu.Lock()
+	if c.exhausted == nil {
+		c.exhausted = map[string]bool{}
+	}
+	c.exhausted[sessionID] = true
+	c.mu.Unlock()
+}
+
+// isExhausted 报告某个会话是否已确认翻到最早。
+func (c *Client) isExhausted(sessionID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.exhausted[sessionID]
 }
 
 // invalidateTimeline 丢掉某个会话的时间线缓存（注入历史后必须失效）。
 func (c *Client) invalidateTimeline(sessionID string) {
 	c.mu.Lock()
 	delete(c.timelineCache, sessionID)
+	c.mu.Unlock()
+}
+
+// resetExhausted 清掉"已翻到最早"的标记（会话有大量新内容时用）。
+func (c *Client) resetExhausted(sessionID string) {
+	c.mu.Lock()
+	delete(c.exhausted, sessionID)
 	c.mu.Unlock()
 }
 
@@ -556,10 +592,29 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) 
 		}
 	}
 
+	// 本页最早的 seq（用来判断执行端还有没有更早的）
+	var pageFirst uint64
+	if start < total && spans[start].valid {
+		pageFirst = spans[start].first
+	}
+
+	// has_more 表示「**还有更早的内容可以拿**」，不是「本地这一页前面还有」。
+	//
+	// 两者差别很关键：首次 attach 只下发最近 attachTailEvents 条事件，
+	// 本地镜像里就只有几十条。如果只看本地，翻到镜像开头就会报
+	// has_more=false，界面于是认为到底了 —— 而执行端磁盘上还有几百条。
+	// 真机表现就是「加载一部分就说已经是最早的内容了」。
+	hasMore := start > 0
+	if !hasMore && before == 0 {
+		// 只有"要最后一页"时才问执行端：这次刷新是界面主动拉的，
+		// 多一次网络往返可以接受；翻历史页（before>0）不必重复问。
+		hasMore = c.hasEarlierOnHost(sessionID, pageFirst)
+	}
+
 	page := map[string]any{
 		"session_id": view.SessionID,
 		"items":      view.Items[start:end],
-		"has_more":   start > 0,
+		"has_more":   hasMore,
 	}
 	if start < total && spans[start].valid {
 		page["seq_from"] = spans[start].first
@@ -577,7 +632,28 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) 
 	return encode(page)
 }
 
-// ProcessDetailJSON 返回一个过程组的完整步骤（用户展开时才调）。
+// hasEarlierOnHost 判断执行端那边是否还有比 from 更早的内容。
+//
+// **不做网络往返**：这个函数在构建页面的路径上，阻塞会直接卡住界面
+// （旧版执行端不认识 backfill 命令，甚至要等到超时）。
+//
+// 判断方式：看本地是否"只装了镜像的尾巴"。首次 attach 只下发最近
+// attachTailEvents 条事件，如果本地条目数明显少于典型会话长度、
+// 且本页已经翻到镜像开头，就保守地认为执行端还有更多。
+// 真正的边界由补拉返回空来确认（那次是异步的，不阻塞界面）。
+func (c *Client) hasEarlierOnHost(sessionID string, from uint64) bool {
+	if from == 0 {
+		return false
+	}
+	// 已经确认过翻到最早就别再报"还有"
+	if c.isExhausted(sessionID) {
+		return false
+	}
+	// 执行端那边必然有 seq < from 的内容 —— 除非 from 就是日志第一条。
+	// 日志的 seq 从 1 开始且不重置，所以 from > 1 就意味着前面还有。
+	// 这是个纯本地判断，不需要问执行端。
+	return from > 1
+}
 //
 // 懒加载的另一半：timeline 里折叠的过程组只带 StepCount，点开时到这里
 // 单独取那一个组。返回 {"key","steps":[...]}；找不到返回 {"error":...}。
