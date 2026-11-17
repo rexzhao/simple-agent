@@ -429,43 +429,46 @@ func itemSeqRange(item timeline.Item) (uint64, uint64, bool) {
 const backfillPageLimit = 300
 
 // ensureEarlierAvailable 在"已经翻到本地镜像最早"时，向执行端要更早的一批事件
-// 并注入镜像。
-func (c *Client) ensureEarlierAvailable(sessionID string, before uint64) {
+// 并注入。
+//
+// 返回 true 表示**确实拿到了新内容**（调用方应重切一次这一页）；
+// false 表示没有新东西可拿（已到最早 / 断线 / 失败）。
+func (c *Client) ensureEarlierAvailable(sessionID string, before uint64) bool {
 	session := c.currentSession(sessionID)
 	remote := c.host()
 	if session == nil || remote == nil {
-		return
+		return false
 	}
-	// 本地能看到的最早内容事件 seq（0 表示还没有内容）
-	oldest := session.OldestContentSeq()
-	if oldest != 0 && before > oldest {
-		return // 还没翻到边界，本地够用
-	}
-
+	// 直接补拉：调用方已经在"这一页切不出来"时才进来，
+	// 不需要再判断一次本地边界（以前这里判断 before > oldest 就返回，
+	// 会让"游标落在本地内容中间但页面切不出来"的情况永远补不到）
 	data, err := remote.Backfill(sessionID, before, backfillPageLimit)
 	if err != nil {
 		// 补拉失败不该让翻页整体失败：界面会显示"已经是最早"，
 		// 但那比"转圈卡住"好；用户再滑一次会重试。
 		log.Printf("bridge：补拉更早内容失败（session=%s before=%d）：%v", sessionID, before, err)
-		return
+		return false
 	}
 	if len(data.Events) == 0 {
 		// 执行端说没有了：记住这个会话已经到底，别再让界面反复请求。
 		c.markExhausted(sessionID)
-		return
+		return false
 	}
 
 	applied := session.ApplyHistory(data.Events)
-	if applied > 0 {
-		// 注入改变 entries 结构：让缓存指纹失效，下次 build 会重建
-		c.invalidateTimeline(sessionID)
-		log.Printf("bridge：补拉了 %d 条更早事件（session=%s before=%d）",
-			applied, sessionID, before)
+	if applied == 0 {
+		return false
 	}
+	// 注入改变 entries 结构：让缓存指纹失效，下次 build 会重建
+	c.invalidateTimeline(sessionID)
+	log.Printf("bridge：补拉了 %d 条更早事件（session=%s before=%d）",
+		applied, sessionID, before)
+
 	// 执行端明确说没有更多了（即使这次给了内容）
 	if !data.HasMore {
 		c.markExhausted(sessionID)
 	}
+	return true
 }
 
 // markExhausted 记录某个会话已经翻到执行端日志的真正开头。
@@ -521,23 +524,43 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) 
 	if beforeSeq > 0 {
 		before = uint64(beforeSeq)
 	}
-	// 翻到本地镜像最早时，向执行端补拉更早的事件。
+	// **先按现有数据切页**，切不出来（游标之前什么都没有）才去补拉。
 	//
-	// **为什么必须补拉**：首次 attach 只下发最近 attachTailEvents 条事件
-	// （长会话首屏才不卡），本地镜像里就只有这一段。只在镜像里翻页时会
-	// 翻到"镜像的最早"，根本不是会话的最早 —— 界面于是谎报
-	// "已经是最早的内容了"。
+	// 顺序很重要：以前是"先补拉再切"，补拉往里塞 300 条更早事件后 total
+	// 变大，start/end 跟着平移，返回的就不是用户要的那一页了 ——
+	// 界面表现为"加载完之后内容跳了，也不知道跳到哪"。
 	//
-	// 只在"已经到镜像边界"时才走网络：正常翻页都在本地完成，不增加延迟。
-	if before > 0 {
-		c.ensureEarlierAvailable(sessionID, before)
+	// 现在先切：能切出来就直接返回，完全不碰网络；只有当游标之前**确实
+	// 本地没有内容**时才补拉，补拉后再切一次 —— 这次切出来的仍是
+	// "seq < before 的最后 limit 条"，位置稳定。
+	page, ok := c.pageOf(sessionID, before, limit)
+	if !ok && before > 0 {
+		// 本地切不出来：向执行端要更早的事件，然后重切同一游标
+		if c.ensureEarlierAvailable(sessionID, before) {
+			page, ok = c.pageOf(sessionID, before, limit)
+		}
 	}
+	if !ok {
+		// 补拉也拿不到 = 真的到最早了
+		return encode(map[string]any{
+			"session_id": sessionID,
+			"items":      []ItemView{},
+			"has_more":   false,
+			"seq_from":   before,
+			"seq_to":     before,
+		})
+	}
+	return page
+}
+
+// pageOf 按 seq 游标切出一页；ok=false 表示游标之前本地没有任何内容。
+//
+// 纯本地操作，不发网络请求。补拉在调用方按需触发后重试一次。
+func (c *Client) pageOf(sessionID string, before uint64, limit int) (string, bool) {
 	view, raw := c.buildTimelineWithRaw(sessionID)
 	total := len(view.Items)
 	if total == 0 || len(raw) != total {
-		return encode(map[string]any{
-			"session_id": sessionID, "items": []ItemView{}, "has_more": false,
-		})
+		return "", false
 	}
 
 	// 预计算每条 item 的 seq 区间（无 seq 的条目返回 ok=false，向前继承）
@@ -569,14 +592,8 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) 
 			}
 		}
 		if end == 0 {
-			// 游标之前没有任何条目：已经到最早了
-			return encode(map[string]any{
-				"session_id": view.SessionID,
-				"items":      []ItemView{},
-				"has_more":   false,
-				"seq_from":   before,
-				"seq_to":     before,
-			})
+			// 游标之前没有任何条目：本地不够，需要补拉（由调用方决定）
+			return "", false
 		}
 	}
 
@@ -632,7 +649,7 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) 
 		page["todos"] = view.Todos
 		page["asks"] = view.Asks
 	}
-	return encode(page)
+	return encode(page), true
 }
 
 // hasEarlierOnHost 判断执行端那边是否还有比 from 更早的内容。
