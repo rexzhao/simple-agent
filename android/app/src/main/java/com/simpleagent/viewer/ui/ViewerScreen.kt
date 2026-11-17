@@ -390,12 +390,35 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     //
     // 不补偿的话：用户滚到顶部触发加载，几十条内容插到上面，当前看到的
     // 那条被推到下面 —— 感觉像"突然跳走了"，完全没法连续阅读。
+    //
+    // 两种情况都要覆盖：
+    //   1. 用户点"加载更早"（loadEarlierItems）→ 前插 N 条
+    //   2. Go 侧补拉历史后重新拉这一页，条目变多 → 前插 N 条
+    //
+    // 关键细节：**必须连条目内部的滚动偏移一起还原**。
+    // 只 scrollToItem(index + added) 会丢掉 offset —— 用户正读着一条长消息、
+    // 只露出下半截时，会被对齐到这条消息顶部，看起来"跳了一下"。
     LaunchedEffect(state.justPrependCount) {
         val added = state.justPrependCount
         if (added <= 0) return@LaunchedEffect
-        // 必须先等 Compose 把新 item 排好版：否则 scrollToItem 用的是旧布局
-        withFrameNanos { }
-        listState.scrollToItem(listState.firstVisibleItemIndex + added)
+
+        // 记下当前第一条可见项与其偏移。这个 effect 是在 state 更新**之后**
+        // 才跑的，但总条数还没重新测量时 layoutInfo 仍是旧的 —— 所以
+        // 这里读到的就是插入前的状态。
+        val first = listState.layoutInfo.visibleItemsInfo.firstOrNull()
+        val fromIndex = first?.index ?: 0
+        val fromOffset = first?.offset ?: 0
+
+        // 等 Compose 把新 item 排好版：一屏要重新测量，单帧常常不够。
+        // 等到"能滚到的范围确实变大"为止（最多 5 帧）。
+        var tries = 0
+        while (listState.layoutInfo.totalItemsCount <= fromIndex && tries < 5) {
+            withFrameNanos { }
+            tries++
+        }
+
+        // 同一条内容的新位置 = 原下标 + 前插条数，offset 原样保留。
+        listState.scrollToItem(fromIndex + added, fromOffset)
         viewModel.consumePrependCount()
     }
     // 把回调提到列表外并记住：否则 items 的 lambda 每帧都是新实例，

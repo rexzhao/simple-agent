@@ -392,6 +392,25 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 旧列表里"不在这个区间内、且 seq 更小"的就是早前翻出来的部分。
         val keptEarlier = earlierPartBySeq(previous.items, page)
         val merged = mergeProcessDetails(keptEarlier + page.items, previous.items)
+
+        // **补拉后要补偿滚动位置**：Go 侧在翻到镜像边界时会向执行端补拉更早的
+        // 事件并注入，返回的那一页可能比上次多出若干条（都是插在前面的历史）。
+        // 不告诉界面"前面多了 N 条"，LazyColumn 会保持同一个 index，
+        // 于是用户眼前的内容被顶下去 —— 看起来就是"跳回顶部"。
+        //
+        // 判据：拿旧列表的第一条当锚点，看它在新列表里排第几。
+        // 排在 N>0 就说明前面插了 N 条。这条在"往下追加"时位置不变（0），
+        // 所以不会误触发补偿。
+        val prepended = if (previous.items.isEmpty() || merged.size <= previous.items.size) {
+            // 条目没变多就不可能"前插"；流式输出时这条会频繁走到，
+            // 尽早返回避免多余的 indexOfFirst。
+            0
+        } else {
+            val anchorKey = previous.items.first().key
+            val newIndex = merged.indexOfFirst { it.key == anchorKey }
+            if (newIndex > 0) newIndex else 0
+        }
+
         state.update {
             // 分页游标：只要用户往上翻过，就保持用户翻到的位置不动。
             // 否则每次流式刷新都会把游标重置回最后一页——表现就是"翻一点就弹回去"。
@@ -414,6 +433,11 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 asks = page.asks ?: it.timeline.asks,
                 hasMoreItems = if (paginated) it.hasMoreItems else page.hasMore,
                 firstSeq = if (paginated) it.firstSeq else page.seqFrom,
+                // 前插了 N 条：界面据此把视野拉回原处（见 ViewerScreen 的补偿逻辑）。
+                //
+                // 没有新前插时**保留原值**，不要清零：上一次的补偿可能还没被
+                // 界面消费（effect 还没跑），覆盖掉就白丢了，视野会跳。
+                justPrependCount = if (prepended > 0) prepended else it.justPrependCount,
             )
         }
         android.util.Log.d(
