@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Stop
 import com.simpleagent.viewer.BuildConfig
+import com.simpleagent.viewer.ui.chat.ChatScrollController
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -300,29 +301,23 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
         }
     }
 
-    // 打开/切换会话时直接跳到末尾：用户期望看到"最新说了什么"。
-    // 只在这个会话第一次有内容时做一次，之后交给下面的"贴底跟随"。
+    // **滚动位置全部交给 controller 托管**。
+    //
+    // 以前这里有三组 effect（跳末尾、贴底跟随、锚点补偿）各自调
+    // scrollToItem，谁后执行看运气 —— 用户看到的是"内容跳了，也不知道
+    // 跳到哪"。现在只有 controller 一处能动滚动位置，其余地方
+    // （包括下面的加载触发）只做判断，不碰滚动。
+    val scrollController = remember(listState) { ChatScrollController(listState, ArchiveHeaderKey) }
+    LaunchedEffect(listState) { scrollController.observe() }
+
+    // 打开/切换会话时跳到末尾：用户期望看到"最新说了什么"。
+    // 只在这个会话第一次有内容时做一次。
     var jumpedSession by remember { mutableStateOf("") }
     LaunchedEffect(state.activeSessionId, itemCount) {
         if (itemCount == 0) return@LaunchedEffect
         if (jumpedSession == state.activeSessionId) return@LaunchedEffect
         jumpedSession = state.activeSessionId
-        // 用 scrollToItem 而不是 animate：首屏动画反而像卡了一下
-        listState.scrollToItem(itemCount - 1)
-    }
-
-    // 贴着底部时自动跟随（流式输出时不要一直把用户拽回底部）
-    LaunchedEffect(itemCount, state.timeline.runtime.busy) {
-        if (itemCount == 0) return@LaunchedEffect
-        // 首次加载完成前 visibleItemsInfo 还是空的：那种情况下"last=0"会让
-        // nearBottom 误判，于是永远不跟随。没有可见项时按"需要跟随"处理。
-        val visible = listState.layoutInfo.visibleItemsInfo
-        val nearBottom = if (visible.isEmpty()) {
-            true
-        } else {
-            (visible.lastOrNull()?.index ?: 0) >= itemCount - 3
-        }
-        if (nearBottom) listState.scrollToItem(itemCount - 1)
+        scrollController.jumpToBottom()
     }
     // 滚到顶部时拉更早的历史（与桌面一致：按需分页，不一次全加载）
     //
@@ -389,144 +384,8 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
             viewModel.loadEarlierItems()
         }
     }
-    // **滚动锚定**：往列表头部插入内容后，把视野拉回原来的位置。
-    //
-    // 不补偿的话：用户滚到顶部触发加载，几十条内容插到上面，当前看到的
-    // 那条被推到下面 —— 感觉像"突然跳走了"，完全没法连续阅读。
-    //
-    // **锚点必须在数据更新前抓**：之前用 LaunchedEffect(justPrependCount)
-    // 是在 state 更新之后才跑的，那时 firstVisibleItemIndex 往往已经是 0
-    // （用户就在顶部），再 +N 反而把视野推到列表中间 —— 真机上看到的就是
-    // "跳一下"。
-    //
-    // 这里拆成两件事，各自一个 effect：
-    //   1. 滚动时不断记录"当前第一条可见项的 key 与偏移"（锚点）
-    //   2. items 总数变化时，用**变化前记下的 key** 在新列表里找回位置
-    // 用 key 而不是 index：key 稳定，index 会因前插整体平移。
-    val anchor = remember { AnchorHolder() }
-
-    // ① 记录锚点：**只在用户主动滚动时**更新。
-    //
-    // 用 isScrollInProgress 区分"用户拖动/惯性滑动"与"程序插入内容引起的
-    // 布局变化"：
-    //   - 用户滚动 → 记下他正在看哪一条
-    //   - 内容插入（补拉/加载更早）→ 布局变了但用户没动，必须保留旧锚点
-    //
-    // 以前靠"布局条数是否变化"判断，但 ② 会先把 anchor.count 改成新值，
-    // ① 再看时已经相等，于是在补拉后的新布局上又更新了一次锚点 ——
-    // ② 下次用的就是"新内容里的某一条"，补偿把视野滚进刚插入的历史里。
-    // 这正是真机上看到的"向前跳"。
-    LaunchedEffect(listState) {
-        snapshotFlow {
-            val info = listState.layoutInfo
-            val firstMessage = info.visibleItemsInfo.firstOrNull { it.key != ArchiveHeaderKey }
-            AnchorSnapshot(
-                key = firstMessage?.key as? String,
-                offset = firstMessage?.offset ?: 0,
-                count = info.totalItemsCount,
-                index = firstMessage?.index ?: 0,
-                scrolling = listState.isScrollInProgress,
-            )
-        }.collect { snapshot ->
-            if (snapshot.key == null) return@collect
-            // 更新锚点的条件：
-            //   1. 用户正在滚动 —— 记下他此刻看的位置
-            //   2. 布局稳定（条数没变且不在滚动）—— 顺手对齐，覆盖
-            //      "停在某处阅读"、"初次进入会话"这些情况
-            //
-            // **条数变了又没在滚动** = 刚插入内容（补拉/加载更早）：
-            // 必须保留旧锚点，否则 ② 拿到的是"新内容里的某一条"，
-            // 补偿会把视野滚进刚插入的历史里（真机的"向前跳"）。
-            val countChanged = snapshot.count != anchor.count
-            if (countChanged && !snapshot.scrolling) return@collect
-            anchor.key = snapshot.key
-            anchor.offset = snapshot.offset
-            anchor.index = snapshot.index
-            anchor.count = snapshot.count
-        }
-    }
-
-    // ①b 兜底：布局稳定后（不在滚动、也不是刚插入的那一帧）对齐一次锚点。
-    //
-    // 光靠 ① 的 snapshotFlow 不够：它只在"值变化"时发射，用户停住不动时
-    // 就不再触发，锚点会一直停在滚动过程中的某个旧值。
-    LaunchedEffect(listState) {
-        snapshotFlow {
-            val info = listState.layoutInfo
-            // 等布局彻底稳定：不在滚动、可见项信息完整
-            listState.isScrollInProgress to info.visibleItemsInfo.size
-        }.collect { (scrolling, visibleCount) ->
-            if (scrolling || visibleCount == 0) return@collect
-            withFrameNanos { }  // 让它先完成这一帧的排版
-            val info = listState.layoutInfo
-            val firstMessage = info.visibleItemsInfo.firstOrNull { it.key != ArchiveHeaderKey }
-            val key = firstMessage?.key as? String ?: return@collect
-            // 条数刚变过（插入中）：跳过，交给 ② 处理
-            if (info.totalItemsCount != anchor.count) return@collect
-            anchor.key = key
-            anchor.offset = firstMessage.offset
-            anchor.index = firstMessage.index
-        }
-    }
-
-    // ② 布局条数变化 → 用旧锚点找回位置。
-    //
-    // 用 snapshotFlow 盯 layoutInfo.totalItemsCount（含顶部那行 header）。
-    // **不要碰 anchor.count**：那是 ① 记录"用户滚动时看到的状态"用的，
-    // 在这里改会让 ① 的判断失效（见 ① 的注释）。
-    var lastCount by remember { mutableIntStateOf(0) }
-    LaunchedEffect(listState) {
-        snapshotFlow { listState.layoutInfo.totalItemsCount }
-            .collect { count ->
-                val previous = lastCount
-                if (count == previous) return@collect
-                lastCount = count
-                android.util.Log.d(
-                    "SimpleAgent",
-                    "布局条数变化：$previous -> $count 锚点=${anchor.key}@${anchor.offset}",
-                )
-                // 只在"变多"时补偿；变少（切换会话、清空）不补
-                if (count <= previous || previous == 0) return@collect
-
-                val key = anchor.key ?: return@collect
-                val offset = anchor.offset
-
-                // 等新布局生效：直到那个 key 出现在可见项里（最多 8 帧）
-                var tries = 0
-                var target = -1
-                while (tries < 8) {
-                    withFrameNanos { }
-                    target = listState.layoutInfo.visibleItemsInfo
-                        .firstOrNull { it.key == key }?.index ?: -1
-                    if (target >= 0) break
-                    tries++
-                }
-                if (target < 0) {
-                    // 锚点被推出可视区（一次补拉 60 条，它落在屏幕外）。
-                    //
-                    // 用「上一个可见项位置 + 插入条数」平移：插入的条数就是
-                    // count - previous，这样原来看的那条应该正好回到原位。
-                    // **必须用 anchor 里存的旧 index**，不能读
-                    // listState.firstVisibleItemIndex —— 补拉后它已经被重置
-                    // （通常是 0），再 +inserted 就会滚进新内容中间。
-                    val inserted = count - previous
-                    val guessed = (anchor.index + inserted)
-                        .coerceIn(0, (count - 1).coerceAtLeast(0))
-                    listState.scrollToItem(guessed, offset)
-                    android.util.Log.d(
-                        "SimpleAgent",
-                        "滚动锚定（估算）：key=$key 不可见，插了 $inserted 条，" +
-                            "旧 index=${anchor.index} -> $guessed offset=$offset",
-                    )
-                } else {
-                    listState.scrollToItem(target, offset)
-                    android.util.Log.d(
-                        "SimpleAgent",
-                        "滚动锚定：key=$key 保持 index=$target offset=$offset（$previous -> $count）",
-                    )
-                }
-            }
-    }
+    // 滚动位置由 scrollController 统一托管（见上面的说明），
+    // 这里不再有任何锚点补偿逻辑 —— 以前那三组 effect 就是跳跃的来源。
     // 把回调提到列表外并记住：否则 items 的 lambda 每帧都是新实例，
     // 会拖累 Compose 对每个条目的重组跳过判断（滚动时尤其明显）。
     val imagePath: (String, (String) -> Unit) -> Unit = remember(viewModel) {
@@ -1052,45 +911,9 @@ private fun ModelChip(
 }
 
 /**
- * 滚动锚点：记住"用户当前正看着哪一条"。
- *
- * 为什么用普通类而不是 remember 三个独立变量：三者要一起改，
- * 分开存容易在快照/重组之间读到不一致的组合。
- *
- * 只在**条目数没变**时更新（见调用处）：数量一变说明刚插入了内容，
- * 这时必须保留旧锚点，补偿才有参照。
- */
-private class AnchorHolder {
-    var count: Int = 0
-    var key: String? = null
-    var offset: Int = 0
-    /**
-     * 锚点条目在**当时的**列表里的下标。
-     *
-     * 估算分支要用它 + 插入条数 来算新位置。不能改用
-     * listState.firstVisibleItemIndex —— 补拉后那个值已经被重置了。
-     */
-    var index: Int = 0
-}
-
-/**
- * 一次可见位置的快照（snapshotFlow 的比较对象）。
- *
- * 用 data class 而不是 Triple：snapshotFlow 靠 equals 判断"值有没有变"，
- * Triple 也可以，但具名字段读起来清楚，也便于以后加字段。
- */
-private data class AnchorSnapshot(
-    val key: String?,
-    val offset: Int,
-    val count: Int,
-    val index: Int,
-    val scrolling: Boolean,
-)
-
-/**
  * 顶部状态行的列表 key（"继续下拉加载更早的内容" / "正在加载…" / "已经是最早"）。
  *
- * 它是 LazyColumn 的第一个 item，但不是"内容"。做滚动锚定时必须跳过，
- * 否则用户滑到顶部时锚点就成了它，补偿把视野钉在 index 0 —— 等于没补偿。
+ * 它是 LazyColumn 的第一个 item，但不是"内容"。ChatScrollController
+ * 做锚点计算时必须跳过它，否则用户滑到顶部时锚点就成了它。
  */
 private const val ArchiveHeaderKey = "archive-header"
