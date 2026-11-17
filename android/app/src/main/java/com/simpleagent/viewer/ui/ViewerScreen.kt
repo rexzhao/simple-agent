@@ -353,37 +353,39 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     val latestState = rememberUpdatedState(state)
     LaunchedEffect(listState, state.activeSessionId) {
         snapshotFlow {
-            // 把"到顶"与"列表不能继续下滑"一起作为信号
-            val first = listState.firstVisibleItemIndex
-            val cannotScrollMore = !listState.canScrollBackward
-            first == 0 && cannotScrollMore
-        }.collect { atTopAndStuck ->
+            // **判据只看"第一条可见项是不是 0"**。
+            //
+            // 以前还要求 !canScrollBackward（"不能再往回滚"），但 index 0 的
+            // item 常常还有一部分露在屏幕上方之外，这时 canScrollBackward
+            // 仍是 true —— 于是条件永远不成立，滑到顶也不加载。
+            // 真机日志里就是：first=0 但 stuck=false，一次都没触发。
+            listState.firstVisibleItemIndex == 0
+        }.collect { atTop ->
             val now = latestState.value
             android.util.Log.d(
                 "SimpleAgent",
-                "到顶检测：stuck=$atTopAndStuck first=${listState.firstVisibleItemIndex} " +
+                "到顶检测：atTop=$atTop first=${listState.firstVisibleItemIndex} " +
                     "canBack=${listState.canScrollBackward} hasMore=${now.hasMoreItems} " +
                     "loading=${now.loadingEarlier} cursor=${now.firstSeq}",
             )
-            if (atTopAndStuck && now.hasMoreItems && !now.loadingEarlier) {
+            if (atTop && now.hasMoreItems && !now.loadingEarlier) {
                 viewModel.loadEarlierItems()
             }
         }
     }
-    // 加载完成后如果仍然到顶（内容还没撑满一屏），继续拉下一页。
-    // 这条专门处理"列表总高度不足一屏"的情况：那时滚动位置不会变化，
-    // 上面的 snapshotFlow 不会再次发射。
+    // 加载完成后如果仍然到顶，继续拉下一页。
+    //
+    // 两种情况都需要它：
+    //   1. 内容不足一屏 —— 滚动位置不会变化，上面的 snapshotFlow 不再发射
+    //   2. 用户停在顶部不动 —— 同上，`firstVisibleItemIndex == 0` 没有变化
+    //
+    // 用 earlierPagesLoaded 做 key 的一部分，保证每拉成功一页就再判断一次；
+    // 真正的"只有一个请求在飞"由 ViewModel 里的原子标志保证，这里不必去重。
     LaunchedEffect(state.loadingEarlier, state.hasMoreItems, state.earlierPagesLoaded) {
         if (state.loadingEarlier || !state.hasMoreItems) return@LaunchedEffect
-        // 等一帧让新内容完成排版，否则量到的还是旧高度
+        // 等一帧让新内容完成排版，否则量到的还是旧位置
         withFrameNanos { }
-        val info = listState.layoutInfo
-        // **判断"内容撑不满一屏"要用可见项是否覆盖全长**，
-        // 不能用 !canScrollForward：那个在前方还有内容时为 false，
-        // 条件几乎永远不成立（等于这条兜底从来没生效过）。
-        val notFilled = info.totalItemsCount > 0 &&
-            info.visibleItemsInfo.size >= info.totalItemsCount
-        if (notFilled && listState.firstVisibleItemIndex == 0) {
+        if (listState.firstVisibleItemIndex == 0) {
             viewModel.loadEarlierItems()
         }
     }
@@ -403,52 +405,82 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     // 用 key 而不是 index：key 稳定，index 会因前插整体平移。
     val anchor = remember { AnchorHolder() }
 
-    // ① 记录锚点：滚动时更新。
+    // ① 记录锚点：**只在用户主动滚动时**更新。
     //
-    // **注意不能用 itemCount 做比较**：LazyColumn 里除了消息还有顶部的
-    // "继续下拉加载更早的内容"那一行，layoutInfo.totalItemsCount 恒比
-    // state.timeline.items.size 多 1。之前用两者比较，条件永远不成立，
-    // 锚点一次都没记下来（日志里一条"滚动锚定"都没有）。
+    // 用 isScrollInProgress 区分"用户拖动/惯性滑动"与"程序插入内容引起的
+    // 布局变化"：
+    //   - 用户滚动 → 记下他正在看哪一条
+    //   - 内容插入（补拉/加载更早）→ 布局变了但用户没动，必须保留旧锚点
     //
-    // 改用"布局条数是否与上次记录的一致"来判断：布局条数一变就说明
-    // 刚插入/删除过内容，那一帧的可见项已经是新状态，不能拿来做参照。
+    // 以前靠"布局条数是否变化"判断，但 ② 会先把 anchor.count 改成新值，
+    // ① 再看时已经相等，于是在补拉后的新布局上又更新了一次锚点 ——
+    // ② 下次用的就是"新内容里的某一条"，补偿把视野滚进刚插入的历史里。
+    // 这正是真机上看到的"向前跳"。
     LaunchedEffect(listState) {
         snapshotFlow {
             val info = listState.layoutInfo
-            // **跳过顶部那行 header**（"继续下拉加载更早的内容"）。
-            // 用户滑到顶部时它就是第一条可见项，拿它当锚点等于把视野
-            // 钉在 index 0，补偿完全失效 —— 真机日志里能看到
-            // "滚动锚定：key=archive-header 保持 index=0"，用户看到的就是
-            // 内容被顶走、视野停在顶部。
             val firstMessage = info.visibleItemsInfo.firstOrNull { it.key != ArchiveHeaderKey }
             AnchorSnapshot(
                 key = firstMessage?.key as? String,
                 offset = firstMessage?.offset ?: 0,
                 count = info.totalItemsCount,
                 index = firstMessage?.index ?: 0,
+                scrolling = listState.isScrollInProgress,
             )
         }.collect { snapshot ->
             if (snapshot.key == null) return@collect
-            // 布局条数与上次记录的不同 = 刚插入过内容：保留旧锚点
-            if (snapshot.count != anchor.count) {
-                return@collect
-            }
+            // 更新锚点的条件：
+            //   1. 用户正在滚动 —— 记下他此刻看的位置
+            //   2. 布局稳定（条数没变且不在滚动）—— 顺手对齐，覆盖
+            //      "停在某处阅读"、"初次进入会话"这些情况
+            //
+            // **条数变了又没在滚动** = 刚插入内容（补拉/加载更早）：
+            // 必须保留旧锚点，否则 ② 拿到的是"新内容里的某一条"，
+            // 补偿会把视野滚进刚插入的历史里（真机的"向前跳"）。
+            val countChanged = snapshot.count != anchor.count
+            if (countChanged && !snapshot.scrolling) return@collect
             anchor.key = snapshot.key
             anchor.offset = snapshot.offset
             anchor.index = snapshot.index
+            anchor.count = snapshot.count
+        }
+    }
+
+    // ①b 兜底：布局稳定后（不在滚动、也不是刚插入的那一帧）对齐一次锚点。
+    //
+    // 光靠 ① 的 snapshotFlow 不够：它只在"值变化"时发射，用户停住不动时
+    // 就不再触发，锚点会一直停在滚动过程中的某个旧值。
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            // 等布局彻底稳定：不在滚动、可见项信息完整
+            listState.isScrollInProgress to info.visibleItemsInfo.size
+        }.collect { (scrolling, visibleCount) ->
+            if (scrolling || visibleCount == 0) return@collect
+            withFrameNanos { }  // 让它先完成这一帧的排版
+            val info = listState.layoutInfo
+            val firstMessage = info.visibleItemsInfo.firstOrNull { it.key != ArchiveHeaderKey }
+            val key = firstMessage?.key as? String ?: return@collect
+            // 条数刚变过（插入中）：跳过，交给 ② 处理
+            if (info.totalItemsCount != anchor.count) return@collect
+            anchor.key = key
+            anchor.offset = firstMessage.offset
+            anchor.index = firstMessage.index
         }
     }
 
     // ② 布局条数变化 → 用旧锚点找回位置。
     //
-    // 用 snapshotFlow 盯 layoutInfo.totalItemsCount（含顶部那行 header），
-    // 而不是 state 里的 items 数 —— 后者少 1，判断会漏。
+    // 用 snapshotFlow 盯 layoutInfo.totalItemsCount（含顶部那行 header）。
+    // **不要碰 anchor.count**：那是 ① 记录"用户滚动时看到的状态"用的，
+    // 在这里改会让 ① 的判断失效（见 ① 的注释）。
+    var lastCount by remember { mutableIntStateOf(0) }
     LaunchedEffect(listState) {
         snapshotFlow { listState.layoutInfo.totalItemsCount }
             .collect { count ->
-                val previous = anchor.count
+                val previous = lastCount
                 if (count == previous) return@collect
-                anchor.count = count
+                lastCount = count
                 android.util.Log.d(
                     "SimpleAgent",
                     "布局条数变化：$previous -> $count 锚点=${anchor.key}@${anchor.offset}",
@@ -1047,7 +1079,13 @@ private class AnchorHolder {
  * 用 data class 而不是 Triple：snapshotFlow 靠 equals 判断"值有没有变"，
  * Triple 也可以，但具名字段读起来清楚，也便于以后加字段。
  */
-private data class AnchorSnapshot(val key: String?, val offset: Int, val count: Int, val index: Int)
+private data class AnchorSnapshot(
+    val key: String?,
+    val offset: Int,
+    val count: Int,
+    val index: Int,
+    val scrolling: Boolean,
+)
 
 /**
  * 顶部状态行的列表 key（"继续下拉加载更早的内容" / "正在加载…" / "已经是最早"）。

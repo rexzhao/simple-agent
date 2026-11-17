@@ -17,11 +17,13 @@ import com.simpleagent.viewer.data.ProviderChoice
 import com.simpleagent.viewer.data.SessionSummary
 import com.simpleagent.viewer.data.TimelinePage
 import com.simpleagent.viewer.data.TimelineView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /** 界面状态（单一数据类，渲染只读它）。 */
@@ -144,6 +146,14 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     // 连接参数记在本机（手机输入地址很麻烦，尤其是中文输入法打不出 ASCII 路径）
     private val prefs = app.getSharedPreferences("viewer", android.content.Context.MODE_PRIVATE)
+    /**
+     * "加载更早"的互斥标志（原子）。
+     *
+     * 同一时刻只允许一个请求在飞：滑到顶时滚动事件很密集，
+     * 光靠 state.loadingEarlier 判断会有窗口，可能并发进两次，
+     * 各自用同一份游标插一批内容 —— 结果重复且位置全乱。
+     */
+    private val earlierLoading = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // 流式刷新的节流状态（见 scheduleTimelineRefresh）
     private var timelineRefreshJob: kotlinx.coroutines.Job? = null
@@ -396,7 +406,10 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 用 seq 判定比找 key 更可靠：本页覆盖 [seqFrom, seqTo]，
         // 旧列表里"不在这个区间内、且 seq 更小"的就是早前翻出来的部分。
         val keptEarlier = earlierPartBySeq(previous.items, page)
-        val merged = mergeProcessDetails(keptEarlier + page.items, previous.items)
+        // 合并时按 key 去重：keptEarlier 与 page.items 在补拉/边界处可能
+        // 有重叠条目，不去重的话列表里会出现两条一样的 key ——
+        // LazyColumn 对重复 key 的行为未定义，会导致条目错位、数量抖动。
+        val merged = mergeProcessDetails(dedupeByKey(keptEarlier + page.items), previous.items)
 
         // **补拉后要补偿滚动位置**：Go 侧在翻到镜像边界时会向执行端补拉更早的
         // 事件并注入，返回的那一页可能比上次多出若干条（都是插在前面的历史）。
@@ -464,12 +477,44 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
      * 但 key 在这里是安全的锚——同一条消息的 key 在**未流式**时是稳定的，
      * 而历史页里的消息早已 finalize，不会被流式改写。
      */
+    /**
+     * 按 key 去重，保留**先出现的**那条。
+     *
+     * 翻页/补拉合并时，旧列表与 Go 返回的新页在边界处会有重叠条目。
+     * 不去重会让 LazyColumn 里出现重复 key —— 它的行为未定义，
+     * 表现为条目错位、列表数量抖动，滚动位置跟着乱跳。
+     */
+    private fun dedupeByKey(items: List<ItemView>): List<ItemView> {
+        if (items.size < 2) return items
+        val seen = HashSet<String>(items.size)
+        val out = ArrayList<ItemView>(items.size)
+        for (item in items) {
+            if (!seen.add(item.key)) continue
+            out.add(item)
+        }
+        return out
+    }
+
     private fun earlierPartBySeq(old: List<ItemView>, page: TimelinePage): List<ItemView> {
         if (old.isEmpty() || page.items.isEmpty()) return emptyList()
-        val anchor = page.items.first().key
-        val index = old.indexOfFirst { it.key == anchor }
-        if (index <= 0) return emptyList()
-        return old.subList(0, index)
+        // 锚点不能只取 page.items.first()：补拉之后 Go 侧会把**更早的条目**
+        // 塞进这一页的开头，那个 key 在旧列表里根本不存在，
+        // indexOfFirst 返回 -1 → keptEarlier 变空 → 合并后 items 数量忽然
+        // 减少，然后下一次刷新又变回来。真机上看到的就是列表内容来回抖
+        // （日志里 items 在 79/80/81 之间跳）。
+        //
+        // 改用"page 里第一个**能在旧列表中找到**的 key"当锚点：
+        // 补拉只影响开头那几条，中间那批 key 是稳定的，总能对上。
+        var anchorIndex = -1
+        for (item in page.items) {
+            val index = old.indexOfFirst { it.key == item.key }
+            if (index >= 0) {
+                anchorIndex = index
+                break
+            }
+        }
+        if (anchorIndex <= 0) return emptyList()
+        return old.subList(0, anchorIndex)
     }
 
     /**
@@ -548,6 +593,10 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectSession(id: String) {
         if (id == state.value.activeSessionId) return
+        // 切换会话：把"加载更早"的互斥标志也放开 —— 上一个会话的请求
+        // 可能还在飞（它的结果会被 activeSessionId 检查丢掉），
+        // 但标志不释放的话新会话就再也加载不了更早内容了。
+        earlierLoading.set(false)
         // 分页状态必须一起清：否则新会话会带着上一个会话的 firstSeq 去翻页
         state.update {
             it.copy(
@@ -782,14 +831,23 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
      * 往头部插入内容会让用户正在看的位置突然跳走）。
      */
     fun loadEarlierItems() {
+        // **互斥**：同一时刻只允许一个"加载更早"请求在飞。
+        //
+        // 光靠 state.loadingEarlier 判断不够 —— 它和随后的 state.update
+        // 之间有窗口，滚动事件密集时（滑到顶会连续触发）会并发进两次，
+        // 各自拿到同一份游标、各自插一批，结果内容重复且位置全乱。
+        // 这里用 compareAndSet 做真正的原子占位。
+        if (!earlierLoading.compareAndSet(false, true)) {
+            android.util.Log.d("SimpleAgent", "loadEarlierItems 跳过：已有请求在飞")
+            return
+        }
         val current = state.value
         val id = current.activeSessionId
-        if (id.isEmpty() || current.loadingEarlier || !current.hasMoreItems) {
-            // 诊断：这三种情况都会静默返回，界面看不出任何变化。
-            // 真机排障时靠这行日志判断到底是"没触发"还是"触发了但被守卫挡掉"。
+        if (id.isEmpty() || !current.hasMoreItems) {
+            earlierLoading.set(false)
             android.util.Log.d(
                 "SimpleAgent",
-                "loadEarlierItems 跳过：id=${id.ifEmpty { "空" }} loading=${current.loadingEarlier} " +
+                "loadEarlierItems 跳过：id=${id.ifEmpty { "空" }} " +
                     "hasMore=${current.hasMoreItems} cursor=${current.firstSeq} " +
                     "items=${current.timeline.items.size}",
             )
@@ -797,32 +855,49 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         }
         val cursor = current.firstSeq
         if (cursor <= 0) {
+            earlierLoading.set(false)
             android.util.Log.d("SimpleAgent", "loadEarlierItems 跳过：游标为 0")
             return
         }
         android.util.Log.d("SimpleAgent", "loadEarlierItems 开始：cursor=$cursor items=${current.timeline.items.size}")
+        // **先置 loading 再发起请求**，且请求放在 IO 线程。
+        //
+        // core.timelinePage 是**同步阻塞**调用（Go 侧翻到镜像边界时会向执行端
+        // 补拉更早事件，最长等 20 秒）。以前直接写在 viewModelScope.launch 里，
+        // 而它默认跑在主线程 —— 于是主线程被阻塞，连"正在加载"的转圈都画不出来，
+        // 界面看起来像卡死。真机上的表现就是"完全看不到在加载"。
         state.update { it.copy(loadingEarlier = true) }
         viewModelScope.launch {
-            val page = core.timelinePage(id, cursor, timelinePageSize)
-            state.update { st ->
-                if (st.activeSessionId != id) return@update st.copy(loadingEarlier = false)
-                if (page.items.isEmpty()) {
-                    // 空页 = 已经到最早（或游标失效）
-                    return@update st.copy(loadingEarlier = false, hasMoreItems = false)
+            try {
+                val page = withContext(Dispatchers.IO) {
+                    core.timelinePage(id, cursor, timelinePageSize)
                 }
-                // 插到最前面；已展开的组保留已加载的详情
-                val merged = mergeProcessDetails(page.items + st.timeline.items, st.timeline.items)
-                st.copy(
-                    loadingEarlier = false,
-                    timeline = st.timeline.copy(items = merged),
-                    hasMoreItems = page.hasMore,
-                    // 游标推进到本页最早处；为 0 时保持原值（防御）
-                    firstSeq = if (page.seqFrom > 0) page.seqFrom else st.firstSeq,
-                    // 记录翻过页：之后刷新不再重置游标
-                    earlierPagesLoaded = st.earlierPagesLoaded + 1,
-                    // 让界面知道要补偿多少
-                    justPrependCount = page.items.size,
-                )
+                state.update { st ->
+                    if (st.activeSessionId != id) return@update st.copy(loadingEarlier = false)
+                    if (page.items.isEmpty()) {
+                        // 空页 = 已经到最早（或游标失效）
+                        return@update st.copy(loadingEarlier = false, hasMoreItems = false)
+                    }
+                    // 插到最前面；已展开的组保留已加载的详情
+                    val merged = mergeProcessDetails(
+                        dedupeByKey(page.items + st.timeline.items), st.timeline.items,
+                    )
+                    st.copy(
+                        loadingEarlier = false,
+                        timeline = st.timeline.copy(items = merged),
+                        hasMoreItems = page.hasMore,
+                        // 游标推进到本页最早处；为 0 时保持原值（防御）
+                        firstSeq = if (page.seqFrom > 0) page.seqFrom else st.firstSeq,
+                        // 记录翻过页：之后刷新不再重置游标
+                        earlierPagesLoaded = st.earlierPagesLoaded + 1,
+                        // 让界面知道要补偿多少
+                        justPrependCount = page.items.size,
+                    )
+                }
+            } finally {
+                // **必须释放**：任何异常/提前返回都不能让标志卡住，
+                // 否则"加载更早"永久失效（界面一直显示正在加载）。
+                earlierLoading.set(false)
             }
         }
     }
