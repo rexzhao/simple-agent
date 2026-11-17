@@ -604,10 +604,13 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) 
 	// 本地镜像里就只有几十条。如果只看本地，翻到镜像开头就会报
 	// has_more=false，界面于是认为到底了 —— 而执行端磁盘上还有几百条。
 	// 真机表现就是「加载一部分就说已经是最早的内容了」。
+	//
+	// **判据是 start == 0（本地这一页已到镜像开头），与 before 无关**：
+	// 以前这里写 `before == 0`，于是用户翻页（before>0）翻到镜像开头时
+	// 永远拿不到 has_more=true，界面就停在那里 —— 这正是"加载一部分
+	// 就说到最早了"的直接原因。
 	hasMore := start > 0
-	if !hasMore && before == 0 {
-		// 只有"要最后一页"时才问执行端：这次刷新是界面主动拉的，
-		// 多一次网络往返可以接受；翻历史页（before>0）不必重复问。
+	if !hasMore {
 		hasMore = c.hasEarlierOnHost(sessionID, pageFirst)
 	}
 
@@ -654,6 +657,8 @@ func (c *Client) hasEarlierOnHost(sessionID string, from uint64) bool {
 	// 这是个纯本地判断，不需要问执行端。
 	return from > 1
 }
+
+// ProcessDetailJSON 返回一个过程组的完整步骤（用户展开时才调）。
 //
 // 懒加载的另一半：timeline 里折叠的过程组只带 StepCount，点开时到这里
 // 单独取那一个组。返回 {"key","steps":[...]}；找不到返回 {"error":...}。
