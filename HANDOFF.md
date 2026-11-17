@@ -257,3 +257,82 @@ javap -classpath cls bridge.Client | grep -i 方法名
 **改源码一律用 edit 工具，不要用 shell 重定向写文件。**
 （我用 PowerShell `Set-Content -Encoding UTF8` 把 `replay.go` 的中文注释
 全变成乱码，只能 `git checkout` 重做。）
+
+---
+
+# 附：2025-11-17 一轮工作（分页 / 滚动 / 崩溃）
+
+> 上面 1-10 节是 11/16 的会话日志重构。这一节是之后一天的工作，
+> 补完分页与滚动的实际问题。设备已移除，**下次接续从这里开始**。
+
+## 现状
+
+代码全部推送（`master` 到 `3e1d46b`），工作区干净。APK 已装过，
+但**用户说"好点了，还不是很对"** —— 最后一轮的滚动落位修复还没在
+真实会话里完整验证过（设备被移除了）。
+
+## 修好的（已验证）
+
+| 问题 | 根因 | commit |
+| --- | --- | --- |
+| Android 15 的 16KB 页对齐警告 | Go 默认 4KB 对齐 + graphics-path 1.0.1 | `8b51d9c` |
+| 「连接已断开」横幅永不消失 | `Connected()` 读了永不更新的缓存字段 | `8e86ba2` |
+| 历史工具组全都转圈 | `streaming := !idle`（会话级当成了组级） | `3ad22a4` |
+| 工具执行期间不转圈 | 只查 `item.Live`，漏了 `BusyRunningTools` | `254cbaf` |
+| 翻页提示在但怎么滑都不加载 | `LaunchedEffect` 闭包捕获了首次组合的 state | `bb1af60` |
+| 翻到镜像最早就说"已到最早" | `has_more` 只看本地镜像，没问执行端 | `60492fb` / `ee38d10` |
+| **App 反复崩溃**（"有时候加载不了"） | backfill 重复注入导致 `Ref.Part()` 越界 | `8f65c2c` |
+| 分页看不到加载提示 | `timelinePage` 同步阻塞在主线程 | `bd98afd` |
+| 同时多个加载请求 | 缺原子互斥 | `bd98afd` |
+| 补拉让当前页漂移 | 先补拉再切页（顺序反了） | `1dbf4e9` |
+
+## 重构：滚动位置单一权威
+
+原来滚动逻辑散在 6 个 `LaunchedEffect` 里，各自调 `scrollToItem`，
+谁后执行看运气 —— 这是"内容跳了，也不知道跳到哪"的根源。
+
+新增 `android/app/src/main/java/com/simpleagent/viewer/ui/chat/`：
+
+- **`ChatScrollController.kt`** —— 滚动位置的唯一权威。核心不变式：
+  「用户眼睛盯着的那条内容必须留在原处」。外部不再调 `scrollToItem`。
+- **`ScrollLabScreen.kt`** —— 不接真实数据的验证页：
+  `adb shell am start -e screen scrolllab`
+
+接入后 `ViewerScreen.kt` **净删 177 行**（+17 / -194）。
+
+## 下次接续：最后一轮的遗留
+
+用户反馈"好点了，还不是很对"。最后一次修复（`3e1d46b`）改的是
+`settle()` 的降级分支：锚点被挤出屏幕时，原来用 `snap.firstIndex`
+（插入**之后**读的，通常是 0/1）当目标 → 滚到接近顶部；
+改成用插入**前**记下的 `anchorIndex + inserted`。
+
+**待验证**：在真实会话里滑到顶部，加载完成后视野是否稳住。
+
+排查工具（都在）：
+
+```bash
+# 落位日志
+adb logcat -d -s SimpleAgent | grep "滚动落位"
+# 期望看到：滚动落位（平移）：插了 N 条，锚点旧下标=X → Y
+# 若没有这条，说明走的是「按 key 精确还原」路径
+
+# 独立验证页（不接数据，先确认组件本身）
+adb shell am start -e screen scrolllab
+```
+
+**一个踩过的坑**：验证页最初一次只插 20 条，不足以把锚点挤出屏幕，
+走的是理想的「按 key 还原」路径 —— 所以组件在验证页上完美、真实数据
+上出错。现在验证页已改成 60 条（与真实补拉量一致）。
+
+## 环境备忘
+
+- mini 的 `~/go-sdk/go/bin/go` 是 1.24.5，太旧。构建脚本用
+  `GOTOOLCHAIN=auto` 解析出 1.27.3 后锁 `GOROOT` + `local`，否则
+  gomobile 内部的 `go mod tidy` 会挑到 1.27.0 而失败。
+- `git pull` 在 mini 上常被本地改动挡住；脚本的 `--no-pull` 会
+  悄悄用旧代码构建 —— 构建后**务必确认 `git log --oneline -1`**。
+- `scripts/dev-agent.ps1`：杀掉 `simple-agent.exe` 就会自动重编重拉的
+  开发循环（不依赖 CI）。
+- Kotlin 的 `LaunchedEffect` 里闭包捕获的是**首次组合**的 state 值，
+  要读最新值必须 `rememberUpdatedState` 或把值放 key 里。
