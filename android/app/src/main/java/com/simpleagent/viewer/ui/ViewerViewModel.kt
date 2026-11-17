@@ -97,18 +97,6 @@ data class ViewerState(
      * items"去反推——那个推导在边界上会失效，表现为翻一点就弹回最后一页。
      */
     val earlierPagesLoaded: Int = 0,
-    /**
-     * **已废弃：没有消费者了。**
-     *
-     * 原意是"刚往头部插了 N 条，界面据此补偿滚动"。但补偿 effect 是在
-     * state 更新之后才跑的，那时 firstVisibleItemIndex 往往已经是 0，
-     * 再 +N 反而把视野推到列表中间 —— 真机上表现为"跳一下"。
-     *
-     * 现在改成由 ViewerScreen 用 snapshotFlow 持续记录"当前第一条可见项的
-     * key 与偏移"，items 数量变化时按 key 找回位置，不再依赖这个计数字段。
-     * 保留字段是为了不动太多调用点，新代码不要用它做滚动补偿。
-     */
-    val justPrependCount: Int = 0,
     /** 一次性提示（Snackbar）。 */
     val toast: String = "",
     /** 待回答的提问（非空时弹面板）。 */
@@ -394,6 +382,17 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshTimeline() {
         val id = state.value.activeSessionId
         if (id.isEmpty()) return
+        // **加载更早内容的期间跳过刷新**。
+        //
+        // refreshTimeline 由流式输出高频触发（几十毫秒一次），它会用
+        // "最后一页 + 旧列表里更早的部分"重建整体列表。如果正好和
+        // loadEarlierItems 的插入并发，后者的结果会被前者基于旧快照覆盖 ——
+        // 表现为：加载成功但 items 条数不变，hasMore 仍是 true，
+        // 于是界面在顶部反复触发加载，陷入死循环（真机日志里 pages 一直涨、
+        // items 一直是 60 就是这样）。
+        //
+        // 跳过是安全的：加载结束后会有新的刷新把最新内容带回来。
+        if (state.value.loadingEarlier) return
         // 分页取最后一页：完整 timeline 在长会话里是几百 KB（实测 774KB），
         // 全量传过来再反序列化就是打开会话时那几秒白屏。
         //
@@ -410,24 +409,6 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 有重叠条目，不去重的话列表里会出现两条一样的 key ——
         // LazyColumn 对重复 key 的行为未定义，会导致条目错位、数量抖动。
         val merged = mergeProcessDetails(dedupeByKey(keptEarlier + page.items), previous.items)
-
-        // **补拉后要补偿滚动位置**：Go 侧在翻到镜像边界时会向执行端补拉更早的
-        // 事件并注入，返回的那一页可能比上次多出若干条（都是插在前面的历史）。
-        // 不告诉界面"前面多了 N 条"，LazyColumn 会保持同一个 index，
-        // 于是用户眼前的内容被顶下去 —— 看起来就是"跳回顶部"。
-        //
-        // 判据：拿旧列表的第一条当锚点，看它在新列表里排第几。
-        // 排在 N>0 就说明前面插了 N 条。这条在"往下追加"时位置不变（0），
-        // 所以不会误触发补偿。
-        val prepended = if (previous.items.isEmpty() || merged.size <= previous.items.size) {
-            // 条目没变多就不可能"前插"；流式输出时这条会频繁走到，
-            // 尽早返回避免多余的 indexOfFirst。
-            0
-        } else {
-            val anchorKey = previous.items.first().key
-            val newIndex = merged.indexOfFirst { it.key == anchorKey }
-            if (newIndex > 0) newIndex else 0
-        }
 
         state.update {
             // 分页游标：只要用户往上翻过，就保持用户翻到的位置不动。
@@ -451,19 +432,13 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 asks = page.asks ?: it.timeline.asks,
                 hasMoreItems = if (paginated) it.hasMoreItems else page.hasMore,
                 firstSeq = if (paginated) it.firstSeq else page.seqFrom,
-                // 前插了 N 条：界面据此把视野拉回原处（见 ViewerScreen 的补偿逻辑）。
-                //
-                // 没有新前插时**保留原值**，不要清零：上一次的补偿可能还没被
-                // 界面消费（effect 还没跑），覆盖掉就白丢了，视野会跳。
-                justPrependCount = if (prepended > 0) prepended else it.justPrependCount,
             )
         }
         android.util.Log.d(
             "SimpleAgent",
             "refreshTimeline：items=${merged.size} hasMore=${page.hasMore} " +
                 "seq=${page.seqFrom}..${page.seqTo} earlierPart=${keptEarlier.size} " +
-                "pages=${state.value.earlierPagesLoaded} " +
-                "prevItems=${previous.items.size} prepended=$prepended",
+                "pages=${state.value.earlierPagesLoaded} prevItems=${previous.items.size}",
         )
     }
 
@@ -513,7 +488,26 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 break
             }
         }
-        if (anchorIndex <= 0) return emptyList()
+        if (anchorIndex < 0) {
+            // 新页的条目一个都不在旧列表里：说明内容整体换了（切会话等）。
+            // 保留旧列表没有意义，返回空。
+            return emptyList()
+        }
+        if (anchorIndex == 0) {
+            // 新页的第一条就是旧列表的第一条 —— 但**不能就此认为"没有更早的内容"**。
+            // 用户翻页加载出来的历史（old 里排在更早位置、新页里没有的）
+            // 必须保住，否则会出现：加载成功 → 立刻被 refreshTimeline 抹掉 →
+            // hasMore 仍是 true → 再次加载，陷入死循环。
+            //
+            // 判据：新页覆盖的 key 集合之外的旧条目就是"只有旧列表才有"的部分。
+            val freshKeys = page.items.mapTo(HashSet(page.items.size)) { it.key }
+            val kept = ArrayList<ItemView>()
+            for (item in old) {
+                if (item.key in freshKeys) break  // 到了新页覆盖区，后面都归新页
+                kept.add(item)
+            }
+            return kept
+        }
         return old.subList(0, anchorIndex)
     }
 
@@ -606,7 +600,6 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 hasMoreItems = false,
                 loadingEarlier = false,
                 earlierPagesLoaded = 0,
-                justPrependCount = 0,
             )
         }
         // 记住正在看的会话：重启 App 后直接回到这里
@@ -890,8 +883,6 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                         firstSeq = if (page.seqFrom > 0) page.seqFrom else st.firstSeq,
                         // 记录翻过页：之后刷新不再重置游标
                         earlierPagesLoaded = st.earlierPagesLoaded + 1,
-                        // 让界面知道要补偿多少
-                        justPrependCount = page.items.size,
                     )
                 }
             } finally {
@@ -900,11 +891,6 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 earlierLoading.set(false)
             }
         }
-    }
-
-    /** 界面做完滚动补偿后清零（避免重复补偿）。 */
-    fun consumePrependCount() {
-        state.update { if (it.justPrependCount == 0) it else it.copy(justPrependCount = 0) }
     }
 
     /** 加载下一页归档（滚到顶部时触发）。 */
