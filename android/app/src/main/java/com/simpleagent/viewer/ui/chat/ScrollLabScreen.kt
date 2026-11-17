@@ -72,11 +72,6 @@ fun ScrollLabScreen(
     LaunchedEffect(listState) {
         controller.observe { latestKeys.value }
     }
-    // 加载状态同步给控制器：加载期间冻结锚点，避免 header 高度变化把
-    // 坐标系带偏（"按钮 ↔ 转圈"会让内容区整体上下移动）。
-    LaunchedEffect(data.loading) {
-        controller.setLoading(data.loading)
-    }
 
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(12.dp)) {
@@ -130,26 +125,21 @@ fun ScrollLabScreen(
             }) { Text("跳到底部", fontSize = 12.sp) }
         }
 
-        // 固定的"加载更早"提示：**不进 LazyColumn**，所以不参与滚动，
-        // 也不会污染 scrollToItem 的 offset 参照系。
-        HeaderRow(
-            loading = data.loading,
-            hasMore = data.hasMore,
-            onLoad = {
-                scope.launch {
-                    source.loadEarlier()
-                    action = "头部插入完成（现 ${data.items.size} 条）"
-                }
-            },
-        )
-
         LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-            // **header 不进 LazyColumn**：它固定在列表上方。
-            //
-            // 以前把"加载更早"提示当成列表第一项，导致 scrollToItem 的
-            // offset 参照系里混着 header 高度：想让某条内容停在 -2px 时，
-            // LazyColumn 只能把它压在 header 下方（实测卡在 162px 左右），
-            // 怎么补都收敛不到目标位置 —— 真机上表现为"位置总是差一点"。
+            // header 放回列表内部，**与真实页面结构保持一致** ——
+            // 要验证的是"header 在列表里时也能零漂移"，就按真实结构测。
+            item(key = HEADER_KEY) {
+                HeaderRow(
+                    loading = data.loading,
+                    hasMore = data.hasMore,
+                    onLoad = {
+                        scope.launch {
+                            source.loadEarlier()
+                            action = "头部插入完成（现 ${data.items.size} 条）"
+                        }
+                    },
+                )
+            }
             items(data.items, key = { it.key }) { item ->
                 ItemRow(item)
             }
