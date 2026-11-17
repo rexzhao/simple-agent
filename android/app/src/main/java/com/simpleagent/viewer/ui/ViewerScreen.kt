@@ -405,66 +405,95 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
 
     // ① 记录锚点：滚动时更新。
     //
-    // **itemCount 刚变化时不要更新**：那一帧的可见项已经是"新内容插进来
-    // 之后"的状态，记下来就失去参照了。用 state 里的 itemCount 判断
-    // （它在重组时一定是最新的），而不是依赖 ② 何时跑。
-    LaunchedEffect(listState, itemCount) {
+    // **注意不能用 itemCount 做比较**：LazyColumn 里除了消息还有顶部的
+    // "继续下拉加载更早的内容"那一行，layoutInfo.totalItemsCount 恒比
+    // state.timeline.items.size 多 1。之前用两者比较，条件永远不成立，
+    // 锚点一次都没记下来（日志里一条"滚动锚定"都没有）。
+    //
+    // 改用"布局条数是否与上次记录的一致"来判断：布局条数一变就说明
+    // 刚插入/删除过内容，那一帧的可见项已经是新状态，不能拿来做参照。
+    LaunchedEffect(listState) {
         snapshotFlow {
-            val first = listState.layoutInfo.visibleItemsInfo.firstOrNull()
+            val info = listState.layoutInfo
+            // **跳过顶部那行 header**（"继续下拉加载更早的内容"）。
+            // 用户滑到顶部时它就是第一条可见项，拿它当锚点等于把视野
+            // 钉在 index 0，补偿完全失效 —— 真机日志里能看到
+            // "滚动锚定：key=archive-header 保持 index=0"，用户看到的就是
+            // 内容被顶走、视野停在顶部。
+            val firstMessage = info.visibleItemsInfo.firstOrNull { it.key != ArchiveHeaderKey }
             AnchorSnapshot(
-                key = first?.key as? String,
-                offset = first?.offset ?: 0,
-                count = listState.layoutInfo.totalItemsCount,
+                key = firstMessage?.key as? String,
+                offset = firstMessage?.offset ?: 0,
+                count = info.totalItemsCount,
+                index = firstMessage?.index ?: 0,
             )
         }.collect { snapshot ->
-            // 布局里的条数与 state 的条数不一致：说明还在"插入后未稳定"的阶段
-            if (snapshot.count != itemCount) return@collect
-            if (snapshot.key != null) {
-                anchor.key = snapshot.key
-                anchor.offset = snapshot.offset
+            if (snapshot.key == null) return@collect
+            // 布局条数与上次记录的不同 = 刚插入过内容：保留旧锚点
+            if (snapshot.count != anchor.count) {
+                return@collect
             }
+            anchor.key = snapshot.key
+            anchor.offset = snapshot.offset
+            anchor.index = snapshot.index
         }
     }
 
-    // ② items 数量变化 → 用旧锚点找回位置。
+    // ② 布局条数变化 → 用旧锚点找回位置。
     //
-    // 这个 effect 在重组后运行，此时 anchor 里存的还是**变化前**记下的值
-    // （①的更新会被推迟到下一帧，因为新布局还没测量完）。
-    LaunchedEffect(itemCount) {
-        val previous = anchor.count
-        anchor.count = itemCount
-        if (itemCount <= previous || previous == 0) return@LaunchedEffect
+    // 用 snapshotFlow 盯 layoutInfo.totalItemsCount（含顶部那行 header），
+    // 而不是 state 里的 items 数 —— 后者少 1，判断会漏。
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.layoutInfo.totalItemsCount }
+            .collect { count ->
+                val previous = anchor.count
+                if (count == previous) return@collect
+                anchor.count = count
+                android.util.Log.d(
+                    "SimpleAgent",
+                    "布局条数变化：$previous -> $count 锚点=${anchor.key}@${anchor.offset}",
+                )
+                // 只在"变多"时补偿；变少（切换会话、清空）不补
+                if (count <= previous || previous == 0) return@collect
 
-        val key = anchor.key ?: return@LaunchedEffect
-        val offset = anchor.offset
+                val key = anchor.key ?: return@collect
+                val offset = anchor.offset
 
-        // 等新布局生效：直到那个 key 出现在可见项里（最多 8 帧）
-        var tries = 0
-        var target = -1
-        while (tries < 8) {
-            withFrameNanos { }
-            target = listState.layoutInfo.visibleItemsInfo
-                .firstOrNull { it.key == key }?.index ?: -1
-            if (target >= 0) break
-            tries++
-        }
-        if (target < 0) {
-            // 屏幕外找不到（前插太多，它被推出可视区）：
-            // 按数量差平移，至少不会跳回顶部。
-            val guessed = (listState.firstVisibleItemIndex + (itemCount - previous))
-                .coerceIn(0, (itemCount - 1).coerceAtLeast(0))
-            listState.scrollToItem(guessed)
-            android.util.Log.d(
-                "SimpleAgent",
-                "滚动锚定（估算）：key=$key 不可见，$previous -> $itemCount 滚到 $guessed",
-            )
-        } else {
-            listState.scrollToItem(target, offset)
-            android.util.Log.d(
-                "SimpleAgent",
-                "滚动锚定：key=$key 保持 index=$target offset=$offset（$previous -> $itemCount）",
-            )
-        }
+                // 等新布局生效：直到那个 key 出现在可见项里（最多 8 帧）
+                var tries = 0
+                var target = -1
+                while (tries < 8) {
+                    withFrameNanos { }
+                    target = listState.layoutInfo.visibleItemsInfo
+                        .firstOrNull { it.key == key }?.index ?: -1
+                    if (target >= 0) break
+                    tries++
+                }
+                if (target < 0) {
+                    // 锚点被推出可视区（一次补拉 60 条，它落在屏幕外）。
+                    //
+                    // 用「上一个可见项位置 + 插入条数」平移：插入的条数就是
+                    // count - previous，这样原来看的那条应该正好回到原位。
+                    // **必须用 anchor 里存的旧 index**，不能读
+                    // listState.firstVisibleItemIndex —— 补拉后它已经被重置
+                    // （通常是 0），再 +inserted 就会滚进新内容中间。
+                    val inserted = count - previous
+                    val guessed = (anchor.index + inserted)
+                        .coerceIn(0, (count - 1).coerceAtLeast(0))
+                    listState.scrollToItem(guessed, offset)
+                    android.util.Log.d(
+                        "SimpleAgent",
+                        "滚动锚定（估算）：key=$key 不可见，插了 $inserted 条，" +
+                            "旧 index=${anchor.index} -> $guessed offset=$offset",
+                    )
+                } else {
+                    listState.scrollToItem(target, offset)
+                    android.util.Log.d(
+                        "SimpleAgent",
+                        "滚动锚定：key=$key 保持 index=$target offset=$offset（$previous -> $count）",
+                    )
+                }
+            }
     }
     // 把回调提到列表外并记住：否则 items 的 lambda 每帧都是新实例，
     // 会拖累 Compose 对每个条目的重组跳过判断（滚动时尤其明显）。
@@ -479,7 +508,7 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
         // 于是翻到最早那一刻整行消失——用户看不到"已经是最早的内容了"，
         // 只看到滑不动，会以为卡死。
         if (state.timeline.items.isNotEmpty()) {
-            item(key = "archive-header") {
+            item(key = ArchiveHeaderKey) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1003,6 +1032,13 @@ private class AnchorHolder {
     var count: Int = 0
     var key: String? = null
     var offset: Int = 0
+    /**
+     * 锚点条目在**当时的**列表里的下标。
+     *
+     * 估算分支要用它 + 插入条数 来算新位置。不能改用
+     * listState.firstVisibleItemIndex —— 补拉后那个值已经被重置了。
+     */
+    var index: Int = 0
 }
 
 /**
@@ -1011,4 +1047,12 @@ private class AnchorHolder {
  * 用 data class 而不是 Triple：snapshotFlow 靠 equals 判断"值有没有变"，
  * Triple 也可以，但具名字段读起来清楚，也便于以后加字段。
  */
-private data class AnchorSnapshot(val key: String?, val offset: Int, val count: Int)
+private data class AnchorSnapshot(val key: String?, val offset: Int, val count: Int, val index: Int)
+
+/**
+ * 顶部状态行的列表 key（"继续下拉加载更早的内容" / "正在加载…" / "已经是最早"）。
+ *
+ * 它是 LazyColumn 的第一个 item，但不是"内容"。做滚动锚定时必须跳过，
+ * 否则用户滑到顶部时锚点就成了它，补偿把视野钉在 index 0 —— 等于没补偿。
+ */
+private const val ArchiveHeaderKey = "archive-header"
