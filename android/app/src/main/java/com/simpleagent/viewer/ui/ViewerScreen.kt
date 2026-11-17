@@ -47,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -391,35 +392,79 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     // 不补偿的话：用户滚到顶部触发加载，几十条内容插到上面，当前看到的
     // 那条被推到下面 —— 感觉像"突然跳走了"，完全没法连续阅读。
     //
-    // 两种情况都要覆盖：
-    //   1. 用户点"加载更早"（loadEarlierItems）→ 前插 N 条
-    //   2. Go 侧补拉历史后重新拉这一页，条目变多 → 前插 N 条
+    // **锚点必须在数据更新前抓**：之前用 LaunchedEffect(justPrependCount)
+    // 是在 state 更新之后才跑的，那时 firstVisibleItemIndex 往往已经是 0
+    // （用户就在顶部），再 +N 反而把视野推到列表中间 —— 真机上看到的就是
+    // "跳一下"。
     //
-    // 关键细节：**必须连条目内部的滚动偏移一起还原**。
-    // 只 scrollToItem(index + added) 会丢掉 offset —— 用户正读着一条长消息、
-    // 只露出下半截时，会被对齐到这条消息顶部，看起来"跳了一下"。
-    LaunchedEffect(state.justPrependCount) {
-        val added = state.justPrependCount
-        if (added <= 0) return@LaunchedEffect
+    // 这里拆成两件事，各自一个 effect：
+    //   1. 滚动时不断记录"当前第一条可见项的 key 与偏移"（锚点）
+    //   2. items 总数变化时，用**变化前记下的 key** 在新列表里找回位置
+    // 用 key 而不是 index：key 稳定，index 会因前插整体平移。
+    val anchor = remember { AnchorHolder() }
 
-        // 记下当前第一条可见项与其偏移。这个 effect 是在 state 更新**之后**
-        // 才跑的，但总条数还没重新测量时 layoutInfo 仍是旧的 —— 所以
-        // 这里读到的就是插入前的状态。
-        val first = listState.layoutInfo.visibleItemsInfo.firstOrNull()
-        val fromIndex = first?.index ?: 0
-        val fromOffset = first?.offset ?: 0
+    // ① 记录锚点：滚动时更新。
+    //
+    // **itemCount 刚变化时不要更新**：那一帧的可见项已经是"新内容插进来
+    // 之后"的状态，记下来就失去参照了。用 state 里的 itemCount 判断
+    // （它在重组时一定是最新的），而不是依赖 ② 何时跑。
+    LaunchedEffect(listState, itemCount) {
+        snapshotFlow {
+            val first = listState.layoutInfo.visibleItemsInfo.firstOrNull()
+            AnchorSnapshot(
+                key = first?.key as? String,
+                offset = first?.offset ?: 0,
+                count = listState.layoutInfo.totalItemsCount,
+            )
+        }.collect { snapshot ->
+            // 布局里的条数与 state 的条数不一致：说明还在"插入后未稳定"的阶段
+            if (snapshot.count != itemCount) return@collect
+            if (snapshot.key != null) {
+                anchor.key = snapshot.key
+                anchor.offset = snapshot.offset
+            }
+        }
+    }
 
-        // 等 Compose 把新 item 排好版：一屏要重新测量，单帧常常不够。
-        // 等到"能滚到的范围确实变大"为止（最多 5 帧）。
+    // ② items 数量变化 → 用旧锚点找回位置。
+    //
+    // 这个 effect 在重组后运行，此时 anchor 里存的还是**变化前**记下的值
+    // （①的更新会被推迟到下一帧，因为新布局还没测量完）。
+    LaunchedEffect(itemCount) {
+        val previous = anchor.count
+        anchor.count = itemCount
+        if (itemCount <= previous || previous == 0) return@LaunchedEffect
+
+        val key = anchor.key ?: return@LaunchedEffect
+        val offset = anchor.offset
+
+        // 等新布局生效：直到那个 key 出现在可见项里（最多 8 帧）
         var tries = 0
-        while (listState.layoutInfo.totalItemsCount <= fromIndex && tries < 5) {
+        var target = -1
+        while (tries < 8) {
             withFrameNanos { }
+            target = listState.layoutInfo.visibleItemsInfo
+                .firstOrNull { it.key == key }?.index ?: -1
+            if (target >= 0) break
             tries++
         }
-
-        // 同一条内容的新位置 = 原下标 + 前插条数，offset 原样保留。
-        listState.scrollToItem(fromIndex + added, fromOffset)
-        viewModel.consumePrependCount()
+        if (target < 0) {
+            // 屏幕外找不到（前插太多，它被推出可视区）：
+            // 按数量差平移，至少不会跳回顶部。
+            val guessed = (listState.firstVisibleItemIndex + (itemCount - previous))
+                .coerceIn(0, (itemCount - 1).coerceAtLeast(0))
+            listState.scrollToItem(guessed)
+            android.util.Log.d(
+                "SimpleAgent",
+                "滚动锚定（估算）：key=$key 不可见，$previous -> $itemCount 滚到 $guessed",
+            )
+        } else {
+            listState.scrollToItem(target, offset)
+            android.util.Log.d(
+                "SimpleAgent",
+                "滚动锚定：key=$key 保持 index=$target offset=$offset（$previous -> $itemCount）",
+            )
+        }
     }
     // 把回调提到列表外并记住：否则 items 的 lambda 每帧都是新实例，
     // 会拖累 Compose 对每个条目的重组跳过判断（滚动时尤其明显）。
@@ -944,3 +989,26 @@ private fun ModelChip(
         }
     }
 }
+
+/**
+ * 滚动锚点：记住"用户当前正看着哪一条"。
+ *
+ * 为什么用普通类而不是 remember 三个独立变量：三者要一起改，
+ * 分开存容易在快照/重组之间读到不一致的组合。
+ *
+ * 只在**条目数没变**时更新（见调用处）：数量一变说明刚插入了内容，
+ * 这时必须保留旧锚点，补偿才有参照。
+ */
+private class AnchorHolder {
+    var count: Int = 0
+    var key: String? = null
+    var offset: Int = 0
+}
+
+/**
+ * 一次可见位置的快照（snapshotFlow 的比较对象）。
+ *
+ * 用 data class 而不是 Triple：snapshotFlow 靠 equals 判断"值有没有变"，
+ * Triple 也可以，但具名字段读起来清楚，也便于以后加字段。
+ */
+private data class AnchorSnapshot(val key: String?, val offset: Int, val count: Int)

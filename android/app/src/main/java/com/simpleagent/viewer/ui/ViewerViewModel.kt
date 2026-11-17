@@ -96,10 +96,15 @@ data class ViewerState(
      */
     val earlierPagesLoaded: Int = 0,
     /**
-     * 刚刚往列表头部插入了多少条（界面据此做滚动补偿）。
+     * **已废弃：没有消费者了。**
      *
-     * 不做补偿的话：用户滚到顶部触发加载，新内容插到上面，当前视野会被
-     * 推下去几十条——看起来像是"突然跳走了"。
+     * 原意是"刚往头部插了 N 条，界面据此补偿滚动"。但补偿 effect 是在
+     * state 更新之后才跑的，那时 firstVisibleItemIndex 往往已经是 0，
+     * 再 +N 反而把视野推到列表中间 —— 真机上表现为"跳一下"。
+     *
+     * 现在改成由 ViewerScreen 用 snapshotFlow 持续记录"当前第一条可见项的
+     * key 与偏移"，items 数量变化时按 key 找回位置，不再依赖这个计数字段。
+     * 保留字段是为了不动太多调用点，新代码不要用它做滚动补偿。
      */
     val justPrependCount: Int = 0,
     /** 一次性提示（Snackbar）。 */
@@ -444,7 +449,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             "SimpleAgent",
             "refreshTimeline：items=${merged.size} hasMore=${page.hasMore} " +
                 "seq=${page.seqFrom}..${page.seqTo} earlierPart=${keptEarlier.size} " +
-                "pages=${state.value.earlierPagesLoaded}",
+                "pages=${state.value.earlierPagesLoaded} " +
+                "prevItems=${previous.items.size} prepended=$prepended",
         )
     }
 
