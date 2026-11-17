@@ -50,6 +50,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -323,10 +324,15 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
         if (nearBottom) listState.scrollToItem(itemCount - 1)
     }
     // 滚到顶部时拉更早的历史（与桌面一致：按需分页，不一次全加载）
+    //
+    // 与下面那段一样要读最新 state：这里的闭包只捕获首次组合的 state 值，
+    // 用它判断 hasMoreHistory 会永远是初始的 false，归档分页永远不触发。
+    val latestForArchive = rememberUpdatedState(state)
     LaunchedEffect(listState, state.activeSessionId) {
         snapshotFlow { listState.firstVisibleItemIndex }
             .collect { first ->
-                if (first == 0 && state.hasMoreHistory && !state.loadingOlder) {
+                val now = latestForArchive.value
+                if (first == 0 && now.hasMoreHistory && !now.loadingOlder) {
                     viewModel.loadOlder()
                 }
             }
@@ -337,6 +343,13 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     // 这里监听的是"滚动位置 + 列表是否撑满"，而不是单纯的 firstVisibleItemIndex：
     // 内容不足一屏时下标恒为 0，单纯的 snapshotFlow 只在第一次发射，之后
     // 再也不会有新值 —— 表现就是"只加载一页就停了，再也翻不动"。
+    //
+    // **必须用 rememberUpdatedState**：TimelinePane 的 state 是值参数，
+    // LaunchedEffect 的 key 只有 activeSessionId，组合不会因为 state 变化重启它，
+    // 于是闭包捕获的是**首次组合那份 state**（hasMoreItems=false、firstSeq=0）。
+    // 表现就是：顶部明明显示"继续下拉加载更早的内容"，怎么滑都不加载 ——
+    // 因为判断用的是过期的 hasMoreItems，永远被挡掉。
+    val latestState = rememberUpdatedState(state)
     LaunchedEffect(listState, state.activeSessionId) {
         snapshotFlow {
             // 把"到顶"与"列表不能继续下滑"一起作为信号
@@ -344,13 +357,14 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
             val cannotScrollMore = !listState.canScrollBackward
             first == 0 && cannotScrollMore
         }.collect { atTopAndStuck ->
+            val now = latestState.value
             android.util.Log.d(
                 "SimpleAgent",
                 "到顶检测：stuck=$atTopAndStuck first=${listState.firstVisibleItemIndex} " +
-                    "canBack=${listState.canScrollBackward} hasMore=${state.hasMoreItems} " +
-                    "loading=${state.loadingEarlier} cursor=${state.firstSeq}",
+                    "canBack=${listState.canScrollBackward} hasMore=${now.hasMoreItems} " +
+                    "loading=${now.loadingEarlier} cursor=${now.firstSeq}",
             )
-            if (atTopAndStuck && state.hasMoreItems && !state.loadingEarlier) {
+            if (atTopAndStuck && now.hasMoreItems && !now.loadingEarlier) {
                 viewModel.loadEarlierItems()
             }
         }
@@ -360,8 +374,15 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     // 上面的 snapshotFlow 不会再次发射。
     LaunchedEffect(state.loadingEarlier, state.hasMoreItems, state.earlierPagesLoaded) {
         if (state.loadingEarlier || !state.hasMoreItems) return@LaunchedEffect
+        // 等一帧让新内容完成排版，否则量到的还是旧高度
         withFrameNanos { }
-        if (listState.firstVisibleItemIndex == 0 && !listState.canScrollForward) {
+        val info = listState.layoutInfo
+        // **判断"内容撑不满一屏"要用可见项是否覆盖全长**，
+        // 不能用 !canScrollForward：那个在前方还有内容时为 false，
+        // 条件几乎永远不成立（等于这条兜底从来没生效过）。
+        val notFilled = info.totalItemsCount > 0 &&
+            info.visibleItemsInfo.size >= info.totalItemsCount
+        if (notFilled && listState.firstVisibleItemIndex == 0) {
             viewModel.loadEarlierItems()
         }
     }
