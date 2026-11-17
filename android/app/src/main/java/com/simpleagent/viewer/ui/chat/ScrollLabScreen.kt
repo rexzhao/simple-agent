@@ -65,8 +65,9 @@ fun ScrollLabScreen() {
             modifier = Modifier.padding(12.dp),
         )
         Text(
-            "操作：滑到中间某条（记住编号），然后按「头部插入 20 条」，\n" +
-                "看那条编号是否还停在原处。",
+            "操作：滑到中间某条（记住编号），然后按「头部插入 60 条」，\n" +
+                "看那条编号是否还停在原处。\n" +
+                "（60 条是真实补拉的量：会把锚点挤出屏幕，专门验证这段路径）",
             fontSize = 12.sp, color = Color.Gray,
             modifier = Modifier.padding(horizontal = 12.dp),
         )
@@ -79,11 +80,11 @@ fun ScrollLabScreen() {
         Row(Modifier.padding(8.dp)) {
             Button(onClick = {
                 // 头部插入：编号比当前最小值还小
-                val batch = (topSeq - 20 until topSeq).toList()
-                topSeq -= 20
+                val batch = (topSeq - 60 until topSeq).toList()
+                topSeq -= 60
                 items.addAll(0, batch)
                 action = "头部插入 ${batch.size} 条（${batch.first()}..${batch.last()}）"
-            }) { Text("头部插入 20", fontSize = 12.sp) }
+            }) { Text("头部插入 60", fontSize = 12.sp) }
 
             Button(onClick = {
                 val batch = (bottomSeq until bottomSeq + 10).toList()

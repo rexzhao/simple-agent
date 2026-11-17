@@ -34,9 +34,16 @@ class ChatScrollController(
 ) {
     private var lastCount = 0
 
-    /** 用户正在看的那一条（key + 它被视口顶部裁掉的高度）。 */
+    /** 用户正在看的那一条（key + 它被视口顶部裁掉的高度 + 当时的下标）。 */
     private var anchorKey: Any? = null
     private var anchorOffset = 0
+    /**
+     * 锚点条目**在插入发生前**的列表下标。
+     *
+     * 锚点被挤出屏幕时，用它 + 插入条数 算新位置。
+     * 不能用插入后读到的 firstIndex（那已经是 0/1，会滚到顶部）。
+     */
+    private var anchorIndex = 0
 
     /** 用户是否停在底部附近。 */
     private var atBottom = true
@@ -66,6 +73,7 @@ class ChatScrollController(
                 if (snap.firstKey != null) {
                     anchorKey = snap.firstKey
                     anchorOffset = snap.firstOffset
+                    anchorIndex = snap.firstIndex
                 }
                 atBottom = snap.lastIndex >= snap.count - 2
                 return@collect
@@ -82,13 +90,24 @@ class ChatScrollController(
     /**
      * 内容插入后的落位。
      *
-     * 先试着按 key 找回"用户原来那条"；找不到就按插入数量平移。
+     * 三条路径，优先级从高到低：
+     *   1. 按 key 找到原来那条 → 精确还原它的位置与偏移（最理想）
+     *   2. 找不到（一次插入几十条，锚点被挤出屏幕）→ **按插入条数把锚点
+     *      的旧下标往后平移**，也就是"原来那条现在在哪"
+     *   3. 连锚点都没有（首屏）→ 不处理，交给跳末尾
+     *
      * 唯独**用户本来就在底部**时例外 —— 那说明新增的是新消息，应该跟随。
      */
     private suspend fun settle(snap: Snapshot, previousCount: Int) {
+        if (atBottom) {
+            // 用户原本在底部：新增的是新消息，跟随到底
+            listState.scrollToItem(snap.count - 1)
+            return
+        }
+
         val key = anchorKey
 
-        // 按 key 精确定位（最多等 5 帧让新布局生效）
+        // 路径 1：按 key 精确定位（最多等 5 帧让新布局生效）
         if (key != null) {
             var tries = 0
             while (tries < 5) {
@@ -96,28 +115,28 @@ class ChatScrollController(
                 val live = readSnapshot()
                 val target = live.visibleFirstIndexOf(key)
                 if (target >= 0) {
-                    if (atBottom) {
-                        // 用户原本在底部：新增的是新消息，跟随到底
-                        listState.scrollToItem(live.count - 1)
-                    } else {
-                        listState.scrollToItem(target, anchorOffset)
-                    }
+                    listState.scrollToItem(target, anchorOffset)
                     return
                 }
                 tries++
             }
         }
 
-        // 锚点被挤出屏幕（一次插了很多条）：按插入数量平移
+        // 路径 2：锚点被挤出屏幕。用**插入前记下的下标** + 插入条数，
+        // 算它现在应该在哪。
+        //
+        // **不能用 snap.firstIndex**：那是插入之后读到的，已经是新布局里
+        // 的第一个可见项（通常就是 0 或 1），拿它当目标就会滚到接近顶部 ——
+        // 真机上"加载完跳到接近顶部"就是这么来的。
         val inserted = snap.count - previousCount
         if (inserted <= 0) return
-        if (atBottom) {
-            listState.scrollToItem(snap.count - 1)
-            return
-        }
-        // 插入前用户看的是"当前 firstIndex - inserted"那条，
-        // 也就是说现在应该把它推回到 firstIndex 位置
-        listState.scrollToItem(snap.firstIndex.coerceIn(0, snap.count - 1), snap.firstOffset)
+        val target = (anchorIndex + inserted).coerceIn(0, snap.count - 1)
+        android.util.Log.d(
+            "SimpleAgent",
+            "滚动落位（平移）：插了 $inserted 条，锚点旧下标=$anchorIndex → $target " +
+                "offset=$anchorOffset（count $previousCount→${snap.count}）",
+        )
+        listState.scrollToItem(target, anchorOffset)
     }
 
     /** 首次打开会话：跳到末尾。 */
