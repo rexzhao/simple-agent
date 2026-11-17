@@ -1,3 +1,12 @@
+// 注意：Gradle 的 Kotlin DSL 里 `java` 是 JavaPluginExtension（一个扩展），
+// 所以直接写 `java.time.LocalDate` 会报 "Unresolved reference: time"。
+// 必须像下面这样先 import，再用简单名。
+import java.text.SimpleDateFormat
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.temporal.ChronoUnit
+import java.util.Date
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -22,18 +31,17 @@ android {
     val envVersionCode = System.getenv("SIMPLE_AGENT_VERSION_CODE")?.toIntOrNull()
 
     val autoVersionName = envVersionName ?: run {
-        val stamp = java.text.SimpleDateFormat("yyyyMMdd.HHmm")
-            .format(java.util.Date())
+        val stamp = SimpleDateFormat("yyyyMMdd.HHmm").format(Date())
         "0.1.8-dev.$stamp"
     }
     val autoVersionCode = envVersionCode ?: run {
         // 距 2026-01-01 的天数 × 10000 + 当天分钟数（0..1439），
         // 保证"后构建的包 code 更大"。上限约 3.6e9，int 放得下。
-        val base = java.time.LocalDate.of(2026, 1, 1)
-        val now = java.time.LocalDate.now()
-        val days = java.time.temporal.ChronoUnit.DAYS.between(base, now).toInt()
-        val minuteOfDay = java.time.LocalTime.now().let { it.hour * 60 + it.minute }
-        days * 10000 + minuteOfDay
+        val base = LocalDate.of(2026, 1, 1)
+        val now = LocalDate.now()
+        val days = ChronoUnit.DAYS.between(base, now).toInt()
+        val time = LocalTime.now()
+        days * 10000 + time.hour * 60 + time.minute
     }
 
     defaultConfig {
