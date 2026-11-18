@@ -431,33 +431,51 @@ const backfillPageLimit = 300
 // ensureEarlierAvailable 在"已经翻到本地镜像最早"时，向执行端要更早的一批事件
 // 并注入。
 //
-// 返回 true 表示**确实拿到了新内容**（调用方应重切一次这一页）；
-// false 表示没有新东西可拿（已到最早 / 断线 / 失败）。
-func (c *Client) ensureEarlierAvailable(sessionID string, before uint64) bool {
+// 返回值的三种含义（调用方必须区别对待，否则会把"临时失败"当成"到底了"，
+// 用户表现为"还没翻到第一条就说没有更多内容了"）：
+//
+//	backfillGot   拿到了新内容，调用方应重切一次这一页
+//	backfillEnd   执行端明确说没有了 —— 真的到最早
+//	backfillRetry 断线 / 请求失败 —— **不能**判定为到底，下次还能再试
+type backfillResult int
+
+const (
+	backfillRetry backfillResult = iota
+	backfillGot
+	backfillEnd
+)
+
+func (c *Client) ensureEarlierAvailable(sessionID string, before uint64) backfillResult {
 	session := c.currentSession(sessionID)
 	remote := c.host()
 	if session == nil || remote == nil {
-		return false
+		// 断线：不是"没有更早内容"，只是现在问不到。保持可重试。
+		log.Printf("bridge：补拉跳过（session=%s before=%d）：会话或连接不可用", sessionID, before)
+		return backfillRetry
 	}
-	// 直接补拉：调用方已经在"这一页切不出来"时才进来，
-	// 不需要再判断一次本地边界（以前这里判断 before > oldest 就返回，
-	// 会让"游标落在本地内容中间但页面切不出来"的情况永远补不到）
 	data, err := remote.Backfill(sessionID, before, backfillPageLimit)
 	if err != nil {
-		// 补拉失败不该让翻页整体失败：界面会显示"已经是最早"，
-		// 但那比"转圈卡住"好；用户再滑一次会重试。
+		// 补拉失败不该让翻页整体失败，但也**不能**当成到底了。
+		// 以前这里返回 false，调用方一律报 has_more=false，于是网络抖一下
+		// 界面就永久显示"已经是最早的内容了"。
 		log.Printf("bridge：补拉更早内容失败（session=%s before=%d）：%v", sessionID, before, err)
-		return false
+		return backfillRetry
 	}
 	if len(data.Events) == 0 {
 		// 执行端说没有了：记住这个会话已经到底，别再让界面反复请求。
 		c.markExhausted(sessionID)
-		return false
+		log.Printf("bridge：执行端确认已到最早（session=%s before=%d）", sessionID, before)
+		return backfillEnd
 	}
 
 	applied := session.ApplyHistory(data.Events)
 	if applied == 0 {
-		return false
+		// 事件都拿到了但一条也没注入成功（全是重复的）：说明这批事件
+		// 本地已经有了，游标可能没推进。不判定到底，让调用方重切一次
+		// 看看能否切出新页。
+		log.Printf("bridge：补拉 %d 条事件但注入 0 条（session=%s before=%d，可能重复）",
+			len(data.Events), sessionID, before)
+		return backfillRetry
 	}
 	// 注入改变 entries 结构：让缓存指纹失效，下次 build 会重建
 	c.invalidateTimeline(sessionID)
@@ -468,7 +486,7 @@ func (c *Client) ensureEarlierAvailable(sessionID string, before uint64) bool {
 	if !data.HasMore {
 		c.markExhausted(sessionID)
 	}
-	return true
+	return backfillGot
 }
 
 // markExhausted 记录某个会话已经翻到执行端日志的真正开头。
@@ -536,8 +554,25 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) 
 	page, ok := c.pageOf(sessionID, before, limit)
 	if !ok && before > 0 {
 		// 本地切不出来：向执行端要更早的事件，然后重切同一游标
-		if c.ensureEarlierAvailable(sessionID, before) {
+		switch c.ensureEarlierAvailable(sessionID, before) {
+		case backfillGot:
 			page, ok = c.pageOf(sessionID, before, limit)
+		case backfillEnd:
+			// 执行端确认到底了：has_more=false 是准确的
+		case backfillRetry:
+			// **断线/失败：不能说"没有更多内容了"**。
+			//
+			// 以前这里一律返回 has_more=false，于是网络抖一下、或者执行端
+			// 一时不可用，界面就永久显示"已经是最早的内容了" —— 用户明明
+			// 还没翻到第一条。现在保持 has_more=true，让界面可以重试。
+			return encode(map[string]any{
+				"session_id": sessionID,
+				"items":      []ItemView{},
+				"has_more":   true,
+				"seq_from":   before,
+				"seq_to":     before,
+				"retry":      true,
+			})
 		}
 	}
 	if !ok {
@@ -592,7 +627,25 @@ func (c *Client) pageOf(sessionID string, before uint64, limit int) (string, boo
 			}
 		}
 		if end == 0 {
-			// 游标之前没有任何条目：本地不够，需要补拉（由调用方决定）
+			// 游标之前没有任何条目：本地不够，需要补拉（由调用方决定）。
+			//
+			// 诊断用：把 before 与本地最早/最晚的 seq 打出来，才能分辨
+			// "真的到底了"和"游标算错了"。之前只有一句"补拉也拿不到 =
+			// 真的到最早了"，两种完全不同的情况被混成一种。
+			var oldest, newest uint64
+			for index := 0; index < total; index++ {
+				if !spans[index].valid {
+					continue
+				}
+				if oldest == 0 || spans[index].first < oldest {
+					oldest = spans[index].first
+				}
+				if spans[index].last > newest {
+					newest = spans[index].last
+				}
+			}
+			log.Printf("bridge：切不出页（session=%s before=%d 本地 seq %d..%d 共 %d 条）",
+				sessionID, before, oldest, newest, total)
 			return "", false
 		}
 	}

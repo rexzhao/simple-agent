@@ -144,6 +144,14 @@ data class TimelinePage(
     /** 本页覆盖的事件序号区间；翻更早的页时用它当游标。 */
     @SerialName("seq_from") val seqFrom: Long = 0,
     @SerialName("seq_to") val seqTo: Long = 0,
+    /**
+     * 本次没取到内容、但**不代表到底了**（断线 / 补拉失败），可以重试。
+     *
+     * 与"真的到最早"（`hasMore == false` 且 `retry == false`）区分开：
+     * 以前两者都表现为空页 + has_more=false，界面于是永久显示
+     * "已经是最早的内容了" —— 用户明明还没翻到第一条。
+     */
+    val retry: Boolean = false,
     val title: String? = null,
     val runtime: RuntimeView? = null,
     val todos: List<TodoView>? = null,

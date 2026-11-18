@@ -874,11 +874,23 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 // 记下这个游标已经拉过：下次同一个游标直接跳过，
                 // 避免"返回同一页 → items 不增长 → 无限重复"。
-                lastLoadedCursor = cursor
+                // 只有成功拿到内容时才记：失败的情况下次还要能重试同一游标。
+                if (!page.retry && page.items.isNotEmpty()) {
+                    lastLoadedCursor = cursor
+                }
                 state.update { st ->
                     if (st.activeSessionId != id) return@update st.copy(loadingEarlier = false)
                     if (page.items.isEmpty()) {
-                        // 空页 = 已经到最早（或游标失效）
+                        if (page.retry) {
+                            // **没取到内容，但不是到底了**（断线 / 补拉失败）。
+                            //
+                            // 以前这里统一当成"已到最早"，把 hasMoreItems 置 false，
+                            // 界面于是永久显示"已经是最早的内容了" —— 用户明明
+                            // 还没翻到第一条。现在保持 hasMore=true、游标不动，
+                            // 用户再滑一次就能重试。
+                            return@update st.copy(loadingEarlier = false)
+                        }
+                        // 执行端明确说没有了：真的到最早
                         return@update st.copy(loadingEarlier = false, hasMoreItems = false)
                     }
                     // 插到最前面；已展开的组保留已加载的详情
