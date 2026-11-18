@@ -627,12 +627,20 @@ func (c *Client) pageOf(sessionID string, before uint64, limit int) (string, boo
 			}
 		}
 		if end == 0 {
-			// 游标之前没有任何条目：本地不够，需要补拉（由调用方决定）。
+			// 游标之前没有任何条目。这里有两种完全不同的情况：
 			//
-			// 诊断用：把 before 与本地最早/最晚的 seq 打出来，才能分辨
-			// "真的到底了"和"游标算错了"。之前只有一句"补拉也拿不到 =
-			// 真的到最早了"，两种完全不同的情况被混成一种。
-			var oldest, newest uint64
+			//   A. 本地最早就等于 before（before <= 本地最早 seq）——
+			//      这是**边界差一**：before=X 表示"要 X 之前的内容"，而本地
+			//      最早那条的 first 恰好是 X，它自己不算"X 之前"。真机上
+			//      游标就是从这里推出来的，于是每次都切不出、每次又去补拉
+			//      同一个游标，形成"补拉了但内容不增长"的循环
+			//      （日志：切不出页 before=6768 本地 seq 6768..6966）。
+			//
+			//      **降一格**：用 first-1 作为真正的"更早"边界，就能切出
+			//      本地已有的内容，不必每次都走网络。
+			//
+			//   B. 本地最早已明显晚于 before —— 那才是真的没有更早的内容。
+			var oldest uint64
 			for index := 0; index < total; index++ {
 				if !spans[index].valid {
 					continue
@@ -640,12 +648,13 @@ func (c *Client) pageOf(sessionID string, before uint64, limit int) (string, boo
 				if oldest == 0 || spans[index].first < oldest {
 					oldest = spans[index].first
 				}
-				if spans[index].last > newest {
-					newest = spans[index].last
-				}
 			}
-			log.Printf("bridge：切不出页（session=%s before=%d 本地 seq %d..%d 共 %d 条）",
-				sessionID, before, oldest, newest, total)
+			if oldest > 1 && before >= oldest {
+				// 情况 A：降一格重切。只在还没降过时才递归（避免栈溢出）。
+				return c.pageOf(sessionID, oldest-1, limit)
+			}
+			log.Printf("bridge：切不出页（session=%s before=%d 本地最早 seq=%d，共 %d 条）",
+				sessionID, before, oldest, total)
 			return "", false
 		}
 	}
