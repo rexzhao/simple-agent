@@ -480,43 +480,25 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun earlierPartBySeq(old: List<ItemView>, page: TimelinePage): List<ItemView> {
         if (old.isEmpty() || page.items.isEmpty()) return emptyList()
-        // 锚点不能只取 page.items.first()：补拉之后 Go 侧会把**更早的条目**
-        // 塞进这一页的开头，那个 key 在旧列表里根本不存在，
-        // indexOfFirst 返回 -1 → keptEarlier 变空 → 合并后 items 数量忽然
-        // 减少，然后下一次刷新又变回来。真机上看到的就是列表内容来回抖
-        // （日志里 items 在 79/80/81 之间跳）。
+
+        // **判据：新页覆盖了哪些 key，旧列表里在第一个被覆盖的 key 之前的部分
+        // 就是"只有旧列表才有"的更早内容。**
         //
-        // 改用"page 里第一个**能在旧列表中找到**的 key"当锚点：
-        // 补拉只影响开头那几条，中间那批 key 是稳定的，总能对上。
-        var anchorIndex = -1
-        for (item in page.items) {
-            val index = old.indexOfFirst { it.key == item.key }
-            if (index >= 0) {
-                anchorIndex = index
-                break
-            }
+        // 不再用 indexOfFirst 找锚点后 subList —— 那个写法在"新页第一条
+        // 恰好也在旧列表中间"时会算错锚点位置，把本该保留的历史丢掉
+        // （真机日志：earlierPart 从 25 掉到 4，items 从 87 掉回 64）。
+        //
+        // 这里遍历旧列表（它是从旧到新排的），一旦遇到"新页也有"的 key
+        // 就停 —— 那之前的都是更早的内容。
+        val freshKeys = HashSet<String>(page.items.size)
+        for (item in page.items) freshKeys.add(item.key)
+
+        val kept = ArrayList<ItemView>()
+        for (item in old) {
+            if (item.key in freshKeys) break
+            kept.add(item)
         }
-        if (anchorIndex < 0) {
-            // 新页的条目一个都不在旧列表里：说明内容整体换了（切会话等）。
-            // 保留旧列表没有意义，返回空。
-            return emptyList()
-        }
-        if (anchorIndex == 0) {
-            // 新页的第一条就是旧列表的第一条 —— 但**不能就此认为"没有更早的内容"**。
-            // 用户翻页加载出来的历史（old 里排在更早位置、新页里没有的）
-            // 必须保住，否则会出现：加载成功 → 立刻被 refreshTimeline 抹掉 →
-            // hasMore 仍是 true → 再次加载，陷入死循环。
-            //
-            // 判据：新页覆盖的 key 集合之外的旧条目就是"只有旧列表才有"的部分。
-            val freshKeys = page.items.mapTo(HashSet(page.items.size)) { it.key }
-            val kept = ArrayList<ItemView>()
-            for (item in old) {
-                if (item.key in freshKeys) break  // 到了新页覆盖区，后面都归新页
-                kept.add(item)
-            }
-            return kept
-        }
-        return old.subList(0, anchorIndex)
+        return kept
     }
 
     /**
