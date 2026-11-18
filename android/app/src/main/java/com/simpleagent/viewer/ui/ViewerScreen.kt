@@ -47,6 +47,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -307,13 +308,21 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     // scrollToItem，谁后执行看运气 —— 用户看到的是"内容跳了，也不知道
     // 跳到哪"。现在只有 controller 一处能动滚动位置，其余地方
     // （包括下面的加载触发）只做判断，不碰滚动。
-    val scrollController = remember(listState) { ChatScrollController(listState, ArchiveHeaderKey) }
-    // 把完整列表的 key 序列喂给控制器：数据变化后它能在这里查到锚点的新下标，
-    // 不依赖 LazyColumn 是否把锚点渲染出来（一次补拉 60 条时它会被挤出屏幕）。
-    val latestItemKeys = rememberUpdatedState(state.timeline.items.map { it.key as Any })
-    LaunchedEffect(listState) {
-        scrollController.observe { latestItemKeys.value }
+    val scrollController = remember(listState) {
+        ChatScrollController(listState, ArchiveHeaderKey, TimelineFooterKey)
     }
+    // 把与 LazyColumn **逐项对应**的 key 序列喂给控制器（含顶部提示行、归档、尾部占位），
+    // 下标才和 LazyColumn 一致。放在 SideEffect：组合提交后、新数据测量前执行，
+    // 控制器能拿到"旧数据的布局"作基准，并让修正在同一帧生效（不闪）。
+    val listKeys = remember(state.timeline.items, state.archive) {
+        buildList<Any> {
+            if (state.timeline.items.isNotEmpty()) add(ArchiveHeaderKey)
+            state.archive.forEach { add("arch:" + it.id) }
+            state.timeline.items.forEach { add(it.key) }
+            add(TimelineFooterKey)
+        }
+    }
+    SideEffect { scrollController.onKeysChanged(listKeys) }
 
     // 打开/切换会话时跳到末尾：用户期望看到"最新说了什么"。
     // 只在这个会话第一次有内容时做一次。
@@ -424,7 +433,7 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
                 onImagePath = imagePath,
             )
         }
-        item { Box(Modifier.size(1.dp)) }
+        item(key = TimelineFooterKey) { Box(Modifier.size(1.dp)) }
     }
 }
 
@@ -896,3 +905,4 @@ private fun ModelChip(
  * 做锚点计算时必须跳过它，否则用户滑到顶部时锚点就成了它。
  */
 private const val ArchiveHeaderKey = "archive-header"
+private const val TimelineFooterKey = "timeline-footer"

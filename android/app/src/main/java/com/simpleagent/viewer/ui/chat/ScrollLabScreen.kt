@@ -18,12 +18,11 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,15 +62,10 @@ fun ScrollLabScreen(
 
     var action by remember { mutableStateOf("（尚未操作）") }
 
-    // 把"完整列表的 key"喂给控制器：它据此在数据变化后查到锚点的新下标，
-    // 不依赖 LazyColumn 是否把锚点渲染出来了（一次插 60 条时它会被挤出屏幕）。
-    //
-    // 用 rememberUpdatedState 而不是把 keys 放进 LaunchedEffect 的 key：
-    // 后者会在每次数据变化时重启 observe()，控制器内部状态就丢了。
-    val latestKeys = rememberUpdatedState(data.items.map { it.key as Any })
-    LaunchedEffect(listState) {
-        controller.observe { latestKeys.value }
-    }
+    // 把与 LazyColumn 逐项对应的 key（含顶部提示行）喂给控制器。
+    // 必须在 SideEffect 里：组合提交后、新数据测量前执行，此时 layoutInfo 还是旧画面。
+    val listKeys = remember(data.items) { listOf<Any>(HEADER_KEY) + data.items.map { it.key } }
+    SideEffect { controller.onKeysChanged(listKeys) }
 
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(12.dp)) {
