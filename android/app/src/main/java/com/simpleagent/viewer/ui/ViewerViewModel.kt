@@ -142,6 +142,14 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
      * 各自用同一份游标插一批内容 —— 结果重复且位置全乱。
      */
     private val earlierLoading = java.util.concurrent.atomic.AtomicBoolean(false)
+    /**
+     * 上一次已经请求过的分页游标。
+     *
+     * 用来挡住"同一游标被反复请求"：Go 侧对同一个 before 会返回同一页，
+     * 去重后 items 不增长但 has_more 仍为 true，于是界面无限重复加载
+     * （真机日志里 pages 涨到 1048 就是这样）。游标推进后才允许再拉。
+     */
+    private var lastLoadedCursor: Long = -1
 
     // 流式刷新的节流状态（见 scheduleTimelineRefresh）
     private var timelineRefreshJob: kotlinx.coroutines.Job? = null
@@ -591,6 +599,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 可能还在飞（它的结果会被 activeSessionId 检查丢掉），
         // 但标志不释放的话新会话就再也加载不了更早内容了。
         earlierLoading.set(false)
+        // 新会话的游标从头算起，别让上一个会话的"已拉过"记录挡住它
+        lastLoadedCursor = -1
         // 分页状态必须一起清：否则新会话会带着上一个会话的 firstSeq 去翻页
         state.update {
             it.copy(
@@ -852,6 +862,21 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             android.util.Log.d("SimpleAgent", "loadEarlierItems 跳过：游标为 0")
             return
         }
+        // **同一个游标不重复请求**。
+        //
+        // 互斥只挡住"同时"的请求，挡不住"上一个刚完成、界面又立刻触发同样的
+        // 游标"。那种情况下 Go 侧会返回和上次相同的一页，Kotlin 侧去重后
+        // items 不增长，但 has_more 仍是 true —— 于是无限循环。
+        //
+        // 记录"这个游标已经拉过"，直到 firstSeq 真的推进了才允许再拉。
+        if (cursor == lastLoadedCursor) {
+            earlierLoading.set(false)
+            android.util.Log.d(
+                "SimpleAgent",
+                "loadEarlierItems 跳过：游标 $cursor 已拉过，等它推进",
+            )
+            return
+        }
         android.util.Log.d("SimpleAgent", "loadEarlierItems 开始：cursor=$cursor items=${current.timeline.items.size}")
         // **先置 loading 再发起请求**，且请求放在 IO 线程。
         //
@@ -865,6 +890,9 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 val page = withContext(Dispatchers.IO) {
                     core.timelinePage(id, cursor, timelinePageSize)
                 }
+                // 记下这个游标已经拉过：下次同一个游标直接跳过，
+                // 避免"返回同一页 → items 不增长 → 无限重复"。
+                lastLoadedCursor = cursor
                 state.update { st ->
                     if (st.activeSessionId != id) return@update st.copy(loadingEarlier = false)
                     if (page.items.isEmpty()) {

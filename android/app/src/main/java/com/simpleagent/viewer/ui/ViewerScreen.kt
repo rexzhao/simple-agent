@@ -341,53 +341,27 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
     // 滚到顶部时加载**同一段会话里更早的 items**（分页尚未加载的部分）。
     // 与上面的归档加载是两件事：归档是压缩后的旧消息，这里是同一段会话的历史。
     //
-    // 这里监听的是"滚动位置 + 列表是否撑满"，而不是单纯的 firstVisibleItemIndex：
-    // 内容不足一屏时下标恒为 0，单纯的 snapshotFlow 只在第一次发射，之后
-    // 再也不会有新值 —— 表现就是"只加载一页就停了，再也翻不动"。
+    // 这里监听的是"第一条可见项是不是 0"，并且**只在状态真的变化时**才处理。
     //
-    // **必须用 rememberUpdatedState**：TimelinePane 的 state 是值参数，
-    // LaunchedEffect 的 key 只有 activeSessionId，组合不会因为 state 变化重启它，
-    // 于是闭包捕获的是**首次组合那份 state**（hasMoreItems=false、firstSeq=0）。
-    // 表现就是：顶部明明显示"继续下拉加载更早的内容"，怎么滑都不加载 ——
-    // 因为判断用的是过期的 hasMoreItems，永远被挡掉。
+    // **不再有"加载完自动继续拉"的第二个 effect**：那个逻辑会在用户停在顶部
+    // 时一页接一页地拉，一旦某次返回的内容和已有内容重复（items 不增长但
+    // has_more 仍是 true），就变成无限循环 —— 真机日志里 pages 涨到 1048
+    // 就是这么来的。现在的规则简单明确：
+    //   - 用户滑到顶部 → 拉一页
+    //   - 想再拉 → 用户必须再滑一下（离开顶部再回来）
+    // 这才是"下拉加载更多"的正常交互，也天然避免了自激循环。
     val latestState = rememberUpdatedState(state)
     LaunchedEffect(listState, state.activeSessionId) {
-        snapshotFlow {
-            // **判据只看"第一条可见项是不是 0"**。
-            //
-            // 以前还要求 !canScrollBackward（"不能再往回滚"），但 index 0 的
-            // item 常常还有一部分露在屏幕上方之外，这时 canScrollBackward
-            // 仍是 true —— 于是条件永远不成立，滑到顶也不加载。
-            // 真机日志里就是：first=0 但 stuck=false，一次都没触发。
-            listState.firstVisibleItemIndex == 0
-        }.collect { atTop ->
-            val now = latestState.value
-            android.util.Log.d(
-                "SimpleAgent",
-                "到顶检测：atTop=$atTop first=${listState.firstVisibleItemIndex} " +
-                    "canBack=${listState.canScrollBackward} hasMore=${now.hasMoreItems} " +
-                    "loading=${now.loadingEarlier} cursor=${now.firstSeq}",
-            )
-            if (atTop && now.hasMoreItems && !now.loadingEarlier) {
+        snapshotFlow { listState.firstVisibleItemIndex == 0 }
+            .collect { atTop ->
+                val now = latestState.value
+                if (!atTop) return@collect
+                // **请求还在飞就不再发**：这条是用户明确要求的 ——
+                // fetch 期间重复触发只会堆出多个相同请求。
+                if (now.loadingEarlier) return@collect
+                if (!now.hasMoreItems) return@collect
                 viewModel.loadEarlierItems()
             }
-        }
-    }
-    // 加载完成后如果仍然到顶，继续拉下一页。
-    //
-    // 两种情况都需要它：
-    //   1. 内容不足一屏 —— 滚动位置不会变化，上面的 snapshotFlow 不再发射
-    //   2. 用户停在顶部不动 —— 同上，`firstVisibleItemIndex == 0` 没有变化
-    //
-    // 用 earlierPagesLoaded 做 key 的一部分，保证每拉成功一页就再判断一次；
-    // 真正的"只有一个请求在飞"由 ViewModel 里的原子标志保证，这里不必去重。
-    LaunchedEffect(state.loadingEarlier, state.hasMoreItems, state.earlierPagesLoaded) {
-        if (state.loadingEarlier || !state.hasMoreItems) return@LaunchedEffect
-        // 等一帧让新内容完成排版，否则量到的还是旧位置
-        withFrameNanos { }
-        if (listState.firstVisibleItemIndex == 0) {
-            viewModel.loadEarlierItems()
-        }
     }
     // 滚动位置由 scrollController 统一托管（见上面的说明），
     // 这里不再有任何锚点补偿逻辑 —— 以前那三组 effect 就是跳跃的来源。
