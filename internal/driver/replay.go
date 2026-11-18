@@ -216,6 +216,13 @@ func (st *replayState) apply(event store.Event) {
 		conv = rebuilt
 		out.Conversation = conv
 		st.conv = conv
+		// 摘要与 kept 消息都「来自」这条快照：给它们记上快照的 seq。
+		// 没有 seq 的条目在展示端分页时无法定位（切页、判断「更早」都靠它）。
+		for _, entry := range conv.Entries() {
+			if entry.Message != nil {
+				entry.Message.SetSeqRange(event.Seq, event.Seq)
+			}
+		}
 		// 清单是会话状态（不在消息里），快照里没带就等于空
 		conv.SetTodos(data.Todos)
 		// 快照是压缩后的新起点：计数从它记下的基线接续（旧快照没有这两个

@@ -575,25 +575,26 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 放开"加载更早"的互斥标志、清掉"游标已拉过"的记录（切换会话时调用）。
+     *
+     * 上一个会话的请求可能还在飞（它的结果会被 activeSessionId 检查丢掉），
+     * 标志不释放的话新会话就再也加载不了更早内容；"已拉过"的游标也会误挡
+     * 新会话的第一页。
+     */
+    private fun resetPagingGuards() {
+        earlierLoading.set(false)
+        lastLoadedCursor = -1
+    }
+
     fun selectSession(id: String) {
         if (id == state.value.activeSessionId) return
         // 切换会话：把"加载更早"的互斥标志也放开 —— 上一个会话的请求
         // 可能还在飞（它的结果会被 activeSessionId 检查丢掉），
         // 但标志不释放的话新会话就再也加载不了更早内容了。
-        earlierLoading.set(false)
-        // 新会话的游标从头算起，别让上一个会话的"已拉过"记录挡住它
-        lastLoadedCursor = -1
+        resetPagingGuards()
         // 分页状态必须一起清：否则新会话会带着上一个会话的 firstSeq 去翻页
-        state.update {
-            it.copy(
-                activeSessionId = id,
-                timeline = TimelineView(),
-                firstSeq = 0,
-                hasMoreItems = false,
-                loadingEarlier = false,
-                earlierPagesLoaded = 0,
-            )
-        }
+        state.update { it.switchedTo(id) }
         // 记住正在看的会话：重启 App 后直接回到这里
         prefs.edit().putString("activeSessionId", id).apply()
         refreshTimeline()
@@ -617,11 +618,11 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             kotlinx.coroutines.delay(300)
             val sessions = core.sessions()
             val created = sessions.lastOrNull { it.id !in before } ?: sessions.lastOrNull()
+            if (created != null && created.id != state.value.activeSessionId) resetPagingGuards()
             state.update { current ->
-                current.copy(
-                    sessions = sessions,
-                    activeSessionId = created?.id ?: current.activeSessionId,
-                )
+                val target = created?.id ?: current.activeSessionId
+                if (target == current.activeSessionId) current.copy(sessions = sessions)
+                else current.switchedTo(target).copy(sessions = sessions)
             }
             refreshTimeline()
         }
@@ -667,7 +668,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 state.update { it.copy(toast = "调试发送失败：没有建出会话") }
                 return@launch
             }
-            state.update { it.copy(sessions = sessions, activeSessionId = created.id) }
+            resetPagingGuards()
+            state.update { it.switchedTo(created.id).copy(sessions = sessions) }
             refreshTimeline()
             send(text)
             state.update { it.copy(toast = "调试发送：$text") }
@@ -923,8 +925,12 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         state.update { it.copy(loadingOlder = true) }
         core.loadOlderAsync(id, current.archiveCursor) { page ->
             state.update { st ->
+                // 结果回来时已经切到别的会话：丢掉，否则会把 A 的归档插进 B 里
+                if (st.activeSessionId != id) return@update st
                 if (page.error.isNotEmpty()) {
-                    st.copy(loadingOlder = false, hasMoreHistory = false, toast = page.error)
+                    // **失败不等于没有更多**：保持 hasMoreHistory，用户再滑一次就能重试。
+                    // 以前这里置 false，网络抖一下归档就永久看不到了。
+                    st.copy(loadingOlder = false, toast = page.error)
                 } else {
                     st.copy(
                         loadingOlder = false,
@@ -1030,3 +1036,23 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 }
+
+/**
+ * 切到另一个会话：清掉所有**按会话**的分页状态。
+ *
+ * 分页游标、"还有更早"、归档及其游标都只对当前会话有意义。漏清任何一个，
+ * 新会话就会带着上一个会话的游标去翻页、或者把上一个会话的归档显示在顶上。
+ * 所有改 activeSessionId 的地方都走这里，免得各处各清一部分。
+ */
+internal fun ViewerState.switchedTo(id: String): ViewerState = copy(
+    activeSessionId = id,
+    timeline = TimelineView(),
+    firstSeq = 0,
+    hasMoreItems = false,
+    loadingEarlier = false,
+    earlierPagesLoaded = 0,
+    archive = emptyList(),
+    archiveCursor = "",
+    hasMoreHistory = true,
+    loadingOlder = false,
+)

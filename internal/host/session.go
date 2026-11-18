@@ -48,8 +48,6 @@ type Session struct {
 	autoRetry int
 	// keptFromSeq 是快照的归档截断点（更早的归档在界面上只显示、不参与请求）。
 	keptFromSeq uint64
-	// archiveCursor 是"加载更早历史"的游标。
-	archiveCursor *store.ArchiveCursor
 	// history 是 backfill 补拉进来的**更早**条目（展示端专用）。
 	//
 	// 镜像只收到最近 attachTailEvents 条事件，翻页翻到最早时向执行端补拉，
@@ -870,7 +868,6 @@ func (s *Session) cancelSummary() {
 // loadOlder 把归档页转成界面用的条目（只用于显示，不参与请求）。
 // LoadOlderForTest 用指定游标翻一页（测试用：与展示端走同一条逻辑）。
 func (s *Session) LoadOlderForTest(cursor string) (OlderPage, error) {
-	s.archiveCursor = nil
 	return s.loadOlder(cursor)
 }
 
@@ -878,8 +875,12 @@ func (s *Session) loadOlder(cursor string) (OlderPage, error) {
 	if s.journal == nil {
 		return OlderPage{}, nil
 	}
-	// 空游标 = 从最近一份归档开始（单机沿用会话自己的游标；展示端每次带上自己的）
-	from := s.archiveCursor
+	// 空游标 = 从最近一份归档开始。
+	//
+	// **游标完全由调用方持有**：以前空游标会沿用会话自己记的游标，
+	// 而那个游标是被所有展示端共享的 —— 桌面翻过一页后，手机第一次请求
+	// （空游标）就会从中间某份归档开始，最近那份被跳过。
+	var from *store.ArchiveCursor
 	if cursor != "" {
 		from = &store.ArchiveCursor{Name: cursor}
 	}
@@ -925,7 +926,6 @@ func (s *Session) loadOlder(cursor string) (OlderPage, error) {
 			})
 		}
 	}
-	s.archiveCursor = page.Next
 	next := ""
 	if page.Next != nil {
 		next = page.Next.Name
@@ -962,7 +962,11 @@ func (s *Session) backfill(before uint64, limit int) (BackfillData, error) {
 	var picked []store.Event
 	var oldest uint64
 	for _, event := range loaded.Events {
-		if !isContentEvent(event.Type) {
+		// 压缩快照也要带上：它里面是压缩时**保留下来的那段对话**（kept），
+		// 这些消息只存在快照里，不会再以内容事件出现；而归档那边又按 id
+		// 把它们排除掉了（避免重复）。不带快照，展示端翻到这里就永远看不到
+		// 这一段 —— 真机表现是"还没到会话开头就说已经是最早的内容了"。
+		if !isContentEvent(event.Type) && event.Type != store.TypeCompactSnapshot {
 			continue
 		}
 		if oldest == 0 {

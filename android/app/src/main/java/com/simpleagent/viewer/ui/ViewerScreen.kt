@@ -333,16 +333,26 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
         jumpedSession = state.activeSessionId
         scrollController.jumpToBottom()
     }
-    // 滚到顶部时拉更早的历史（与桌面一致：按需分页，不一次全加载）
+    // 时间线翻到最早之后，再往上就是**归档**（压缩之前的对话）。
     //
-    // 与下面那段一样要读最新 state：这里的闭包只捕获首次组合的 state 值，
-    // 用它判断 hasMoreHistory 会永远是初始的 false，归档分页永远不触发。
+    // **必须等时间线翻完（!hasMoreItems）才拉**：归档排在时间线上方，
+    // 提前拉会把压缩前的内容接在一个还有缺口的时间线上。以前这里只看
+    // firstVisibleItemIndex == 0 —— 打开会话那一帧（还没跳到末尾）就是 0，
+    // 于是一打开就拉归档。
+    //
+    // 监听 (在顶部, 时间线已到头) 这一对：用户停在顶部时时间线刚好翻完，
+    // 也能接着触发，不必再滑一次。失败后这对值不变，不会自动重试成死循环 ——
+    // 用户离开顶部再回来就是重试。
     val latestForArchive = rememberUpdatedState(state)
     LaunchedEffect(listState, state.activeSessionId) {
-        snapshotFlow { listState.firstVisibleItemIndex }
-            .collect { first ->
+        snapshotFlow {
+            val now = latestForArchive.value
+            (listState.firstVisibleItemIndex == 0) to
+                (now.timeline.items.isNotEmpty() && !now.hasMoreItems)
+        }
+            .collect { (atTop, timelineDone) ->
                 val now = latestForArchive.value
-                if (first == 0 && now.hasMoreHistory && !now.loadingOlder) {
+                if (atTop && timelineDone && now.hasMoreHistory && !now.loadingOlder) {
                     viewModel.loadOlder()
                 }
             }

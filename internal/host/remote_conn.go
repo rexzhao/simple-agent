@@ -191,11 +191,11 @@ func (r *Remote) ResetForNewHost() {
 	r.pendingBlob = map[string][]byte{}
 	// 切换执行端：旧机器的 backfill 回包不会再来了，唤醒所有等待方
 	// （否则那边会一直挂到超时）
-	waiters := r.backfillWaiters
-	r.backfillWaiters = map[string]chan BackfillData{}
+	waiters := r.syncWaiters
+	r.syncWaiters = map[string]chan CmdResult{}
 	r.mu.Unlock()
 	for _, wait := range waiters {
-		wait <- BackfillData{}
+		wait <- CmdResult{Error: "已切换执行端"}
 	}
 	if r.mgr != nil {
 		r.mgr.resetPendingUnknown()

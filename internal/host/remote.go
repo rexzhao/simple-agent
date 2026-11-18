@@ -2,6 +2,7 @@ package host
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -729,12 +730,12 @@ type Remote struct {
 	blobs *remoteBlobs
 	// pendingBlob 暂存执行端回传、等待 blob.ok 的分块数据。
 	pendingBlob map[string][]byte
-	// backfillWaiters 是按 CmdID 等待 backfill 回包的调用方。
+	// syncWaiters 是按 CmdID 同步等待回包的调用方（backfill / loadOlder）。
 	//
 	// backfill 需要"调用即得结果"（分页要在一次刷新里决定 has_more），
 	// 而普通命令是异步的（结果经 cmdResult 回界面线程）。
 	// 这里照 remoteBlobs 的 chan + 超时模式做一份同步等待。
-	backfillWaiters map[string]chan BackfillData
+	syncWaiters map[string]chan CmdResult
 	// attachSpecs 是"重连时要 attach 的会话与游标"（界面线程写，发布给管理器）。
 	attachSpecs []map[string]any
 	// epoch 是执行端实例 id（握手时拿到；重启后会变，届时一律全量）。
@@ -953,9 +954,9 @@ func (r *Remote) handle(packet wire.Packet) {
 		if err := wire.Decode(packet.Body, &result); err != nil {
 			return
 		}
-		// backfill 是"同步调用"的命令：有等待方就直接交给它，
-		// 不走 cmdResult 事件（否则界面会收到一条它不认识的 cmdResult）。
-		if r.deliverBackfill(result) {
+		// backfill / loadOlder 的同步调用：有等待方就直接交给它，
+		// 不走 cmdResult 事件（否则界面会收到一条它没请求过的 cmdResult）。
+		if r.deliverSync(result) {
 			break
 		}
 		result.Data = decodeResultData(result)
@@ -982,19 +983,38 @@ func (r *Remote) Providers() []ProviderChoice {
 }
 
 // LoadOlder 同步取一页更早的归档（**会阻塞**：要等执行端回包）。
+//
 // 与 `loadOlder` **命令**的区别：命令是异步的，结果以 cmdResult 回到界面线程，
 // Data 还是 any；有些调用方（Android 的 bridge）需要"调用即得结果"的形态，
 // 又不能占界面线程，所以这里给一个阻塞版本，调用方自己在后台 goroutine 里用。
 //
+// **必须走网络**：展示端的会话是镜像，没有日志文件，归档只在执行端磁盘上。
+// 以前这里直接调本地 session.loadOlder —— 镜像的 journal 为 nil，永远返回
+// 空页且 More=false，手机于是永远翻不到压缩之前的内容。
+//
 // 游标由**调用方**携带（`cursor` 为空表示从最近一份归档开始）：执行端的会话是
 // 共享的，两个展示端各自翻页时不能共用一个"读到哪了"。
 func (r *Remote) LoadOlder(sessionID, cursor string) (OlderPage, error) {
-	session := r.Session(sessionID)
-	if session == nil {
+	if r.Session(sessionID) == nil {
 		return OlderPage{}, errors.New("会话不存在")
 	}
-	return session.loadOlder(cursor)
+	payload, err := wire.Encode(LoadOlderPayload{Cursor: cursor})
+	if err != nil {
+		return OlderPage{}, err
+	}
+	result, err := r.request(Command{SessionID: sessionID, Kind: "loadOlder", Payload: payload}, loadOlderTimeout)
+	if err != nil {
+		return OlderPage{}, err
+	}
+	var page OlderPage
+	if err := decodeInto(result.Data, &page); err != nil {
+		return OlderPage{}, err
+	}
+	return page, nil
 }
+
+// loadOlderTimeout 是等一页归档的超时：一份归档就是压缩前的整份日志，可能好几 MB。
+var loadOlderTimeout = 30 * time.Second
 
 // backfillTimeout 是等待执行端回一段历史的超时。
 //
@@ -1010,26 +1030,8 @@ var backfillTimeout = 20 * time.Second
 //
 // **必须在后台 goroutine 调用**（它会等回包）。
 func (r *Remote) Backfill(sessionID string, before uint64, limit int) (BackfillData, error) {
-	if !r.Connected() {
-		return BackfillData{}, errors.New("已断开")
-	}
 	payload, err := wire.Encode(BackfillPayload{Before: before, Limit: limit})
 	if err != nil {
-		return BackfillData{}, err
-	}
-	cmd := Command{SessionID: sessionID, Kind: "backfill", Payload: payload}
-	cmd.CmdID = defaultNewID()[:16]
-
-	wait := make(chan BackfillData, 1)
-	r.mu.Lock()
-	if r.backfillWaiters == nil {
-		r.backfillWaiters = map[string]chan BackfillData{}
-	}
-	r.backfillWaiters[cmd.CmdID] = wait
-	r.mu.Unlock()
-
-	if _, err := r.Submit(cmd); err != nil {
-		r.forgetBackfill(cmd.CmdID)
 		return BackfillData{}, err
 	}
 	// 超时按请求量估算：小请求（比如只探 1 条判断存在性）不该等 20 秒 ——
@@ -1038,43 +1040,82 @@ func (r *Remote) Backfill(sessionID string, before uint64, limit int) (BackfillD
 	if limit <= 4 {
 		timeout = 3 * time.Second
 	}
+	result, err := r.request(Command{SessionID: sessionID, Kind: "backfill", Payload: payload}, timeout)
+	if err != nil {
+		return BackfillData{}, err
+	}
+	var data BackfillData
+	if err := decodeInto(result.Data, &data); err != nil {
+		return BackfillData{}, err
+	}
+	return data, nil
+}
+
+// request 发一条命令并**同步等它的回包**（必须在后台 goroutine 调用）。
+//
+// 普通命令是异步的（结果经 cmdResult 回界面线程）；backfill / loadOlder 这类
+// "调用即得结果"的命令走这里：按 CmdID 登记等待方，handle 收到回包时直接交给它。
+//
+// 执行端回报的错误、切换执行端、超时都以 error 返回 —— 调用方据此判断"可重试"，
+// **不能**把它们当成空结果（以前 backfill 出错会被当成"没有更早内容"，
+// 会话从此被标记为已到最早）。
+func (r *Remote) request(cmd Command, timeout time.Duration) (CmdResult, error) {
+	if !r.Connected() {
+		return CmdResult{}, errors.New("已断开")
+	}
+	cmd.CmdID = defaultNewID()[:16]
+	wait := make(chan CmdResult, 1)
+	r.mu.Lock()
+	if r.syncWaiters == nil {
+		r.syncWaiters = map[string]chan CmdResult{}
+	}
+	r.syncWaiters[cmd.CmdID] = wait
+	r.mu.Unlock()
+
+	if _, err := r.Submit(cmd); err != nil {
+		r.forgetWaiter(cmd.CmdID)
+		return CmdResult{}, err
+	}
 	select {
-	case data := <-wait:
-		return data, nil
+	case result := <-wait:
+		if result.Error != "" {
+			return CmdResult{}, errors.New(result.Error)
+		}
+		return result, nil
 	case <-time.After(timeout):
-		r.forgetBackfill(cmd.CmdID)
-		return BackfillData{}, errors.New("拉取更早内容超时")
+		r.forgetWaiter(cmd.CmdID)
+		return CmdResult{}, fmt.Errorf("等待执行端回包超时（%s）", cmd.Kind)
 	}
 }
 
-// deliverBackfill 把 backfill 的回包交给等待方。返回 false 表示没人等（普通命令）。
-func (r *Remote) deliverBackfill(result CmdResult) bool {
+// deliverSync 把回包交给同步等待方。返回 false 表示没人等（普通命令）。
+func (r *Remote) deliverSync(result CmdResult) bool {
 	r.mu.Lock()
-	wait, ok := r.backfillWaiters[result.CmdID]
+	wait, ok := r.syncWaiters[result.CmdID]
 	if ok {
-		delete(r.backfillWaiters, result.CmdID)
+		delete(r.syncWaiters, result.CmdID)
 	}
 	r.mu.Unlock()
 	if !ok {
 		return false
 	}
-	if result.Error != "" {
-		// 出错也唤醒等待方（否则会一直等到超时）
-		wait <- BackfillData{}
-		return true
-	}
-	var data BackfillData
-	if body, err := wire.Encode(result.Data); err == nil {
-		_ = wire.Decode(body, &data)
-	}
-	wait <- data
+	wait <- result
 	return true
 }
 
-func (r *Remote) forgetBackfill(cmdID string) {
+func (r *Remote) forgetWaiter(cmdID string) {
 	r.mu.Lock()
-	delete(r.backfillWaiters, cmdID)
+	delete(r.syncWaiters, cmdID)
 	r.mu.Unlock()
+}
+
+// decodeInto 把 JSON 解出来的 any 还原成具体类型。
+func decodeInto(data any, target any) error {
+	body, err := wire.Encode(data)
+	if err != nil {
+		return err
+	}
+	return wire.Decode(body, target)
 }
 
 func (r *Remote) applyCatalog(refs []SessionRef) {

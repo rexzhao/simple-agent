@@ -305,8 +305,20 @@ func TestLoadOlderArchive(t *testing.T) {
 	})
 
 	// 没有压缩过就没有归档：应当返回空页而不是报错
+	// LoadOlder 会阻塞等执行端回包，回包靠 post 队列投递：放后台跑，这边持续 pump
+	bodyCh := make(chan string, 1)
+	go func() { bodyCh <- client.LoadOlder(sessionID, "") }()
+	var body string
+	waitFor(t, poster, func() bool {
+		select {
+		case body = <-bodyCh:
+			return true
+		default:
+			return false
+		}
+	})
 	var page bridge.ArchiveView
-	if errText := json.Unmarshal([]byte(client.LoadOlder(sessionID, "")), &page); errText != nil {
+	if errText := json.Unmarshal([]byte(body), &page); errText != nil {
 		t.Fatalf("归档回包解析失败：%v", errText)
 	}
 	if page.Error != "" {
