@@ -99,7 +99,9 @@ func buildOpenAIBody(req ChatRequest, includeUsage bool, extraBody, modelExtra m
 		body[key] = value
 	}
 	applyReasoningEffort(body, req.ReasoningEffort)
-	return json.Marshal(body)
+	// **必须用确定性序列化**：messages/tools 全是 map，json/v2 默认按
+	// 随机迭代顺序输出键，会让每次请求的前缀都不一样，缓存永远不命中。
+	return marshalDeterministic(body)
 }
 
 // applyReasoningEffort 用请求里的档位覆盖模型配置：

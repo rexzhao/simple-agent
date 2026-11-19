@@ -99,7 +99,10 @@ func buildAnthropicBody(req ChatRequest, extraBody, modelExtra map[string]any) (
 	// 注意：**不要**写 reasoning_effort。Anthropic Messages API 没有这个字段，
 	// 未知的顶层字段会被拒（400）。要开思考请通过 extra_body 传
 	// thinking: {type: enabled, budget_tokens: N}——厂商特有的参数走那条路。
-	return json.Marshal(body)
+	//
+	// **必须用确定性序列化**：messages/system 是 map，json/v2 默认按随机
+	// 迭代顺序输出键，每次请求前缀都不一样，prompt caching 永远不命中。
+	return marshalDeterministic(body)
 }
 
 // anthropicParser 是有状态的解析器：只有 tool_use 块的 stop 才算工具调用结束。
