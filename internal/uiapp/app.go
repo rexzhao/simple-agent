@@ -1607,6 +1607,12 @@ func (a *App) renderContent(c *ui.Context, refs []partRef) {
 // 与 Android 端 Timeline.kt 的 COLLAPSED_STEP_PREVIEW 保持一致。
 const processPreviewSteps = 3
 
+// debugCacheUsage 打开后状态条每次重绘都把 usage 打到 stderr。
+//
+// 用来确认"缓存命中率为什么不显示"到底是解析没拿到、还是这一环丢了。
+// 定位完置回 false。
+const debugCacheUsage = false
+
 // renderProcessItem 渲染过程组：1 个 part 就内联，≥2 个合并成一行。
 //
 // 展开分两级（与 Android 端一致）：
@@ -2530,7 +2536,15 @@ func (a *App) statusBar(c *ui.Context, session *Session, theme *ui.Theme) {
 		// 判据用 CacheRead > 0 而不是"字段存在"：旧网关压根不发这些字段，
 		// 读出来恒为 0；画面上突然多个"缓存 0%"会让人以为缓存失效了。
 		// 命中过才显示，第一次请求（纯写入、还没得命中）也自然不显示。
-		if usage := session.Usage(); usage.CacheReadTokens > 0 {
+		usage := session.Usage()
+		// 诊断：状态条每次重绘都打一行，用来确认 usage 到底有没有值。
+		// 定位完就删。
+		if debugCacheUsage {
+			println("[cache] input=", usage.InputTokens,
+				" read=", usage.CacheReadTokens,
+				" write=", usage.CacheWriteTokens)
+		}
+		if usage.CacheReadTokens > 0 {
 			ui.Text(c, a.tr("composer.cacheHit", cacheHitPercent(usage))).
 				FontSize(11).TextColor(theme.TextMuted).
 				Label(a.tr("composer.cacheHint",
