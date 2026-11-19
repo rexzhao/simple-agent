@@ -113,6 +113,10 @@ type Options struct {
 type Usage struct {
 	InputTokens  int
 	OutputTokens int
+	// CacheReadTokens 是命中缓存的输入 token（没花钱重算的那部分）。
+	CacheReadTokens int
+	// CacheWriteTokens 是写入缓存的输入 token（Anthropic 的 cache_creation）。
+	CacheWriteTokens int
 }
 
 // toolBuffer 累积一个工具调用的流式分片。
@@ -1026,6 +1030,14 @@ func (d *Driver) ApplyStreamDelta(messageID string, ev providers.Event) ([]Effec
 		if ev.OutputTokens > 0 {
 			round.usage.OutputTokens = ev.OutputTokens
 		}
+		// 缓存字段：**每次都覆盖，包括 0**。
+		//
+		// 与上面两个不同：input/output 在流里可能分多个事件发（Anthropic 的
+		// message_start 给 input、message_delta 给 output），0 表示"这次没带"，
+		// 所以只在非 0 时写。而缓存字段只在一个事件里出现，0 就是"这次没命中"，
+		// 沿用上一轮的旧值会显示成假的命中率。
+		round.usage.CacheReadTokens = ev.CacheReadTokens
+		round.usage.CacheWriteTokens = ev.CacheWriteTokens
 		return nil, nil
 
 	}

@@ -112,6 +112,8 @@ var enTable = map[string]string{
 	"todo.toggle":                 "Expand or collapse the to-do list",
 	"composer.usage":              "Context %s / %s",
 	"composer.usagePercent":       "Context %s / %s (%d%%)",
+	"composer.cacheHit":           "Cache %d%%",
+	"composer.cacheHint":          "%s of this prompt hit cache (of %s total)",
 	"composer.usageLabel":         "Context usage",
 	"composer.turns":              "Turns: %d",
 	"composer.steps":              "Steps: %d",

@@ -217,8 +217,20 @@ type Event struct {
 	Delta string
 
 	// 用量
-	InputTokens  int
-	OutputTokens int
+	InputTokens         int
+	OutputTokens        int
+	// CacheReadTokens 是本次请求里**命中缓存**的输入 token 数。
+	//
+	// 两家语义一致（都是"没花钱重算的那部分"），但字段名不同：
+	//   OpenAI     → usage.prompt_tokens_details.cached_tokens
+	//   Anthropic  → usage.cache_read_input_tokens
+	// 0 表示未知/没命中（旧网关一般不发这些字段）。
+	CacheReadTokens int
+	// CacheWriteTokens 是本次请求**写入缓存**的输入 token 数。
+	//
+	// 只有 Anthropic 有这个概念（usage.cache_creation_input_tokens）：它按
+	// 额外费率收一次写入费。OpenAI 是自动缓存、不单列，恒为 0。
+	CacheWriteTokens int
 
 	// 结束/错误
 	StopReason string

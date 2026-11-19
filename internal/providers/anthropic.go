@@ -134,6 +134,10 @@ func (p *anthropicParser) Parse(sse SSEEvent) []Event {
 		Message struct {
 			Usage struct {
 				InputTokens int `json:"input_tokens"`
+				// 缓存读/写：Anthropic 把命中缓存和写入缓存分开计价，
+				// 两者都不算在 input_tokens 里，需要单独取。
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 			} `json:"usage"`
 		} `json:"message"`
 		Usage *struct {
@@ -149,8 +153,16 @@ func (p *anthropicParser) Parse(sse SSEEvent) []Event {
 
 	switch event.Type {
 	case "message_start":
-		if event.Message.Usage.InputTokens > 0 {
-			return []Event{{Kind: EventUsage, InputTokens: event.Message.Usage.InputTokens}}
+		// input_tokens 可能是 0 而缓存字段非 0（整段 prompt 都命中缓存时），
+		// 所以判据是三者任一大干 0，不能只看 InputTokens。
+		usage := event.Message.Usage
+		if usage.InputTokens > 0 || usage.CacheReadInputTokens > 0 || usage.CacheCreationInputTokens > 0 {
+			return []Event{{
+				Kind:             EventUsage,
+				InputTokens:      usage.InputTokens,
+				CacheReadTokens:  usage.CacheReadInputTokens,
+				CacheWriteTokens: usage.CacheCreationInputTokens,
+			}}
 		}
 		return nil
 

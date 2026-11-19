@@ -2416,6 +2416,14 @@ func (a *App) ContextPercentForTest() int {
 	return 0
 }
 
+// CacheHitPercentForTest 返回当前会话的缓存命中率（0–100，测试用）。
+func (a *App) CacheHitPercentForTest() int {
+	if session := a.Current(); session != nil {
+		return cacheHitPercent(session.Usage())
+	}
+	return 0
+}
+
 // DeleteSessionForTest 按 id 删除会话（测试用：走界面同一条删除路径）。
 func (a *App) DeleteSessionForTest(id string) {
 	for index, session := range a.sessions {
@@ -2491,11 +2499,11 @@ func (a *App) contextPercent(session *Session) int {
 
 // statusBar 是输入卡下方的一行状态条。
 //
-// 左侧：上下文用量 + 一条 `ui.Meter` 条形（80% 起变警告色，与自动压缩阈值同源）；
+// 左侧：上下文用量 + 一条 `ui.Meter` 条形（80% 起变警告色，与自动压缩阈值同源）
+// + 缓存命中率（provider 报了缓存字段才显示）；
 // 右侧：轮数 / 步数（口径见 driver.Counts）。
 //
-// 还没做的指标（tok/s、cache hit、环形）留档在方案 §6：tok/s 与 cache hit 要动
-// providers 的协议层（解析 usage 的缓存字段）并用真实网关冒烟，不适合与本期一起改。
+// tok/s 还没做：它要按回合统计输出速度，与本条"瞬时状态"的口径不同。
 func (a *App) statusBar(c *ui.Context, session *Session, theme *ui.Theme) {
 	used, window := a.contextNumbers(session)
 	percent := a.contextPercent(session)
@@ -2516,10 +2524,59 @@ func (a *App) statusBar(c *ui.Context, session *Session, theme *ui.Theme) {
 			Warning:  driver.AutoCompactRatio * 100,
 			Critical: 95,
 		}).Width(meterWidth).Height(meterHeight).Label(a.tr("composer.usageLabel"))
+
+		// 缓存命中率：只有 provider 报了缓存字段才显示。
+		//
+		// 判据用 CacheRead > 0 而不是"字段存在"：旧网关压根不发这些字段，
+		// 读出来恒为 0；画面上突然多个"缓存 0%"会让人以为缓存失效了。
+		// 命中过才显示，第一次请求（纯写入、还没得命中）也自然不显示。
+		if usage := session.Usage(); usage.CacheReadTokens > 0 {
+			ui.Text(c, a.tr("composer.cacheHit", cacheHitPercent(usage))).
+				FontSize(11).TextColor(theme.TextMuted).
+				Label(a.tr("composer.cacheHint",
+					compactTokens(usage.CacheReadTokens),
+					compactTokens(usage.CacheReadTokens+usage.CacheWriteTokens+usage.InputTokens)))
+		}
+
 		ui.Spacer(c)
 		ui.Text(c, a.tr("composer.turns", counts.Turns)).FontSize(11).TextColor(theme.TextMuted)
 		ui.Text(c, a.tr("composer.steps", counts.Steps)).FontSize(11).TextColor(theme.TextMuted)
 	})
+}
+
+// cacheHitPercent 返回缓存命中率（0–100，四舍五入）。
+//
+// **两家 provider 的 input 语义不同，不能用一个公式套**：
+//
+//	OpenAI     prompt_tokens **已包含**命中部分 → 分母就是 InputTokens
+//	Anthropic  input_tokens **不含**缓存读写     → 分母要三者相加
+//
+// 怎么区分？CacheWriteTokens 只有 Anthropic 才有（OpenAI 是自动缓存、
+// 没有"写入费"这个概念）。所以：
+//   - CacheWrite > 0 → Anthropic 口径
+//   - 否则           → OpenAI 口径
+//
+// 这个判据在"Anthropic 本次没写缓存"时会退化，但那也正是 OpenAI 口径的
+// 算法（分母=Input），结果仍然正确。
+func cacheHitPercent(usage driver.Usage) int {
+	var total int
+	if usage.CacheWriteTokens > 0 {
+		// Anthropic：input 不含缓存，三者相加才是完整输入
+		total = usage.CacheReadTokens + usage.CacheWriteTokens + usage.InputTokens
+	} else {
+		// OpenAI：prompt_tokens 已含命中部分
+		total = usage.InputTokens
+		if total < usage.CacheReadTokens {
+			// 防御：个别网关的 prompt_tokens 不含缓存，以两者的较大值为准
+			total = usage.CacheReadTokens
+		}
+	}
+	if total <= 0 {
+		return 0
+	}
+	// 四舍五入：98.6% 显示成 99% 比截断成 98% 更贴近直觉
+	percent := (usage.CacheReadTokens*100 + total/2) / total
+	return clampInt(percent, 0, 100)
 }
 
 // compactTokens 把 token 数压成 12k / 1.2M 这样的短形式。

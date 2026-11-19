@@ -141,6 +141,10 @@ type toolsQuestionView struct {
 type UsageView struct {
 	Input  int `json:"input"`
 	Output int `json:"output"`
+	// 缓存读/写（展示端据此显示缓存命中率）。旧执行端不下发这两个字段，
+	// 读出来是 0 —— 界面按"未知"处理，不显示命中率。
+	CacheRead  int `json:"cache_read,omitempty"`
+	CacheWrite int `json:"cache_write,omitempty"`
 }
 
 // CountsView 是轮数/步数。
@@ -155,13 +159,19 @@ func (l *Local) Snapshot(sessionID string) (ViewState, bool) {
 	if session == nil {
 		return ViewState{}, false
 	}
+	usage := session.Usage()
 	view := ViewState{
 		Epoch:      l.epoch,
 		Generation: session.generation,
 		Seq:        l.currentStreamSeq(sessionID),
 		Busy:       string(session.Busy()),
 		Queued:     session.Queued(),
-		Usage:      UsageView{Input: session.Usage().InputTokens, Output: session.Usage().OutputTokens},
+		Usage: UsageView{
+			Input:      usage.InputTokens,
+			Output:     usage.OutputTokens,
+			CacheRead:  usage.CacheReadTokens,
+			CacheWrite: usage.CacheWriteTokens,
+		},
 		Counts:     CountsView{Turns: session.Counts().Turns, Steps: session.Counts().Steps},
 		Selection:  session.Selection(),
 		Effort:     session.Effort(),

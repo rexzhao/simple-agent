@@ -193,6 +193,13 @@ func (p *openAIParser) Parse(sse SSEEvent) []Event {
 		Usage *struct {
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
+			// 缓存命中数：官方在 prompt_tokens_details.cached_tokens，
+			// 部分兼容网关直接给一个顶层 cached_tokens / prompt_cache_hit_tokens。
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			CachedTokens         int `json:"cached_tokens"`
+			PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
 		} `json:"usage"`
 		Error *struct {
 			Message string `json:"message"`
@@ -210,10 +217,25 @@ func (p *openAIParser) Parse(sse SSEEvent) []Event {
 
 	if chunk.Usage != nil {
 		p.usageSeen = true
+		// 缓存命中数三个可能的位置，按"官方优先"取第一个非零的。
+		// 不同兼容网关写法不一样（有的照抄 OpenAI，有的自创字段），
+		// 挨个兜一下比只认一种更稳。
+		cached := 0
+		if d := chunk.Usage.PromptTokensDetails; d != nil {
+			cached = d.CachedTokens
+		}
+		if cached == 0 {
+			cached = chunk.Usage.CachedTokens
+		}
+		if cached == 0 {
+			cached = chunk.Usage.PromptCacheHitTokens
+		}
 		events = append(events, Event{
-			Kind:         EventUsage,
-			InputTokens:  chunk.Usage.PromptTokens,
-			OutputTokens: chunk.Usage.CompletionTokens,
+			Kind:            EventUsage,
+			InputTokens:     chunk.Usage.PromptTokens,
+			OutputTokens:    chunk.Usage.CompletionTokens,
+			CacheReadTokens: cached,
+			// OpenAI 是自动缓存，没有"写入费"的概念
 		})
 	}
 

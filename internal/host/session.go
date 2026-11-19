@@ -296,7 +296,12 @@ func (s *Session) AskGroups() []*driver.AskGroup {
 
 func (s *Session) Usage() driver.Usage {
 	if s.view != nil {
-		return driver.Usage{InputTokens: s.view.Usage.Input, OutputTokens: s.view.Usage.Output}
+		return driver.Usage{
+			InputTokens:      s.view.Usage.Input,
+			OutputTokens:     s.view.Usage.Output,
+			CacheReadTokens:  s.view.Usage.CacheRead,
+			CacheWriteTokens: s.view.Usage.CacheWrite,
+		}
 	}
 	return s.drv.Usage()
 }
