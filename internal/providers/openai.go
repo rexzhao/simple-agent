@@ -30,6 +30,9 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req ChatRequest) (<-chan Ev
 	if err != nil {
 		return nil, err
 	}
+	// 排查缓存命中率：把完整请求体录下来（默认关闭）。
+	// 两次请求逐字节对比，第一处差异就是缓存断点。
+	recordRequest("openai", body)
 	headers := map[string]string{}
 	if p.apiKey != "" {
 		headers["Authorization"] = "Bearer " + p.apiKey
