@@ -183,10 +183,9 @@ func main() {
 	// headless：不建窗口、不跑 mygo 事件循环，只做执行端
 	if opts.headless {
 		// 无界面时的提示写进会话即可；Remote 通知仍可经 relay 到达展示端
-		os.Exit(runHeadless(&cfg, &appRuntime{
-			registry: registry, provider: provider, allowShell: cfg.AllowShell,
-			webFetch: !cfg.DisableWebFetch,
-		}, selection, listenAddr, opts.relay, opts.name, opts.relayToken, opts.netLog, catalog, blobs))
+		// （工具开关由 executorConfig 写进 runtime，见 toolOptionsFor）
+		os.Exit(runHeadless(&cfg, &appRuntime{registry: registry, provider: provider},
+			selection, listenAddr, opts.relay, opts.name, opts.relayToken, opts.netLog, catalog, blobs))
 	}
 
 	// 展示端：先连上执行端，拿到 Remote 之后把它注入 uiapp（界面代码不变）。
@@ -252,10 +251,8 @@ func main() {
 	}
 
 	runtime := &appRuntime{
-		registry:   registry,
-		provider:   provider,
-		allowShell: cfg.AllowShell,
-		webFetch:   !cfg.DisableWebFetch,
+		registry: registry,
+		provider: provider,
 	}
 
 	// 执行端配置只组装一次：UI 模式与 headless 模式共用 executorConfig，
@@ -415,11 +412,15 @@ type pinnedHost struct {
 
 // appRuntime 把 providers 与 tools 接到 uiapp.Runtime 上。
 type appRuntime struct {
-	registry   *providers.Registry
-	provider   providers.Provider
-	allowShell bool
-	// webFetch 决定 web_fetch 是否注册（配置里默认开，可以关）。
-	webFetch bool
+	registry *providers.Registry
+	provider providers.Provider
+	// toolOptions 是**执行**这一侧的工具开关。
+	//
+	// 必须与 driver 拿到的那份（host.Config → driverOptionsFor 里的 BuiltinWith）
+	// 完全一致，否则就会"清单里有、执行时说未知工具"——web_search 正是这样翻的车：
+	// RunTools 自己另拼了一遍 Options，漏了 Searcher。现在两个入口都从
+	// executorConfig 里取同一份 toolOptions，见 executorConfig。
+	toolOptions tools.Options
 }
 
 // OpenStream 发起一次流式请求。
@@ -436,8 +437,10 @@ func (r *appRuntime) OpenStream(ctx context.Context, sel providers.Selection, re
 }
 
 // RunTools 执行工具调用。
+//
+// 用 r.toolOptions 构造工具表，**不要在这里临时拼**：它必须和 driver 那份同源。
 func (r *appRuntime) RunTools(ctx context.Context, tc *tools.ToolContext, calls []tools.Call) []tools.ToolOutcome {
-	return tools.ExecuteAll(ctx, tools.BuiltinWith(tools.Options{AllowShell: r.allowShell, WebFetch: r.webFetch}), tc, calls)
+	return tools.ExecuteAll(ctx, tools.BuiltinWith(r.toolOptions), tc, calls)
 }
 
 // windowFor 返回某模型配置的上下文窗口（0 表示未知，driver 会按 32k 处理）。

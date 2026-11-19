@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"simple-agent/internal/config"
 	"simple-agent/internal/host"
 	"simple-agent/internal/providers"
+	"simple-agent/internal/tools"
 )
 
 // 执行端配置只有一个组装点（executorConfig）：这里守两件事。
@@ -74,7 +78,7 @@ func TestUIAndHeadlessShareExecutorConfig(t *testing.T) {
 		{Workspace: "/ws", AllowShell: true, DisableWebFetch: true},
 	} {
 		cfg := cfg
-		runtime := &appRuntime{registry: nil, allowShell: cfg.AllowShell, webFetch: !cfg.DisableWebFetch}
+		runtime := &appRuntime{}
 		selection := providers.Selection{ProviderID: "p", Model: "m"}
 		post := func(func()) {}
 
@@ -119,6 +123,63 @@ func TestSearchBackendFollowsEnv(t *testing.T) {
 	if got.Searcher == nil || !got.Searcher.Available() {
 		t.Fatalf("executorConfig 应带上搜索后端：%+v", got.Searcher)
 	}
+}
+
+// 回归：**driver 的清单**与**执行端真正执行用的表**必须是同一份工具集。
+//
+// 真实事故（web_search 第一次上线）：driver 拿到的是带 Searcher 的选项，而
+// appRuntime.RunTools 自己拼了一份没有 Searcher 的 Options——于是模型看到
+// web_search（清单里有），一调用就回「未知工具：web_search」。这个 bug 只在
+// 真机上表现为"清单有、调用无"，界面上完全看不出来，所以必须由测试守住。
+//
+// 关键是**真的走 RunTools 去执行**：只比 runtime.toolOptions 字段抓不到
+// "RunTools 自己另拼一份"的那种写法（我第一版测试就漏掉了，故意打回 bug 也没红）。
+func TestRuntimeToolsMatchDriverList(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "sk-test") // 让 searcher 可用，才走得到"两边都该有"的情形
+	cfg := config.Config{Workspace: "/ws", AllowShell: true}
+	runtime := &appRuntime{}
+
+	driverConfig := executorConfig(&cfg, runtime, providers.Selection{ProviderID: "p", Model: "m"},
+		nil, nil, func(func()) {}, "", "")
+
+	// driver 侧：用 host.Config 的字段还原出工具表（host 内部就是这么做的）
+	driverTools := tools.BuiltinWith(tools.Options{
+		AllowShell: driverConfig.AllowShell,
+		WebFetch:   driverConfig.WebFetch,
+		Searcher:   driverConfig.Searcher,
+	})
+	if !strings.Contains(names(driverTools), "web_search") {
+		t.Fatalf("配了 Key 时 driver 清单里该有 web_search：%v", names(driverTools))
+	}
+
+	// 执行侧：**让 RunTools 真的去执行**清单里的每个工具名，看它认不认得。
+	// 认不得的那一个会回「未知工具」——这正是线上看到的现象。
+	tc := tools.NewToolContext(t.TempDir(), false)
+	calls := make([]tools.Call, 0, len(driverTools))
+	for index, tool := range driverTools {
+		calls = append(calls, tools.Call{
+			ID:   fmt.Sprintf("c%d", index),
+			Name: tool.Name,
+			// 参数故意留空：这些工具都会因为缺参数而报错，但**不会**报「未知工具」。
+			Args: tools.Args{},
+		})
+	}
+	outcomes := runtime.RunTools(context.Background(), tc, calls)
+	for index, outcome := range outcomes {
+		if strings.Contains(outcome.Output, "未知工具") {
+			t.Fatalf("清单里有 %s，但执行端不认识它（这就是「清单有、调用说未知工具」）：%s",
+				driverTools[index].Name, outcome.Output)
+		}
+	}
+}
+
+// names 把工具表拍成一行名字，便于比对/报错。
+func names(list []*tools.ToolDef) string {
+	out := make([]string, 0, len(list))
+	for _, tool := range list {
+		out = append(out, tool.Name)
+	}
+	return strings.Join(out, ",")
 }
 
 // sameExecutorShape 比较配置里与"入口选择"无关的字段（函数字段比指针太脆，

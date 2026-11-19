@@ -148,7 +148,7 @@ func TestHeadlessHostConfigCarriesAllowShell(t *testing.T) {
 			AllowShell: allow,
 			Workspace:  t.TempDir(),
 		}
-		runtime := &appRuntime{allowShell: allow}
+		runtime := &appRuntime{}
 		local := host.NewLocal(headlessHostConfig(cfg, runtime,
 			providers.Selection{ProviderID: "fake", Model: "m"}, nil, nil,
 			func(f func()) { f() }, "", ""))
