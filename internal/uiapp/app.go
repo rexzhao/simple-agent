@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1608,13 +1607,6 @@ func (a *App) renderContent(c *ui.Context, refs []partRef) {
 // 与 Android 端 Timeline.kt 的 COLLAPSED_STEP_PREVIEW 保持一致。
 const processPreviewSteps = 3
 
-// debugCacheUsage 打开后状态条每次重绘都把 usage 写进 <data_dir>/cache-debug.log。
-//
-// 用来确认"缓存命中率为什么不显示"到底卡在哪一环：解析没拿到、还是这一环丢了。
-// 写文件而不是 stderr：桌面 GUI 没有控制台，打出来也看不见。
-// 定位完置回 false。
-const debugCacheUsage = true
-
 // renderProcessItem 渲染过程组：1 个 part 就内联，≥2 个合并成一行。
 //
 // 展开分两级（与 Android 端一致）：
@@ -2539,10 +2531,6 @@ func (a *App) statusBar(c *ui.Context, session *Session, theme *ui.Theme) {
 		// 读出来恒为 0；画面上突然多个"缓存 0%"会让人以为缓存失效了。
 		// 命中过才显示，第一次请求（纯写入、还没得命中）也自然不显示。
 		usage := session.Usage()
-		// 诊断：把 usage 写到数据目录下的 cache-debug.log，定位完删掉。
-		if debugCacheUsage {
-			a.debugLogCacheUsage(usage, used)
-		}
 		if usage.CacheReadTokens > 0 {
 			ui.Text(c, a.tr("composer.cacheHit", cacheHitPercent(usage))).
 				FontSize(11).TextColor(theme.TextMuted).
@@ -2587,35 +2575,22 @@ func cacheHitPercent(usage driver.Usage) int {
 	if total <= 0 {
 		return 0
 	}
-	// 四舍五入：98.6% 显示成 99% 比截断成 98% 更贴近直觉
-	percent := (usage.CacheReadTokens*100 + total/2) / total
-	return clampInt(percent, 0, 100)
+	// **向下取整，并且不显示 100%**。
+	//
+	// 缓存不可能真的全命中：本轮新增的那段提示词（最新用户消息、最新工具
+	// 结果）必然要重新计算，至少占几百 token。99.9% 四舍五入成 100% 会让
+	// 人以为"这次一分钱没花"，反而不可信。
+	//
+	// 所以上限压在 99：显示"缓存 99%"是诚实的；真到 100 时宁可少报一个点。
+	percent := usage.CacheReadTokens * 100 / total
+	if percent > 99 {
+		percent = 99
+	}
+	return clampInt(percent, 0, 99)
 }
 
 // debugLogCacheUsage 把当前 usage 追加到 <data_dir>/cache-debug.log。
 //
-// 桌面 GUI 没有控制台，打印出来看不见，所以写文件。
-func (a *App) debugLogCacheUsage(usage driver.Usage, tokensInUse int) {
-	dir := a.dataDir()
-	if dir == "" {
-		return
-	}
-	path := filepath.Join(dir, "cache-debug.log")
-	// 同时记 TokensInUse：它是状态条"上下文 x/y"用的那份。如果它是非 0
-	// 而 usage 全 0，说明用量数据没到 Usage() 这条路（rate limit/字段丢失）；
-	// 两个都 0 说明这一轮压根还没请求过。
-	line := fmt.Sprintf("%s input=%d output=%d read=%d write=%d inuse=%d\n",
-		time.Now().Format("15:04:05.000"),
-		usage.InputTokens, usage.OutputTokens,
-		usage.CacheReadTokens, usage.CacheWriteTokens, tokensInUse)
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-	_, _ = file.WriteString(line)
-}
-
 // compactTokens 把 token 数压成 12k / 1.2M 这样的短形式。
 func compactTokens(tokens int) string {
 	switch {

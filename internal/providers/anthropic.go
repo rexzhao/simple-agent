@@ -36,8 +36,6 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req ChatRequest) (<-chan
 	if err != nil {
 		return nil, err
 	}
-	// 排查缓存命中率：把完整请求体录下来（默认关闭）。
-	recordRequest("anthropic", body)
 	headers := map[string]string{"anthropic-version": anthropicVersion}
 	if p.apiKey != "" {
 		headers["x-api-key"] = p.apiKey
@@ -162,7 +160,6 @@ func (p *anthropicParser) Parse(sse SSEEvent) []Event {
 		// 所以判据是三者任一大于 0，不能只看 InputTokens。
 		usage := event.Message.Usage
 		if usage.InputTokens > 0 || usage.CacheReadInputTokens > 0 || usage.CacheCreationInputTokens > 0 {
-			recordUsageRaw("anthropic", data)
 			return []Event{{
 				Kind:             EventUsage,
 				InputTokens:      usage.InputTokens,

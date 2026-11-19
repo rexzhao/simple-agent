@@ -25,13 +25,25 @@ func TestCacheHitPercent(t *testing.T) {
 		{
 			name:  "Anthropic：input 不含缓存，三者相加",
 			usage: driver.Usage{InputTokens: 120, CacheReadTokens: 900, CacheWriteTokens: 80},
-			// 900 / (900+80+120) = 900/1100 = 81.8% → 82
-			want: 82,
+			// 900 / (900+80+120) = 900/1100 = 81.8% → 向下取整 81
+			want: 81,
 		},
 		{
-			name:  "全部命中",
+			name:  "全部命中也不显示 100%",
 			usage: driver.Usage{CacheReadTokens: 500},
-			want:  100,
+			// 上限压在 99：本轮新增的提示词必然要重新计算，不可能是 100%
+			want: 99,
+		},
+		{
+			name: "99.9% 不四舍五入成 100%",
+			// 真机数据：prompt=685801 cached=685312
+			usage: driver.Usage{InputTokens: 685801, CacheReadTokens: 685312},
+			want:  99,
+		},
+		{
+			name:  "98.6% 向下取整为 98%",
+			usage: driver.Usage{InputTokens: 1000, CacheReadTokens: 986},
+			want:  98,
 		},
 		{
 			name:  "没命中：只有写入与新增",
@@ -42,11 +54,6 @@ func TestCacheHitPercent(t *testing.T) {
 			name:  "全零：不该除零崩掉",
 			usage: driver.Usage{},
 			want:  0,
-		},
-		{
-			name:  "四舍五入：98.6% 显示 99%",
-			usage: driver.Usage{InputTokens: 1000, CacheReadTokens: 986},
-			want:  99,
 		},
 	}
 

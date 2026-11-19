@@ -30,9 +30,6 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req ChatRequest) (<-chan Ev
 	if err != nil {
 		return nil, err
 	}
-	// 排查缓存命中率：把完整请求体录下来（默认关闭）。
-	// 两次请求逐字节对比，第一处差异就是缓存断点。
-	recordRequest("openai", body)
 	headers := map[string]string{}
 	if p.apiKey != "" {
 		headers["Authorization"] = "Bearer " + p.apiKey
@@ -222,10 +219,6 @@ func (p *openAIParser) Parse(sse SSEEvent) []Event {
 
 	if chunk.Usage != nil {
 		p.usageSeen = true
-		// 排查用：把这一块的原始 JSON 记下来（默认关闭，见 SetUsageRecorder）。
-		// 直接记全文而不是只抽 usage：网关的字段可能藏在别处
-		// （比如顶层 cached_tokens），只抽 usage 会漏掉线索。
-		recordUsageRaw("openai", data)
 		// 缓存命中数三个可能的位置，按"官方优先"取第一个非零的。
 		// 不同兼容网关写法不一样（有的照抄 OpenAI，有的自创字段），
 		// 挨个兜一下比只认一种更稳。

@@ -148,13 +148,6 @@ func main() {
 		}
 		dirLock = lock
 		defer dirLock.Release()
-		// 排查用：把每次请求的原始 usage 记到 <data_dir>/usage-debug.log。
-		// 用量显示不出来时，先看这个文件能分辨"网关没给"和"我们解析丢了"。
-		providers.SetUsageRecorder(providers.NewUsageRecorder(cfg.DataDir))
-		// 排查缓存命中率：录前几份完整请求体到 <data_dir>/requests/。
-		// 两次请求逐字节对比，第一处差异就是缓存失效的位置。
-		// 限制份数：一份请求体可能几 MB（长会话），录太多会把磁盘写满。
-		providers.SetRequestRecorder(providers.NewRequestRecorder(cfg.DataDir, 6))
 		catalog = store.NewCatalog(cfg.DataDir)
 		opened, blobsErr := store.NewBlobs(cfg.DataDir)
 		if blobsErr != nil {
