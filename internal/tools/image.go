@@ -41,7 +41,7 @@ type ImageOutput struct {
 	Height int
 }
 
-func readImageTool() *ToolDef {
+func readImageTool(fullAccess bool) *ToolDef {
 	return &ToolDef{
 		Name: "read_image",
 		Description: "Read a PNG/JPEG/WebP/GIF file and return the image itself. " +
@@ -50,7 +50,7 @@ func readImageTool() *ToolDef {
 		Guidance: "Use the read_image tool to look at an image file directly; " +
 			"do not transcode or resize it with shell commands first.",
 		Parameters: schema(map[string]any{
-			"file_path": map[string]any{"type": "string", "description": "Path to the image file, relative to the session working directory."},
+			"file_path": map[string]any{"type": "string", "description": pathDescription(fullAccess, "Path to the image file")},
 		}, "file_path"),
 		Run: readImageRun,
 	}

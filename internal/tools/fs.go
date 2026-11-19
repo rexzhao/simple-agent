@@ -18,7 +18,7 @@ const (
 	maxReadBytes     = 200_000
 )
 
-func readTool() *ToolDef {
+func readTool(fullAccess bool) *ToolDef {
 	return &ToolDef{
 		Name: "read",
 		Description: "Read a text file and return line-numbered content. " +
@@ -26,7 +26,7 @@ func readTool() *ToolDef {
 		Guidance: "Use the read tool — not shell commands like cat — to inspect text files. " +
 			"Use offset and limit to continue reading large files.",
 		Parameters: schema(map[string]any{
-			"file_path": map[string]any{"type": "string", "description": "Path to read, relative to the session working directory."},
+			"file_path": map[string]any{"type": "string", "description": pathDescription(fullAccess, "Path to read")},
 			"offset":    map[string]any{"type": "number", "description": "1-based first line to return. Defaults to 1."},
 			"limit":     map[string]any{"type": "number", "description": fmt.Sprintf("Maximum number of lines to return. Defaults to %d.", maxReadLines)},
 		}, "file_path"),
@@ -207,7 +207,7 @@ const readUTF16Note = "（注意：文件是 UTF-16 编码，已转换为 UTF-8 
 
 const readNonUTF8Note = "（注意：文件不是 UTF-8，已按系统代码页解码显示；用 write 写回会变成 UTF-8）\n"
 
-func writeTool() *ToolDef {
+func writeTool(fullAccess bool) *ToolDef {
 	return &ToolDef{
 		Name: "write",
 		Description: "Create or fully replace a text file. Content is always written as UTF-8 " +
@@ -215,7 +215,7 @@ func writeTool() *ToolDef {
 		Guidance: "Read an existing file before overwriting it with write " +
 			"and prefer edit for targeted changes.",
 		Parameters: schema(map[string]any{
-			"file_path": map[string]any{"type": "string", "description": "Path to write, relative to the session working directory."},
+			"file_path": map[string]any{"type": "string", "description": pathDescription(fullAccess, "Path to write")},
 			"content":   map[string]any{"type": "string", "description": "Full text content to write; stored as UTF-8."},
 		}, "file_path", "content"),
 		Run: writeRun,
@@ -258,14 +258,14 @@ func writeRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, erro
 		verb, displayPath(tc, path), len(content), len(splitLines(content)))), nil
 }
 
-func editTool() *ToolDef {
+func editTool(fullAccess bool) *ToolDef {
 	return &ToolDef{
 		Name:        "edit",
 		Description: "Edit an existing UTF-8 text file by replacing literal text.",
 		Guidance: "Read a file before editing it, " +
 			"unless you just created or edited it in this session.",
 		Parameters: schema(map[string]any{
-			"file_path": map[string]any{"type": "string", "description": "Path to edit, relative to the session working directory."},
+			"file_path": map[string]any{"type": "string", "description": pathDescription(fullAccess, "Path to edit")},
 			"old_string": map[string]any{"type": "string",
 				"description": "Literal text to replace."},
 			"new_string": map[string]any{"type": "string",
@@ -376,13 +376,20 @@ func clip(text string) string {
 	return strings.ReplaceAll(text, "\n", "⏎")
 }
 
-func workingDirectoryTool() *ToolDef {
+func workingDirectoryTool(fullAccess bool) *ToolDef {
+	description := "Read the current working directory, or change it with cd. Relative paths use the " +
+		"current directory. Existing shells and running processes keep their own directories."
+	cd := "Existing directory to enter. Omit to read the current directory."
+	if fullAccess {
+		description += " In full access mode any existing directory on this machine is allowed."
+		cd = "Existing directory to enter (absolute or relative; in full access mode outside the workspace is allowed). " +
+			"Omit to read the current directory."
+	}
 	return &ToolDef{
-		Name: "working_directory",
-		Description: "Read the current working directory, or change it with cd. Relative paths use the " +
-			"current directory. Existing shells and running processes keep their own directories.",
+		Name:        "working_directory",
+		Description: description,
 		Parameters: schema(map[string]any{
-			"cd": map[string]any{"type": "string", "description": "Existing directory to enter. Omit to read the current directory."},
+			"cd": map[string]any{"type": "string", "description": cd},
 		}),
 		Run: workingDirectoryRun,
 	}

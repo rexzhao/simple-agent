@@ -28,9 +28,14 @@ type dirEntry = os.DirEntry
 
 func osReadDir(dir string) ([]dirEntry, error) { return os.ReadDir(dir) }
 
-// Resolve 把模型给的相对路径解析到会话 cwd 内。
+// Resolve 把模型给的路径解析成本机绝对路径。
 //
-// 三道校验：
+// 两种模式，由 ToolContext.FullAccess 决定（= allow_shell，即界面上的「完全权限」）：
+//
+//   - 默认（沙箱）：相对路径基于会话 cwd，并做三道校验；
+//   - 完全权限：不限制工作区，绝对路径原样接受，相对路径仍基于会话 cwd。
+//
+// 沙箱模式的三道校验：
 //  1. 拒绝绝对路径（模型应该用相对路径）；
 //  2. 词法规范化后必须仍在工作区内（拦住 `..`）；
 //  3. lstat + EvalSymlinks 必须仍在工作区内（拦住链接与 junction）。
@@ -40,8 +45,15 @@ func Resolve(tc *ToolContext, raw string) (string, error) {
 	if raw == "" {
 		return cwd, nil
 	}
+	if tc.FullAccess() {
+		// 不设边界：绝对路径照用，相对路径仍落在会话 cwd 下（与默认模式一致）。
+		if filepath.IsAbs(raw) {
+			return normalize(raw), nil
+		}
+		return normalize(filepath.Join(cwd, raw)), nil
+	}
 	if filepath.IsAbs(raw) {
-		return "", fmt.Errorf("拒绝绝对路径：%s（只允许相对路径）", raw)
+		return "", fmt.Errorf("拒绝绝对路径：%s（只允许相对路径；需要访问工作区外请开启完全权限：--allow-shell）", raw)
 	}
 
 	joined := normalize(filepath.Join(cwd, raw))

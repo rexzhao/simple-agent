@@ -218,6 +218,53 @@ func TestResolveRejectsEscapes(t *testing.T) {
 	mustOutput(t, tc, "write", tools.Args{"file_path": "new/dir/file.txt", "content": "ok"})
 }
 
+// 完全权限（allow_shell=true = 界面上的「完全权限」）下路径工具不再限制工作目录：
+// 绝对路径与 `..` 都接受，工作的仍是真实文件系统。
+func TestFullAccessIgnoresWorkspaceBoundary(t *testing.T) {
+	tc := newCtx(t, true)
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "outside.txt")
+	if err := os.WriteFile(outsideFile, []byte("外部内容"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 绝对路径读
+	out := mustOutput(t, tc, "read", tools.Args{"file_path": outsideFile})
+	if !strings.Contains(out, "外部内容") {
+		t.Fatalf("完全权限下应能读工作区外文件：%q", out)
+	}
+	// 相对路径 `..` 逃逸：写到工作区的上一级
+	parentFile := filepath.Join(filepath.Dir(tc.Workspace()), "escaped-"+filepath.Base(outside)+".txt")
+	t.Cleanup(func() { _ = os.Remove(parentFile) })
+	mustOutput(t, tc, "write", tools.Args{
+		"file_path": "../" + filepath.Base(parentFile), "content": "escaped",
+	})
+	if data, err := os.ReadFile(parentFile); err != nil || string(data) != "escaped" {
+		t.Fatalf("完全权限下应能写工作区外文件：%v %q", err, data)
+	}
+	// glob / grep 指到工作区外（结果用 `/` 分隔，工作区外给绝对路径）
+	if got := mustOutput(t, tc, "glob", tools.Args{"pattern": "*.txt", "path": outside}); !strings.Contains(got, filepath.ToSlash(outsideFile)) {
+		t.Fatalf("完全权限下 glob 应能搜索工作区外目录：%q", got)
+	}
+	if got := mustOutput(t, tc, "grep", tools.Args{"pattern": "外部内容", "path": outside}); !strings.Contains(got, "outside.txt") {
+		t.Fatalf("完全权限下 grep 应能搜索工作区外目录：%q", got)
+	}
+	// working_directory 能切出去，且路径工具随之以新 cwd 为基准
+	mustOutput(t, tc, "working_directory", tools.Args{"cd": outside})
+	if got := tc.Cwd(); !strings.EqualFold(got, outside) {
+		t.Fatalf("cwd 未切到工作区外：%s", got)
+	}
+	if got := mustOutput(t, tc, "read", tools.Args{"file_path": "outside.txt"}); !strings.Contains(got, "外部内容") {
+		t.Fatalf("相对路径应基于新的 cwd：%q", got)
+	}
+
+	// 同一个文件在工作区内修改档位下必须被拒绝（两条路径不能都放开）
+	sandboxed := tools.NewToolContext(tc.Workspace(), false)
+	if _, err := runTool(t, sandboxed, "read", tools.Args{"file_path": outsideFile}); err == nil {
+		t.Fatal("工作区内修改档位下不应能读工作区外的绝对路径")
+	}
+}
+
 // 回归（opus）：工作区里的 symlink/junction 会把读写带到工作区外。
 // Windows 上 junction（mklink /J）普通用户即可创建，不需要开发者模式。
 func TestSymlinkEscapeRejected(t *testing.T) {
@@ -558,9 +605,11 @@ func TestShellWorkdir(t *testing.T) {
 	if !strings.Contains(out, "sub") {
 		t.Fatalf("workdir 未生效：%q", out)
 	}
-	// 越界的 workdir 被拒绝
-	if _, err := runTool(t, tc, "bash", tools.Args{"command": echoCommand("x"), "workdir": "../.."}); err == nil {
-		t.Fatal("越界 workdir 应被拒绝")
+	// 完全权限下 workdir 可以指向工作区外（shell 本来就是完全权限档位）
+	outside := t.TempDir()
+	out = mustOutput(t, tc, "bash", tools.Args{"command": cwdCommand(), "workdir": outside})
+	if !strings.Contains(out, filepath.Base(outside)) {
+		t.Fatalf("完全权限下应允许工作区外的 workdir：%q", out)
 	}
 }
 

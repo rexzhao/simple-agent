@@ -65,7 +65,9 @@ func shellParams() map[string]any {
 		"timeoutMs": map[string]any{"type": "number",
 			"description": fmt.Sprintf("Timeout in milliseconds. Defaults to %d.", defaultTimeoutMs)},
 		"workdir": map[string]any{"type": "string",
-			"description": "Working directory for this command. Defaults to the session working directory; a relative path is resolved against it."},
+			"description": "Working directory for this command. Defaults to the session working directory; " +
+				"a relative path is resolved against it (shell tools are only available in full access mode, " +
+				"so absolute paths outside the workspace are allowed)."},
 		"description": map[string]any{"type": "string",
 			"description": "Clear, concise description of what this command does in active voice."},
 	}, "command")

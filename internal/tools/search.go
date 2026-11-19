@@ -17,7 +17,7 @@ const (
 	maxGrepLineCh = 300
 )
 
-func globTool() *ToolDef {
+func globTool(fullAccess bool) *ToolDef {
 	return &ToolDef{
 		Name: "glob",
 		Description: "Find files, not directories, whose paths match a glob pattern, including hidden " +
@@ -27,7 +27,7 @@ func globTool() *ToolDef {
 			"pattern": map[string]any{"type": "string",
 				"description": `Glob pattern to match file paths against (e.g. "**/*.ts", "src/**/*.test.js").`},
 			"path": map[string]any{"type": "string",
-				"description": "Directory to search in. Defaults to the session workspace; a relative path resolves against it."},
+				"description": searchPathDescription(fullAccess, "Directory to search in")},
 		}, "pattern"),
 		Run: globRun,
 	}
@@ -143,7 +143,7 @@ func globToRegexp(pattern string) (string, error) {
 	return out.String(), nil
 }
 
-func grepTool() *ToolDef {
+func grepTool(fullAccess bool) *ToolDef {
 	return &ToolDef{
 		Name:        "grep",
 		Description: "Search file contents with a regular expression. Returns matching lines with line numbers, grouped by file.",
@@ -152,12 +152,21 @@ func grepTool() *ToolDef {
 		Parameters: schema(map[string]any{
 			"pattern": map[string]any{"type": "string", "description": "Regular expression to search for."},
 			"path": map[string]any{"type": "string",
-				"description": "File or directory to search. Defaults to the session workspace; a relative path resolves against it."},
+				"description": searchPathDescription(fullAccess, "File or directory to search")},
 			"include": map[string]any{"type": "string",
 				"description": `One glob filter for which files to search (e.g. "*.rs"). Not a list; negation is not supported.`},
 		}, "pattern"),
 		Run: grepRun,
 	}
+}
+
+// searchPathDescription 是 glob/grep 的 path 参数说明（默认从会话 cwd 出发）。
+func searchPathDescription(fullAccess bool, target string) string {
+	if fullAccess {
+		return target + ". Defaults to the session working directory; absolute paths are allowed " +
+			"in full access mode, a relative path resolves against the working directory."
+	}
+	return target + ". Defaults to the session workspace; a relative path resolves against it."
 }
 
 func grepRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, error) {

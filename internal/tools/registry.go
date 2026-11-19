@@ -3,9 +3,13 @@
 // 已实现：read / write / edit / glob / grep / working_directory / todo_write /
 // ask_user_question / bash / pwsh。
 //
-// 安全边界：所有路径限制在工作区（或会话 cwd）内，绝对路径与 `..` 逃逸一律拒绝；
-// 词法校验之外还要 lstat + EvalSymlinks，否则工作区里的一个链接（克隆的仓库、
-// 解压的 zip 都可能带进来）就能把读写带到外面。`bash`/`pwsh` 需显式开启。
+// 安全边界分两档，由 allow_shell（界面上的「完全权限」）决定：
+//   - 默认（工作区内修改）：所有路径限制在工作区（或会话 cwd）内，绝对路径与 `..`
+//     逃逸一律拒绝；词法校验之外还要 lstat + EvalSymlinks，否则工作区里的一个链接
+//     （克隆的仓库、解压的 zip 都可能带进来）就能把读写带到外面。
+//   - 完全权限：不再限制工作区——绝对路径照用、`..` 不拦；`bash`/`pwsh` 同时可用。
+//     理由：能跑任意命令的会话本来就能访问任何文件，再把文件工具关在工作区里只是
+//     让模型绕路走 shell。
 //
 // 与 Rust 版的差异（G5）：Run 接 context.Context，取消即中止——shell 命令杀整棵
 // 进程树，文件工具在读写前检查 ctx。工具层不 import providers/ui：参数声明由
@@ -19,6 +23,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -99,7 +104,10 @@ type SessionState struct {
 
 // ToolContext 是一次会话内共享的工具上下文。
 type ToolContext struct {
-	// workspace 是工作区根目录，路径解析的最终边界。
+	// workspace 是工作区根目录：默认模式下路径解析的边界，也是展示路径的基准。
+	//
+	// 完全权限下它不再限制访问，但仍然有意义：相对路径与「默认搜索目录」都从
+	// 会话 cwd（初始 = 工作区）出发，界面上也按它分组。
 	workspace string
 	// AllowShell 控制是否允许执行命令。
 	AllowShell bool
@@ -111,6 +119,11 @@ type ToolContext struct {
 }
 
 // NewToolContext 构造上下文（cwd 初始为工作区根）。
+//
+// allowShell 同时决定**权限档位**（界面上的「完全权限 / 工作区内修改」）：
+// 开命令执行就等于完全权限，路径工具也不再限制在工作区内。这是用户定的口径——
+// 能跑任意命令的会话本来就能用 shell 访问任何文件，再把 read/write 关在工作区里
+// 只是让模型绕路（`cat ../x`），既不安全也不好用。
 func NewToolContext(workspace string, allowShell bool) *ToolContext {
 	abs, err := filepath.Abs(workspace)
 	if err != nil {
@@ -122,6 +135,11 @@ func NewToolContext(workspace string, allowShell bool) *ToolContext {
 		state:      SessionState{cwd: abs},
 	}
 }
+
+// FullAccess 报告是否处于完全权限（= allow_shell）。
+//
+// 为真时路径工具不限制在工作区内：绝对路径原样接受，`..` 也不拦。
+func (c *ToolContext) FullAccess() bool { return c.AllowShell }
 
 // Workspace 返回工作区根目录。
 func (c *ToolContext) Workspace() string { return c.workspace }
@@ -304,17 +322,20 @@ type Call struct {
 
 // Builtin 返回内置工具（顺序即 system 提示中的顺序）。
 //
+// allowShell 同时是**权限档位**（完全权限）：为真时多出 bash/pwsh，路径参数也接受
+// 绝对路径（见沙箱与 ToolContext.FullAccess）。
+//
 // shell 工具只在 allowShell 时注册：注册了却不给用，会让模型反复试错。
 func Builtin(allowShell bool) []*ToolDef {
 	list := []*ToolDef{
-		readTool(),
-		readImageTool(),
-		writeTool(),
-		editTool(),
-		globTool(),
-		grepTool(),
+		readTool(allowShell),
+		readImageTool(allowShell),
+		writeTool(allowShell),
+		editTool(allowShell),
+		globTool(allowShell),
+		grepTool(allowShell),
 		todoWriteTool(),
-		workingDirectoryTool(),
+		workingDirectoryTool(allowShell),
 		askUserQuestionTool(),
 	}
 	if allowShell {
@@ -400,12 +421,27 @@ func schema(properties map[string]any, required ...string) map[string]any {
 }
 
 // displayPath 相对工作区显示（统一用 `/`，跨平台一致）。
+//
+// 完全权限下路径可能落在工作区外：那种情况给绝对路径。否则 filepath.Rel 会
+// 返回一堆 `../..`，模型拿它回填给别的工具只是噪音。
 func displayPath(tc *ToolContext, path string) string {
 	rel, err := filepath.Rel(tc.workspace, path)
-	if err != nil {
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return filepath.ToSlash(path)
 	}
 	return filepath.ToSlash(rel)
+}
+
+// pathDescription 是路径参数的说明：默认模式强调相对路径，完全权限下明说允许绝对路径。
+//
+// 说明必须与实际行为一致：schema 里写"只能相对路径"而实际接受绝对路径，模型不会
+// 用这个能力；反过来（说明允许、实际拒绝）会让它反复试错。
+func pathDescription(fullAccess bool, target string) string {
+	if fullAccess {
+		return target + " (encoding: absolute paths are allowed in full access mode; " +
+			"a relative path resolves against the session working directory)."
+	}
+	return target + ", relative to the session working directory."
 }
 
 // walkFiles 遍历目录（跳过构建产物与 VCS 目录），visit 收到文件路径；
