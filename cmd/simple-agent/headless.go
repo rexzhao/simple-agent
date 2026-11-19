@@ -28,6 +28,9 @@ import (
 func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Selection,
 	listenAddr, relayAddr, name, relayToken string, netLog bool, catalog *store.Catalog, blobs *store.Blobs) int {
 	host.EnableNetLog(netLog)
+	// 排查用：把每次请求的原始 usage 记到 <data_dir>/usage-debug.log。
+	// 与界面模式一致，方便不带 GUI 复现同一个问题。
+	providers.SetUsageRecorder(providers.NewUsageRecorder(cfg.DataDir))
 	// headless 在 main 的界面语言解析之前就退出了：这里自己设置一次，
 	// 否则新建会话的默认标题会显示成 locale key（session.defaultTitle）。
 	if lang, recognized := locale.Parse(cfg.Language); recognized {

@@ -154,9 +154,10 @@ func (p *anthropicParser) Parse(sse SSEEvent) []Event {
 	switch event.Type {
 	case "message_start":
 		// input_tokens 可能是 0 而缓存字段非 0（整段 prompt 都命中缓存时），
-		// 所以判据是三者任一大干 0，不能只看 InputTokens。
+		// 所以判据是三者任一大于 0，不能只看 InputTokens。
 		usage := event.Message.Usage
 		if usage.InputTokens > 0 || usage.CacheReadInputTokens > 0 || usage.CacheCreationInputTokens > 0 {
+			recordUsageRaw("anthropic", data)
 			return []Event{{
 				Kind:             EventUsage,
 				InputTokens:      usage.InputTokens,

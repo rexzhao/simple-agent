@@ -148,6 +148,9 @@ func main() {
 		}
 		dirLock = lock
 		defer dirLock.Release()
+		// 排查用：把每次请求的原始 usage 记到 <data_dir>/usage-debug.log。
+		// 用量显示不出来时，先看这个文件能分辨"网关没给"和"我们解析丢了"。
+		providers.SetUsageRecorder(providers.NewUsageRecorder(cfg.DataDir))
 		catalog = store.NewCatalog(cfg.DataDir)
 		opened, blobsErr := store.NewBlobs(cfg.DataDir)
 		if blobsErr != nil {

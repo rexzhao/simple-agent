@@ -217,6 +217,10 @@ func (p *openAIParser) Parse(sse SSEEvent) []Event {
 
 	if chunk.Usage != nil {
 		p.usageSeen = true
+		// 排查用：把这一块的原始 JSON 记下来（默认关闭，见 SetUsageRecorder）。
+		// 直接记全文而不是只抽 usage：网关的字段可能藏在别处
+		// （比如顶层 cached_tokens），只抽 usage 会漏掉线索。
+		recordUsageRaw("openai", data)
 		// 缓存命中数三个可能的位置，按"官方优先"取第一个非零的。
 		// 不同兼容网关写法不一样（有的照抄 OpenAI，有的自创字段），
 		// 挨个兜一下比只认一种更稳。
