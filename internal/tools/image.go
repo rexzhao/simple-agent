@@ -1,4 +1,4 @@
-package tools
+﻿package tools
 
 import (
 	"bytes"
@@ -39,6 +39,13 @@ type ImageOutput struct {
 	// Width/Height 是**返回给模型**的尺寸；原图尺寸在 Output 的文字里说明。
 	Width  int
 	Height int
+	// Caption 是可选的说明文字，显示在图片上方。
+	//
+	// 只有 display_image（给用户看）会带：read_image 是给模型读的，
+	// 那段文字已经写在 Output 里了，再放一份到图片上没意义。
+	Caption string
+	// DisplayOnly 表示这张图只给用户看，**不要发给模型**（见 ToolImageRef）。
+	DisplayOnly bool
 }
 
 func readImageTool(fullAccess bool) *ToolDef {

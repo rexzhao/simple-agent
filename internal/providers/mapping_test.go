@@ -169,6 +169,97 @@ func TestSettleUnfinishedToolCalls(t *testing.T) {
 	}
 }
 
+// display_only 的消息**整条跳过**：界面要显示，模型不该看到。
+//
+// 典型是 display_image 插进来的那张图。界面上有它，但发请求时不能带上 ——
+// 模型可能没有视觉能力，一张图还会白烧几十万 token。
+func TestHistoryForRequestSkipsDisplayOnly(t *testing.T) {
+	history := []message.Message{
+		{MessageID: "u1", Role: message.RoleUser, Parts: []message.Part{message.NewTextPart("画个图")}},
+		{
+			MessageID: "a1", Role: message.RoleAgent,
+			Parts: []message.Part{message.NewTextPart("这是图")},
+		},
+		{
+			// 展示消息：带图片引用，但不进上下文
+			MessageID: "d1", Role: message.RoleAgent,
+			Parts: []message.Part{{
+				Content:   message.URLPart{URL: "blob:sha256:" + strings.Repeat("ab", 32)},
+				MediaType: "image/png",
+			}},
+			Metadata: message.Metadata{message.MetadataDisplayOnly: true},
+		},
+		{MessageID: "u2", Role: message.RoleUser, Parts: []message.Part{message.NewTextPart("谢谢")}},
+	}
+
+	out := providers.HistoryForRequest(history)
+	if len(out) != 3 {
+		t.Fatalf("应保留 3 条（跳过 display_only 那条），实际 %d 条", len(out))
+	}
+	for _, msg := range out {
+		if msg.MessageID == "d1" {
+			t.Fatal("display_only 的消息不该进请求历史")
+		}
+	}
+	// 普通消息不受影响
+	if out[0].MessageID != "u1" || out[2].MessageID != "u2" {
+		t.Fatalf("其它消息顺序应保持不变，实际 %#v", []string{out[0].MessageID, out[1].MessageID, out[2].MessageID})
+	}
+}
+
+// display_only 的工具结果图片也不该出现在请求里。
+func TestResultImagesSkipDisplayOnly(t *testing.T) {
+	blob := strings.Repeat("cd", 32)
+	data := []byte{0x89, 'P', 'N', 'G'}
+	reader := func(hash string) ([]byte, error) {
+		if hash == blob {
+			return data, nil
+		}
+		return nil, os.ErrNotExist
+	}
+	// 一条工具结果里挂两张图：一张给模型看，一张只给用户看
+	result := message.Part{
+		MediaType: render.MediaToolResult,
+		Content: message.DataPart{Data: map[string]any{
+			"id": "c1", "name": "display_image", "output": "ok",
+			"images": []any{
+				map[string]any{"ref": "blob:sha256:" + blob, "media_type": "image/png"},
+				map[string]any{"ref": "blob:sha256:" + blob, "media_type": "image/png", "display_only": true},
+			},
+		}},
+	}
+	msgs := []message.Message{{
+		MessageID: "a1", Role: message.RoleAgent,
+		Parts: []message.Part{
+			message.NewTextPart("看图"),
+			// 工具结果必须配一条 tool_use，否则会被当成孤儿结果丢掉
+			toolUse("c1", "display_image", map[string]any{}),
+			result,
+		},
+	}}
+	out, err := providers.ToOpenAIMessages(msgs, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 工具结果的图片不塞进 tool 消息（OpenAI 不允许），而是在后面追加一条
+	// user 消息带 image_url。所以这里数所有 image_url 的总数。
+	images := 0
+	for _, msg := range out {
+		content, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range content {
+			if entry, ok := item.(map[string]any); ok && entry["type"] == "image_url" {
+				images++
+			}
+		}
+	}
+	if images != 1 {
+		t.Fatalf("应只有 1 张图发往模型（display_only 的被跳过），实际 %d 张", images)
+	}
+}
+
 func TestHistoryForRequestSkipsPending(t *testing.T) {
 	pendingResult := message.NewDataPart(map[string]any{"id": "c1", "name": "ask", "pending": true}).
 		WithMediaType(render.MediaToolResult)

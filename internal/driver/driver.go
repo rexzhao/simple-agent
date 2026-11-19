@@ -1,4 +1,4 @@
-// Package driver 是会话编排状态机：把用户操作与提供商事件翻译成会话变化，
+﻿// Package driver 是会话编排状态机：把用户操作与提供商事件翻译成会话变化，
 // 并把"接下来该做什么"以 Effect 形式交给调用方（uiapp）。
 //
 // 三条硬约束（方案 §4 / §9）：
@@ -294,6 +294,35 @@ func (d *Driver) Busy() Busy { return d.busy }
 
 // SetContextWindow 更新当前模型的上下文窗口（切换模型后由调用方同步）。
 func (d *Driver) SetContextWindow(window int) { d.opts.ContextWindow = window }
+
+// AddDisplayMessage 插入一条**只用于展示**的消息（不进模型上下文）。
+//
+// 场景：界面要显示某样东西（比如 display_image 的图），但模型不该看到它。
+// 消息必须带 message.MetadataDisplayOnly 标记，组装请求时整条跳过。
+//
+// 会写日志（recordMessageOutput），所以重放后照样出现在界面里。
+// 状态用 StatusComplete：它是一条"已经完成"的展示消息，没有流式过程。
+func (d *Driver) AddDisplayMessage(msg message.Message) (*conversation.ChatEntry, error) {
+	if !msg.DisplayOnly() {
+		// 防御：调用方忘了打标记就等于"往上下文里塞了条没人认识的消息"
+		return nil, errors.New("AddDisplayMessage 需要 display_only 标记")
+	}
+	entry, err := d.conv.AddMessage(msg, conversation.StatusComplete)
+	if err != nil {
+		return nil, err
+	}
+	entry.SetFinishedAt(time.Now())
+	d.pendingRecords = append(d.pendingRecords, recordMessageOutput(
+		0, 0, *entry.Message, conversation.StatusComplete, ""))
+	return entry, nil
+}
+
+// TakePendingRecords 取走积压的事件（没有 effect 返回值的操作用）。
+func (d *Driver) TakePendingRecords() []Effect {
+	out := d.pendingRecords
+	d.pendingRecords = nil
+	return out
+}
 
 // tr 查文案：优先用调用方注入的 Tr，其次进程级默认语言。
 func (d *Driver) tr(key string, args ...any) string {
@@ -1409,12 +1438,22 @@ func (d *Driver) ToolResult(messageID string, outcome tools.ToolOutcome) ([]Effe
 	if len(outcome.Images) > 0 {
 		images := make([]any, 0, len(outcome.Images))
 		for _, image := range outcome.Images {
-			images = append(images, map[string]any{
+			entry := map[string]any{
 				"ref":        image.Ref,
 				"media_type": image.MediaType,
 				"width":      image.Width,
 				"height":     image.Height,
-			})
+			}
+			// caption 只有 display_image（给用户看）会带；空值不写，
+			// 免得历史里多出一堆空字符串。
+			if image.Caption != "" {
+				entry["caption"] = image.Caption
+			}
+			// display_only：这张图只给用户看，不发模型（组装请求时跳过）。
+			if image.DisplayOnly {
+				entry["display_only"] = true
+			}
+			images = append(images, entry)
 		}
 		data["images"] = images
 	}
@@ -1706,7 +1745,12 @@ func imagesOf(data map[string]any) []tools.ToolImageRef {
 		mediaType, _ := obj["media_type"].(string)
 		width, _ := toInt(obj["width"])
 		height, _ := toInt(obj["height"])
-		out = append(out, tools.ToolImageRef{Ref: ref, MediaType: mediaType, Width: width, Height: height})
+		caption, _ := obj["caption"].(string)
+		displayOnly, _ := obj["display_only"].(bool)
+		out = append(out, tools.ToolImageRef{
+			Ref: ref, MediaType: mediaType, Width: width, Height: height,
+			Caption: caption, DisplayOnly: displayOnly,
+		})
 	}
 	return out
 }

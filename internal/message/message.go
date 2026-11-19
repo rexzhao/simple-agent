@@ -23,6 +23,26 @@ import (
 // Metadata 是任意 JSON 元数据（A2A 的 metadata）。
 type Metadata map[string]any
 
+// MetadataDisplayOnly 是"这条消息只用于展示，不进模型上下文"的标记。
+//
+// 用途：界面要显示某个东西，但模型完全不需要看到它。典型是
+// `show_image` —— 用户要看图，模型既看不见那张图（可能没有视觉能力），
+// 也不该为它付 token。
+//
+// 约定：值为 true 时，组装请求的历史里会**整条跳过**这条消息。
+// 标记挂在消息上而不是工具结果里，所以任何"生成一条消息"的功能都能用：
+// 图表、截图、调试输出、系统提示条……
+const MetadataDisplayOnly = "display_only"
+
+// DisplayOnly 报告这条消息是否只用于展示（不进模型上下文）。
+func (m Message) DisplayOnly() bool {
+	if m.Metadata == nil {
+		return false
+	}
+	value, ok := m.Metadata[MetadataDisplayOnly].(bool)
+	return ok && value
+}
+
 // Role 标识消息发送方。
 type Role string
 

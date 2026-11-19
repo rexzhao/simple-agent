@@ -1,4 +1,4 @@
-// Package tools 是本地工具链（对齐 deepseek-harness 的工具名、参数与语义）。
+﻿// Package tools 是本地工具链（对齐 deepseek-harness 的工具名、参数与语义）。
 //
 // 已实现：read / read_image / write / edit / glob / grep / working_directory /
 // todo_write / ask_user_question / web_fetch / bash / pwsh。
@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 
+	"simple-agent/internal/message"
 	"simple-agent/internal/web"
 )
 
@@ -302,6 +303,12 @@ type ToolOutcome struct {
 	Images []ToolImageRef
 	// RawImages 是工具刚返回、还没落盘的图片字节（只在内存里传一手）。
 	RawImages []ImageOutput
+	// DisplayParts 是"只给用户看"的内容（目前是 display_image 的图片），
+	// 由调用方在**主线程**插成一条独立消息。
+	//
+	// 为什么不在工具里直接插消息：工具跑在后台 goroutine，而 driver
+	// 不是线程安全的。这里只把要插的 part 带出来，时机由调用方掌握。
+	DisplayParts []message.Part
 	// Pending 非空表示需要用户回答（此时 Output 为空，作答后回填）。
 	Pending []QuestionSpec
 }
@@ -313,6 +320,15 @@ type ToolImageRef struct {
 	MediaType string
 	Width     int
 	Height    int
+	// Caption 是可选的说明文字（display_image 用），显示在图片上方。
+	Caption string
+	// DisplayOnly 表示这张图**只给用户看，不要发给模型**。
+	//
+	// read_image 的图要给模型（Vision 模型据此"看到"内容），
+	// display_image 的图不能给：一来模型可能没有视觉能力，二来一张图
+	// 动辄几十万 token，纯展示用途不该花这个钱。
+	// 组装请求时会跳过 DisplayOnly 的图片。
+	DisplayOnly bool
 }
 
 // IsPending 报告是否在等待用户回答。
@@ -355,6 +371,9 @@ func BuiltinWith(opts Options) []*ToolDef {
 	list := []*ToolDef{
 		readTool(opts.AllowShell),
 		readImageTool(opts.AllowShell),
+		// display_image 与 read_image 成对出现：一个给用户看（不要求视觉模型、
+		// 不压缩），一个给自己看。分开是因为它们的约束完全不同。
+		displayImageTool(opts.AllowShell),
 		writeTool(opts.AllowShell),
 		editTool(opts.AllowShell),
 		globTool(opts.AllowShell),

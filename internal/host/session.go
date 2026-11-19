@@ -1,4 +1,4 @@
-package host
+﻿package host
 
 import (
 	"context"
@@ -809,6 +809,14 @@ func (s *Session) runTools(effect driver.RunTools) {
 				if effects, err := s.drv.ToolResult(mid, outcome); err == nil {
 					s.applyEffects(effects)
 				}
+				// display_image 这类"只给用户看"的内容：在**主线程**插一条独立消息
+				// （driver 不线程安全，不能在上面的后台 goroutine 里做）。
+				if len(outcome.DisplayParts) > 0 {
+					s.addDisplayMessage(outcome.DisplayParts)
+					// AddDisplayMessage 把事件攒在 driver 里，要主动取出写日志，
+					// 否则重放后这张图就没了。
+					s.applyEffects(s.drv.TakeRecords())
+				}
 			})
 			<-done
 			if ctx.Err() != nil {
@@ -838,12 +846,18 @@ func toConversationTodos(todos []tools.TodoItem) []conversation.TodoItem {
 }
 
 // persistToolImages 把工具返回的图片写进 blob 存储，并换成 `blob:sha256:` 引用。
+//
+// 对 DisplayOnly 的图片（display_image 用）额外生成一条**独立消息**：
+// Android 只渲染"消息里的 image part"，工具结果里的图片它不显示；
+// 而 mobile 不能随便改版，所以靠多插一条消息让它能看见。
+// 那条消息带 display_only 标记，不会进模型上下文。
 func (s *Session) persistToolImages(outcome *tools.ToolOutcome) {
 	if len(outcome.RawImages) == 0 {
 		return
 	}
 	blobs := s.cfg.Blobs
 	refs := make([]tools.ToolImageRef, 0, len(outcome.RawImages))
+	var displayParts []message.Part
 	for _, image := range outcome.RawImages {
 		if blobs == nil {
 			outcome.Output += "\n（图片无法保存：没有 blob 存储）"
@@ -857,10 +871,47 @@ func (s *Session) persistToolImages(outcome *tools.ToolOutcome) {
 		refs = append(refs, tools.ToolImageRef{
 			Ref: "blob:sha256:" + hash, MediaType: image.MediaType,
 			Width: image.Width, Height: image.Height,
+			Caption: image.Caption, DisplayOnly: image.DisplayOnly,
 		})
+		if image.DisplayOnly {
+			displayParts = append(displayParts, displayImagePart(hash, image))
+		}
 	}
 	outcome.Images = refs
 	outcome.RawImages = nil
+	// **不在这里插消息**：本函数跑在工具的后台 goroutine 里，而 driver 不是
+	// 线程安全的。把待插入的 part 挂回 outcome，由调用方在主线程处理。
+	outcome.DisplayParts = displayParts
+}
+
+// addDisplayMessage 插入一条"只展示、不进上下文"的助手消息。
+//
+// 失败不报错：图片没显示出来不该影响这一轮工具结果（工具本身是成功的）。
+func (s *Session) addDisplayMessage(parts []message.Part) {
+	id, err := conversation.NewMessageID()
+	if err != nil {
+		return
+	}
+	msg := message.Message{
+		MessageID: id,
+		Role:      message.RoleAgent,
+		Parts:     parts,
+		Metadata:  message.Metadata{message.MetadataDisplayOnly: true},
+	}
+	_, _ = s.drv.AddDisplayMessage(msg)
+}
+
+// displayImagePart 把一张图片变成消息里的 image part（URLPart + blob 引用）。
+//
+// 用 URLPart 而不是 RawPart：RawPart 会把字节内联进消息，日志里多拷一份
+// （几十 MB）；blob 引用只有几十字节，界面本来也是按 hash 去取图。
+func displayImagePart(hash string, image tools.ImageOutput) message.Part {
+	return message.Part{
+		MediaType: image.MediaType,
+		Content:   message.URLPart{URL: "blob:sha256:" + hash},
+		// caption 走 Filename：界面按它显示图片上方的说明
+		Filename: image.Caption,
+	}
 }
 
 // post 把函数投递到执行端主线程。

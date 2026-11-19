@@ -1,4 +1,4 @@
-package providers
+﻿package providers
 
 import (
 	"encoding/base64"
@@ -146,6 +146,13 @@ func Extract(msg message.Message, blobs BlobReader) Extracted {
 
 // extractResultImages 读出工具结果里挂的图片（`images: [{ref, media_type}]`）。
 //
+// **跳过 display_only 的图片**：那是 display_image 用来"给用户看"的，
+// 不该发进请求。理由有两条：
+//   - 模型可能没有视觉能力（display_image 不要求）；
+//   - 一张图动辄几十万 token，纯展示用途不该花这个钱。
+// 跳过时**不留占位文字**：模型既看不到图，也不需要知道"这里有一张图"
+// （工具结果的 Output 里已经写清了"已把 X 显示给用户"）。
+//
 // 读不到（blob 被删/损坏）不报错：结果里保留一条 Missing 的图片，请求组装时
 // 换成「[图片丢失]」文字，整个会话不会因为一张图片发不出去。
 func extractResultImages(data map[string]any, blobs BlobReader) []ExtractedImage {
@@ -157,6 +164,9 @@ func extractResultImages(data map[string]any, blobs BlobReader) []ExtractedImage
 	for _, item := range list {
 		entry, ok := item.(map[string]any)
 		if !ok {
+			continue
+		}
+		if displayOnly, _ := entry["display_only"].(bool); displayOnly {
 			continue
 		}
 		image := ExtractedImage{MediaType: stringField(entry, "media_type")}
@@ -481,10 +491,15 @@ func IsPendingResult(part message.Part) bool {
 }
 
 // HistoryForRequest 过滤出可发给模型的消息：
-// 只取正常完成、且不含 pending 占位结果的消息。
+//   - 跳过 pending 占位结果（工具还没跑完）；
+//   - 跳过标记了 display_only 的消息（界面要显示、模型不该看到，
+//     见 message.MetadataDisplayOnly）。
 func HistoryForRequest(history []message.Message) []message.Message {
 	out := make([]message.Message, 0, len(history))
 	for _, msg := range history {
+		if msg.DisplayOnly() {
+			continue
+		}
 		pending := false
 		for _, part := range msg.Parts {
 			if IsPendingResult(part) {
