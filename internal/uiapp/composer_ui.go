@@ -70,8 +70,10 @@ func (a *App) modelChip(c *ui.Context, session *Session, theme *ui.Theme) {
 
 // permissionChip 只读展示当前访问模式（dsh 的 Full access / Workspace Write 那一档）。
 //
-// 我们的权限是**启动期全局开关** `allow_shell`，不支持按会话切换，所以这里只展示，
-// 点击没有动作，靠 Tooltip 说明去哪里改（避免"这里能改"的错觉）。
+// 我们的权限是**启动期全局开关** `allow_shell`：为真 = 完全权限（可执行命令，且工具
+// 可以访问任意目录），为假 = 工作区内修改（无命令执行，路径限制在工作区内）。不支持
+// 按会话切换，所以这里只展示，点击没有动作，靠 Tooltip 说明两档的区别与去哪里改
+// （避免"这里能改"的错觉）。
 //
 // 取值必须来自**执行端**（`host.Info()`），不能用界面自己的 opts：远程模式下执行端
 // 可能开了命令执行而展示端没配（--connect 甚至根本不读本地配置），按本地猜会把

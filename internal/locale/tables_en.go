@@ -80,7 +80,7 @@ var enTable = map[string]string{
 	"permission.fullAccess":     "Full access",
 	"permission.workspaceWrite": "Workspace Write",
 	"permission.mode":           "Access mode, current: %s",
-	"permission.hint":           "Set allow_shell in the config file, or start with --allow-shell.",
+	"permission.hint":           "Full access runs shell commands and lets tools touch any directory; workspace write keeps every path inside the workspace.\nSet allow_shell in the config file, or start with --allow-shell.",
 
 	// Header
 	"header.more":        "More",

@@ -18,8 +18,17 @@
 # 追加在默认系统提示之后的内容。
 # system_prompt: "回答尽量简短，先给结论。"
 
-# 是否允许执行命令（bash / pwsh）。默认 false；也能用 --allow-shell 或
-# SIMPLE_AGENT_ALLOW_SHELL=1 打开。
+# 权限档位（界面输入卡左下角的「完全权限 / 工作区内修改」）。
+#
+# allow_shell 是**唯一**的权限开关，两档的含义：
+#   · false（默认，工作区内修改）：不注册 bash/pwsh；read/write/edit/glob/grep 等
+#     路径工具限制在工作区内，绝对路径与 `..` 逃逸一律拒绝（还会校验符号链接/junction）。
+#   · true（完全权限）：注册 bash/pwsh；路径工具**不再限制工作目录**，绝对路径与
+#     `..` 都接受，`working_directory` 可以切到任意目录。
+#     理由：能跑任意命令的会话本来就能访问任何文件，再把文件工具关在工作区里只是
+#     让模型绕路走 shell。
+#
+# 也能用 --allow-shell 或 SIMPLE_AGENT_ALLOW_SHELL=1 打开。
 allow_shell: false
 
 # 一次用户输入内最多几轮工具调用（0 表示不限）。防止模型无限调用工具。

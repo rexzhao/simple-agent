@@ -194,6 +194,15 @@ func TestHeadlessSystemPromptMatchesAllowShell(t *testing.T) {
 		if mentionsDisabled == allow {
 			t.Fatalf("AllowShell=%v 时「不可用」提示存在=%v：\n%s", allow, mentionsDisabled, prompt)
 		}
+		// 路径约定必须与权限档位同源：完全权限下可以说"可以访问工作区外"，
+		// 否则提示里的「路径一律使用相对路径」会把新放开的绝对路径能力挡住。
+		saysOutsideAllowed := strings.Contains(prompt, "可以访问工作区外的路径")
+		if saysOutsideAllowed != allow {
+			t.Fatalf("AllowShell=%v 时「可访问工作区外」提示存在=%v：\n%s", allow, saysOutsideAllowed, prompt)
+		}
+		if !allow && !strings.Contains(prompt, "工作区外的路径不可访问") {
+			t.Fatalf("工作区内修改档位下应写明工作区外不可访问：\n%s", prompt)
+		}
 	}
 }
 

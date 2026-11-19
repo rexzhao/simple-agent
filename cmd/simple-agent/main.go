@@ -524,8 +524,16 @@ func effortFor(registry *providers.Registry, sel providers.Selection) string {
 // 工具指导用英文：这些句子直接取自 dsh 的原文，保持逐字一致便于与上游对照。
 func systemPrompt(cfg config.Config) string {
 	base := `你是 simple-agent，一个运行在用户本机的桌面 AI 助手。
-- 用中文回答，除非用户使用其它语言。
-- 路径一律使用相对会话工作目录的相对路径。
+- 用中文回答，除非用户使用其它语言。`
+	if cfg.AllowShell {
+		// 完全权限：路径工具不再限制在工作区内，说清楚模型才敢用绝对路径
+		base += `
+- 路径优先使用相对会话工作目录的相对路径；确有必要时可以访问工作区外的路径（绝对路径也行），但要在回复里说明访问了什么、为什么。`
+	} else {
+		base += `
+- 路径一律使用相对会话工作目录的相对路径（工作区外的路径不可访问）。`
+	}
+	base += `
 - 任务步骤较多时先用 todo_write 列出计划，并在推进过程中更新状态。`
 	if !cfg.AllowShell {
 		// 工具不可用时要说清楚：否则模型会去调用一个不存在的工具反复试错

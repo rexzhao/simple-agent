@@ -87,7 +87,7 @@ var zhTable = map[string]string{
 	"permission.fullAccess":     "完全权限",
 	"permission.workspaceWrite": "工作区内修改",
 	"permission.mode":           "访问模式，当前：%s",
-	"permission.hint":           "在配置文件中设置 allow_shell，或者用 --allow-shell 启动。",
+	"permission.hint":           "完全权限会执行命令，且工具可以访问任意目录；工作区内修改会把所有路径限制在工作区内。\n在配置文件中设置 allow_shell，或者用 --allow-shell 启动。",
 
 	// 头部（dsh 的图标按钮组）
 	"header.more":        "更多",

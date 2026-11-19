@@ -29,7 +29,8 @@ type Config struct {
 	ActiveModel    string `toml:"active_model" yaml:"active_model"`
 	// SystemPrompt 是追加在默认系统提示后的内容。
 	SystemPrompt string `toml:"system_prompt" yaml:"system_prompt"`
-	// AllowShell 控制是否启用 bash/pwsh 工具。默认 **关闭**（对齐 Rust 版）。
+	// AllowShell 是权限档位：true = 完全权限（允许执行命令，且路径工具不限制工作区），
+	// false = 工作区内修改（不执行命令，路径限制在工作区内）。默认 **关闭**（对齐 Rust 版）。
 	AllowShell bool `toml:"allow_shell" yaml:"allow_shell"`
 	// MaxToolRounds 是一次用户输入内最多几轮工具调用（0 = 不限，默认 12）。
 	MaxToolRounds int `toml:"max_tool_rounds" yaml:"max_tool_rounds"`
@@ -437,9 +438,9 @@ func Help() string {
   --tls-print-fingerprint  生成/读取证书并打印指纹后退出，方便填到客户端
                      注意：默认不启用加密；加密与 --token 互不替代，建议同时用
   relay              子命令：simple-agent relay --listen 0.0.0.0:7900 --token 口令，只做帧转发
-  --allow-shell        启用 bash/pwsh 工具（默认关闭）
-  --no-shell           关闭命令执行
-  --workspace, -w DIR  工具的工作区根目录（默认当前目录）
+  --allow-shell        完全权限：启用 bash/pwsh，且路径工具不再限制工作区（默认关闭）
+  --no-shell           工作区内修改：关闭命令执行，路径限制在工作区内
+  --workspace, -w DIR  工作区根目录（默认当前目录；相对路径与默认搜索目录的基准）
   --config, -c FILE    配置文件路径（默认见下）
   --help, -h           显示本说明
 
