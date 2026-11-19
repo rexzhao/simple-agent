@@ -152,6 +152,53 @@ func TestAskGroupMultiSelectOrderStable(t *testing.T) {
 	}
 }
 
+// 多选：先写了自定义文字、再勾选选项时，**勾选必须有效**。
+//
+// 回归（用户反馈「多选没有把选择发给模型」）：Toggle 的多选分支漏了清
+// customActive，于是 customActive 仍为 true，answers() 里
+// `case g.CustomActive(index)` 优先命中，答案只剩那段文字，
+// selected 被完全忽略 —— 模型看到的就是"用户只写了文字"。
+func TestAskGroupMultiSelectAfterCustomText(t *testing.T) {
+	spec := tools.QuestionSpec{ID: "q1", Question: "多选", MultiSelect: true,
+		Options: []tools.QuestionOption{{Label: "甲"}, {Label: "乙"}, {Label: "丙"}}}
+	group := driver.NewAskGroup("m", "c", []tools.QuestionSpec{spec})
+
+	// 先写文字
+	group.SetCustom(0, "我自己写的")
+	if !group.CustomActive(0) {
+		t.Fatal("写了文字后应以文字作答")
+	}
+
+	// 再勾两个选项：应当转为"以选项作答"
+	group.Toggle(0, 0)
+	group.Toggle(0, 2)
+	if !group.Selected(0, 0) || !group.Selected(0, 2) {
+		t.Fatal("勾选应生效")
+	}
+	if group.CustomActive(0) {
+		t.Fatal("勾选选项后不该再以文字作答（否则自定义文字会盖掉选择）")
+	}
+
+	out := group.Output(driver.AskSubmit, "")
+	if !strings.Contains(out, `"selected":["甲","丙"]`) {
+		t.Fatalf("模型应收到勾选的两个选项，实际：%s", out)
+	}
+	if strings.Contains(out, "我自己写的") {
+		t.Fatalf("勾选之后不该再带上自定义文字，实际：%s", out)
+	}
+
+	// 两项都取消 → 回到"以文字作答"
+	group.Toggle(0, 0)
+	group.Toggle(0, 2)
+	if group.CustomActive(0) != true {
+		t.Fatal("取消到一项不剩时应把手写文字重新当成答案")
+	}
+	out = group.Output(driver.AskSubmit, "")
+	if !strings.Contains(out, "我自己写的") {
+		t.Fatalf("取消全部选项后应回落到自定义文字，实际：%s", out)
+	}
+}
+
 // 提交/跳过的驱动层流程：多组提问一次提交。
 func TestSubmitAsksSettlesAllGroups(t *testing.T) {
 	d, conv := newDriver(t, false)

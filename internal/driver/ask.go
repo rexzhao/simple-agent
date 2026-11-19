@@ -65,9 +65,24 @@ func (g *AskGroup) Toggle(questionIndex, optionIndex int) {
 	if g.Questions[questionIndex].MultiSelect {
 		if _, ok := picked[optionIndex]; ok {
 			delete(picked, optionIndex)
+			// 取消到一项不剩，才把手写文字重新当成答案（与单选路径一致）
+			if len(picked) == 0 {
+				g.restoreCustom(questionIndex)
+			}
 			return
 		}
 		picked[optionIndex] = struct{}{}
+		// **多选也要清掉"以文字作答"的标记**。
+		//
+		// 少了这一步会丢用户的选择：先写自定义文字（customActive=true）、
+		// 再点选项时，customActive 仍是 true，answers() 里
+		// `case g.CustomActive(index)` 优先命中，于是答案只剩那段文字，
+		// 勾选的选项被完全忽略 —— 模型看到的就是"用户只写了文字"。
+		//
+		// 单选路径一直有这句，多选漏了。
+		if questionIndex < len(g.customActive) {
+			g.customActive[questionIndex] = false
+		}
 		return
 	}
 	clear(picked)

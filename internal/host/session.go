@@ -446,23 +446,33 @@ func (s *Session) stop() CmdResult {
 	return CmdResult{OK: true}
 }
 
+// submitAsks 提交提问答案。
 func (s *Session) submitAsks(payload AnswerPayload) CmdResult {
 	// 其他端已经回答/跳过：这里已经没有待回答的提问，别把它当成"提交成功"
 	if s.drv.Busy() != driver.BusyAwaitingAnswer {
 		return CmdResult{Notice: s.cfg.Tr("ask.answeredElsewhere")}
 	}
-	// 来自展示端的答案：先把选择应用回执行端自己的提问组，再统一提交
+	// 来自展示端的答案：先把选择应用回执行端自己的提问组，再统一提交。
 	for _, answer := range payload.Answers {
 		for _, group := range s.drv.AskGroups() {
 			if group.CallID != answer.CallID {
 				continue
 			}
 			for index, question := range group.Questions {
-				for _, option := range answer.Selected[question.ID] {
-					group.Toggle(index, option)
-				}
+				// **顺序不能反：先写文字，再勾选项。**
+				//
+				// SetCustom（文字非空时）会清掉该题已选的选项 —— 这是有意的：
+				// 用户开始写文字就说明这题以文字作答，界面上的选中标记也该消失。
+				// 如果先 Toggle 再 SetCustom，刚勾好的选项会被全部清空，
+				// 模型收到的是"用户只写了文字" —— 正是"多选的选择没发给模型"。
+				//
+				// 反过来先 SetCustom 再 Toggle 就对了：勾选会把 customActive
+				// 置回 false，语义是"以勾选的选项为准"。
 				if text := answer.Custom[question.ID]; text != "" {
 					group.SetCustom(index, text)
+				}
+				for _, option := range answer.Selected[question.ID] {
+					group.Toggle(index, option)
 				}
 			}
 		}
