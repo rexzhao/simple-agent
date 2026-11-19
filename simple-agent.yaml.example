@@ -40,6 +40,18 @@ allow_shell: false
 # 也不支持 PDF；返回内容前会显式声明"这是外部不可信内容"。
 # disable_web_fetch: true
 
+# 联网搜索（web_search）走 DeepSeek Search API，需要 DEEPSEEK_API_KEY。
+#
+# 没配 Key 时 **web_search 不会被注册**（模型看不到这个工具，也就不会去调，
+# 免得每次报"没配 Key"）；web_fetch 不受影响——抓取走普通 HTTP，不需要凭据。
+# Key 只从环境变量读，不写在这个文件里：
+#   PowerShell：$env:DEEPSEEK_API_KEY = "sk-..."      （当前会话）
+#   cmd：       set DEEPSEEK_API_KEY=sk-...           （当前窗口）
+# 设置后要重启 simple-agent 才生效。
+#
+# 行为要点：一次最多 10 个查询（并发发出、结果轮转合并、按 URL 去重，最多 10 条来源）；
+# 单次请求受服务端 5 QPS 限制；返回摘要与链接，正文需要 web_fetch 再抓。
+
 # 一次用户输入内最多几轮工具调用（0 表示不限）。防止模型无限调用工具。
 max_tool_rounds: 12
 

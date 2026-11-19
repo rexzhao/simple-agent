@@ -458,6 +458,7 @@ func Help() string {
 环境变量：
   DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / MOONSHOT_API_KEY
   ZHIPU_API_KEY / DASHSCOPE_API_KEY     提供商凭据
+  DEEPSEEK_API_KEY                      web_search 用（没配就不注册该工具；web_fetch 不需要）
   SIMPLE_AGENT_ALLOW_SHELL=1            启用命令执行
   SIMPLE_AGENT_MAX_TOOL_ROUNDS=N        工具轮数上限
   SIMPLE_AGENT_DATA=DIR                 数据目录

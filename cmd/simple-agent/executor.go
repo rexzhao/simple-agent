@@ -1,10 +1,14 @@
 package main
 
 import (
+	"os"
+	"strings"
+
 	"simple-agent/internal/config"
 	"simple-agent/internal/host"
 	"simple-agent/internal/providers"
 	"simple-agent/internal/store"
+	"simple-agent/internal/web"
 )
 
 // 本文件是**执行端配置的唯一组装点**：UI 模式与 headless 模式都调它。
@@ -31,7 +35,11 @@ func executorConfig(cfg *config.Config, runtime *appRuntime, selection providers
 		// 权限档位：完全权限 = 可执行命令 + 路径不限工作区。
 		AllowShell: cfg.AllowShell,
 		// web_fetch 与权限分开：抓网页不执行东西、不要凭据，默认开启、配置里可关。
-		WebFetch:      !cfg.DisableWebFetch,
+		WebFetch: !cfg.DisableWebFetch,
+		// web_search 需要 DeepSeek 的 Key（`DEEPSEEK_API_KEY`）：没配就干脆不注册
+		// 这个工具——注册了每次报"没配 Key"只会让模型反复试错。
+		// 与 web_fetch 无关：抓取走普通 HTTP，不需要任何凭据。
+		Searcher:      searchBackend(),
 		MaxToolRounds: cfg.MaxToolRounds,
 
 		// ---- 会话与存储 ----
@@ -48,4 +56,16 @@ func executorConfig(cfg *config.Config, runtime *appRuntime, selection providers
 		// 模型列表随 catalog 发给展示端：headless 也要给，否则远程端切不了模型。
 		Models: providerChoices(runtime.registry),
 	}
+}
+
+// searchBackend 构造搜索后端（读 DEEPSEEK_API_KEY）。
+//
+// **每次启动读一次环境变量**（不是每次调用读）：用户在会话里 `$env:DEEPSEEK_API_KEY=...`
+// 设置后必须重启才生效，这是有意的——凭据变化时工具清单可能变（没有 Key 就不注册
+// web_search），中途改变会让 driver 手里的工具表与执行端不一致。
+//
+// 没有 Key 时返回的 Searcher 也保留（Available() 为假）：BuiltinWith 据此决定
+// 不注册工具，而调用点不必再判空。
+func searchBackend() *web.Searcher {
+	return &web.Searcher{APIKey: strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY"))}
 }

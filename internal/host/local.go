@@ -590,9 +590,13 @@ func keptFromSeq(events []store.Event) uint64 {
 // 默认值，于是「添加项目」建出来的会话在重放后会掉回默认项目。
 func (l *Local) driverOptionsFor(sel providers.Selection, workspace string) driver.Options {
 	return driver.Options{
-		Selection:          sel,
-		SystemPrompt:       l.cfg.SystemPrompt,
-		Tools:              tools.BuiltinWith(tools.Options{AllowShell: l.cfg.AllowShell, WebFetch: l.cfg.WebFetch}),
+		Selection:    sel,
+		SystemPrompt: l.cfg.SystemPrompt,
+		Tools: tools.BuiltinWith(tools.Options{
+			AllowShell: l.cfg.AllowShell,
+			WebFetch:   l.cfg.WebFetch,
+			Searcher:   l.cfg.Searcher,
+		}),
 		MaxToolRounds:      l.cfg.MaxToolRounds,
 		ContextWindow:      l.cfg.ContextWindow,
 		MaxOutputTokens:    l.maxOutputFor(sel),

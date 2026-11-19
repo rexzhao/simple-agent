@@ -1,13 +1,15 @@
-// Package web 是 web_fetch 工具的抓取与正文转换（对齐 deepseek-harness 的
-// `web-fetch-http` + `tool-web` 两半）。
+// Package web 是联网工具的后端：抓取（web_fetch）与搜索（web_search）。
 //
-// 分两块：
-//   - Fetcher：URL 校验、同源跳转、字节/字符上限、按 Content-Type 分类并解码；
-//   - ToMarkdown：HTML 正文转 markdown（模型读的是文本，不是标签）。
+// 三块，各自对齐 deepseek-harness 的一个包：
+//   - Fetcher（fetch.go）：URL 校验、同源跳转、字节/字符上限、按 Content-Type 分类并解码
+//     ← `web-fetch-http`；
+//   - ToMarkdown（render.go）：HTML 正文转 markdown（模型读的是文本，不是标签）
+//     ← `tool-web` 的 turndown 用法；
+//   - Searcher（search.go）：DeepSeek Search API 客户端 ← `web-deepseek-api`。
 //
 // 与 dsh 的差异（按本仓的取舍）：
-//   - 不做 web_search（用户决定只做抓取），所以这里没有搜索相关的任何东西；
-//   - 不在 DNS 层拦内网地址：本工具默认就对用户可见，能访问内网与本地地址是
+//   - 搜索后端只有 DeepSeek 一个（不再做 provider 注册表与多后端选择）；
+//   - 不在 DNS 层拦内网地址：抓取默认就对用户可见，能访问内网与本地地址是
 //     刻意保留的能力（对齐 dsh 的 http provider 描述），只做 scheme/凭据/跳转
 //     这类与网络安全无关的校验；
 //   - 不跟随跨源跳转（每次跳转都要模型自己重新决定），最多 5 跳。
@@ -87,6 +89,11 @@ const (
 	CodeAborted          = "WEB_ABORTED"
 	CodeProviderError    = "WEB_PROVIDER_ERROR"
 	CodeTransportFailure = "WEB_TRANSPORT_FAILURE"
+
+	// 搜索专用（web_search）。取值沿用 dsh 的 WebError code。
+	CodeSearchUnavailable = "WEB_SEARCH_UNAVAILABLE"
+	CodeSearchInvalidArgs = "WEB_SEARCH_INVALID_ARGS"
+	CodeSearchAuth        = "WEB_SEARCH_AUTH"
 )
 
 // Fetcher 抓取一个 URL 并把正文解码成文本。

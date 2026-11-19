@@ -28,6 +28,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"simple-agent/internal/web"
 )
 
 // QuestionOption 是一个可选项。
@@ -341,6 +343,11 @@ type Options struct {
 	// 可以关）；零值 Options 里它是 false，所以**不要**用它表达"默认开启"——
 	// 那只会在漏传字段时静默少一个工具。
 	WebFetch bool
+	// Searcher 非 nil 且配了凭据时才注册 web_search。
+	//
+	// 与 WebFetch 分开：抓取是普通 HTTP、不需要任何凭据；搜索要走 DeepSeek
+	// Search API，没 Key 就干脆不注册（注册了每次报"没配 Key"会让模型反复试错）。
+	Searcher *web.Searcher
 }
 
 // BuiltinWith 按显式开关构造工具集（生产入口用这个）。
@@ -358,6 +365,9 @@ func BuiltinWith(opts Options) []*ToolDef {
 	}
 	if opts.WebFetch {
 		list = append(list, webFetchTool())
+	}
+	if opts.Searcher != nil && opts.Searcher.Available() {
+		list = append(list, webSearchTool(opts.Searcher, opts.WebFetch))
 	}
 	if opts.AllowShell {
 		list = append(list, bashTool())

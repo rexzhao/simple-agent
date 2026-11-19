@@ -24,6 +24,7 @@ import (
 	"simple-agent/internal/providers"
 	"simple-agent/internal/store"
 	"simple-agent/internal/tools"
+	"simple-agent/internal/web"
 )
 
 // Runtime 是执行端需要的外部能力：发流、跑工具。
@@ -38,19 +39,22 @@ type Runtime interface {
 type Config struct {
 	Runtime Runtime
 
-	Selection     providers.Selection
-	SystemPrompt  string
-	AllowShell    bool
+	Selection    providers.Selection
+	SystemPrompt string
+	AllowShell   bool
 	// WebFetch 决定是否注册 web_fetch（默认开启，配置里可以关掉）。
 	//
 	// 与 AllowShell 分开：抓网页不执行任何东西、也不要凭据，风险量级与跑命令
 	// 不同，不该绑在同一个开关上。
 	WebFetch bool
+	// Searcher 是 web_search 的后端。nil 或没配凭据时不注册那个工具
+	// （抓取不需要凭据，搜索要走 DeepSeek Search API 才需要）。
+	Searcher *web.Searcher
 	// Token 是执行端自己的访问口令（`--listen` 模式下由 `--token` 指定）。
 	//
 	// 与 relay 的 token 是两套：relay 保护"经过 relay 这一跳"，这里保护
 	// "直连执行端这一跳"。为空表示不校验（保持原来的开放行为）。
-	Token         string
+	Token string
 	// Name 是本机作为执行端对外显示的名字（握手时告诉展示端）。
 	//
 	// 为空时用操作系统的机器名：界面上"当前连的是哪台"就靠它，

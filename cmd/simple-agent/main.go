@@ -547,7 +547,13 @@ func systemPrompt(cfg config.Config) string {
 		base += `
 - 联网抓取当前**不可用**：不要调用 web_fetch，只能依据用户提供的内容与本地文件回答。`
 	}
-	options := tools.Options{AllowShell: cfg.AllowShell, WebFetch: !cfg.DisableWebFetch}
+	// 指导从**实际注册的工具**里取：没有配置搜索凭据时 web_search 不在表里，
+	// 它的指导也就不会出现（模型不会去调一个不存在的工具）。
+	options := tools.Options{
+		AllowShell: cfg.AllowShell,
+		WebFetch:   !cfg.DisableWebFetch,
+		Searcher:   searchBackend(),
+	}
 	if guidance := tools.GuidanceSection(tools.BuiltinWith(options)); guidance != "" {
 		base += "\n\n" + guidance
 	}
