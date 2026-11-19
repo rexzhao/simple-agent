@@ -105,38 +105,13 @@ func runHeadless(cfg *config.Config, runtime *appRuntime, selection providers.Se
 
 // headlessHostConfig 把配置转成执行端的 host.Config。
 //
-// 单独抽出来是为了能被单测覆盖：这里的字段**漏一个就是静默的功能缺失**
-// （典型是 allow_shell 没传 → 工具列表里根本不注册 bash/pwsh，而系统提示仍然
-// 写着"可以执行命令"，模型只能拿回「未知工具」）。
+// 实现直接委托给 executorConfig（与 UI 模式共用同一个组装点）：以前这里和
+// uiapp 各写一遍字段映射，漏一个字段就是静默的功能缺失——真实的两次事故是
+// allow_shell（headless 漏传 → 没有 bash）与 web_fetch（UI 漏传 → 模型看不到
+// 工具）。现在保留这个薄封装只是为了测试能直接调它。
 func headlessHostConfig(cfg *config.Config, runtime *appRuntime, selection providers.Selection,
 	catalog *store.Catalog, blobs *store.Blobs, post func(func()), token, name string) host.Config {
-	return host.Config{
-		Catalog:      catalog,
-		Blobs:        blobs,
-		Runtime:      runtime,
-		Selection:    selection,
-		SystemPrompt: systemPrompt(*cfg),
-		// 权限是启动期全局开关：必须原样传给执行端，否则 --allow-shell 在
-		// --headless 模式下会被悄悄丢掉（界面模式由 uiapp 传，不要照抄成两套口径）。
-		AllowShell: cfg.AllowShell,
-		// web_fetch 与权限分开：抓网页不执行东西，默认开启、配置里可关。
-		WebFetch:      !cfg.DisableWebFetch,
-		Workspace:     cfg.Workspace,
-		MaxToolRounds: cfg.MaxToolRounds,
-		ContextWindow: windowFor(runtime.registry, selection),
-		Post:          post,
-		Tr:            locale.Tr,
-		EffortFor:     func(sel providers.Selection) string { return effortFor(runtime.registry, sel) },
-		VisionFor:     func(sel providers.Selection) bool { return visionFor(runtime.registry, sel) },
-		MaxOutputFor:  func(sel providers.Selection) int { return maxOutputFor(runtime.registry, sel) },
-		// 模型列表随 catalog 发给展示端：headless 也要给，否则远程端切不了模型。
-		Models: providerChoices(runtime.registry),
-		// 执行端自己的 token：`--listen` 直连时校验展示端握手带来的口令。
-		// 与 relay 的 token 是两套，互不影响。
-		Token: token,
-		// 对外显示的名字：空则用机器名（展示端靠它区分"连的是哪台"）
-		Name: name,
-	}
+	return executorConfig(cfg, runtime, selection, catalog, blobs, post, token, name)
 }
 
 // listenHeadless 起一个 TCP 监听，每条连接交给 host.Serve。

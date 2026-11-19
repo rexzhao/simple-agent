@@ -40,6 +40,12 @@ type Options struct {
 	Selection     providers.Selection
 	SystemPrompt  string
 	AllowShell    bool
+	// WebFetch 决定 web_fetch 是否注册（字段式路径用；生产走 LocalConfig）。
+	//
+	// 这个字段本身是踩过坑的：host.Config 的零值是 false，漏传就等于静默关掉
+	// 这个工具，而执行端（appRuntime.RunTools）却仍然认得它——表现为模型压根
+	// 看不到工具（不是调用失败，更难发现）。生产入口现在统一走 LocalConfig。
+	WebFetch bool
 	// Token 是执行端自己的访问口令（`--listen` 直连时校验展示端的握手口令）。
 	// 与 relay 的 token 是两套：这里保护"直连执行端"这一跳。
 	Token string
@@ -95,6 +101,15 @@ type Options struct {
 	Title string
 	// Host 覆盖执行端（展示端接入 remoteHost 时用；nil = 进程内 Local）。
 	Host host.Host
+	// LocalConfig 是**进程内执行端**的完整配置（nil 时按下面的字段拼）。
+	//
+	// 生产入口（cmd/simple-agent）一律给这个：UI 模式与 headless 模式共用同一份
+	// `executorConfig(...)`，字段漏传导致「某个工具静默消失」的问题就只剩一处可犯。
+	// 字段式 Options（Selection/AllowShell/WebFetch/…）保留给测试——测试要的是
+	// 几个开关，不是一整份执行端配置。
+	//
+	// 优先级：Host（注入的 host）> LocalConfig > 字段式选项。
+	LocalConfig *host.Config
 	// Providers 是界面上可选的提供商与模型（空表示不显示选择器）。
 	Providers []ProviderChoice
 	// Catalog 是数据目录索引（nil 表示不持久化：测试与临时会话用）。
@@ -614,32 +629,20 @@ func NewApp(rt Runtime, opts Options) *App {
 		}
 		return app
 	}
-	app.host = host.NewLocal(host.Config{
-		Runtime:            rt,
-		Selection:          opts.Selection,
-		SystemPrompt:       opts.SystemPrompt,
-		AllowShell:         opts.AllowShell,
-		Name:               opts.Name,
-		Token:              opts.Token,
-		Workspace:          opts.Workspace,
-		MaxToolRounds:      opts.MaxToolRounds,
-		ContextWindow:      opts.ContextWindow,
-		WindowFor:          opts.WindowFor,
-		MaxOutputFor:       opts.MaxOutputFor,
-		EffortFor:          opts.EffortFor,
-		VisionFor:          opts.VisionFor,
-		DisableAutoCompact: opts.DisableAutoCompact,
-		Blobs:              opts.Blobs,
-		Catalog:            opts.Catalog,
-		NewID:              opts.NewID,
-		Post:               post,
-		Tr:                 app.tr,
-		Title:              opts.Title,
-		Efforts:            app.effortsFor,
-		Deferred:           opts.DeferredCommands,
-		// 执行端把模型列表公布给展示端（providerChoices 已按配置生成）。
-		Models: opts.Providers,
-	})
+	if opts.LocalConfig != nil {
+		// 生产路径：执行端配置由入口一次性组装（UI 与 headless 共用同一份），
+		// 这里只补齐界面才知道的部分。
+		local := *opts.LocalConfig
+		local.Runtime = rt
+		local.Post = post
+		local.Tr = app.tr
+		if local.Efforts == nil {
+			local.Efforts = app.effortsFor
+		}
+		app.host = host.NewLocal(local)
+	} else {
+		app.host = host.NewLocal(localConfigFromOptions(rt, opts, post, app.tr, app.effortsFor))
+	}
 	if local, ok := app.host.(*host.Local); ok {
 		local.SetEfforts(app.effortsFor)
 	}
@@ -654,6 +657,45 @@ func NewApp(rt Runtime, opts Options) *App {
 		app.NotifyDisplay(app.startupErr)
 	}
 	return app
+}
+
+// localConfigFromOptions 把字段式 Options 翻成执行端配置。
+//
+// **只在测试路径上用**：生产入口一律通过 Options.LocalConfig 传入由
+// `cmd/simple-agent` 组装的配置，UI 与 headless 共用同一份，避免两处手写
+// 字段映射（漏一个字段 = 某个工具静默消失，界面上完全看不出来）。
+//
+// 测试需要的是"几个开关"，给它一整份 host.Config 太重；这条路径让测试继续
+// 只写 Options{AllowShell: true} 这种最小配置。
+func localConfigFromOptions(rt Runtime, opts Options, post func(func()),
+	tr func(string, ...any) string, efforts func(providers.Selection) []string) host.Config {
+	return host.Config{
+		Runtime:            rt,
+		Selection:          opts.Selection,
+		SystemPrompt:       opts.SystemPrompt,
+		AllowShell:         opts.AllowShell,
+		WebFetch:           opts.WebFetch,
+		Name:               opts.Name,
+		Token:              opts.Token,
+		Workspace:          opts.Workspace,
+		MaxToolRounds:      opts.MaxToolRounds,
+		ContextWindow:      opts.ContextWindow,
+		WindowFor:          opts.WindowFor,
+		MaxOutputFor:       opts.MaxOutputFor,
+		EffortFor:          opts.EffortFor,
+		VisionFor:          opts.VisionFor,
+		DisableAutoCompact: opts.DisableAutoCompact,
+		Blobs:              opts.Blobs,
+		Catalog:            opts.Catalog,
+		NewID:              opts.NewID,
+		Post:               post,
+		Tr:                 tr,
+		Title:              opts.Title,
+		Efforts:            efforts,
+		Deferred:           opts.DeferredCommands,
+		// 执行端把模型列表公布给展示端（providerChoices 已按配置生成）。
+		Models: opts.Providers,
+	}
 }
 
 // syncSessions 让界面壳与执行端会话一一对应（新建/删除/恢复后调用）。

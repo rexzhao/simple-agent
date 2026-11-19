@@ -258,34 +258,21 @@ func main() {
 		webFetch:   !cfg.DisableWebFetch,
 	}
 
+	// 执行端配置只组装一次：UI 模式与 headless 模式共用 executorConfig，
+	// 界面侧不再手写一遍字段映射（漏一个字段 = 某个工具静默消失）。
+	local := executorConfig(&cfg, runtime, selection, catalog, blobs, post, opts.relayToken, opts.name)
+
 	app := uiapp.NewApp(runtime, uiapp.Options{
-		Host:          remoteHost,
-		Executors:     executors,
-		Selection:     selection,
-		SystemPrompt:  systemPrompt(cfg),
-		AllowShell:    cfg.AllowShell,
+		Host:      remoteHost,
+		Executors: executors,
+		// 展示端模式（Host 非空）下执行端在对面，配置也在对面，不用 LocalConfig；
+		// 单机模式直接用这份组装好的配置。
+		LocalConfig: localConfigFor(remoteHost, local),
+		Language:    lang,
 		// --token 同时用于"直连执行端的认证"与"注册 relay 的认证"。
 		// 两个场景用同一个口令更方便（用户只记一个），语义上也一致：
 		// 都是"能出示口令的人可以操作这个执行端"。
-		Token:         opts.relayToken,
-		// 执行端对外显示的名字：空则用机器名（展示端界面靠它区分"连的是哪台"）
-		Name:          opts.name,
-		Workspace:     cfg.Workspace,
-		MaxToolRounds: cfg.MaxToolRounds,
-		ContextWindow: windowFor(registry, selection),
-		WindowFor: func(sel providers.Selection) int {
-			return windowFor(registry, sel)
-		},
-		MaxOutputFor: func(sel providers.Selection) int {
-			return maxOutputFor(registry, sel)
-		},
-		EffortFor: func(sel providers.Selection) string {
-			return effortFor(registry, sel)
-		},
-		VisionFor: func(sel providers.Selection) bool {
-			return visionFor(registry, sel)
-		},
-		Language:       lang,
+		Token:          opts.relayToken,
 		PasteImages:    pasteImages,
 		PickImageFiles: pickImageFiles,
 		PickDirectory:  pickDirectory,
@@ -514,6 +501,15 @@ func effortFor(registry *providers.Registry, sel providers.Selection) string {
 		}
 	}
 	return efforts[0]
+}
+
+// localConfigFor 在单机模式下返回执行端配置；展示端模式（Host 非空）返回 nil——
+// 那时执行端在对面，配置也在对面，uiapp 不该自己再造一个 Local。
+func localConfigFor(injected host.Host, local host.Config) *host.Config {
+	if injected != nil {
+		return nil
+	}
+	return &local
 }
 
 // systemPrompt 组合系统提示。
