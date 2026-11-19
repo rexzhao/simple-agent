@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/ui"
+
+	"simple-agent/internal/driver"
 )
 
 // 布局与视觉常量（单一来源）。
@@ -423,7 +425,7 @@ func (a *App) setSidebarGroupOpen(key string, open bool) {
 // 这正是用户要的效果——会话文字与项目文字左对齐，且项目那个三角不参与对齐。
 const sidebarArrowSlot = 14
 
-// sidebarSessionRow 渲染一条会话：标题 + 相对时间，右键菜单做改名/复制/删除。
+// sidebarSessionRow 渲染一条会话：状态点 + 标题 + 相对时间，右键菜单做改名/复制/删除。
 func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 	theme := c.Theme()
 	var session *Session
@@ -480,8 +482,27 @@ func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 		a.sidebarSessionMenu(m, session)
 	})
 	row.Children(func() {
-		// 与项目行的三角槽等宽的空白：让两种行的文字起点对齐
-		ui.Box(c).Width(sidebarArrowSlot).Shrink(0)
+		// 运行状态点：代替原来纯留白的位置，让用户一眼看出哪些会话还在跑。
+		//
+		// 为什么用字符而不是 SVG 图标：mygo 没有内建动画组件；而状态点最需要
+		// 表达的恰恰是"还在动"。用实心点 + 颜色（对齐 todo_panel 里
+		// StateDot 的做法）已经能把"忙/空闲/等你回答"分开，比画一个静态
+		// 小图标信息量大，也不必自绘动画。
+		//
+		// 空闲时**不占位**：侧栏里大多数会话都是安静的，全都画一个灰点反而
+		// 让"And others"淹没重点。
+		//
+		// **不能给这个 Text 设 Label**：mygo 里元素一旦有 Label，a11y 树就用
+		// Label 顶替可见文本，符号会被"正在生成"这类文字替换掉（实测就是这样：
+		// 侧栏里显示的是文字而不是圆点）。状态含义靠颜色和位置表达，
+		// 读屏用户从"上下文 1 轮 1 步"那些信息也能判断，不必为此牺牲视觉。
+		if dot, color := a.sessionStatusDot(session); dot != "" {
+			ui.Text(c, dot).FontSize(10).TextColor(color).
+				Width(sidebarArrowSlot).Shrink(0)
+		} else {
+			// 与项目行的三角槽等宽的空白：让两种行的文字起点对齐
+			ui.Box(c).Width(sidebarArrowSlot).Shrink(0)
+		}
 		title := ui.Text(c, session.Title).FontSize(12).TextColor(theme.Text).
 			MaxLines(1).Grow(1).Cursor(ui.CursorPointer)
 		if title.Clicked() {
@@ -515,6 +536,37 @@ func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 			a.sidebarSessionMenu(m, session)
 		})
 	})
+}
+
+// sessionStatusDot 返回会话的运行状态符号与颜色（空符号表示空闲、不显示）。
+func (a *App) sessionStatusDot(session *Session) (string, ui.Color) {
+	return statusDotFor(session.Busy())
+}
+
+// statusDotFor 是 Busy → (符号, 颜色) 的映射，抽成纯函数便于测试。
+//
+// 为什么空闲不显示：侧栏里大多数会话都是安静的，全都画一个灰点反而
+// 让真正在跑的那几个淹没在噪声里。
+//
+// 符号选择：
+//
+//	●  正在干活（流式输出 / 执行工具）—— 实心点，最醒目
+//	?  等你回答 —— 必须让用户注意到，否则回合一直卡着
+//	◐  后台压缩 —— 用户不需要操作，弱化显示
+func statusDotFor(busy driver.Busy) (string, ui.Color) {
+	switch busy {
+	case driver.BusyStreaming:
+		return "●", dsh.BrandBlue
+	case driver.BusyRunningTools:
+		// 执行工具用警告色：这段时间通常比流式长，且可能要用户授权
+		return "●", dsh.Warning
+	case driver.BusyAwaitingAnswer:
+		return "?", dsh.BrandBlue
+	case driver.BusyCompacting:
+		return "◐", dsh.LabelSecondary
+	default:
+		return "", dsh.StateIdle
+	}
 }
 
 // sidebarSessionMenu 填会话行的菜单项（右键菜单与「⋯」共用）。

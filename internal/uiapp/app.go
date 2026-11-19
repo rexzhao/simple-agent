@@ -319,6 +319,14 @@ func (a *App) ThemeForTest() *ui.Theme { return a.lastTheme }
 // SidebarWidthForTest 返回侧栏当前宽度（测试用）。
 func (a *App) SidebarWidthForTest() int { return int(a.sidebarWidth) }
 
+// StatusDotForTest 返回某个运行状态对应的状态点符号（测试用）。
+//
+// 只暴露符号不暴露颜色：颜色由主题决定，换主题不该让测试变红。
+func StatusDotForTest(busy driver.Busy) string {
+	dot, _ := statusDotFor(busy)
+	return dot
+}
+
 // SidebarGroupOpenForTest 返回项目的展开状态表（测试用）。
 func (a *App) SidebarGroupOpenForTest() map[string]bool { return a.sidebarGroupOpen }
 
