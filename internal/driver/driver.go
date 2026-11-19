@@ -367,12 +367,19 @@ func (d *Driver) CurrentMessageID() string {
 
 // Usage 返回最近一次请求的用量。
 //
-// **优先返回进行中的 round**（流式期间状态条要实时更新），没有 round 时
-// 回退到 lastUsage —— 回合结束后 round 已被 reset()，但状态条仍要显示
-// 上一轮的用量（包括缓存命中率）。
+// 取值顺序很关键：**先看 round 有没有真实数据，没有就回退 lastUsage**。
+//
+// 不能只写 `if d.round != nil { return d.round.usage }`：新一轮请求刚开始时
+// round 已经建好、但 usage 事件还没到，那份 usage 是全 0 —— 直接返回它会让
+// 状态条从"缓存 99%"闪成"缓存 0%"或整行消失（用户看到的就是"显示一下又没了"）。
+//
+// 反过来，round 里有值时必须用它（流式期间要实时更新），不能一直用上一轮的旧值。
 func (d *Driver) Usage() Usage {
 	if d.round != nil {
-		return d.round.usage
+		if usage := d.round.usage; usage.InputTokens > 0 || usage.OutputTokens > 0 ||
+			usage.CacheReadTokens > 0 || usage.CacheWriteTokens > 0 {
+			return usage
+		}
 	}
 	return d.lastUsage
 }
@@ -1051,6 +1058,11 @@ func (d *Driver) ApplyStreamDelta(messageID string, ev providers.Event) ([]Effec
 		// 沿用上一轮的旧值会显示成假的命中率。
 		round.usage.CacheReadTokens = ev.CacheReadTokens
 		round.usage.CacheWriteTokens = ev.CacheWriteTokens
+		// **同时更新 lastUsage**：有工具调用的回合里 round 会跨多次请求存活，
+		// 但下一轮请求一开始 round 就被换掉了；只在"回合彻底结束"时记一份
+		// 会让状态条在中间那几轮读到旧的（或空的）值。
+		// 每次真实 usage 到达即刷新，状态条任何时候都是最近一次的真实数据。
+		d.lastUsage = round.usage
 		return nil, nil
 
 	}
