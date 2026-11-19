@@ -181,6 +181,9 @@ func (d *Driver) recordUsage(usage Usage) {
 	d.usageBase = usage.InputTokens + usage.OutputTokens
 	d.historyLenAtUsage = len(d.conv.History())
 	d.hasUsage = true
+	// 留一份完整副本（含缓存字段）：界面在回合结束后要显示命中率，
+	// 而那时 d.round 已经被 reset() 清空了。
+	d.lastUsage = usage
 }
 
 // NeedsDefaultWindowNotice 报告是否该提示「窗口未知，按默认值处理」（只提示一次）。
@@ -424,6 +427,9 @@ func (d *Driver) ApplyCompact(summary string) ([]Effect, error) {
 	d.hasUsage = false
 	d.usageBase = 0
 	d.historyLenAtUsage = 0
+	// 上一轮的用量也不再代表当前上下文（内容被折叠了），
+	// 留着会显示一个与现状无关的命中率。等下一次真实请求重新填。
+	d.lastUsage = Usage{}
 	// 本轮已经压缩过，不再自动重试
 	d.autoCompactUsed = true
 

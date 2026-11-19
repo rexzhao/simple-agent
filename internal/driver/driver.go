@@ -203,6 +203,15 @@ type Driver struct {
 	usageBase         int
 	historyLenAtUsage int
 	hasUsage          bool
+	// lastUsage 是最近一次真实 usage 的**完整**记录（含缓存字段）。
+	//
+	// 为什么不能只从 d.round.usage 取：回合结束时先 reset() 再 recordUsage()，
+	// round 已经被清空；界面在回合结束后（以及重新打开会话后）也要显示用量，
+	// 所以必须留一份独立于 round 的副本。
+	//
+	// 重放历史会话时它同样为「空」——用量不落盘（只有 turn 边界事件），
+	// 旧会话要等下一次真实请求才会有数据。
+	lastUsage Usage
 	// autoCompactUsed 表示本轮用户输入已经自动压缩过一次，不再重试。
 	autoCompactUsed bool
 	// warnedDefaultWindow 表示已经提示过「窗口未知，按默认值处理」。
@@ -356,12 +365,16 @@ func (d *Driver) CurrentMessageID() string {
 	return d.round.messageID
 }
 
-// Usage 返回本轮用量。
+// Usage 返回最近一次请求的用量。
+//
+// **优先返回进行中的 round**（流式期间状态条要实时更新），没有 round 时
+// 回退到 lastUsage —— 回合结束后 round 已被 reset()，但状态条仍要显示
+// 上一轮的用量（包括缓存命中率）。
 func (d *Driver) Usage() Usage {
-	if d.round == nil {
-		return Usage{}
+	if d.round != nil {
+		return d.round.usage
 	}
-	return d.round.usage
+	return d.lastUsage
 }
 
 // CanSend 报告现在能否发送。
