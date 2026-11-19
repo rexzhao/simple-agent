@@ -57,7 +57,9 @@ import com.simpleagent.viewer.data.TimelineView
 fun Timeline(
     view: TimelineView,
     expanded: Set<String>,
+    expandedFull: Set<String>,
     onToggle: (String) -> Unit,
+    onToggleFull: (String) -> Unit,
     onImagePath: (String, (String) -> Unit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -66,7 +68,7 @@ fun Timeline(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         view.items.forEach { item ->
-            TimelineItem(item, expanded, onToggle, onImagePath)
+            TimelineItem(item, expanded, expandedFull, onToggle, onToggleFull, onImagePath)
         }
         if (view.runtime.compacting) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -92,7 +94,9 @@ fun Timeline(
 fun TimelineItem(
     item: ItemView,
     expanded: Set<String>,
+    expandedFull: Set<String>,
     onToggle: (String) -> Unit,
+    onToggleFull: (String) -> Unit,
     onImagePath: (String, (String) -> Unit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -102,7 +106,13 @@ fun TimelineItem(
         when (item.kind) {
             "content" -> item.message?.let { MessageRow(it, onImagePath) }
             "process" -> item.process?.let {
-                ProcessGroup(it, expanded = expanded.contains(item.key), onToggle = { onToggle(item.key) })
+                ProcessGroup(
+                    process = it,
+                    expanded = expanded.contains(item.key),
+                    expandedFull = expandedFull.contains(item.key),
+                    onToggle = { onToggle(item.key) },
+                    onToggleFull = { onToggleFull(item.key) },
+                )
             }
             "notice" -> item.notice?.let { NoticeRow(it) }
             "footer" -> item.footer?.let { FooterRow(it) }
@@ -248,9 +258,28 @@ private fun FooterRow(footer: FooterView) {
     }
 }
 
-/** 过程组：折叠标题 + 展开后的思考/工具卡片。 */
+/**
+ * 一级展开时默认显示的步骤数。
+ *
+ * 一个长回合的过程组动辄几十步，全展开会把时间线撑得很长（往上翻要划很多屏）。
+ * 默认只给最后几步 —— 最近发生的通常最关心 —— 需要看全貌时再点"展开全部"。
+ */
+private const val COLLAPSED_STEP_PREVIEW = 3
+
+/** 过程组：折叠标题 + 展开后的思考/工具卡片。
+ *
+ * 展开分两级：
+ *   - 一级（[expanded]）：只显示最后 [COLLAPSED_STEP_PREVIEW] 步
+ *   - 二级（[expandedFull]）：显示全部步骤
+ */
 @Composable
-private fun ProcessGroup(process: ProcessView, expanded: Boolean, onToggle: () -> Unit) {
+private fun ProcessGroup(
+    process: ProcessView,
+    expanded: Boolean,
+    expandedFull: Boolean,
+    onToggle: () -> Unit,
+    onToggleFull: () -> Unit,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -307,11 +336,42 @@ private fun ProcessGroup(process: ProcessView, expanded: Boolean, onToggle: () -
                         Text("正在加载…", fontSize = 12.sp, color = ViewerColors.muted)
                     }
                 }
-                process.steps.forEach { step ->
+                // 详情到手后才知道真实步数：以实际 steps 为准（stepCount 是
+                // 折叠时 Go 侧给的估算，可能比实际多/少一条）。
+                val total = if (process.steps.isNotEmpty()) process.steps.size else process.stepCount
+                val hidden = if (expandedFull) 0 else (total - COLLAPSED_STEP_PREVIEW).coerceAtLeast(0)
+                val shown = if (hidden > 0) process.steps.takeLast(COLLAPSED_STEP_PREVIEW) else process.steps
+
+                // "上面还有 N 步"：告诉用户这里是被截断的，而不是内容就这么多。
+                if (hidden > 0) {
+                    Text(
+                        text = "⋯ 上面还有 $hidden 步",
+                        fontSize = 11.sp,
+                        color = ViewerColors.muted,
+                        modifier = Modifier.padding(start = 2.dp),
+                    )
+                }
+                shown.forEach { step ->
                     when (step.kind) {
                         "reasoning" -> ReasoningStep(step)
                         else -> ToolStep(step)
                     }
+                }
+                // 切换按钮：只有真的被截断（或已全展开）时才出现，
+                // 步数本来就少于预览数时不该多一个没用的按钮。
+                if (total > COLLAPSED_STEP_PREVIEW) {
+                    Text(
+                        text = if (expandedFull) "收起，只看最后 $COLLAPSED_STEP_PREVIEW 步"
+                        else "展开全部 $total 步",
+                        fontSize = 11.sp,
+                        color = ViewerColors.accent,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable(onClick = onToggleFull)
+                            .padding(vertical = 6.dp),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
                 }
             }
         }

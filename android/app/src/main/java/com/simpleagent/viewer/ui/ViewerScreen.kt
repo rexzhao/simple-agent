@@ -390,6 +390,7 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
         { hash, ready -> viewModel.imagePath(hash, ready) }
     }
     val toggleExpanded: (String) -> Unit = remember(viewModel) { viewModel::toggleExpanded }
+    val toggleExpandedFull: (String) -> Unit = remember(viewModel) { viewModel::toggleExpandedFull }
     LazyColumn(state = listState, modifier = modifier.then(dragDetector)) {
         // 顶部状态行：正在加载 / 还有更多 / 已到最早。
         //
@@ -439,7 +440,9 @@ private fun TimelinePane(state: ViewerState, viewModel: ViewerViewModel, modifie
             TimelineItem(
                 item = item,
                 expanded = state.expanded,
+                expandedFull = state.expandedFull,
                 onToggle = toggleExpanded,
+                onToggleFull = toggleExpandedFull,
                 onImagePath = imagePath,
             )
         }

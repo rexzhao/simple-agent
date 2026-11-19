@@ -71,8 +71,19 @@ data class ViewerState(
     val activeSessionId: String = "",
     val timeline: TimelineView = TimelineView(),
     val providers: List<ProviderChoice> = emptyList(),
-    /** 展开的过程组 key。 */
+    /** 展开的过程组 key（**一级展开**：只显示最后几步）。 */
     val expanded: Set<String> = emptySet(),
+    /**
+     * 进一步展开到全部步骤的过程组 key（**二级展开**）。
+     *
+     * 为什么分两级：一个长回合的过程组动辄几十步，全展开会把时间线撑得很长，
+     * 用户往上翻的时候要划很多屏。默认只给最后几步（最近发生的、通常最关心），
+     * 需要看全貌时再点一次。
+     *
+     * 这里的 key 一定是 [expanded] 的子集：收起一级展开时要把二级一起清掉，
+     * 否则下次展开会直接跳到"全部"，与"默认只显示最后几步"的预期不符。
+     */
+    val expandedFull: Set<String> = emptySet(),
     /**
      * 当前加载的 items 之前还有更多（用于滚到顶部时翻页）。
      *
@@ -971,11 +982,32 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         val willExpand = key !in state.value.expanded
         state.update { current ->
             val expanded = current.expanded.toMutableSet()
-            if (!expanded.add(key)) expanded.remove(key)
-            current.copy(expanded = expanded)
+            // 一级展开收起时，二级也要一起清掉：否则下次展开会直接跳到
+            // "全部步骤"，与"默认只显示最后几步"的预期不符。
+            val expandedFull = current.expandedFull.toMutableSet()
+            if (!expanded.add(key)) {
+                expanded.remove(key)
+                expandedFull.remove(key)
+            }
+            current.copy(expanded = expanded, expandedFull = expandedFull)
         }
         if (willExpand) {
             loadProcessDetailIfNeeded(key)
+        }
+    }
+
+    /**
+     * 在一级展开的基础上，切换"显示全部步骤 / 只显示最后几步"。
+     *
+     * 只对已经一级展开的组有效：没展开时点它没有意义（用户看不到内容）。
+     */
+    fun toggleExpandedFull(key: String) {
+        val current = state.value
+        if (key !in current.expanded) return
+        state.update {
+            val expandedFull = it.expandedFull.toMutableSet()
+            if (!expandedFull.add(key)) expandedFull.remove(key)
+            it.copy(expandedFull = expandedFull)
         }
     }
 

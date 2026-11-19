@@ -3,6 +3,7 @@ package uiapp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -481,6 +482,12 @@ type App struct {
 	pendingCaretArmed bool
 	// expandedParts 记录哪些折叠行被展开（key = 消息 id + part 序号）。
 	expandedParts map[string]bool
+	// expandedFullParts 记录哪些过程组被**二级展开**（显示全部步骤）。
+	//
+	// 一级展开只显示最后 processPreviewSteps 步；这一层再点"展开全部"才全给。
+	// 这里的 key 一定是 expandedParts 的子集：收起一级时要把二级一起清掉，
+	// 否则下次展开会直接跳到"全部"，与"默认只显示最后几步"的预期不符。
+	expandedFullParts map[string]bool
 	// mdParser/mdCache 是 markdown 解析与渲染缓存（键含消息 id 与内容哈希）
 	mdParser *markdown.Parser
 	mdCache  *markdown.Cache
@@ -611,7 +618,8 @@ func NewApp(rt Runtime, opts Options) *App {
 		mdCache:       markdown.NewCache(256),
 		images:        newImageStore(),
 		hlCache:       markdown.NewLRU[[]markdown.HighlightLine](128),
-		expandedParts: map[string]bool{},
+		expandedParts:     map[string]bool{},
+		expandedFullParts: map[string]bool{},
 	}
 	app.loadUIState()
 	app.executors = opts.Executors
@@ -1592,7 +1600,21 @@ func (a *App) renderContent(c *ui.Context, refs []partRef) {
 	})
 }
 
+// processPreviewSteps 是一级展开时默认显示的过程步骤数。
+//
+// 一个长回合的过程组动辄几十步，全展开会把时间线撑得很长（往上翻要划很多屏）。
+// 默认只给最后几步 —— 最近发生的通常最关心 —— 需要看全貌时再点"展开全部"。
+// 与 Android 端 Timeline.kt 的 COLLAPSED_STEP_PREVIEW 保持一致。
+const processPreviewSteps = 3
+
 // renderProcessItem 渲染过程组：1 个 part 就内联，≥2 个合并成一行。
+//
+// 展开分两级（与 Android 端一致）：
+//   - 一级：只显示**最后 processPreviewSteps 步**（最近发生的通常最关心）
+//   - 二级：显示全部，另有按钮收起回一级
+//
+// 为什么要分级：一个长回合的过程组动辄几十步，全展开会把时间线撑得很长，
+// 往上翻要划很多屏。
 func (a *App) renderProcessItem(c *ui.Context, item chatItem) {
 	theme := c.Theme()
 	if len(item.Refs) == 1 {
@@ -1602,6 +1624,7 @@ func (a *App) renderProcessItem(c *ui.Context, item chatItem) {
 	}
 
 	expanded := a.expandedParts[item.Key]
+	expandedFull := a.expandedFullParts[item.Key]
 	last := item.Refs[len(item.Refs)-1]
 	streaming := last.Chat.Status().IsStreaming()
 
@@ -1620,6 +1643,11 @@ func (a *App) renderProcessItem(c *ui.Context, item chatItem) {
 				Size(13, 13).TextColor(theme.TextMuted)
 			if textButtonLines(c, icon+" "+label, 12, theme.TextMuted, 1) {
 				a.expandedParts[item.Key] = !expanded
+				// 收起一级时把二级也清掉：否则下次展开会直接跳到"全部"，
+				// 与"默认只显示最后几步"的预期不符。
+				if expanded {
+					delete(a.expandedFullParts, item.Key)
+				}
 			}
 		})
 	}
@@ -1629,7 +1657,7 @@ func (a *App) renderProcessItem(c *ui.Context, item chatItem) {
 	}
 	// 展开后：**标题行**保持原样，竖线只从标题下方的正文开始。
 	//
-	// 之前竖线把标题行也包进去（整组都缩进），看起来像"标题也是被引用的内容"，
+	// 之前竖线把标题行也包进去（整组都缩进），看起来像"标题本身也是被引用的内容"，
 	// 而且标题的图标被挤到线的右边。现在标题不缩进、线与标题图标左对齐，
 	// 视觉上是"这条线从标题下面挂下来"。
 	header()
@@ -1640,8 +1668,29 @@ func (a *App) renderProcessItem(c *ui.Context, item chatItem) {
 		ui.Box(c).Width(2).MarginX(5).AlignSelf(ui.Stretch).
 			Background(theme.Border.Mix(theme.Text, 0.25)).Radius(1)
 		ui.Column(c).Grow(1).Gap(6).Children(func() {
-			for _, ref := range item.Refs {
+			total := len(item.Refs)
+			// 只显示最后 N 步：用切片下标，避免把前面的 refs 也遍历一遍。
+			start := 0
+			if !expandedFull && total > processPreviewSteps {
+				start = total - processPreviewSteps
+			}
+			// "上面还有 N 步"：告诉用户这里是被截断的，不是内容就这么点。
+			if start > 0 {
+				ui.Text(c, fmt.Sprintf("⋯ 上面还有 %d 步", start)).
+					FontSize(11).TextColor(theme.TextMuted)
+			}
+			for _, ref := range item.Refs[start:] {
 				a.partView(c, ref.Chat, ref.Index, ref.Chat.Message.Parts[ref.Index], theme.Text)
+			}
+			// 切换按钮：只有真的被截断（或已全展开）时才出现。
+			if total > processPreviewSteps {
+				label := fmt.Sprintf("展开全部 %d 步", total)
+				if expandedFull {
+					label = fmt.Sprintf("收起，只看最后 %d 步", processPreviewSteps)
+				}
+				if textButtonLines(c, label, 11, theme.Accent, 1) {
+					a.expandedFullParts[item.Key] = !expandedFull
+				}
 			}
 		})
 	})

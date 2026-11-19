@@ -2299,6 +2299,24 @@ func clickProcessGroup(t *testing.T, tester *ui.Tester) string {
 	return ""
 }
 
+// clickExpandAll 点过程组底部的"展开全部 N 步"，让整组的步骤都可见。
+//
+// 一级展开只显示最后 processPreviewSteps 步；需要断言"组里全部内容"的测试
+// （比如验证跨消息合并）必须先调这个。
+func clickExpandAll(t *testing.T, tester *ui.Tester) {
+	t.Helper()
+	for _, text := range tester.Texts() {
+		if !strings.HasPrefix(text, "展开全部") {
+			continue
+		}
+		if err := tester.Click(text); err != nil {
+			t.Fatalf("点不到 %q：%v", text, err)
+		}
+		return
+	}
+	t.Fatalf("界面上没有「展开全部」按钮（可能组内步骤不多于 3 步）：%v", tester.Texts())
+}
+
 // countDirs 数一个目录下的子目录个数。
 func countDirs(t *testing.T, dir string) int {
 	t.Helper()
@@ -2699,8 +2717,15 @@ func TestProcessGroupSpansMessages(t *testing.T) {
 	if !tester.HasText("最终答案") {
 		t.Fatalf("正文应正常显示：%v", tester.Texts())
 	}
-	// 展开后两条消息里的过程都能看到
+	// 展开后两条消息里的过程都能看到。
+	//
+	// 注意要**先展开全部**：一级展开默认只显示最后 3 步（processPreviewSteps），
+	// 而这里 6 步里前 3 步（"先想想" + read 的调用与结果）会被折叠掉。
+	// 这个测试验证的是"跨消息合并成一个组"，不是"默认显示几步"，
+	// 所以必须让全部步骤可见。
 	clickProcessGroup(t, tester)
+	pump(tester, p)
+	clickExpandAll(t, tester)
 	pump(tester, p)
 	for _, want := range []string{"思考", "read", "思考", "grep"} {
 		if !tester.HasText(want) {
