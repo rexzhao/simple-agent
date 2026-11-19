@@ -1,7 +1,7 @@
 // Package tools 是本地工具链（对齐 deepseek-harness 的工具名、参数与语义）。
 //
-// 已实现：read / write / edit / glob / grep / working_directory / todo_write /
-// ask_user_question / bash / pwsh。
+// 已实现：read / read_image / write / edit / glob / grep / working_directory /
+// todo_write / ask_user_question / web_fetch / bash / pwsh。
 //
 // 安全边界分两档，由 allow_shell（界面上的「完全权限」）决定：
 //   - 默认（工作区内修改）：所有路径限制在工作区（或会话 cwd）内，绝对路径与 `..`
@@ -10,6 +10,9 @@
 //   - 完全权限：不再限制工作区——绝对路径照用、`..` 不拦；`bash`/`pwsh` 同时可用。
 //     理由：能跑任意命令的会话本来就能访问任何文件，再把文件工具关在工作区里只是
 //     让模型绕路走 shell。
+//
+// `web_fetch` 是唯一的联网工具，与权限档位**分开**：抓网页不执行任何东西、也不要
+// 凭据，默认开启，配置里可关（见 Options.WebFetch）。
 //
 // 与 Rust 版的差异（G5）：Run 接 context.Context，取消即中止——shell 命令杀整棵
 // 进程树，文件工具在读写前检查 ctx。工具层不 import providers/ui：参数声明由
@@ -327,18 +330,36 @@ type Call struct {
 //
 // shell 工具只在 allowShell 时注册：注册了却不给用，会让模型反复试错。
 func Builtin(allowShell bool) []*ToolDef {
+	return BuiltinWith(Options{AllowShell: allowShell, WebFetch: true})
+}
+
+// Options 是工具集的开关。
+type Options struct {
+	// AllowShell 是权限档位（见 Builtin）。
+	AllowShell bool
+	// WebFetch 决定是否注册 web_fetch。生产入口一律显式给出（配置里默认开、
+	// 可以关）；零值 Options 里它是 false，所以**不要**用它表达"默认开启"——
+	// 那只会在漏传字段时静默少一个工具。
+	WebFetch bool
+}
+
+// BuiltinWith 按显式开关构造工具集（生产入口用这个）。
+func BuiltinWith(opts Options) []*ToolDef {
 	list := []*ToolDef{
-		readTool(allowShell),
-		readImageTool(allowShell),
-		writeTool(allowShell),
-		editTool(allowShell),
-		globTool(allowShell),
-		grepTool(allowShell),
+		readTool(opts.AllowShell),
+		readImageTool(opts.AllowShell),
+		writeTool(opts.AllowShell),
+		editTool(opts.AllowShell),
+		globTool(opts.AllowShell),
+		grepTool(opts.AllowShell),
 		todoWriteTool(),
-		workingDirectoryTool(allowShell),
+		workingDirectoryTool(opts.AllowShell),
 		askUserQuestionTool(),
 	}
-	if allowShell {
+	if opts.WebFetch {
+		list = append(list, webFetchTool())
+	}
+	if opts.AllowShell {
 		list = append(list, bashTool())
 		if isWindows() {
 			list = append(list, pwshTool())
