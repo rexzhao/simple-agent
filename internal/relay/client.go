@@ -216,6 +216,18 @@ func ProbeExecutorsToken(addr string, timeout time.Duration, token string) ([]Ex
 // 连接断了（relay 重启/网络抖动）会退避重连并重新注册；重连期间展示端自己按
 // 直连同样的语义处理断线（既有 remoteHost 逻辑）。
 func RunExecutor(addr string, info Executor, stop <-chan struct{}, serve func(wire.Conn)) {
+	RunExecutorNotify(addr, info, stop, serve, nil)
+}
+
+// RunExecutorNotify 与 [RunExecutor] 相同，另外在**每次注册成功**时回调
+// onRegistered（首次成功、以及断线后重连成功都会调用），允许为 nil。
+//
+// 调用方用它区分"真的连上了"和"只是启动了重试循环" —— 后者在 relay 拒绝
+// 注册时（同名执行端已在线）可能永远连不上，界面不能显示"已连接"。
+func RunExecutorNotify(
+	addr string, info Executor, stop <-chan struct{},
+	serve func(wire.Conn), onRegistered func(),
+) {
 	delay := time.Second
 	for {
 		select {
@@ -257,6 +269,9 @@ func RunExecutor(addr string, info Executor, stop <-chan struct{}, serve func(wi
 			continue
 		}
 		delay = time.Second // 注册成功后重置退避
+		if onRegistered != nil {
+			onRegistered()
+		}
 		mux := wire.NewMux(conn)
 		// stop 关闭时立刻断开这条 relay 连接（否则 Accept 会一直阻塞到对端关闭）
 		stopped := make(chan struct{})

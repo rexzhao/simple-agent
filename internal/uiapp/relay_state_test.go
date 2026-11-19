@@ -61,7 +61,7 @@ func TestConnectRemembersLastRelay(t *testing.T) {
 
 	// 带参数连一次（用一个不存在的地址也行：保存发生在发起注册时）
 	message, _ := app.ExecSlashCommand("/connect 10.0.0.9:7900 mytoken")
-	if !strings.Contains(message, "已连接") {
+	if !strings.Contains(message, "正在连接") {
 		t.Fatalf("连接应成功发起，实际：%q", message)
 	}
 	t.Cleanup(func() { app.stopRelayRegistration() })

@@ -25,12 +25,11 @@ func TestConnectCommandRegistersToRelay(t *testing.T) {
 	if !ok {
 		t.Fatal("/connect 应当被识别为命令")
 	}
-	if !strings.Contains(message, "已连接") {
-		t.Fatalf("/connect 应报告已连接，实际：%q", message)
+	if !strings.Contains(message, "正在连接") {
+		t.Fatalf("/connect 应报告开始连接，实际：%q", message)
 	}
-	if !app.Relaying() {
-		t.Fatal("执行 /connect 后 Relaying 应为 true")
-	}
+	// 注册是异步的：等 relay 确认之后 Relaying() 才会变 true。
+	waitRelayOnline(t, app)
 
 	// 2) 等 relay 侧看到注册
 	deadline := time.Now().Add(3 * time.Second)
@@ -73,21 +72,45 @@ func TestConnectCommandRegistersToRelay(t *testing.T) {
 	t.Fatal("断开后 relay 仍然显示执行端在线")
 }
 
-// 重复 /connect：应当先断开再重连，不报错。
-func TestConnectCommandReconnects(t *testing.T) {
+// 重复 /connect：已经在线上时直接返回，不做无谓的重连。
+//
+// 为什么要这样：注册用 hostID 作路由键，relay 对同名执行端只允许一个在线。
+// 无脑"先断再连"会让新连接撞上还没清理完的旧连接，被拒绝后无限退避重试 ——
+// 真机日志里就是 30 秒一次的"同名执行端已在线"刷屏。
+func TestConnectCommandIsIdempotent(t *testing.T) {
 	relayServer, addr := startTestRelay(t)
 	defer relayServer.Close()
 
 	app := newLocalApp(t)
-	if message, _ := app.ExecSlashCommand("/connect " + addr + " tk"); !strings.Contains(message, "已连接") {
-		t.Fatalf("第一次 /connect 失败：%q", message)
+	if message, _ := app.ExecSlashCommand("/connect " + addr + " tk"); !strings.Contains(message, "正在连接") {
+		t.Fatalf("第一次 /connect 应开始连接：%q", message)
 	}
-	if message, _ := app.ExecSlashCommand("/connect " + addr + " tk"); !strings.Contains(message, "已连接") {
-		t.Fatalf("第二次 /connect 应重连成功，实际：%q", message)
+	waitRelayOnline(t, app)
+
+	// 等 relay 真正登记上线后再发一次：这一次应当直接返回"无需重连"。
+	if message, _ := app.ExecSlashCommand("/connect " + addr + " tk"); !strings.Contains(message, "无需重连") {
+		t.Fatalf("第二次 /connect 应提示无需重连：%q", message)
 	}
 	if !app.Relaying() {
-		t.Fatal("重连后仍应处于连接状态")
+		t.Fatal("重复 /connect 之后仍应处于连线状态")
 	}
+	// relay 那边也应当只有一个在线执行端（没有因为重连产生第二条记录）
+	if got := len(relayServer.List()); got != 1 {
+		t.Fatalf("relay 在线执行端应恰好 1 个，实际 %d 个", got)
+	}
+}
+
+// waitRelayOnline 等到 App 报告"已上线"（注册是异步的）。
+func waitRelayOnline(t *testing.T, app *App) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if app.Relaying() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("等待 relay 上线超时")
 }
 
 // newLocalApp 构造一个只含本地执行端的最小 App（够跑命令逻辑）。

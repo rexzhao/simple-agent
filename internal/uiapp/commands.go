@@ -194,13 +194,14 @@ func runDisconnect(a *App, args []string) string {
 
 func runRelayStatus(a *App, _ []string) string {
 	a.relayMu.Lock()
-	connected := a.relay.stop != nil
+	started := a.relay.stop != nil
+	online := a.relay.online
 	addr := a.relay.addr
 	hostID := a.relay.hostID
 	since := a.relay.since
 	a.relayMu.Unlock()
 
-	if !connected {
+	if !started {
 		// 没连时也告诉用户"上次连的是哪"：这就是 /connect 下次会用的参数
 		if saved := a.loadSavedRelay(); saved.Addr != "" {
 			encryption := "明文"
@@ -212,11 +213,26 @@ func runRelayStatus(a *App, _ []string) string {
 		}
 		return "当前没有连接 relay（用 /connect 连接）"
 	}
+
+	if !online {
+		// 重试循环在跑但relay 没接受注册 —— 最常见原因是同名执行端已在线。
+		// 以前这里也显示"已连接"，用户完全看不出没连上。
+		return fmt.Sprintf("正在连接 relay %s（尚未上线）\nhost_id：%s\n"+
+			"若持续如此，看日志里是否有“注册被拒绝：同名执行端已在线” —— "+
+			"说明另一台同名执行端还连着，先把它断开", addr, hostID)
+	}
 	return fmt.Sprintf("relay 已连接\n地址：%s\nhost_id：%s\n已运行：%s",
 		addr, hostID, time.Since(since).Truncate(time.Second))
 }
 
 // ---- relay 注册的运行时管理 ----
+
+// relayReRegisterDelay 是"换 relay / 改参数"时，停掉旧注册后等多久再注册新的。
+//
+// relay 用 hostID 做路由键、同名只允许一个在线。旧连接断开后，relay 要等服务
+// 循环退出、把它从在线表摘掉，才肯接受同一个 hostID。立刻重连必然撞上
+// "同名执行端已在线"，而被拒后客户端会无限退避重试（日志里 30 秒一次刷屏）。
+const relayReRegisterDelay = 2 * time.Second
 
 // relaySession 是本机作为执行端注册到 relay 的运行状态。
 type relaySession struct {
@@ -224,13 +240,27 @@ type relaySession struct {
 	addr   string
 	hostID string
 	since  time.Time
+	// token / fingerprint 记住这次注册用的参数：/connect 不带参数（或带同一组
+	// 参数）时可以直接判定"已经连着同一个 relay"，不必断线重连。
+	token       string
+	fingerprint string
+	// online 表示**relay 那边确认过注册成功**（收到不带 error 的 registered）。
+	//
+	// 与 stop != nil 的区别很关键：stop 只表示"启动过重试循环"。relay 拒绝
+	// 注册时（同名在线 / 超限）重试循环照样在跑、stop 不为 nil，但一次都没连上。
+	// 界面若按 stop 显示"已连接"，用户看到的就是假状态。
+	online bool
 }
 
-// Relaying 报告当前是否已注册到 relay。
+// Relaying 报告当前是否**已经成功注册到 relay**。
+//
+// 注意不能只看 relay.stop != nil：那只表示"启动过重试循环"。relay 拒绝注册时
+// （同名执行端已在线）循环一直在跑，但一次都没连上 —— 那种情况下这里必须返回
+// false，否则界面会显示一个假的"已连接"。
 func (a *App) Relaying() bool {
 	a.relayMu.Lock()
 	defer a.relayMu.Unlock()
-	return a.relay.stop != nil
+	return a.relay.online
 }
 
 // StartRelayRegistration 在当前进程里启动"注册到 relay"。
@@ -255,22 +285,70 @@ func (a *App) StartRelayRegistration(addr, token, fingerprint string) string {
 		return "只有执行端才能注册 relay（当前是展示端）"
 	}
 
-	a.stopRelayRegistration()
-
 	name := a.hostIDForRelay()
+
+	// **已经在线上、参数也没变 → 直接返回，不做任何重连。**
+	//
+	// 为什么必须短路：注册用 hostID 作路由键，relay 对同名执行端只允许一个
+	// 在线（拒绝后来的）。如果无脑"先停旧的、再起新的"，新连接到达 relay 时
+	// 旧连接往往还没被清理完，于是被拒绝；被拒后 RunExecutor 会无限退避重试
+	// （日志里 30 秒一次刷屏），而本地一次都没连上。
+	//
+	// 用户敲 /connect 的本意多半是"确认一下连着没"，不是"强行重连"。
+	// 要重建连接请 /disconnect 后再 /connect。
+	//
+	// **判据是 online 而不是 stop**：stop 只表示重试循环在跑，被 relay 拒绝时
+	// 它也为真。只有收到过成功的 registered 才算真的连上。
+	a.relayMu.Lock()
+	cur := a.relay
+	a.relayMu.Unlock()
+	if cur.online && cur.addr == addr && cur.token == token && cur.fingerprint == fingerprint {
+		encryption := "明文"
+		if fingerprint != "" {
+			encryption = "TLS"
+		}
+		return fmt.Sprintf("已经连着 relay %s（%s），无需重连\nhost_id：%s\n已运行：%s\n要重建连接请先 /disconnect",
+			addr, encryption, cur.hostID, time.Since(cur.since).Truncate(time.Second))
+	}
+
+	// 走到这里：要么还没连上（重试中/被拒），要么参数变了。
+	// 两种情况都要先彻底停掉旧的，再注册新的。
+	//
+	// 停掉后等一小会儿：relay 要等旧连接断开、把它从在线表里摘掉，才肯接受
+	// 同一个 hostID 的新注册。立刻重连必然撞上"同名执行端已在线"。
+	hadPrevious := cur.stop != nil
+	a.stopRelayRegistration()
+	if hadPrevious {
+		time.Sleep(relayReRegisterDelay)
+	}
+
 	stop := make(chan struct{})
 	a.relayMu.Lock()
-	a.relay = relaySession{stop: stop, addr: addr, hostID: name, since: time.Now()}
+	a.relay = relaySession{
+		stop: stop, addr: addr, hostID: name, since: time.Now(),
+		token: token, fingerprint: fingerprint,
+	}
 	a.relayMu.Unlock()
 
 	// 拨号按指纹走 TLS：与进程级 --tls 不冲突（这里只影响这条注册连接）
 	wire.SetDialFunc(tlsConfig.Dial)
 
+	// 注册成功的回调：把 online 置真，并记下真实的上线时间。
+	// 断线重连成功后也会再调一次。
+	onRegistered := func() {
+		a.relayMu.Lock()
+		if a.relay.stop == stop {
+			a.relay.online = true
+			a.relay.since = time.Now()
+		}
+		a.relayMu.Unlock()
+	}
+
 	post := a.postFunc()
-	go relay.RunExecutor(addr, relay.Executor{HostID: name, Token: token}, stop,
+	go relay.RunExecutorNotify(addr, relay.Executor{HostID: name, Token: token}, stop,
 		func(conn wire.Conn) {
 			_ = host.Serve(conn, local, post)
-		})
+		}, onRegistered)
 
 	log.Printf("界面：已开始向 relay %s 注册（host_id=%s）", addr, name)
 	// 记住这次参数：下次 `/connect` 不带参数就能直接连（地址 + token + 指纹都省了）
@@ -280,7 +358,7 @@ func (a *App) StartRelayRegistration(addr, token, fingerprint string) string {
 	if fingerprint != "" {
 		encryption = "TLS"
 	}
-	return fmt.Sprintf("已连接 relay %s（%s）\nhost_id：%s\n以后可直接 /connect 复用这组参数",
+	return fmt.Sprintf("正在连接 relay %s（%s）\nhost_id：%s\n以后可直接 /connect 复用这组参数\n用 /relay 查看是否已上线",
 		addr, encryption, name)
 }
 
