@@ -185,6 +185,7 @@ func main() {
 		// 无界面时的提示写进会话即可；Remote 通知仍可经 relay 到达展示端
 		os.Exit(runHeadless(&cfg, &appRuntime{
 			registry: registry, provider: provider, allowShell: cfg.AllowShell,
+			webFetch: !cfg.DisableWebFetch,
 		}, selection, listenAddr, opts.relay, opts.name, opts.relayToken, opts.netLog, catalog, blobs))
 	}
 
@@ -254,6 +255,7 @@ func main() {
 		registry:   registry,
 		provider:   provider,
 		allowShell: cfg.AllowShell,
+		webFetch:   !cfg.DisableWebFetch,
 	}
 
 	app := uiapp.NewApp(runtime, uiapp.Options{
@@ -429,6 +431,8 @@ type appRuntime struct {
 	registry   *providers.Registry
 	provider   providers.Provider
 	allowShell bool
+	// webFetch 决定 web_fetch 是否注册（配置里默认开，可以关）。
+	webFetch bool
 }
 
 // OpenStream 发起一次流式请求。
@@ -446,7 +450,7 @@ func (r *appRuntime) OpenStream(ctx context.Context, sel providers.Selection, re
 
 // RunTools 执行工具调用。
 func (r *appRuntime) RunTools(ctx context.Context, tc *tools.ToolContext, calls []tools.Call) []tools.ToolOutcome {
-	return tools.ExecuteAll(ctx, tools.Builtin(r.allowShell), tc, calls)
+	return tools.ExecuteAll(ctx, tools.BuiltinWith(tools.Options{AllowShell: r.allowShell, WebFetch: r.webFetch}), tc, calls)
 }
 
 // windowFor 返回某模型配置的上下文窗口（0 表示未知，driver 会按 32k 处理）。
@@ -543,7 +547,12 @@ func systemPrompt(cfg config.Config) string {
 		base += `
 - 执行命令前先说明目的；危险操作（删除、覆盖、安装）要先征得用户同意。`
 	}
-	if guidance := tools.GuidanceSection(tools.Builtin(cfg.AllowShell)); guidance != "" {
+	if cfg.DisableWebFetch {
+		base += `
+- 联网抓取当前**不可用**：不要调用 web_fetch，只能依据用户提供的内容与本地文件回答。`
+	}
+	options := tools.Options{AllowShell: cfg.AllowShell, WebFetch: !cfg.DisableWebFetch}
+	if guidance := tools.GuidanceSection(tools.BuiltinWith(options)); guidance != "" {
 		base += "\n\n" + guidance
 	}
 	if prompt := cfg.SystemPrompt; prompt != "" {

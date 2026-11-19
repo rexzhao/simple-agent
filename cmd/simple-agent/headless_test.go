@@ -220,6 +220,30 @@ func TestSystemPromptAppendsUserPromptLast(t *testing.T) {
 	}
 }
 
+// web_fetch 的指导与开关同源：关掉后既不该有 web_fetch 指导，也要明确说不可用
+// （否则模型会去调一个不存在的工具，只能拿回「未知工具」）。
+func TestSystemPromptFollowsWebFetchSwitch(t *testing.T) {
+	enabled := systemPrompt(config.Config{Workspace: t.TempDir()})
+	if !strings.Contains(enabled, "web_fetch returns external, untrusted page content") {
+		t.Fatalf("默认应包含 web_fetch 指导：\n%s", enabled)
+	}
+	if strings.Contains(enabled, "联网抓取当前**不可用**") {
+		t.Fatalf("默认不该说联网不可用：\n%s", enabled)
+	}
+
+	disabled := systemPrompt(config.Config{Workspace: t.TempDir(), DisableWebFetch: true})
+	if strings.Contains(disabled, "web_fetch returns external") {
+		t.Fatalf("关掉后不该有 web_fetch 指导：\n%s", disabled)
+	}
+	if !strings.Contains(disabled, "联网抓取当前**不可用**") {
+		t.Fatalf("关掉后应写明不可用：\n%s", disabled)
+	}
+	// 关掉联网不影响其它工具
+	if !strings.Contains(disabled, "Use the read tool") {
+		t.Fatalf("关掉 web_fetch 不该影响文件工具指导：\n%s", disabled)
+	}
+}
+
 // 「监听非回环地址」的警告判定。
 func TestShouldWarnUnprotected(t *testing.T) {
 	cases := []struct {

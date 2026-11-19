@@ -592,7 +592,7 @@ func (l *Local) driverOptionsFor(sel providers.Selection, workspace string) driv
 	return driver.Options{
 		Selection:          sel,
 		SystemPrompt:       l.cfg.SystemPrompt,
-		Tools:              tools.Builtin(l.cfg.AllowShell),
+		Tools:              tools.BuiltinWith(tools.Options{AllowShell: l.cfg.AllowShell, WebFetch: l.cfg.WebFetch}),
 		MaxToolRounds:      l.cfg.MaxToolRounds,
 		ContextWindow:      l.cfg.ContextWindow,
 		MaxOutputTokens:    l.maxOutputFor(sel),

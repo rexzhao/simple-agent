@@ -32,6 +32,12 @@ type Config struct {
 	// AllowShell 是权限档位：true = 完全权限（允许执行命令，且路径工具不限制工作区），
 	// false = 工作区内修改（不执行命令，路径限制在工作区内）。默认 **关闭**（对齐 Rust 版）。
 	AllowShell bool `toml:"allow_shell" yaml:"allow_shell"`
+	// DisableWebFetch 关闭 web_fetch（联网抓取页面）。
+	//
+	// 默认**开启**（用户决定）：抓取不需要凭据、也不执行任何东西，与命令执行不是
+	// 一个量级的风险；不想让模型联网时显式关掉。用"关闭开关"而不是"启用开关"，
+	// 是为了让旧配置文件与手工构造的 Config 都保持可用。
+	DisableWebFetch bool `toml:"disable_web_fetch" yaml:"disable_web_fetch"`
 	// MaxToolRounds 是一次用户输入内最多几轮工具调用（0 = 不限，默认 12）。
 	MaxToolRounds int `toml:"max_tool_rounds" yaml:"max_tool_rounds"`
 	// Workspace 是工具的工作区根目录（默认当前目录）。
@@ -379,6 +385,8 @@ func applyArgs(cfg *Config, args []string) error {
 			cfg.AllowShell = true
 		case "--no-shell":
 			cfg.AllowShell = false
+		case "--no-web":
+			cfg.DisableWebFetch = true
 		case "--workspace", "-w":
 			if i+1 >= len(args) {
 				return fmt.Errorf("%s 需要一个路径参数", args[i])
@@ -440,6 +448,7 @@ func Help() string {
   relay              子命令：simple-agent relay --listen 0.0.0.0:7900 --token 口令，只做帧转发
   --allow-shell        完全权限：启用 bash/pwsh，且路径工具不再限制工作区（默认关闭）
   --no-shell           工作区内修改：关闭命令执行，路径限制在工作区内
+  --no-web             关闭 web_fetch（联网抓取网页；默认开启）
   --workspace, -w DIR  工作区根目录（默认当前目录；相对路径与默认搜索目录的基准）
   --config, -c FILE    配置文件路径（默认见下）
   --help, -h           显示本说明

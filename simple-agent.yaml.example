@@ -31,6 +31,15 @@
 # 也能用 --allow-shell 或 SIMPLE_AGENT_ALLOW_SHELL=1 打开。
 allow_shell: false
 
+# 关闭 web_fetch（联网抓取网页正文并转成 markdown 交给模型）。
+#
+# 默认 **开启**：抓取不需要凭据、也不执行任何东西，与命令执行不是一个量级的风险。
+# 不想让模型联网时把它设为 true（等价于启动参数 --no-web）。
+# 行为要点：只支持 http/https；只跟随同源跳转（跨站跳转要模型自己重新请求）；
+# 单次最多读 5MB / 10 万字符（超出截断并提示）；不支持需要 JavaScript 或登录的页面，
+# 也不支持 PDF；返回内容前会显式声明"这是外部不可信内容"。
+# disable_web_fetch: true
+
 # 一次用户输入内最多几轮工具调用（0 表示不限）。防止模型无限调用工具。
 max_tool_rounds: 12
 

@@ -118,7 +118,9 @@ func headlessHostConfig(cfg *config.Config, runtime *appRuntime, selection provi
 		SystemPrompt: systemPrompt(*cfg),
 		// 权限是启动期全局开关：必须原样传给执行端，否则 --allow-shell 在
 		// --headless 模式下会被悄悄丢掉（界面模式由 uiapp 传，不要照抄成两套口径）。
-		AllowShell:    cfg.AllowShell,
+		AllowShell: cfg.AllowShell,
+		// web_fetch 与权限分开：抓网页不执行东西，默认开启、配置里可关。
+		WebFetch:      !cfg.DisableWebFetch,
 		Workspace:     cfg.Workspace,
 		MaxToolRounds: cfg.MaxToolRounds,
 		ContextWindow: windowFor(runtime.registry, selection),

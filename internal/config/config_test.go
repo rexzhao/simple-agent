@@ -123,6 +123,39 @@ func TestAllowShellFlag(t *testing.T) {
 	}
 }
 
+// web_fetch 默认开启（不需要凭据、不执行东西），配置与命令行都能关掉。
+//
+// 用"关闭开关"的方式表达，是为了让旧配置文件与手工构造的 Config 都保持可用。
+func TestWebFetchDefaultOnAndCanBeDisabled(t *testing.T) {
+	cfg, err := config.Load(filepath.Join(t.TempDir(), "x.toml"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DisableWebFetch {
+		t.Fatal("web_fetch 默认应开启")
+	}
+
+	cfg, err = config.Load(filepath.Join(t.TempDir(), "x.toml"), []string{"--no-web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.DisableWebFetch {
+		t.Fatal("--no-web 应关掉 web_fetch")
+	}
+	if !strings.Contains(config.Help(), "--no-web") {
+		t.Fatal("帮助信息应包含 --no-web")
+	}
+
+	path := writeConfig(t, "disable_web_fetch = true\n")
+	cfg, err = config.Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.DisableWebFetch {
+		t.Fatal("配置文件应能关掉 web_fetch")
+	}
+}
+
 func TestHelpAndUnknownArgs(t *testing.T) {
 	if _, err := config.Load(filepath.Join(t.TempDir(), "x.toml"), []string{"--help"}); err != config.ErrHelp {
 		t.Fatalf("--help 应返回 ErrHelp，实际 %v", err)

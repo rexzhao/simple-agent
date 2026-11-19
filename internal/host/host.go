@@ -41,6 +41,11 @@ type Config struct {
 	Selection     providers.Selection
 	SystemPrompt  string
 	AllowShell    bool
+	// WebFetch 决定是否注册 web_fetch（默认开启，配置里可以关掉）。
+	//
+	// 与 AllowShell 分开：抓网页不执行任何东西、也不要凭据，风险量级与跑命令
+	// 不同，不该绑在同一个开关上。
+	WebFetch bool
 	// Token 是执行端自己的访问口令（`--listen` 模式下由 `--token` 指定）。
 	//
 	// 与 relay 的 token 是两套：relay 保护"经过 relay 这一跳"，这里保护
