@@ -1,4 +1,4 @@
-package uiapp
+﻿package uiapp
 
 import (
 	"context"
@@ -2416,10 +2416,13 @@ func (a *App) ContextPercentForTest() int {
 	return 0
 }
 
-// CacheHitPercentForTest 返回当前会话的缓存命中率（0–100，测试用）。
-func (a *App) CacheHitPercentForTest() int {
+// CacheHitBasisPointsForTest 返回当前会话的缓存命中率（千分比，测试用）。
+//
+// 用千分比而不是百分比：显示保留两位小数（99.93% → 9993），
+// 整数传递不会引入浮点误差。
+func (a *App) CacheHitBasisPointsForTest() int {
 	if session := a.Current(); session != nil {
-		return cacheHitPercent(session.Usage())
+		return cacheHitBasisPoints(session.Usage())
 	}
 	return 0
 }
@@ -2532,7 +2535,7 @@ func (a *App) statusBar(c *ui.Context, session *Session, theme *ui.Theme) {
 		// 命中过才显示，第一次请求（纯写入、还没得命中）也自然不显示。
 		usage := session.Usage()
 		if usage.CacheReadTokens > 0 {
-			ui.Text(c, a.tr("composer.cacheHit", cacheHitPercent(usage))).
+			ui.Text(c, a.tr("composer.cacheHit", formatBasisPoints(cacheHitBasisPoints(usage)))).
 				FontSize(11).TextColor(theme.TextMuted).
 				Label(a.tr("composer.cacheHint",
 					compactTokens(usage.CacheReadTokens),
@@ -2545,7 +2548,7 @@ func (a *App) statusBar(c *ui.Context, session *Session, theme *ui.Theme) {
 	})
 }
 
-// cacheHitPercent 返回缓存命中率（0–100，四舍五入）。
+// cacheHitBasisPoints 返回缓存命中率（单位：千分比）。
 //
 // **两家 provider 的 input 语义不同，不能用一个公式套**：
 //
@@ -2559,7 +2562,7 @@ func (a *App) statusBar(c *ui.Context, session *Session, theme *ui.Theme) {
 //
 // 这个判据在"Anthropic 本次没写缓存"时会退化，但那也正是 OpenAI 口径的
 // 算法（分母=Input），结果仍然正确。
-func cacheHitPercent(usage driver.Usage) int {
+func cacheHitBasisPoints(usage driver.Usage) int {
 	var total int
 	if usage.CacheWriteTokens > 0 {
 		// Anthropic：input 不含缓存，三者相加才是完整输入
@@ -2575,22 +2578,35 @@ func cacheHitPercent(usage driver.Usage) int {
 	if total <= 0 {
 		return 0
 	}
-	// **向下取整，并且不显示 100%**。
+	// **向下取整到两位小数，并且不显示 100%**。
 	//
 	// 缓存不可能真的全命中：本轮新增的那段提示词（最新用户消息、最新工具
-	// 结果）必然要重新计算，至少占几百 token。99.9% 四舍五入成 100% 会让
+	// 结果）必然要重新计算，至少占几百 token。99.996% 四舍五入成 100% 会让
 	// 人以为"这次一分钱没花"，反而不可信。
 	//
-	// 所以上限压在 99：显示"缓存 99%"是诚实的；真到 100 时宁可少报一个点。
-	percent := usage.CacheReadTokens * 100 / total
-	if percent > 99 {
-		percent = 99
+	// 所以上限压在 99.99：显示"缓存 99.99%"是诚实的；真到 100 时宁可少报一点。
+	//
+	// 返回值单位是**千分比**（99.93% → 9993），显示时再除以 100 保留两位小数。
+	// 用整数算避免浮点误差（0.1+0.2 那类问题在百分比上会显示成 99.989999%）。
+	basisPoints := usage.CacheReadTokens * 10_000 / total
+	if basisPoints > 9_999 {
+		basisPoints = 9_999
 	}
-	return clampInt(percent, 0, 99)
+	return clampInt(basisPoints, 0, 9_999)
+}// formatBasisPoints 把千分比转成两位小数的百分比字符串（9993 → "99.93"）。
+//
+// 不返回浮点再 fmt：百分比只有两位小数，用整数拆整个/小数部分最直观，
+// 也避免 9993/100 = 99.93000000000001 这种显示。
+func formatBasisPoints(basisPoints int) string {
+	whole := basisPoints / 100
+	frac := basisPoints % 100
+	// 小数补足两位：9900 → "99.00"、9905 → "99.05"
+	if frac < 10 {
+		return itoa(whole) + ".0" + itoa(frac)
+	}
+	return itoa(whole) + "." + itoa(frac)
 }
 
-// debugLogCacheUsage 把当前 usage 追加到 <data_dir>/cache-debug.log。
-//
 // compactTokens 把 token 数压成 12k / 1.2M 这样的短形式。
 func compactTokens(tokens int) string {
 	switch {

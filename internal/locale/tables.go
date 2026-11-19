@@ -121,7 +121,7 @@ var zhTable = map[string]string{
 	// 缓存命中率：命中缓存的输入 token 占本次输入的比例。
 	// 只有 provider 报了缓存字段才显示 —— 旧网关不发，画面上突然多一个
 	// "缓存 0%" 会让人以为缓存失效了。
-	"composer.cacheHit":   "缓存 %d%%",
+	"composer.cacheHit":   "缓存 %s%%",
 	"composer.cacheHint":  "本次输入里有 %s 命中缓存（共 %s）",
 	"composer.usageLabel":         "上下文用量",
 	"composer.turns":              "%d 轮",
