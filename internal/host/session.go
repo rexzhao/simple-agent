@@ -431,6 +431,14 @@ func (s *Session) ensurePersisted(firstText string) {
 			}
 		}
 	}
+	// 登记到项目档案：**启动时的会话列表只读档案**，不扫会话目录。
+	// 漏了这一步，新会话重启后就会从侧栏消失（文件还在，但没人认识它）。
+	//
+	// 传 opened 的目录：档案记下实际位置，而不是假设它在项目目录下
+	// —— 这样老会话（在 sessions/ 下）也能被正确登记，**不用搬文件**。
+	if err := s.cfg.Catalog.AddSession(s.ID, title, s.Workspace, opened.Dir()); err != nil {
+		s.host.reportError(s.ID, s.cfg.Tr("session.openFail", err.Error()))
+	}
 }
 
 // titleFromText 从第一条用户消息里取标题（首行、截断）。
@@ -570,6 +578,15 @@ func (s *Session) rename(title string) CmdResult {
 	}
 	s.Title = title
 	s.host.applyEffects(s, s.drv.Rename(title))
+	// 回写项目档案：启动列表读的是档案里的标题，不同步的话
+	// 改名只在这一进程内可见，重启就变回旧名字。
+	if s.cfg.Catalog != nil {
+		// 只回写标题：更新时间由 session.jsonl 的文件时间决定，
+		// 不需要在这里写（写它等于每次改名都要落盘一次项目档案）。
+		_ = s.cfg.Catalog.UpdateSession(s.ID, func(record *store.SessionRecord) {
+			record.Title = title
+		})
+	}
 	return CmdResult{OK: true}
 }
 

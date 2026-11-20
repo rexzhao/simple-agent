@@ -475,6 +475,11 @@ func (l *Local) restoreSessions() {
 	if removed, pruneErr := l.cfg.Catalog.PruneEmpty(); pruneErr == nil && len(removed) > 0 {
 		log.Print(l.cfg.Tr("session.pruned", len(removed)))
 	}
+	// 老布局（sessions/<id>/）的会话要先登记进项目档案，
+	// 否则启动只读档案时它们会从侧栏消失（文件还在，只是没人认识）。
+	if _, migrateErr := l.cfg.Catalog.MigrateLegacySessions(); migrateErr != nil {
+		log.Printf("迁移老会话失败：%v", migrateErr)
+	}
 	summaries, err := l.cfg.Catalog.List()
 	if err != nil {
 		l.startupErr = l.cfg.Tr("session.listFail", err)

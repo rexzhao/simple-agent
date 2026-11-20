@@ -60,6 +60,9 @@ func (s *MemoryStore) LoadOlder(*ArchiveCursor) (OlderPage, error) {
 func (s *MemoryStore) Sync() error { return nil }
 
 // Close 内存后端无需关闭。
+// Dir 返回空串：内存后端没有磁盘目录。
+func (s *MemoryStore) Dir() string { return "" }
+
 func (s *MemoryStore) Close() error { return nil }
 
 var _ SessionStore = (*MemoryStore)(nil)

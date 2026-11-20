@@ -820,6 +820,11 @@ func TestRestoreFailureIsVisible(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bad, "archive-0001.jsonl"), []byte("{}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// 登记进项目档案：启动列表只读档案，未登记的会话不会被尝试恢复，
+	// 也就测不到"恢复失败"这条路径（这正是要验证的）。
+	if err := catalog.AddSession("broken-session", "坏会话", "", bad); err != nil {
+		t.Fatal(err)
+	}
 
 	p := &poster{}
 	app := uiapp.NewApp(&fakeRuntime{}, uiapp.Options{

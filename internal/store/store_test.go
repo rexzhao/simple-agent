@@ -412,7 +412,11 @@ func asLockedError(err error, target **store.LockedError) bool {
 	return false
 }
 
-// Catalog：扫描数据目录，按更新时间倒序列出会话，标题取最后一次重命名。
+// Catalog：按更新时间倒序列出**已登记**的会话，标题取最后一次重命名。
+//
+// 注意新模型：List 只读项目档案，不再扫 sessions/ 目录（那是"项目由会话
+// 反推"的老做法，启动时会把用户早已不看的历史也读一遍）。所以测试要先
+// AddSession 登记 —— 真实运行时由 host 在会话落盘时登记。
 func TestCatalogListsSessions(t *testing.T) {
 	dataDir := t.TempDir()
 	catalog := store.NewCatalog(dataDir)
@@ -429,7 +433,11 @@ func TestCatalogListsSessions(t *testing.T) {
 		store.SessionRenamedData{Title: "改名了"})); err != nil {
 		t.Fatal(err)
 	}
+	firstDir := first.Dir()
 	first.Close()
+	if err := catalog.AddSession("ctx-1", "第一", "", firstDir); err != nil {
+		t.Fatal(err)
+	}
 
 	second, err := catalog.Create("ctx-2")
 	if err != nil {
@@ -439,7 +447,11 @@ func TestCatalogListsSessions(t *testing.T) {
 		store.SessionCreatedData{ContextID: "ctx-2", Title: "第二"})); err != nil {
 		t.Fatal(err)
 	}
+	secondDir := second.Dir()
 	second.Close()
+	if err := catalog.AddSession("ctx-2", "第二", "", secondDir); err != nil {
+		t.Fatal(err)
+	}
 
 	summaries, err := catalog.List()
 	if err != nil {
@@ -452,8 +464,22 @@ func TestCatalogListsSessions(t *testing.T) {
 	for _, summary := range summaries {
 		titles[summary.ContextID] = summary.Title
 	}
+	// 标题来自**档案**（不再重读日志）：改名时由 host 回写档案。
+	// 这里直接验证回写链路。
+	if err := catalog.UpdateSession("ctx-1", func(record *store.SessionRecord) {
+		record.Title = "改名了"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err = catalog.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, summary := range summaries {
+		titles[summary.ContextID] = summary.Title
+	}
 	if titles["ctx-1"] != "改名了" {
-		t.Fatalf("标题应取最后一次重命名：%q", titles["ctx-1"])
+		t.Fatalf("标题应取档案里的最新值：%q", titles["ctx-1"])
 	}
 	if titles["ctx-2"] != "第二" {
 		t.Fatalf("第二个会话标题不一致：%q", titles["ctx-2"])

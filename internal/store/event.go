@@ -172,4 +172,9 @@ type SessionStore interface {
 	Sync() error
 	// Close 关闭底层文件。
 	Close() error
+	// Dir 返回会话日志所在目录（内存后端返回空串）。
+	//
+	// 用途：登记项目档案时要记下会话**实际**在哪，而不是假设它在项目目录下
+	// —— 老会话在 sessions/ 下，不搬文件也要能被登记。
+	Dir() string
 }

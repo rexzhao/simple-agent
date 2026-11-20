@@ -356,6 +356,9 @@ func (s *JsonlStore) Sync() error {
 }
 
 // Close 关闭文件。
+// Dir 返回会话日志所在目录。
+func (s *JsonlStore) Dir() string { return s.dir }
+
 func (s *JsonlStore) Close() error {
 	if s.file == nil {
 		return nil
