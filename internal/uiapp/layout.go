@@ -358,33 +358,14 @@ func (a *App) sidebarRows(c *ui.Context) {
 		for _, session := range active {
 			rows = append(rows, sidebarNode{key: session.ID})
 		}
-		// 已归档的会话挂在这个项目下，但**单独一个默认折叠的小节**：
-		// 归档的意图就是"别占地方"，混在正常会话里等于没归档；
-		// 但也不能整个藏掉 —— 用户要能看见它们还在、能恢复。
-		if len(archived) > 0 {
-			key := archivedKey(g.key)
-			// **默认折叠**：归档的意义就是"收起来不占地方"。
-			// 只在第一次见到时置 false，用户展开过的保持展开。
-			if !a.sidebarGroupSeen[key] {
-				if a.sidebarGroupSeen == nil {
-					a.sidebarGroupSeen = map[string]bool{}
-				}
-				if a.sidebarGroupOpen == nil {
-					a.sidebarGroupOpen = map[string]bool{}
-				}
-				a.sidebarGroupSeen[key] = true
-				a.sidebarGroupOpen[key] = false
-			}
-			rows = append(rows, sidebarNode{
-				isGroup:   true,
-				isArchive: true,
-				key:       key,
-				name:      a.tr("sidebar.showArchived"),
-			})
-			if a.sidebarGroupOpen[key] {
-				for _, session := range archived {
-					rows = append(rows, sidebarNode{key: session.ID})
-				}
+		// 归档的会话**默认完全不显示**，由项目行菜单的「显示已归档」打开。
+		//
+		// 以前是"默认折叠的小节"，用户嫌那个三角丑、也太占注意力。
+		// 对齐 dsh：归档视角属于**项目**，用菜单切换。打开后它们以灰色
+		// 排在正常会话后面（不另起小节），关掉就彻底看不见。
+		if a.showArchived != nil && a.showArchived[g.key] {
+			for _, session := range archived {
+				rows = append(rows, sidebarNode{key: session.ID})
 			}
 		}
 	}
@@ -392,7 +373,7 @@ func (a *App) sidebarRows(c *ui.Context) {
 	ui.List(c, &a.sidebarList, len(rows), func(i int) {
 		node := rows[i]
 		if node.isGroup {
-			a.sidebarGroupRow(c, node.key, node.name, node.isArchive)
+			a.sidebarGroupRow(c, node.key, node.name)
 			return
 		}
 		a.sidebarSessionRow(c, node.key)
@@ -440,7 +421,7 @@ func (a *App) sidebarAddProjectRow(c *ui.Context) {
 // 会话行的缩进量也用同一个常量，两行文字因此左对齐。
 //
 // name 由调用方给出（来自项目档案）；没有档案时是 workspace 反推的名字。
-func (a *App) sidebarGroupRow(c *ui.Context, key, name string, isArchive bool) {
+func (a *App) sidebarGroupRow(c *ui.Context, key, name string) {
 	theme := c.Theme()
 	open := a.sidebarGroupOpen[key]
 	var clicked bool
@@ -452,25 +433,14 @@ func (a *App) sidebarGroupRow(c *ui.Context, key, name string, isArchive bool) {
 	// 层级全靠缩进撑着 —— 而缩进当时还是对齐的，看起来会话比项目还靠前。
 	//
 	// 底色只用最淡的一档（SurfaceHover，bluish-75）：既能把项目行连成
-	// 一块，又不会让侧栏变成一堆色块。归档小节的三角不该有底色（它只是
-	// 一个小开关），所以分开判断。
-	rowPaddingY := float32(5)
-	padLeft := float32(6)
-	nameSize := float32(13)
-	nameColor := theme.Text
-	if isArchive {
-		// 比会话行**浅一点点**：三角和图标的左边缘对齐会话的状态点，
-		// 这样整块内容看起来是"项目下的一个层级"，而不是另一个项目。
-		rowPaddingY = 2
-		padLeft = 6 + sidebarSessionIndent - sidebarArrowSlot
-		nameSize = 12
-		nameColor = theme.TextMuted
-	}
-	row := ui.Row(c).FillWidth().Gap(0).Padding(rowPaddingY, padLeft, rowPaddingY, 6).
-		Radius(6).AlignItems(ui.Center)
-	if !isArchive {
-		row.Background(dsh.SurfaceHover)
-	}
+	// 一块，又不会让侧栏变成一堆色块。
+	row := ui.Row(c).FillWidth().Gap(0).Padding(5, 6, 5, 6).
+		Radius(6).AlignItems(ui.Center).Background(dsh.SurfaceHover)
+	// 右键菜单：项目的视角设置（目前只有「显示已归档」）。
+	//
+	// 对齐 dsh 的做法：归档属于**项目自己的视角**，不是全局开关，
+	// 也不该在侧栏里占一个常驻控件（用户嫌之前那个三角丑又抢眼）。
+	a.projectMenu(row, key)
 	row.Children(func() {
 		// 三角槽：**固定宽度**，宽度与 sidebarArrowSlot 相同。
 		//
@@ -483,60 +453,29 @@ func (a *App) sidebarGroupRow(c *ui.Context, key, name string, isArchive bool) {
 		if open {
 			glyph = "▾"
 		}
-		if isArchive {
-			// 归档只有一个三角，用**实心**符号（▶/▼）：细的 ▸/▾ 在小字号下
-			// 几乎是个点，放大字号也不明显（实测）。但实心符号视觉分量重，
-			// 用 11px + 弱化色，既看得见又不抢眼 —— 它本来就该收着。
-			glyph = "▶"
-			if open {
-				glyph = "▼"
-			}
-		}
 		arrowSlot := ui.Row(c).Size(sidebarArrowSlot, sidebarArrowSlot).Center().
 			Cursor(ui.CursorPointer)
-		if isArchive {
-			// 归档小节只有一个三角、没有文字，测试和读屏都需要一个名字。
-			// 标在槽位（不是里面的文字）上：文字仍参与可见文本索引，不会被替换。
-			arrowSlot.Label(a.tr("sidebar.showArchived"))
-		}
 		arrowSlot.Children(func() {
-			arrowSize := float32(12)
-			arrowColor := theme.TextMuted
-			if isArchive {
-				arrowSize = 11
-			}
-			ui.Text(c, glyph).FontSize(arrowSize).TextColor(arrowColor)
+			ui.Text(c, glyph).FontSize(12).TextColor(theme.TextMuted)
 		})
 		if arrowSlot.Hovered() {
+			// 项目行本身有底色，悬停反馈用更深一档才看得出来
 			arrowSlot.Background(theme.SurfacePressed).Radius(4)
 		}
 		if arrowSlot.Clicked() {
 			clicked = true
 		}
-		// 归档小节**不写文字**，只留一个灰色三角。
-		//
-		// 原先是小号粗体的「显示已归档」，但它和项目行长得太像、
-		// 又占一整行的注意力 —— 用户的原话是"太抢眼了"。归档本来就该
-		// 收着，一个小三角足够表达"这里能展开"，具体内容展开后自然可见。
-		//
-		// 不设 Label：设了会替换可见文本索引，点击命中路径不同（踩过）。
-		if !isArchive {
-			nameText := ui.Text(c, name).FontSize(nameSize).
-				Bold().TextColor(nameColor).Cursor(ui.CursorPointer)
-			if nameText.Clicked() {
-				clicked = true
-			}
+		nameText := ui.Text(c, name).FontSize(13).
+			Bold().TextColor(theme.Text).Cursor(ui.CursorPointer)
+		if nameText.Clicked() {
+			clicked = true
 		}
 		ui.Spacer(c)
 		// 项目行**不显示时间**：它在树上只是分组，用户关心的是"这个项目
 		// 有几个会话"，时间要看会话行或悬停的提示。显示时间还会跟这里的
 		// 新建按钮抢位置（两者挤在一起，项目名被压窄）。
-		//
-		// 归档小节没有「新建会话」：那里不是项目，新建该归到项目本身。
-		if !isArchive {
-			if iconButton(c, iconNewChatSVG, a.tr("session.newHere"), 13, 3) {
-				newHere = true
-			}
+		if iconButton(c, iconNewChatSVG, a.tr("session.newHere"), 13, 3) {
+			newHere = true
 		}
 	})
 	if clicked {
@@ -547,6 +486,26 @@ func (a *App) sidebarGroupRow(c *ui.Context, key, name string, isArchive bool) {
 	if newHere {
 		a.newSessionIn(a.workspaceForGroup(key))
 	}
+}
+
+// projectMenu 挂上项目行的右键菜单。
+//
+// 目前只有「显示已归档」：打开后这个项目下的归档会话以灰色列出来，
+// 关掉就完全不显示（默认）。状态是**纯内存的**，重启回到默认（关）。
+func (a *App) projectMenu(row *ui.Element, projectKey string) {
+	row.ContextMenu(func(m *ui.Menu) {
+		showing := a.showArchived != nil && a.showArchived[projectKey]
+		label := a.tr("sidebar.showArchived")
+		if showing {
+			label = "✓ " + label
+		}
+		if m.Item(label).Chosen() {
+			if a.showArchived == nil {
+				a.showArchived = map[string]bool{}
+			}
+			a.showArchived[projectKey] = !showing
+		}
+	})
 }
 
 // workspaceForGroup 把侧栏分组的 key 还原成 workspace 路径。

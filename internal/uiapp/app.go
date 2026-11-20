@@ -482,6 +482,12 @@ type App struct {
 	// sidebarGroupOpen 记住用户手动收起/展开的结果（纯界面态，不落盘）。
 	sidebarGroupSeen map[string]bool
 	sidebarGroupOpen map[string]bool
+	// showArchived 记录哪些项目打开了"显示已归档"（key 是项目 ID）。
+	//
+	// **纯内存态，重启不保留**：用户明确要求"只需要运行时保持，重启不用记状态"。
+	// 默认不显示归档会话 —— 归档的意图就是收起来，一进来就看见等于没归档。
+	// 开关放在项目行的菜单里（对齐 dsh：那是项目自己的视角设置）。
+	showArchived map[string]bool
 	// deleteConfirm/deleteTarget 是"删除会话"的二次确认。
 	deleteConfirm bool
 	deleteTarget  string
@@ -794,6 +800,19 @@ func (s *Session) SetProjectForTest(id, name string) {
 
 // ArchivedForTest 报告会话是否已归档。
 func (s *Session) ArchivedForTest() bool { return s.archivedSession }
+
+// ShowArchivedForTest 报告某个项目是否打开了"显示已归档"。
+func (a *App) ShowArchivedForTest(projectKey string) bool {
+	return a.showArchived != nil && a.showArchived[projectKey]
+}
+
+// SetShowArchivedForTest 设置某个项目的"显示已归档"（测试用）。
+func (a *App) SetShowArchivedForTest(projectKey string, show bool) {
+	if a.showArchived == nil {
+		a.showArchived = map[string]bool{}
+	}
+	a.showArchived[projectKey] = show
+}
 
 // SetArchivedForTest 设置会话的归档状态（测试用：模拟后端同步过来的状态）。
 func (s *Session) SetArchivedForTest(archived bool) { s.archivedSession = archived }
@@ -2297,6 +2316,9 @@ func (a *App) composer(c *ui.Context) {
 			if session.errMsg != "" {
 				before++
 			}
+			if session.archivedSession {
+				before++
+			}
 			if len(session.Queued()) > 0 {
 				before++
 			}
@@ -2313,6 +2335,14 @@ func (a *App) composer(c *ui.Context) {
 
 			if session.errMsg != "" {
 				ui.Text(c, session.errMsg).FontSize(12).TextColor(theme.Danger).Padding(2, 8)
+			}
+			// 归档会话：说明"为什么发不出去"，并给一个恢复入口。
+			//
+			// 只禁用输入框不解释，用户只会以为坏了 —— 归档是**会话级封存**，
+			// 得先恢复才能继续，这一点必须说清楚。恢复按钮就放在提示旁边：
+			// 让用户在这里一步就能解开，不用去翻右键菜单。
+			if session.archivedSession {
+				a.archivedBanner(c, session, theme)
 			}
 			// 排队中的插话：让用户看得见"已经记下了、还没发出去"
 			if queued := session.Queued(); len(queued) > 0 {
@@ -2423,6 +2453,12 @@ func (a *App) pickImageFiles(session *Session) {
 // "把队列发出去"）。忙时队列非空但输入为空，按钮必须禁用——此时 Send 会直接
 // return，点了没有任何反应。
 func (a *App) sendDisabled(session *Session) bool {
+	// 归档的会话必须先恢复才能对话（历史仍可查看）。
+	// 放在最前面：这不是"暂时不能发"，而是"这个会话被封存了"，
+	// 输入卡会用专门的提示文案说明（见 composer 的归档提示）。
+	if session.archivedSession {
+		return true
+	}
 	busy := session.Busy()
 	steerable := session.CanSteer()
 	if busy != driver.BusyIdle && busy != driver.BusyAwaitingAnswer && !steerable {
@@ -2628,6 +2664,21 @@ func (a *App) composerPlaceholder(session *Session) string {
 }
 
 // queuedPanel 渲染排队中的插话（每条一行，带删除按钮）。
+// archivedBanner 提示"会话已归档"，并给一键恢复。
+//
+// 归档 = 封存：历史照常能看（翻页、加载更早都不受影响），但不能再对话。
+// 用户在输入框里打字时看到的是灰色不可用的发送键 —— 不说清楚原因，
+// 只会以为程序坏了。
+func (a *App) archivedBanner(c *ui.Context, session *Session, theme *ui.Theme) {
+	ui.Row(c).FillWidth().Gap(8).Padding(4, 8).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, a.tr("session.archivedHint")).
+			FontSize(12).TextColor(theme.TextMuted).Grow(1)
+		if ui.Button(c, a.tr("sidebar.restore")).Clicked() {
+			a.setSessionArchived(session, false)
+		}
+	})
+}
+
 func (a *App) queuedPanel(c *ui.Context, queued []string) {
 	theme := c.Theme()
 	ui.Column(c).FillWidth().Padding(4, 8).Gap(2).Children(func() {

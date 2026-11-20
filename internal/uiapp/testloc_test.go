@@ -15,7 +15,8 @@ const (
 	locDismiss        = "跳过"         // 提问面板跳过
 	locNewSession     = "在此项目新建会话"   // 项目行右侧的新建（图标按钮的无障碍名）
 	locCopyIDs        = "复制项目与会话 ID" // 会话行里的复制按钮（无障碍名）
-	locShowArchived   = "显示已归档"      // 项目下的已归档小节标题
+	locShowArchived   = "显示已归档"      // 项目右键菜单里的归档开关
+	locRestore        = "恢复会话"       // 归档提示条上的恢复按钮
 	locNewSessionRail = "新建会话"       // 侧栏折叠成图标栏时的新建（那里看不到项目行）
 	locSidebarHide    = "收起侧边栏"      // 收起侧栏（图标按钮的无障碍名）
 	locSidebarShow    = "打开侧边栏"      // 展开侧栏（图标按钮的无障碍名）
