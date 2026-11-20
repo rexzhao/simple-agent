@@ -2674,9 +2674,12 @@ func TestProcessGroupMerging(t *testing.T) {
 	if !hasProcessGroup(tester) {
 		t.Fatalf("同一回合的过程应合并成一组：%v", tester.Texts())
 	}
-	// 新回合里只有一个过程 part → 内联（⚙ / 名称 / 参数是三个文本片段）
-	if !tester.HasText("⚙") {
-		t.Fatalf("单个过程 part 应内联显示：%v", tester.Texts())
+	// 新回合里只有一个过程 part → 内联（图标 + 工具名胶囊 + 参数）
+	//
+	// 图标换成 SVG 之后不再进文本索引，所以断言工具名本身：
+	// 内联态能看到具体是哪个工具，而折叠成组时只显示"做了什么事"。
+	if !tester.HasText("read") {
+		t.Fatalf("单个过程 part 应内联显示（应能看到工具名）：%v", tester.Texts())
 	}
 	// 回合末尾的回答在组外
 	if !tester.HasText("最终答案") {
@@ -2868,12 +2871,16 @@ func TestProcessGroupTitlesFollowHarness(t *testing.T) {
 	if len(titles) != 2 {
 		t.Fatalf("应有两个过程组，实际 %v", titles)
 	}
-	// 思考、读文件、搜索代码各一次 → 按首次出现排序
-	if want := "▸ 已完成分析，读取文件，搜索代码"; titles[0] != want {
+	// 思考、读文件、搜索代码各一次 → 按首次出现排序。末尾带步骤数：
+	// 折叠态也要能判断这组有多重（3 步 vs 30 步）。
+	//
+	// 步骤数**只数工具调用**（read + grep = 2），思考不算"步"——
+	// 用户看这个数字是想知道"调了几次工具"，思考不是工具。
+	if want := "▸ 已完成分析，读取文件，搜索代码 · 2 步"; titles[0] != want {
 		t.Fatalf("组标题应为 %q，实际 %q", want, titles[0])
 	}
 	// 四种活动 → 只显示前三种 + 等（出现次序：思考、读、搜索、命令）
-	if want := "▸ 已完成分析，读取文件，搜索代码等"; titles[1] != want {
+	if want := "▸ 已完成分析，读取文件，搜索代码等 · 4 步"; titles[1] != want {
 		t.Fatalf("组标题应为 %q，实际 %q", want, titles[1])
 	}
 	// 旧版的构成统计不应再出现

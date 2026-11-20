@@ -98,6 +98,38 @@ var (
 	iconInfoSVG     = ui.MustParseSVG([]byte(iconInfo))
 )
 
+// toolIcon 按**工具名**取图标（比按活动分类更具体）。
+//
+// activityIcon 是按"这一组在干什么"分类的（命令/读/搜/写…），
+// 而单个工具行需要更精确的区分：同样归在 ActivitySearch 里的
+// grep 和 web_search，图标不该一样。
+func toolIcon(name string) *ui.SVG {
+	switch name {
+	case "bash", "pwsh":
+		return iconCommandsSVG
+	case "read", "read_image":
+		return iconBrowseSVG
+	case "write":
+		return iconEditSVG
+	case "edit":
+		return iconEditSVG
+	case "grep":
+		return iconSearchSVG
+	case "glob":
+		return iconSearchSVG
+	case "web_fetch":
+		return iconGlobeSVG
+	case "web_search":
+		return iconGlobeSVG
+	case "ask_user_question":
+		return iconQuestionSVG
+	case "todo_write":
+		return iconSparkleSVG
+	default:
+		return iconSparkleSVG
+	}
+}
+
 // activityIcon 把活动分类映射到 dsh 的图标（对齐 `PROCESS_ICONS`）。
 func activityIcon(kind processActivity) *ui.SVG {
 	switch kind {

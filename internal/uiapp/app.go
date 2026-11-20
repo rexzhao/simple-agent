@@ -1882,21 +1882,34 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 		if !ok {
 			return
 		}
-		// 对齐 harness：工具是一行式（图标 + 名称 + 参数摘要 + 当前状态）
+		// 一行式：图标 + 工具名（胶囊）+ 参数摘要（弱化色）+ 状态
+		//
+		// 为什么把工具名做成胶囊：原来名称和参数同样大小、同样颜色，
+		// 只靠一个空格隔开 ——「grep func (l *Local)」看不出哪是工具、
+		// 哪是搜索词。给名字加一层底色后，眼睛先扫到工具类型，
+		// 再决定要不要看参数。
 		id := stringOf(data, "id")
 		status := a.toolCallStatus(chat, id, streaming)
-		ui.Row(c).Gap(6).Children(func() {
-			ui.Text(c, "⚙").FontSize(12).TextColor(theme.TextMuted)
-			ui.Text(c, stringOf(data, "name")).FontSize(13).TextColor(theme.Text)
+		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, toolIcon(stringOf(data, "name"))).
+				Size(13, 13).TextColor(theme.TextMuted)
+			ui.Text(c, stringOf(data, "name")).FontSize(11).
+				Padding(1, 5).Radius(4).
+				Background(theme.SurfaceHover).TextColor(theme.Text)
 			if summary := toolArgSummary(data); summary != "" {
-				ui.Text(c, summary).FontSize(12).TextColor(theme.TextMuted)
+				// 参数可能是很长的命令/路径：截断并靠右留白，
+				// 不让它把状态挤没（超长内容展开后还能看到完整结果）
+				ui.Text(c, truncateRunes(summary, 72)).FontSize(12).
+					TextColor(theme.TextMuted).Grow(1).MaxLines(1)
+			} else {
+				ui.Spacer(c)
 			}
 			if status != "" {
 				color := theme.TextMuted
 				if status == a.tr("chat.toolRunning") {
 					color = theme.Accent
 				}
-				ui.Text(c, "· "+status).FontSize(11).TextColor(color)
+				ui.Text(c, status).FontSize(11).TextColor(color)
 			}
 		})
 	case render.MediaToolResult:
@@ -2031,6 +2044,13 @@ func (a *App) toolOutput(c *ui.Context, data map[string]any, isError, expanded b
 	ui.Column(c).FillWidth().Padding(6, 8).Radius(6).Background(theme.Surface).Gap(6).Children(func() {
 		if output != "" {
 			shown, _ := truncateOutput(output, expanded)
+			// 失败且折叠时：只留一行要点。
+			//
+			// 原始错误常常是"绝对路径 + Windows errno 长句"占三行，
+			// 折叠态扫一眼只需要知道"失败了、为什么"，细节展开再看。
+			if isError && !expanded {
+				shown = simplifyToolError(output)
+			}
 			ui.Text(c, shown).Font(dshCodeFontStack).FontSize(12).
 				TextColor(pick(isError, theme.Danger, theme.TextMuted))
 		}
@@ -2064,7 +2084,98 @@ func toolImagesOf(data map[string]any) []tools.ToolImageRef {
 	return out
 }
 
+// truncateRunes 把字符串截到 n 个字符（按 rune 算，中文不会被切一半）。
+//
+// 超长时末尾加省略号：调用方用它把"参数摘要"限制在一行内，
+// 免得一条长命令把行内其它信息（状态）挤出去。
+func truncateRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	if n <= 1 {
+		return string(runes[:n])
+	}
+	return string(runes[:n-1]) + "…"
+}
+
 // truncateOutput 按行截断工具输出。
+// simplifyToolError 把工具失败的长错误压成一行能读的要点。
+//
+// 真实见到的：读一个不存在的文件，输出是
+//
+//	读取失败：internal/host/local.go: open C:\Users\rex\AppData\Local\Temp\
+//	TestShotToolDisplay3531176701\001\internal\host\local.go: The system
+//	cannot find the path specified.
+//
+// 三行里只有"文件不存在"有用，其余是临时目录的绝对路径和 Windows 的
+// errno 长句。折叠态只留第一行 + 关键原因；展开才看完整的（展开态直接
+// 返回原文，不做简化）。
+func simplifyToolError(output string) string {
+	first := output
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	first = strings.TrimSpace(first)
+	// 去掉 Windows 的长尾 errno 描述：它总是这两句之一
+	for _, tail := range []string{
+		": The system cannot find the path specified.",
+		": The system cannot find the file specified.",
+		": No such file or directory",
+	} {
+		if strings.HasSuffix(first, tail) {
+			first = strings.TrimSuffix(first, tail) + "（不存在）"
+			break
+		}
+	}
+	// 绝对路径只留末尾两级：完整路径在展开态里能看到，折叠态没必要占宽度
+	first = shortenPaths(first)
+	return truncateRunes(first, 96)
+}
+
+// shortenPaths 把文本里的 Windows/Unix 绝对路径压成"…/末两级"。
+//
+// 只处理以盘符或 / 开头的片段，普通单词不动 —— 宁可少压也不要误伤
+// （比如把 "grep func (l *Local)" 里的东西当成路径）。
+func shortenPaths(s string) string {
+	fields := strings.Fields(s)
+	for i, field := range fields {
+		trimmed := strings.TrimRight(field, "：:，,。.;;")
+		if !looksLikeAbsolutePath(trimmed) {
+			continue
+		}
+		parts := strings.FieldsFunc(trimmed, func(r rune) bool { return r == '\\' || r == '/' })
+		if len(parts) <= 2 {
+			continue
+		}
+		sep := string(filepathSeparatorFor(trimmed))
+		short := "…" + sep + strings.Join(parts[len(parts)-2:], sep)
+		fields[i] = strings.Replace(field, trimmed, short, 1)
+	}
+	return strings.Join(fields, " ")
+}
+
+// looksLikeAbsolutePath 判断一段文本是不是绝对路径。
+func looksLikeAbsolutePath(s string) bool {
+	if len(s) < 4 {
+		return false
+	}
+	// Windows：C:\ 或 C:/
+	if len(s) >= 3 && s[1] == ':' && (s[2] == '\\' || s[2] == '/') {
+		return true
+	}
+	// Unix：以 / 开头且有至少两级
+	return s[0] == '/' && strings.Count(s, "/") >= 2
+}
+
+// filepathSeparatorFor 返回该路径惯用的分隔符。
+func filepathSeparatorFor(path string) rune {
+	if strings.ContainsRune(path, '\\') {
+		return '\\'
+	}
+	return '/'
+}
+
 func truncateOutput(output string, expanded bool) (string, bool) {
 	const maxLines = 1
 	const maxRunes = 200

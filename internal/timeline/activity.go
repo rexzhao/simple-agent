@@ -1,6 +1,7 @@
 package timeline
 
 import (
+	"fmt"
 	"strings"
 
 	"simple-agent/internal/locale"
@@ -142,7 +143,30 @@ func GroupTitle(refs []Ref, streaming bool, lang locale.Lang) string {
 	if len(shown) > 3 {
 		shown = shown[:3]
 	}
-	return joinActivityTitles(shown, len(ranked) > 3, lang)
+	title := joinActivityTitles(shown, len(ranked) > 3, lang)
+	// 末尾补「· N 步」，让折叠态也能判断这组有多重：
+	// 「执行了命令，读取文件，搜索代码」看不出是 3 步还是 30 步。
+	//
+	// 只在多步时加（1 步时"1 步"是废话）。用 refs 而不是调用次数：
+	// 一个工具调用会产生 tool_use 与 tool_result 两个 part，
+	// 按 part 数会虚高 —— 这里数 tool_use 的个数。
+	if steps := countToolUses(refs); steps > 1 {
+		title += fmt.Sprintf(" · %d 步", steps)
+	}
+	return title
+}
+
+// countToolUses 数这一组里有多少次工具调用。
+//
+// 只数 MediaToolUse：tool_result 是配对的另一半，数进去会翻倍。
+func countToolUses(refs []Ref) int {
+	n := 0
+	for _, ref := range refs {
+		if ref.Part().MediaType == render.MediaToolUse {
+			n++
+		}
+	}
+	return n
 }
 
 // GroupActivity 返回这一组当前（或最后一次）活动的分类，供标题前的图标使用。
