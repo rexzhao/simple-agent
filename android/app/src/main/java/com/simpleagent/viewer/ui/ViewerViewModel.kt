@@ -614,12 +614,16 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 新建会话。
      *
+     * workspace 决定新会话归到哪个项目：
+     *  - 传具体路径 → 执行端把它登记到（或新建）那个项目下；
+     *  - 传空串   → 落到执行端的默认工作区。
+     *
      * 命令是异步的：新会话的 id 经 cmdResult 回到 refreshSessions，
      * 这里用"会话数量变多"来选中最后一个（与桌面一致：新会话排在末尾）。
      */
-    fun newSession() {
+    fun newSession(workspace: String = "") {
         val before = state.value.sessions.map { it.id }.toSet()
-        val error = core.newSession("", "")
+        val error = core.newSession(workspace, "")
         if (error.isNotEmpty()) {
             state.update { it.copy(toast = error) }
             return

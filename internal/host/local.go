@@ -128,9 +128,15 @@ func (l *Local) Sessions() []SessionRef {
 	projectOf := map[string]string{}   // 会话 id → 项目名
 	projectIDOf := map[string]string{} // 会话 id → 项目 id
 	archivedOf := map[string]bool{}
+	// 按工作区查项目：留给"还没登记进档案"的新会话用（见下面回退）。
+	byWorkspace := map[string]ProjectRef{}
 	if l.cfg.Catalog != nil {
 		if projects, err := l.cfg.Catalog.ListProjects(); err == nil {
 			for _, project := range projects {
+				key := normalizeWorkspaceKey(project.Workspace)
+				if key != "" {
+					byWorkspace[key] = ProjectRef{ID: project.ID, Name: project.Name}
+				}
 				for _, record := range project.Sessions {
 					projectOf[record.ID] = project.Name
 					projectIDOf[record.ID] = project.ID
@@ -149,16 +155,44 @@ func (l *Local) Sessions() []SessionRef {
 				updated = last.Notice.CreatedAt.Unix()
 			}
 		}
+		projectID := projectIDOf[session.ID]
+		projectName := projectOf[session.ID]
+		if projectID == "" {
+			// **新会话还没登记进档案**（还没产生第一条内容，ensurePersisted
+			// 没跑）。这时按工作区找它该属于哪个项目 —— 否则界面会拿
+			// workspace 路径当分组 key，而其它会话用的是项目 ID，
+			// 于是同一个项目显示成**两个同名分组**（真实踩过：手机上新
+			// 建会话，侧栏先出现两个 simple-agent，聊两句又合成一个）。
+			if ref, ok := byWorkspace[normalizeWorkspaceKey(session.Workspace)]; ok {
+				projectID = ref.ID
+				projectName = ref.Name
+			}
+		}
 		out = append(out, SessionRef{
 			ID: session.ID, Title: session.Title,
 			Workspace:   session.Workspace,
 			UpdatedAt:   updated,
-			ProjectID:   projectIDOf[session.ID],
-			ProjectName: projectOf[session.ID],
+			ProjectID:   projectID,
+			ProjectName: projectName,
 			Archived:    archivedOf[session.ID],
 		})
 	}
 	return out
+}
+
+// ProjectRef 是项目的最小标识（分组用，不需要完整档案）。
+type ProjectRef struct {
+	ID   string
+	Name string
+}
+
+// normalizeWorkspaceKey 把工作区路径规范化成查表用的 key。
+//
+// 与 store 里的比较口径一致：斜杠统一、去掉尾部斜杠、小写
+// （Windows 路径大小写不敏感）。
+func normalizeWorkspaceKey(workspace string) string {
+	cleaned := strings.TrimRight(strings.ReplaceAll(workspace, "\\", "/"), "/")
+	return strings.ToLower(cleaned)
 }
 
 func (l *Local) Session(id string) *Session {

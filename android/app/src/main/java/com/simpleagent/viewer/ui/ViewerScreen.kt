@@ -34,6 +34,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedTextField
@@ -50,6 +51,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -148,6 +150,10 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
                     },
                     onNew = {
                         viewModel.newSession()
+                        scope.launch { drawerState.close() }
+                    },
+                    onNewProject = { workspace ->
+                        viewModel.newSession(workspace)
                         scope.launch { drawerState.close() }
                     },
                     onSwitchHost = {
@@ -598,6 +604,8 @@ private fun SessionDrawer(
     currentHostId: String,
     onSelect: (String) -> Unit,
     onNew: () -> Unit,
+    /** 在指定项目里新建会话（参数是 workspace 路径）。 */
+    onNewProject: (String) -> Unit,
     onSwitchHost: (String) -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -654,27 +662,58 @@ private fun SessionDrawer(
                 modifier = Modifier.padding(20.dp),
             )
         }
+        // 按项目分组（与桌面侧栏一致）：项目顺序 = 会话出现的先后，
+        // 会话在组内保持执行端给的顺序（用户可调整，不重排）。
+        val groups = remember(sessions) {
+            val order = LinkedHashMap<String, MutableList<SessionSummary>>()
+            sessions.forEach { order.getOrPut(it.groupKey) { mutableListOf() }.add(it) }
+            order
+        }
+        // 折叠状态：项目默认展开，「已归档」小节默认折叠。
+        // key 加前缀区分两种分组，避免项目 id 与归档小节撞上。
+        val collapsed = remember { mutableStateMapOf<String, Boolean>() }
         LazyColumn(modifier = Modifier.weight(1f)) {
-            items(sessions, key = { it.id }) { session ->
-                val active = session.id == activeId
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onSelect(session.id) }
-                        .background(
-                            if (active) ViewerColors.surfaceHigh else androidx.compose.ui.graphics.Color.Transparent,
-                        )
-                        .padding(horizontal = 20.dp, vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(3.dp),
-                ) {
-                    Text(
-                        text = session.title.ifEmpty { session.id.take(8) },
-                        fontSize = 14.sp,
-                        fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
-                        maxLines = 2,
+            groups.forEach { (key, members) ->
+                val active = members.filter { !it.archived }
+                val archived = members.filter { it.archived }
+                val name = members.firstOrNull()?.let {
+                    it.projectName.ifEmpty { workspaceLabel(it.workspace) }
+                } ?: key
+                item(key = "group:$key") {
+                    ProjectRow(
+                        name = name,
+                        expanded = collapsed["group:$key"] != true,
+                        onToggle = {
+                            collapsed["group:$key"] = collapsed["group:$key"] != true
+                        },
+                        onNewHere = onNewProject,
+                        workspace = members.firstOrNull()?.workspace ?: "",
                     )
-                    if (session.workspace.isNotEmpty()) {
-                        Text(session.workspace, fontSize = 11.sp, color = ViewerColors.muted, maxLines = 1)
+                }
+                if (collapsed["group:$key"] != true) {
+                    items(active, key = { it.id }) { session ->
+                        SessionRow(session, session.id == activeId) { onSelect(session.id) }
+                    }
+                    // 已归档的会话挂在这个项目下，单独一个**默认折叠**的小节：
+                    // 归档的意图就是"别占地方"，但也不能全藏掉（要能恢复）。
+                    if (archived.isNotEmpty()) {
+                        val archiveKey = "archive:$key"
+                        item(key = archiveKey) {
+                            ProjectRow(
+                                name = "已归档（${archived.size}）",
+                                expanded = collapsed[archiveKey] == true,
+                                onToggle = { collapsed[archiveKey] = collapsed[archiveKey] != true },
+                                onNewHere = null,
+                                muted = true,
+                            )
+                        }
+                        if (collapsed[archiveKey] == true) {
+                            items(archived, key = { it.id }) { session ->
+                                SessionRow(session, session.id == activeId, muted = true) {
+                                    onSelect(session.id)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -688,6 +727,97 @@ private fun SessionDrawer(
 }
 
 // ---- 输入卡 ----
+
+/**
+ * 项目行：三角 + 项目名 + 右侧「在此项目新建会话」。
+ *
+ * 与桌面一致：新建按钮放在项目行里，这样新会话天然归到这个项目，
+ * 不需要用户先"切过去"再新建。
+ *
+ * onNewHere 为 null 时不显示新建按钮（「已归档」小节用它 —— 那里不是项目）。
+ */
+@Composable
+private fun ProjectRow(
+    name: String,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    onNewHere: ((String) -> Unit)?,
+    workspace: String = "",
+    muted: Boolean = false,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onToggle() }
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = if (expanded) "▾" else "▸",
+            fontSize = 11.sp,
+            color = ViewerColors.muted,
+        )
+        Text(
+            text = name,
+            fontSize = if (muted) 12.sp else 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = if (muted) ViewerColors.muted else MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = 6.dp),
+        )
+        if (onNewHere != null && workspace.isNotEmpty()) {
+            Text(
+                text = "＋",
+                fontSize = 16.sp,
+                color = ViewerColors.accent,
+                modifier = Modifier
+                    .clickable { onNewHere(workspace) }
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+            )
+        }
+    }
+}
+
+/** 会话行：标题 + （可选）workspace 路径。 */
+@Composable
+private fun SessionRow(
+    session: SessionSummary,
+    active: Boolean,
+    muted: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .background(
+                if (active) ViewerColors.surfaceHigh else androidx.compose.ui.graphics.Color.Transparent,
+            )
+            .padding(start = 30.dp, end = 20.dp, top = 10.dp, bottom = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Text(
+            text = session.title.ifEmpty { session.id.take(8) },
+            fontSize = 14.sp,
+            fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
+            color = if (muted) ViewerColors.muted else MaterialTheme.colorScheme.onSurface,
+            maxLines = 2,
+        )
+        if (!muted && session.workspace.isNotEmpty()) {
+            Text(session.workspace, fontSize = 11.sp, color = ViewerColors.muted, maxLines = 1)
+        }
+    }
+}
+
+/** workspaceLabel 取路径末级作为项目名（没有项目档案时的降级显示）。 */
+private fun workspaceLabel(workspace: String): String {
+    val cleaned = workspace.trimEnd('/', '\\')
+    if (cleaned.isEmpty()) return "默认"
+    val idx = maxOf(cleaned.lastIndexOf('/'), cleaned.lastIndexOf('\\'))
+    return if (idx >= 0 && idx + 1 < cleaned.length) cleaned.substring(idx + 1) else cleaned
+}
 
 @Composable
 private fun Composer(

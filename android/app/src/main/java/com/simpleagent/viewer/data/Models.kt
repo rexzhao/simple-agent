@@ -23,7 +23,16 @@ data class SessionSummary(
     val title: String = "",
     val workspace: String = "",
     @SerialName("updated_at") val updatedAt: Long = 0,
-)
+    // 项目分组用。为空表示执行端没有项目档案（旧版本/内存后端），
+    // 这时退回按 workspace 分组，与桌面端的降级策略一致。
+    @SerialName("project_id") val projectId: String = "",
+    @SerialName("project_name") val projectName: String = "",
+    // 已归档：仍列出但折叠在「已归档」小节里，不能运行。
+    val archived: Boolean = false,
+) {
+    /** 侧栏分组用的 key：有项目档案就按项目，否则按 workspace。 */
+    val groupKey: String get() = projectId.ifEmpty { workspace }
+}
 
 @Serializable
 data class RuntimeView(

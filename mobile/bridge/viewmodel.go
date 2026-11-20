@@ -18,6 +18,15 @@ type SessionSummary struct {
 	Title     string `json:"title"`
 	Workspace string `json:"workspace,omitempty"`
 	UpdatedAt int64  `json:"updated_at,omitempty"`
+	// ProjectID/ProjectName 是会话所属项目（来自项目档案）。
+	//
+	// 手机端用它把会话归到项目下，并支持"在这个项目里新建会话"——
+	// 没有这两个字段时，Android 只能按 workspace 字符串分组，
+	// 也说不出"新建到哪个项目"（NewSession 的 workspace 只能传空）。
+	ProjectID   string `json:"project_id,omitempty"`
+	ProjectName string `json:"project_name,omitempty"`
+	// Archived 表示会话已归档（不能再运行）。
+	Archived bool `json:"archived,omitempty"`
 }
 
 // RuntimeView 是状态条 / 输入卡要用的瞬时状态。

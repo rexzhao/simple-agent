@@ -353,13 +353,18 @@ func (c *Client) Close() {
 
 // ---- 读（全部返回 JSON，不阻塞）----
 
-// SessionsJSON 返回侧栏的会话列表：[{"id","title","workspace","updated_at"}]
+// SessionsJSON 返回侧栏的会话列表：
+// [{"id","title","workspace","updated_at","project_id","project_name","archived"}]
+//
+// 项目字段是手机端分组和"在指定项目下新建会话"的依据 —— 少传的话
+// Android 只能按 workspace 猜，且没法把新会话建到某个项目里。
 func (c *Client) SessionsJSON() string {
 	sessions := c.sessions()
 	summaries := make([]SessionSummary, 0, len(sessions))
 	for _, ref := range sessions {
 		summaries = append(summaries, SessionSummary{
 			ID: ref.ID, Title: ref.Title, Workspace: ref.Workspace, UpdatedAt: ref.UpdatedAt,
+			ProjectID: ref.ProjectID, ProjectName: ref.ProjectName, Archived: ref.Archived,
 		})
 	}
 	return encode(summaries)
