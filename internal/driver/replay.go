@@ -493,6 +493,12 @@ func (st *replayState) applyToolResult(data ToolResultData, seq uint64) {
 			fields["questions"] = result.Questions
 		}
 	}
+	// edit 的结构化差异：**持久化在日志里**（ToolResultRecord.Diff），
+	// 重放时必须带回 part，否则重启后界面就画不出 diff 了
+	// （真实踩到：编辑过的文件记录，重启后只剩一句"已编辑 xxx（+1 -1）"）。
+	if result.Diff != nil {
+		fields["diff"] = result.Diff
+	}
 	entry.AddPart(message.Part{
 		Content:   message.DataPart{Data: fields},
 		MediaType: render.MediaToolResult,
