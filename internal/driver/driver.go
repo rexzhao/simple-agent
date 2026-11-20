@@ -1,4 +1,4 @@
-// Package driver 是会话编排状态机：把用户操作与提供商事件翻译成会话变化，
+﻿// Package driver 是会话编排状态机：把用户操作与提供商事件翻译成会话变化，
 // 并把"接下来该做什么"以 Effect 形式交给调用方（uiapp）。
 //
 // 三条硬约束（方案 §4 / §9）：
@@ -1248,7 +1248,7 @@ func (d *Driver) finishStream(messageID, _ string) []Effect {
 	effects := []Effect{
 		recordMessageOutput(round.id, round.turn, *entry.Message, conversation.StatusComplete, ""),
 		// Turn 边界：这一次请求结束了（后面可能还有工具执行与续轮）
-		recordTurnFinished(round.id, round.turn, time.Since(round.startedAt)),
+		recordTurnFinished(round.id, round.turn, time.Since(round.startedAt), round.usage),
 	}
 	// 累计这次请求的用量。
 	//
@@ -1420,7 +1420,7 @@ func (d *Driver) failStream(messageID, reason string) []Effect {
 		// 失败也是终点：Turn 与 Round 都要收尾，否则崩溃恢复会把它当成"未完成"
 		if d.round != nil {
 			effects = append(effects,
-				recordTurnFinished(d.round.id, d.round.turn, time.Since(d.round.startedAt)),
+				recordTurnFinished(d.round.id, d.round.turn, time.Since(d.round.startedAt), d.round.usage),
 				recordRoundFinished(d.round.id, time.Since(d.roundStartedAt)),
 			)
 		}
@@ -1727,7 +1727,7 @@ func (d *Driver) Stop() []Effect {
 			// 用户主动停止也是终点：Turn 与 Round 都要收尾
 			if d.round != nil {
 				effects = append(effects,
-					recordTurnFinished(d.round.id, d.round.turn, time.Since(d.round.startedAt)),
+					recordTurnFinished(d.round.id, d.round.turn, time.Since(d.round.startedAt), d.round.usage),
 					recordRoundFinished(d.round.id, time.Since(d.roundStartedAt)),
 				)
 			}

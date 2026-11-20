@@ -1001,6 +1001,8 @@ func TestReadImageTool(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "big.png"), bigBuf.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// 长边上限 1568：2400 宽要缩到 1568（**只缩不放**，小图另见
+	// read_image_size_test.go）。
 	scaled, err := runTool(t, tc, "read_image", tools.Args{"file_path": "big.png"})
 	if err != nil {
 		t.Fatal(err)

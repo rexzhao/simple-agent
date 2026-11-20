@@ -401,6 +401,11 @@ func (st *replayState) apply(event store.Event) {
 		if out.OpenTurn.Round == data.Round && out.OpenTurn.Turn == data.Turn {
 			out.OpenTurn = TurnEventData{} // 正常收尾
 		}
+		// 逐条累加真实用量：没压缩过的会话靠这个还原累计值
+		// （以前只有压缩快照存累计，于是"刚打开旧会话看不到命中率"）。
+		if data.Usage != nil {
+			out.TotalUsage = addUsage(out.TotalUsage, data.Usage.toUsage())
+		}
 
 	case store.TypeNotice:
 		var data NoticeData

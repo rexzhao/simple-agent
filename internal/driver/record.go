@@ -135,6 +135,30 @@ type TurnEventData struct {
 	Turn  int `json:"turn"`
 	// DurationMs 只出现在 turn.finished 上（这一次请求的耗时）。
 	DurationMs int64 `json:"duration_ms,omitempty"`
+	// Usage 是这一次请求的真实用量（只有 turn.finished 会带）。
+	//
+	// **必须落盘**：否则打开一个没压缩过的旧会话，累计用量是 0，
+	// 状态条上的缓存命中率显示不出来（用户报的："刚打开会话时不显示
+	// 缓存命中率"）。以前只有压缩快照里存过累计值，没压缩过的会话
+	// 就永远读不到任何用量。
+	//
+	// 重放时逐条累加得到会话累计（见 Replayed.TotalUsage）。
+	Usage *UsageData `json:"usage,omitempty"`
+}
+
+// recordTurnFinished 记录 Turn 结束（带本次请求耗时与用量）。
+func recordTurnFinished(roundID, turn int, duration time.Duration, usage Usage) Effect {
+	data := TurnEventData{
+		Round:      roundID,
+		Turn:       turn,
+		DurationMs: duration.Milliseconds(),
+	}
+	// 全零不写：省日志空间，也让"这条没有用量"和"用量是 0"区分开
+	if usage != (Usage{}) {
+		converted := toUsageData(usage)
+		data.Usage = &converted
+	}
+	return record(store.TypeTurnFinished, data)
 }
 
 // recordRoundStarted 记录 Round 开始。
@@ -153,15 +177,6 @@ func recordRoundFinished(roundID int, duration time.Duration) Effect {
 // recordTurnStarted 记录 Turn 开始（请求即将发出）。
 func recordTurnStarted(roundID, turn int) Effect {
 	return record(store.TypeTurnStarted, TurnEventData{Round: roundID, Turn: turn})
-}
-
-// recordTurnFinished 记录 Turn 结束（带本次请求耗时）。
-func recordTurnFinished(roundID, turn int, duration time.Duration) Effect {
-	return record(store.TypeTurnFinished, TurnEventData{
-		Round:      roundID,
-		Turn:       turn,
-		DurationMs: duration.Milliseconds(),
-	})
 }
 
 // recordCreated 是会话开始时写的第一条事件。

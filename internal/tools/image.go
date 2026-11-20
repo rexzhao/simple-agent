@@ -9,7 +9,6 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,14 +17,17 @@ import (
 )
 
 // read_image 的限额（与 dsh 的 attachment 默认值对齐：20MB / 8192px / 64MP），
-// 再加上一条自己的缩放上限——视觉模型对超过 ~1600px 的长边没有更多细节收益，
-// 却要付 token 与带宽。
+// 再加上一条自己的缩放上限（1568 长边）。小图不受影响 —— 只缩不放。
 const (
 	maxImageBytes     = 20 * 1024 * 1024
 	maxImageDimension = 8192
 	maxImagePixels    = 64_000_000
-	downscaleLongEdge = 1568
-	downscalePixels   = 4_000_000
+	// defaultImageLongEdge 是发给模型的图片长边**上限**。
+	//
+	// 1568 对齐 Anthropic 服务端的口径（超过它会在服务端再缩一次），
+	// 提前缩到同一尺寸既省上传字节，也省按 tile 计费的 token。
+	// **小于这个值的图不经任何处理**：拉大既浪费 token 又不多出细节。
+	defaultImageLongEdge = 1568
 	// reencodeJPEGQuality 是缩放后重新编码的质量（有透明通道时改用 PNG）。
 	reencodeJPEGQuality = 88
 )
@@ -48,16 +50,32 @@ type ImageOutput struct {
 	DisplayOnly bool
 }
 
+// readImageTool 的 read_image 把图片交给模型看。
+//
+// 长边上限 1568：超过就缩，**小于则原样返回**（只缩不放）。
+// max_size 让模型要更小的副本（读 4K 截图只看整体布局时传 768，
+// 能省掉约 3/4 的图片 token）。
 func readImageTool(fullAccess bool) *ToolDef {
 	return &ToolDef{
 		Name: "read_image",
 		Description: "Read a PNG/JPEG/WebP/GIF file and return the image itself. " +
-			"Large images are downscaled automatically; do not create thumbnails to inspect an image. " +
+			"Images larger than 1568px on the long edge are downscaled; smaller ones are sent as-is. " +
+			"Pass max_size to ask for an even smaller copy when you only need the overall layout. " +
+			"Do not create thumbnails to inspect an image. " +
 			"Requires a model with image input.",
 		Guidance: "Use the read_image tool to look at an image file directly; " +
-			"do not transcode or resize it with shell commands first.",
+			"do not transcode or resize it with shell commands first. " +
+			"For a large screenshot where you only need the layout, pass max_size (e.g. 768) " +
+			"to spend far fewer image tokens.",
 		Parameters: schema(map[string]any{
 			"file_path": map[string]any{"type": "string", "description": pathDescription(fullAccess, "Path to the image file")},
+			"max_size": map[string]any{
+				"type": "number",
+				"description": fmt.Sprintf(
+					"Optional long-edge limit in pixels for the copy you receive. "+
+						"Defaults to %d; smaller means fewer tokens. Never upscales.",
+					defaultImageLongEdge),
+			},
 		}, "file_path"),
 		Run: readImageRun,
 	}
@@ -122,10 +140,33 @@ func readImageRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, 
 			displayPath(tc, path), width, height, maxImagePixels/10_000)
 	}
 
+	// **默认发原图，不做任何缩放**。
+	//
+	// 以前无条件缩到 1568 长边，理由是"对齐 Anthropic 的服务端上限"——
+	// 但对小图是白缩一次（缩完还有编码损失），而 openai 兼容网关按 tile
+	// 计费时模型也确实看得到原图。用户的原话："不指定大小的话，最多都原图
+	// 就可以了，没必要缩放。"
+	//
+	// 模型要省 token 就自己传 max_size —— 那时才缩，且**只缩不放**。
+	// 硬上限（8192px / 64MP / 20MB）仍然生效，那是协议层面的约束。
+	// 长边**上限** 1568（默认），超过才缩，**小图原样返回**。
+	//
+	// 1568 对齐 Anthropic 服务端的口径：超过这个长边的图它会在服务端再缩一次，
+	// 我们提前缩到同一尺寸既省上传字节，也省 openai 兼容网关按 tile 计的 token。
+	//
+	// 关键是**只缩不放**：原图小于 1568 时不动它 —— 拉大既浪费 token
+	// 又不会多出任何细节。
+	//
+	// 模型要更小的副本就传 max_size（只能比 1568 更小，传更大的按 1568 算）。
+	longEdge := defaultImageLongEdge
+	if requested, ok := args.Int("max_size"); ok && requested > 0 && requested < longEdge {
+		longEdge = requested
+	}
+
 	out := ImageOutput{MediaType: mediaType, Data: data, Width: width, Height: height}
 	scaled := false
-	if mediaType != "image/webp" && shouldDownscale(width, height) {
-		if small, newWidth, newHeight, scaleErr := downscaleImage(data, mediaType); scaleErr == nil {
+	if mediaType != "image/webp" && shouldDownscaleTo(width, height, longEdge) {
+		if small, newWidth, newHeight, scaleErr := downscaleImage(data, mediaType, longEdge); scaleErr == nil {
 			out = ImageOutput{MediaType: small.mediaType, Data: small.data, Width: newWidth, Height: newHeight}
 			scaled = true
 		}
@@ -137,13 +178,19 @@ func readImageRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, 
 	}, nil
 }
 
-// shouldDownscale 报告是否值得把图片缩小后再发给模型。
-func shouldDownscale(width, height int) bool {
+// shouldDownscaleTo 报告是否值得把图片缩到 longEdge 长边以内。
+//
+// longEdge <= 0 时用默认上限 1568。**只在原图更大时返回 true** ——
+// 小图原样返回：拉大既浪费 token 又不会多出任何细节。
+func shouldDownscaleTo(width, height, longEdge int) bool {
+	if longEdge <= 0 {
+		longEdge = defaultImageLongEdge
+	}
 	long := width
 	if height > long {
 		long = height
 	}
-	return long > downscaleLongEdge || width*height > downscalePixels
+	return long > longEdge
 }
 
 // imageExtHint 是错误信息里的扩展名提示（真正判定看文件签名）。
@@ -237,11 +284,13 @@ type encodedImage struct {
 	data      []byte
 }
 
-// downscaleImage 把长边超过上限的图片按比例缩小，并重新编码。
+// downscaleImage 把图片缩到 longEdge 长边以内，并重新编码。
 //
 // 用**区域平均**（box filter）而不是最近邻：缩小时最近邻会丢细节、产生锯齿，
 // 而视觉模型看的正是细节。透明通道存在时统一编码成 PNG，否则用 JPEG 控制体积。
-func downscaleImage(data []byte, mediaType string) (encodedImage, int, int, error) {
+//
+// longEdge <= 0 时用默认上限。**只缩不放**：原图本来就小会直接返回"无需缩放"。
+func downscaleImage(data []byte, mediaType string, longEdge int) (encodedImage, int, int, error) {
 	src, format, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return encodedImage{}, 0, 0, err
@@ -252,7 +301,7 @@ func downscaleImage(data []byte, mediaType string) (encodedImage, int, int, erro
 	}
 	bounds := src.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
-	newWidth, newHeight := scaledDimensions(width, height)
+	newWidth, newHeight := scaledDimensionsTo(width, height, longEdge)
 	if newWidth >= width && newHeight >= height {
 		return encodedImage{}, 0, 0, errors.New("无需缩放")
 	}
@@ -272,14 +321,17 @@ func downscaleImage(data []byte, mediaType string) (encodedImage, int, int, erro
 	return encodedImage{mediaType: outType, data: buf.Bytes()}, newWidth, newHeight, nil
 }
 
-// scaledDimensions 按长边与像素预算算出缩放后的尺寸（保持比例）。
-func scaledDimensions(width, height int) (int, int) {
-	ratio := 1.0
-	if long := maxInt(width, height); long > downscaleLongEdge {
-		ratio = float64(downscaleLongEdge) / float64(long)
+// scaledDimensionsTo 按 longEdge 算出缩放后的尺寸（保持比例）。
+//
+// longEdge <= 0 时用默认上限 1568。**结果永远不大于原图**：
+// ratio 只减不增（原图更小时返回原尺寸）。
+func scaledDimensionsTo(width, height, longEdge int) (int, int) {
+	if longEdge <= 0 {
+		longEdge = defaultImageLongEdge
 	}
-	if pixels := float64(width) * float64(height); pixels*ratio*ratio > downscalePixels {
-		ratio = math.Sqrt(downscalePixels / pixels)
+	ratio := 1.0
+	if long := maxInt(width, height); long > longEdge {
+		ratio = float64(longEdge) / float64(long)
 	}
 	if ratio >= 1 {
 		return width, height
