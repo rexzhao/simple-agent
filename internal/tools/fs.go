@@ -112,8 +112,24 @@ func readRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, error
 		}
 	}
 
+	// 结构化摘要：界面折叠行显示"第 1-80 行 / 共 300 行"，
+// 不用把末尾那句"用 offset=81 继续"（给模型的续读指令）摊出来。
+	read := &ReadInfo{
+		Path:       displayPath(tc, path),
+		TotalLines: total,
+		NotUTF8:    notUTF8,
+		UTF16:      utf16,
+	}
+	if emitted > 0 {
+		read.StartLine = startLine
+		read.EndLine = startLine + emitted - 1
+		read.Truncated = read.EndLine < total
+	}
+
 	if emitted == 0 {
-		return OutputOf(fmt.Sprintf("（文件共 %d 行，offset=%d 超出范围）", total, offset)), nil
+		ret := OutputOf(fmt.Sprintf("（文件共 %d 行，offset=%d 超出范围）", total, offset))
+		ret.Read = read
+		return ret, nil
 	}
 	if last := startLine + emitted - 1; last < total {
 		fmt.Fprintf(&out, "…（共 %d 行，已返回第 %d-%d 行；用 offset=%d 继续）", total, startLine, last, last+1)
@@ -126,7 +142,9 @@ func readRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, error
 		// 把编码这件事摆在最前面：模型据此才知道用 write 重写会改变文件编码
 		output = readNonUTF8Note + output
 	}
-	return OutputOf(output), nil
+	ret := OutputOf(output)
+	ret.Read = read
+	return ret, nil
 }
 
 // splitLines 按 \n 切行（保留最后一段，去掉行尾 \r）。

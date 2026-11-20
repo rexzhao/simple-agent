@@ -1515,21 +1515,11 @@ func (d *Driver) ToolResult(messageID string, outcome tools.ToolOutcome) ([]Effe
 		"output":   outcome.Output,
 		"is_error": outcome.IsError,
 	}
-	// edit 的结构化差异：**只给界面渲染**，组装请求时不会发给模型
-	// （providers 那边只取 output/is_error）。
-	if outcome.Diff != nil {
-		data["diff"] = outcome.Diff
-	}
-	// 命令执行的元信息（exit_code / elapsed / cwd）：只给界面排版，
-	// 组装请求时不发给模型（模型看 Output 第一行那句摘要就够）。
-	if outcome.Exec != nil {
-		data["exec"] = outcome.Exec
-	}
-	// 图片工具的摘要：折叠行用它显示一行人话（"x.png · 1920x1080 · 240KB"），
-	// 而不是把 Output 里的 XML 信封摊出来。
-	if outcome.Image != nil {
-		data["image_info"] = outcome.Image
-	}
+	// 结构化附加字段全部走一个入口：
+	//   diff / exec / image_info / web / search / read / todo
+	// 它们**只给界面**渲染，组装请求时不会发给模型（providers 只取
+	// output/is_error）。字段多，逐个写在这里容易漏，收成一个函数。
+	attachToolExtras(data, outcome)
 	if len(outcome.Images) > 0 {
 		images := make([]any, 0, len(outcome.Images))
 		for _, image := range outcome.Images {

@@ -87,7 +87,9 @@ func todoWriteRun(_ context.Context, args Args, tc *ToolContext) (ToolReturn, er
 	tc.setTodos(todos)
 
 	if len(todos) == 0 {
-		return OutputOf("任务列表已清空"), nil
+		ret := OutputOf("任务列表已清空")
+		ret.Todo = &TodoInfo{}
+		return ret, nil
 	}
 
 	completed := 0
@@ -102,5 +104,8 @@ func todoWriteRun(_ context.Context, args Args, tc *ToolContext) (ToolReturn, er
 	for _, todo := range todos {
 		fmt.Fprintf(&out, "\n%s %s", todo.Status.glyph(), todo.Content)
 	}
-	return OutputOf(out.String()), nil
+	ret := OutputOf(out.String())
+	// 结构化摘要：界面折叠行显示 "3/5 完成"，清单本身在 todo 面板里。
+	ret.Todo = &TodoInfo{Total: len(todos), Completed: completed}
+	return ret, nil
 }

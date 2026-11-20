@@ -76,7 +76,17 @@ func webFetchRun(ctx context.Context, args Args, _ *ToolContext) (ToolReturn, er
 		return ToolReturn{}, fmt.Errorf("抓取 %s 失败：%w", raw, err)
 	}
 
-	return OutputOf(formatFetchOutput(result)), nil
+	ret := OutputOf(formatFetchOutput(result))
+	// 给界面的摘要：Output 里掺着 "External web content follows..." 和
+	// 截断提示 —— 那是写给模型的，用户看着就是一段莫名其妙的英文。
+	ret.Web = &WebInfo{
+		Kind:      "fetch",
+		URL:       result.URL,
+		Status:    result.Status,
+		Bytes:     len(result.Content),
+		Truncated: result.Truncated || len([]rune(result.Content)) > maxFetchOutputChars,
+	}
+	return ret, nil
 }
 
 // formatFetchOutput 把抓取结果拼成模型可见的一段文本。
@@ -192,7 +202,25 @@ func webSearchRun(ctx context.Context, args Args, searcher *web.Searcher) (ToolR
 		}
 		return ToolReturn{}, fmt.Errorf("搜索失败：%w", err)
 	}
-	return OutputOf(formatSearchOutput(results)), nil
+	ret := OutputOf(formatSearchOutput(results))
+	// 给界面的摘要：Output 里除了结果列表，还掺着
+	// "External web content follows..." 和 "Cite the relevant URLs above..."
+	// 这类**给模型的指令** —— 用户看到的就是结果后面跟着一句英文命令。
+	ret.Web = &WebInfo{Kind: "search"}
+	for _, source := range results.Sources {
+		title := source.Title
+		if title == "" {
+			title = hostOf(source.URL)
+		}
+		ret.Web.Results = append(ret.Web.Results, WebResult{
+			Title:       title,
+			URL:         source.URL,
+			Excerpt:     firstNonEmpty(source.Summary, source.Snippet),
+			PublishedAt: source.PublishedAt,
+		})
+	}
+	ret.Web.Truncated = results.Truncated
+	return ret, nil
 }
 
 // parseSearchArgs 校验并去重查询词（对齐 dsh 的 parseSearchArgs）。

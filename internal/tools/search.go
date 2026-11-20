@@ -76,15 +76,29 @@ func globRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, error
 	if err := ctx.Err(); err != nil {
 		return ToolReturn{}, err
 	}
-	if len(matches) == 0 {
-		return OutputOf(fmt.Sprintf("没有文件匹配 %q", pattern)), nil
-	}
 	sortStrings(matches)
+	// 结构化副本：glob 每个文件一条（没有行内容）。
+	search := &SearchInfo{
+		Pattern:   pattern,
+		FileCount: len(matches),
+		HitCount:  len(matches),
+		Truncated: len(matches) >= maxGlobFiles,
+	}
+	for _, match := range matches {
+		search.Files = append(search.Files, SearchFile{Path: match})
+	}
+	if len(matches) == 0 {
+		ret := OutputOf(fmt.Sprintf("没有文件匹配 %q", pattern))
+		ret.Search = search
+		return ret, nil
+	}
 	out := strings.Join(matches, "\n")
 	if len(matches) >= maxGlobFiles {
 		out += fmt.Sprintf("\n…（已达 %d 个文件上限）", maxGlobFiles)
 	}
-	return OutputOf(out), nil
+	ret := OutputOf(out)
+	ret.Search = search
+	return ret, nil
 }
 
 // compileGlob 编译 glob 模式。
@@ -199,6 +213,8 @@ func grepRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, error
 
 	total := 0
 	var groups []string
+	// 结构化副本：给界面按文件分组显示（Output 里的纯文本是给模型的）。
+	var searchFiles []SearchFile
 
 	searchFile := func(file string) bool {
 		if include != nil && !include.MatchString(filepath.Base(file)) {
@@ -213,22 +229,27 @@ func grepRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, error
 			return true
 		}
 		var hits []string
+		var structured []SearchHit
 		for index, line := range splitLines(decodeConsole(data)) {
 			if !re.MatchString(line) {
 				continue
 			}
 			line = strings.TrimRight(line, " \t\r")
+			full := line
 			if runes := []rune(line); len(runes) > maxGrepLineCh {
 				line = string(runes[:maxGrepLineCh]) + "…"
 			}
 			hits = append(hits, fmt.Sprintf("%6d: %s", index+1, line))
+			structured = append(structured, SearchHit{Line: index + 1, Text: full})
 			total++
 			if total >= maxGrepHits {
 				break
 			}
 		}
 		if len(hits) > 0 {
-			groups = append(groups, displayPath(tc, file)+"\n"+strings.Join(hits, "\n"))
+			path := displayPath(tc, file)
+			groups = append(groups, path+"\n"+strings.Join(hits, "\n"))
+			searchFiles = append(searchFiles, SearchFile{Path: path, Hits: structured})
 		}
 		return total < maxGrepHits && ctx.Err() == nil
 	}
@@ -242,14 +263,26 @@ func grepRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, error
 	if err := ctx.Err(); err != nil {
 		return ToolReturn{}, err
 	}
+	truncated := total >= maxGrepHits
+	search := &SearchInfo{
+		Pattern:   pattern,
+		Files:     searchFiles,
+		FileCount: len(searchFiles),
+		HitCount:  total,
+		Truncated: truncated,
+	}
 	if len(groups) == 0 {
-		return OutputOf(fmt.Sprintf("没有匹配 %q 的内容", pattern)), nil
+		ret := OutputOf(fmt.Sprintf("没有匹配 %q 的内容", pattern))
+		ret.Search = search
+		return ret, nil
 	}
 	out := strings.Join(groups, "\n\n")
-	if total >= maxGrepHits {
+	if truncated {
 		out += fmt.Sprintf("\n…（已达 %d 条命中上限）", maxGrepHits)
 	}
-	return OutputOf(out), nil
+	ret := OutputOf(out)
+	ret.Search = search
+	return ret, nil
 }
 
 func sortStrings(list []string) { sort.Strings(list) }

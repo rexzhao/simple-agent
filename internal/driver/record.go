@@ -71,6 +71,11 @@ type ToolResultRecord struct {
 	Exec *tools.ExecInfo `json:"exec,omitempty"`
 	// ImageInfo 是图片工具的摘要，**只给界面**（折叠行一行人话）。
 	ImageInfo *tools.ImageInfo `json:"image_info,omitempty"`
+	// Web / Search / Read / Todo 同理：都是只给界面的结构化摘要。
+	Web    *tools.WebInfo    `json:"web,omitempty"`
+	Search *tools.SearchInfo `json:"search,omitempty"`
+	Read   *tools.ReadInfo   `json:"read,omitempty"`
+	Todo   *tools.TodoInfo   `json:"todo,omitempty"`
 }
 
 // ToolResultData 是 tool.result 的载荷：**单条**工具结果。
@@ -292,6 +297,10 @@ func resultRecords(outcomes []tools.ToolOutcome) []ToolResultRecord {
 			Diff:      outcome.Diff,
 			Exec:      outcome.Exec,
 			ImageInfo: outcome.Image,
+			Web:       outcome.Web,
+			Search:    outcome.Search,
+			Read:      outcome.Read,
+			Todo:      outcome.Todo,
 		})
 	}
 	return out
@@ -327,9 +336,86 @@ func partResultRecords(msg *message.Message) []ToolResultRecord {
 			Diff:      diffOf(data),
 			Exec:      execOf(data),
 			ImageInfo: imageInfoOf(data),
+			Web:       webOf(data),
+			Search:    searchOf(data),
+			Read:      readOf(data),
+			Todo:      todoOf(data),
 		})
 	}
 	return out
+}
+
+// toolExtraKeys 是工具结果里**只给界面**的结构化字段。
+//
+// 集中在这里的理由：这些字段要经过两条路径 ——
+//  1. 实时：ToolResult() 把 outcome 写进 part
+//  2. 重放：applyToolResult() 从日志重建 part
+//
+// 两份代码各自写一遍，加字段时极容易只改一边（已经踩过两次：
+// diff 和 exec 都曾"刚编辑完能看到、重启后就没了"）。
+// 现在两条路都调 attachToolExtras，漏改的可能性降到最低。
+const (
+	extraDiff      = "diff"
+	extraExec      = "exec"
+	extraImageInfo = "image_info"
+	extraWeb       = "web"
+	extraSearch    = "search"
+	extraRead      = "read"
+	extraTodo      = "todo"
+)
+
+// attachToolExtras 把 outcome 里的结构化附加字段挂到 part 数据上。
+//
+// 实时路径（ToolResult）与重放路径（applyToolResult）**共用这一个函数**。
+// 这些字段都不发给模型：providers 组装请求时只取 output/is_error。
+func attachToolExtras(data map[string]any, outcome tools.ToolOutcome) {
+	if outcome.Diff != nil {
+		data[extraDiff] = outcome.Diff
+	}
+	if outcome.Exec != nil {
+		data[extraExec] = outcome.Exec
+	}
+	if outcome.Image != nil {
+		data[extraImageInfo] = outcome.Image
+	}
+	if outcome.Web != nil {
+		data[extraWeb] = outcome.Web
+	}
+	if outcome.Search != nil {
+		data[extraSearch] = outcome.Search
+	}
+	if outcome.Read != nil {
+		data[extraRead] = outcome.Read
+	}
+	if outcome.Todo != nil {
+		data[extraTodo] = outcome.Todo
+	}
+}
+
+// attachRecordExtras 是重放侧的对应版本：从 ToolResultRecord 把同样这些
+// 字段写回 part。
+func attachRecordExtras(data map[string]any, record ToolResultRecord) {
+	if record.Diff != nil {
+		data[extraDiff] = record.Diff
+	}
+	if record.Exec != nil {
+		data[extraExec] = record.Exec
+	}
+	if record.ImageInfo != nil {
+		data[extraImageInfo] = record.ImageInfo
+	}
+	if record.Web != nil {
+		data[extraWeb] = record.Web
+	}
+	if record.Search != nil {
+		data[extraSearch] = record.Search
+	}
+	if record.Read != nil {
+		data[extraRead] = record.Read
+	}
+	if record.Todo != nil {
+		data[extraTodo] = record.Todo
+	}
 }
 
 // diffOf 读取 part 里的结构化差异（edit 用）。
@@ -353,6 +439,35 @@ func diffOf(data map[string]any) *tools.FileDiff {
 	}
 	return nil
 }
+
+// decodeExtra 把 part 里的结构化字段还原成具体类型。
+//
+// 内存里是 *T 指针，重放后是 map[string]any（JSON 解出来的）——
+// 两条路都要认。diff/exec/image/of 都是一样的形状，所以收成一个泛型函数，
+// 免得每加一个字段就复制一遍 12 行。
+func decodeExtra[T any](data map[string]any, key string) *T {
+	switch value := data[key].(type) {
+	case *T:
+		return value
+	case map[string]any:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		var out T
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil
+		}
+		return &out
+	}
+	return nil
+}
+
+// webOf / searchOf / readOf / todoOf 读取各工具的结构化摘要。
+func webOf(data map[string]any) *tools.WebInfo    { return decodeExtra[tools.WebInfo](data, extraWeb) }
+func searchOf(data map[string]any) *tools.SearchInfo { return decodeExtra[tools.SearchInfo](data, extraSearch) }
+func readOf(data map[string]any) *tools.ReadInfo  { return decodeExtra[tools.ReadInfo](data, extraRead) }
+func todoOf(data map[string]any) *tools.TodoInfo  { return decodeExtra[tools.TodoInfo](data, extraTodo) }
 
 // imageInfoOf 读取 part 里的图片摘要（read_image / display_image）。
 //

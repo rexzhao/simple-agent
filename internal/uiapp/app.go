@@ -2001,6 +2001,248 @@ func (a *App) renderMonoBlock(c *ui.Context, text string, background, foreground
 		})
 }
 
+// renderStructuredResult 用结构化数据渲染工具结果（检索/web/read/todo）。
+//
+// 返回 false 表示"没有结构化数据"，调用方退回渲染原始 Output。
+// 只给**有结构化摘要**的工具用：它们 Output 里掺着给模型的指令文本
+// （"External web content follows..."、"用 offset=81 继续"），
+// 直接摊出来用户看不懂。
+func (a *App) renderStructuredResult(c *ui.Context, data map[string]any, theme *ui.Theme) bool {
+	if info := searchInfoOfPart(data); info != nil {
+		a.renderSearchResult(c, info, theme)
+		return true
+	}
+	if info := webInfoOfPart(data); info != nil {
+		a.renderWebResult(c, info, theme)
+		return true
+	}
+	if info := readInfoOfPart(data); info != nil {
+		// read 的正文有价值（就是文件内容），所以仍然显示 Output，
+		// 但要**去掉末尾那句续读指令** —— 那是给模型的。
+		a.renderReadResult(c, data, info, theme)
+		return true
+	}
+	if info := todoInfoOfPart(data); info != nil {
+		a.renderTodoResult(c, info, theme)
+		return true
+	}
+	return false
+}
+
+// renderSearchResult 按文件分组显示检索结果（grep）或文件列表（glob）。
+func (a *App) renderSearchResult(c *ui.Context, info *tools.SearchInfo, theme *ui.Theme) {
+	if len(info.Files) == 0 {
+		ui.Text(c, "没有匹配").FontSize(11).TextColor(theme.TextMuted)
+		return
+	}
+	ui.Column(c).FillWidth().Padding(6, 8).Radius(6).
+		Background(theme.Surface).Gap(4).Children(func() {
+			for _, file := range info.Files {
+				ui.Column(c).FillWidth().Gap(1).Children(func() {
+					// 文件路径 + 该文件命中数
+					ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, file.Path).Font(dshCodeFontStack).FontSize(11).
+							TextColor(theme.Text).MaxLines(1)
+						if len(file.Hits) > 1 {
+							ui.Text(c, fmt.Sprintf("%d 处", len(file.Hits))).
+								FontSize(10).TextColor(theme.TextMuted)
+						}
+					})
+					// 命中行：行号 + 内容
+					for _, hit := range file.Hits {
+						text := fmt.Sprintf("%4d  %s", hit.Line,
+							truncateRunes(strings.TrimSpace(hit.Text), 100))
+						ui.Text(c, text).Font(dshCodeFontStack).FontSize(11).
+							TextColor(theme.TextMuted).MaxLines(1)
+					}
+				})
+			}
+			if info.Truncated {
+				ui.Text(c, "… 已达上限，结果被截断").
+					FontSize(10).TextColor(theme.TextMuted)
+			}
+		})
+}
+
+// renderWebResult 显示抓取摘要或搜索结果列表。
+func (a *App) renderWebResult(c *ui.Context, info *tools.WebInfo, theme *ui.Theme) {
+	if info.Kind == "fetch" {
+		// fetch 的正文就是抓到的网页内容，有价值 —— 由调用方继续显示 Output。
+		// 这里只补一行"抓的哪个地址、什么状态"。
+		return
+	}
+	ui.Column(c).FillWidth().Padding(6, 8).Radius(6).
+		Background(theme.Surface).Gap(4).Children(func() {
+			for index, result := range info.Results {
+				ui.Column(c).FillWidth().Gap(1).Children(func() {
+					ui.Text(c, fmt.Sprintf("%d. %s", index+1, result.Title)).
+						FontSize(12).TextColor(theme.Text).MaxLines(1)
+					if result.URL != "" {
+						ui.Text(c, result.URL).Font(dshCodeFontStack).FontSize(10).
+							TextColor(theme.TextMuted).MaxLines(1)
+					}
+					if result.Excerpt != "" {
+						ui.Text(c, truncateRunes(result.Excerpt, 120)).FontSize(11).
+							TextColor(theme.TextMuted).MaxLines(2)
+					}
+				})
+			}
+			if info.Truncated {
+				ui.Text(c, "… 只显示了前面的结果").
+					FontSize(10).TextColor(theme.TextMuted)
+			}
+		})
+}
+
+// renderReadResult 显示文件内容（保留行号），去掉末尾的续读指令。
+func (a *App) renderReadResult(c *ui.Context, data map[string]any, info *tools.ReadInfo, theme *ui.Theme) {
+	output := stringOf(data, "output")
+	// 去掉末尾那句 "…（共 300 行，已返回第 1-80 行；用 offset=81 继续）"：
+	// 那是让模型续读的指令，界面用折叠行的"第 1-80 行 / 共 300 行"表达。
+	if index := strings.LastIndex(output, "\n…（共 "); index >= 0 {
+		output = output[:index]
+	}
+	if strings.TrimSpace(output) != "" {
+		a.renderMonoBlock(c, strings.TrimRight(output, "\n"), theme.Surface, theme.Text)
+	}
+}
+
+// renderTodoResult 显示任务进度（清单本身在 todo 面板里）。
+func (a *App) renderTodoResult(c *ui.Context, info *tools.TodoInfo, theme *ui.Theme) {
+	if info.Total == 0 {
+		ui.Text(c, "任务列表已清空").FontSize(11).TextColor(theme.TextMuted)
+		return
+	}
+	ui.Text(c, fmt.Sprintf("任务列表：%d/%d 完成", info.Completed, info.Total)).
+		FontSize(11).TextColor(theme.TextMuted)
+}
+
+// toolSummaryLine 生成工具结果的一行结构化摘要（折叠行显示）。
+//
+// 优先级：图片 > 检索 > web > read > todo。
+// 一般只有一种（一个工具只产一类结果），排序只是为了行为确定。
+func toolSummaryLine(data map[string]any) string {
+	if info := imageInfoOfPart(data); info != nil {
+		return imageInfoSummary(info)
+	}
+	if info := searchInfoOfPart(data); info != nil {
+		return searchInfoSummary(info)
+	}
+	if info := webInfoOfPart(data); info != nil {
+		return webInfoSummary(info)
+	}
+	if info := readInfoOfPart(data); info != nil {
+		return readInfoSummary(info)
+	}
+	if info := todoInfoOfPart(data); info != nil {
+		return todoInfoSummary(info)
+	}
+	return ""
+}
+
+// searchInfoSummary："3 个文件 · 12 处命中"（glob 只有文件数）。
+func searchInfoSummary(info *tools.SearchInfo) string {
+	if info.FileCount == 0 && info.HitCount == 0 {
+		return ""
+	}
+	// glob：每个文件一条命中，说"处命中"没意义
+	if info.HitCount == info.FileCount {
+		text := fmt.Sprintf("%d 个文件", info.FileCount)
+		if info.Truncated {
+			text += "（已达上限）"
+		}
+		return text
+	}
+	text := fmt.Sprintf("%d 个文件 · %d 处命中", info.FileCount, info.HitCount)
+	if info.Truncated {
+		text += "（已达上限）"
+	}
+	return text
+}
+
+// webInfoSummary："HTTP 200 · 12KB" 或 "5 条结果"。
+func webInfoSummary(info *tools.WebInfo) string {
+	if info.Kind == "search" {
+		text := fmt.Sprintf("%d 条结果", len(info.Results))
+		if info.Truncated {
+			text += "（已截断）"
+		}
+		return text
+	}
+	var parts []string
+	if info.Status > 0 {
+		parts = append(parts, fmt.Sprintf("HTTP %d", info.Status))
+	}
+	if info.Bytes > 0 {
+		parts = append(parts, formatBytes(info.Bytes))
+	}
+	if info.Truncated {
+		parts = append(parts, "已截断")
+	}
+	return strings.Join(parts, " · ")
+}
+
+// readInfoSummary："第 1-80 行 / 共 300 行"。
+func readInfoSummary(info *tools.ReadInfo) string {
+	if info.TotalLines == 0 {
+		return ""
+	}
+	if info.EndLine == 0 {
+		return fmt.Sprintf("共 %d 行", info.TotalLines)
+	}
+	if info.StartLine == info.EndLine {
+		return fmt.Sprintf("第 %d 行 / 共 %d 行", info.StartLine, info.TotalLines)
+	}
+	return fmt.Sprintf("第 %d-%d 行 / 共 %d 行",
+		info.StartLine, info.EndLine, info.TotalLines)
+}
+
+// todoInfoSummary："3/5 完成"。
+func todoInfoSummary(info *tools.TodoInfo) string {
+	if info.Total == 0 {
+		return "已清空"
+	}
+	return fmt.Sprintf("%d/%d 完成", info.Completed, info.Total)
+}
+
+// decodePartExtra 把 part 里的结构化字段还原成具体类型。
+//
+// 内存里是 *T 指针，重放后是 map[string]any（JSON 解出来的）。
+// 与 driver 侧的 decodeExtra 同一思路，避免每个字段复制一遍。
+func decodePartExtra[T any](data map[string]any, key string) *T {
+	switch value := data[key].(type) {
+	case *T:
+		return value
+	case map[string]any:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		var out T
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil
+		}
+		return &out
+	}
+	return nil
+}
+
+func searchInfoOfPart(data map[string]any) *tools.SearchInfo {
+	return decodePartExtra[tools.SearchInfo](data, "search")
+}
+
+func webInfoOfPart(data map[string]any) *tools.WebInfo {
+	return decodePartExtra[tools.WebInfo](data, "web")
+}
+
+func readInfoOfPart(data map[string]any) *tools.ReadInfo {
+	return decodePartExtra[tools.ReadInfo](data, "read")
+}
+
+func todoInfoOfPart(data map[string]any) *tools.TodoInfo {
+	return decodePartExtra[tools.TodoInfo](data, "todo")
+}
+
 // imageInfoOfPart 从工具结果 data 里取出图片摘要。
 func imageInfoOfPart(data map[string]any) *tools.ImageInfo {
 	switch value := data["image_info"].(type) {
@@ -2442,12 +2684,17 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 				ui.Text(c, truncateRunes(summary, limit)).FontSize(12).
 					TextColor(theme.TextMuted).MaxLines(1)
 			}
-			// 图片：折叠行给**一行简略信息**（尺寸 + 大小），
-			// 而不是把 Output 里那段 <path>/<type>/<content> 信封摊出来
-			// —— 那是给模型看的，人读不懂。
+			// 各工具的结构化摘要（折叠行一行）。
+			//
+			// 这些都是"Output 里掺着给模型的文本，界面不该照搬"的同一类问题：
+			//   read_image → XML 信封
+			//   grep/glob  → 纯文本命中列表（看不出总数、文件分组）
+			//   web_*      → 夹着 "External web content follows..." 之类的指令
+			//   read       → 末尾挂着"用 offset=81 继续"
+			//   todo_write → 整个清单（界面上已有 todo 面板）
 			if hasResult {
-				if info := imageInfoOfPart(resultData); info != nil {
-					ui.Text(c, imageInfoSummary(info)).FontSize(11).
+				if line := toolSummaryLine(resultData); line != "" {
+					ui.Text(c, line).FontSize(11).
 						TextColor(theme.TextMuted).MaxLines(1)
 				}
 			}
@@ -2521,10 +2768,10 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 
 				// 1) 参数全文（bash 的命令、read 的路径…）
 				//
-				// 图片工具**跳过**：文件名已在折叠行，这里再画一块
-				// 显示路径没有意义（用户看到的就是"多跟着一行黑底文件名"）。
-				hasImages := len(toolImagesOf(resultData)) > 0
-				if argsText != "" && !hasImages {
+				// **只给 shell 用**：别的工具的参数已经浓缩进折叠行摘要了
+				// （grep 的 pattern、read 的路径、edit 的文件名），
+				// 再来一块就是重复（截图里 grep 展开后先冒出一行 pattern）。
+				if argsText != "" && terminal {
 					a.renderArgsBlock(c, argsText, terminal, theme)
 				}
 				if !hasResult {
@@ -2546,6 +2793,9 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 					// 它会画缩略图。**不能**用终端块 —— 那只会把 Output 里的
 					// XML 信封画成黑底，图片本体就丢了。
 					a.toolOutput(c, resultData, isError, true, color)
+				} else if a.renderStructuredResult(c, resultData, theme) {
+					// 检索/web/read/todo 有结构化数据：按结构渲染，
+					// 而不是把 Output 里掺着指令的文本摊出来。
 				} else if output := stringOf(resultData, "output"); output != "" {
 					// 有结构化元信息时，把 Output 开头那行 "exit_code=... cwd=..."
 					// 去掉 —— 它和上面刚画的元信息是同一件事，留着就是重复。

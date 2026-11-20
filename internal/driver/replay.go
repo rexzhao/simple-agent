@@ -496,18 +496,13 @@ func (st *replayState) applyToolResult(data ToolResultData, seq uint64) {
 	// edit 的结构化差异：**持久化在日志里**（ToolResultRecord.Diff），
 	// 重放时必须带回 part，否则重启后界面就画不出 diff 了
 	// （真实踩到：编辑过的文件记录，重启后只剩一句"已编辑 xxx（+1 -1）"）。
-	if result.Diff != nil {
-		fields["diff"] = result.Diff
-	}
-	// 命令元信息同理：不带上，重启后 exit_code / 耗时就不显示了。
-	// （上一个 bug 就是只补了实时路径、漏了这里，diff 重启后消失。）
-	if result.Exec != nil {
-		fields["exec"] = result.Exec
-	}
-	// 图片摘要同理：不带上的话，重启后折叠行就退回显示 XML 信封。
-	if result.ImageInfo != nil {
-		fields["image_info"] = result.ImageInfo
-	}
+	// 结构化附加字段（diff/exec/image_info/web/search/read/todo）：
+	// 走与实时路径**共用的** attachRecordExtras。
+	//
+	// 这里是 bug 的高发区 —— 曾经只补了实时路径、漏了这里，导致
+	// "刚编辑完能看到 diff，重启后就没了"。改成共用函数后，
+	// 新增字段只要在 attachToolExtras/attachRecordExtras 里各加一行。
+	attachRecordExtras(fields, result)
 	entry.AddPart(message.Part{
 		Content:   message.DataPart{Data: fields},
 		MediaType: render.MediaToolResult,
