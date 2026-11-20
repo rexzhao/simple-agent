@@ -1358,6 +1358,8 @@ func (a *App) effortLabel(effort string) string {
 		return a.tr("effort.medium")
 	case "high":
 		return a.tr("effort.high")
+	case "xhigh":
+		return a.tr("effort.xhigh")
 	case "max":
 		return a.tr("effort.max")
 	default:

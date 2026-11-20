@@ -207,6 +207,46 @@ type ProviderChoice struct {
 	Efforts map[string][]string `json:"efforts,omitempty"`
 }
 
+// ProviderChoices 把注册表转成选择器要用的列表。
+//
+// 放在这里而不是 cmd 里，是为了能测：这段"配置里写了什么，界面上就该
+// 显示什么"的判断曾经错过一次 —— Anthropic 的档位被无条件排除，
+// 表现是"配了 reasoning_efforts，界面上却没有 effort 选项"。
+//
+// registry 为 nil 时返回空（headless 单测会用 nil 构造配置，
+// 模型列表是可选信息，不该把启动路径搞崩）。
+func ProviderChoices(registry *providers.Registry) []ProviderChoice {
+	if registry == nil {
+		return nil
+	}
+	choices := make([]ProviderChoice, 0, len(registry.All()))
+	for _, entry := range registry.Configured() {
+		efforts := map[string][]string{}
+		labels := map[string]string{}
+		// 两个协议都支持思考档位，只是字段位置不同：
+		//   OpenAI 兼容 → 顶层 reasoning_effort
+		//   Anthropic   → output_config.effort
+		// 配置层已经按 kind 搬过位置（见 ModelEntry.requestParams），
+		// 所以这里**不按协议过滤**：配了档位就显示。
+		for _, model := range entry.Config.Models {
+			if len(model.ReasoningEfforts) > 0 {
+				efforts[model.ID] = model.ReasoningEfforts
+			}
+			if model.Label != "" {
+				labels[model.ID] = model.Label
+			}
+		}
+		choices = append(choices, ProviderChoice{
+			ProviderID: entry.Config.ID,
+			Label:      entry.Config.Label,
+			Models:     entry.Config.ModelIDs(),
+			Labels:     labels,
+			Efforts:    efforts,
+		})
+	}
+	return choices
+}
+
 // SetEfforts 注入"按模型返回思考档位"的查询函数（构造后替换也支持）。
 func (l *Local) SetEfforts(fn func(providers.Selection) []string) {
 	if fn == nil {

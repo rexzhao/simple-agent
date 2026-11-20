@@ -80,6 +80,7 @@ var enTable = map[string]string{
 	"effort.medium":  "Medium",
 	"effort.high":    "High",
 	"effort.max":     "Max",
+	"effort.xhigh":   "Extra high",
 	"effort.busy":    "You can change the effort only when idle",
 
 	// Permission (dsh ui-permission-presets `permission.access`)

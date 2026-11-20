@@ -87,6 +87,7 @@ var zhTable = map[string]string{
 	"effort.medium":  "中",
 	"effort.high":    "高",
 	"effort.max":     "最高",
+	"effort.xhigh":   "极高",
 	"effort.busy":    "只有空闲时才能切换思考档位",
 
 	// 权限（dsh ui-permission-presets 的 `permission.access` 文案）

@@ -571,32 +571,9 @@ func systemPrompt(cfg config.Config) string {
 // registry 为 nil 时返回空（headless 的单测会以 nil 构造配置，模型列表是可选信息，
 // 不该让它把整条启动路径搞崩）。
 func providerChoices(registry *providers.Registry) []uiapp.ProviderChoice {
-	if registry == nil {
-		return nil
-	}
-	choices := make([]uiapp.ProviderChoice, 0, len(registry.All()))
-	for _, entry := range registry.Configured() {
-		efforts := map[string][]string{}
-		labels := map[string]string{}
-		// Anthropic Messages API 没有 reasoning_effort 字段（多传会 400），
-		// 因此这类提供商不暴露档位选择，配置里写了也不生效。
-		supportsEffort := entry.Config.Kind != providers.KindAnthropic
-		for _, model := range entry.Config.Models {
-			if supportsEffort && len(model.ReasoningEfforts) > 0 {
-				efforts[model.ID] = model.ReasoningEfforts
-			}
-			if model.Label != "" {
-				labels[model.ID] = model.Label
-			}
-		}
-		choices = append(choices, uiapp.ProviderChoice{
-			ProviderID: entry.Config.ID,
-			Label:      entry.Config.Label,
-			Models:     entry.Config.ModelIDs(),
-			Labels:     labels,
-			Efforts:    efforts,
-		})
-	}
+	// 逻辑在 host.ProviderChoices（那里能测）：它负责"配置里配了档位就
+	// 把它暴露给界面"，两个协议只是字段位置不同，不按 kind 过滤。
+	choices := host.ProviderChoices(registry)
 	simulated := providers.SimulatedConfig()
 	choices = append(choices, uiapp.ProviderChoice{
 		ProviderID: simulated.ID,
