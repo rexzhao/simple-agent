@@ -1520,6 +1520,11 @@ func (d *Driver) ToolResult(messageID string, outcome tools.ToolOutcome) ([]Effe
 	if outcome.Diff != nil {
 		data["diff"] = outcome.Diff
 	}
+	// 命令执行的元信息（exit_code / elapsed / cwd）：只给界面排版，
+	// 组装请求时不发给模型（模型看 Output 第一行那句摘要就够）。
+	if outcome.Exec != nil {
+		data["exec"] = outcome.Exec
+	}
 	if len(outcome.Images) > 0 {
 		images := make([]any, 0, len(outcome.Images))
 		for _, image := range outcome.Images {

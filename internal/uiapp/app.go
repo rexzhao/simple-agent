@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1881,6 +1882,184 @@ func (a *App) renderProcessItem(c *ui.Context, item chatItem) {
 	})
 }
 
+// execOfPart 从工具结果 data 里取出命令元信息。
+//
+// 内存里是 *tools.ExecInfo，重放后是 map[string]any（JSON 解出来的）。
+func execOfPart(data map[string]any) *tools.ExecInfo {
+	switch value := data["exec"].(type) {
+	case *tools.ExecInfo:
+		return value
+	case map[string]any:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		var info tools.ExecInfo
+		if err := json.Unmarshal(raw, &info); err != nil {
+			return nil
+		}
+		return &info
+	}
+	return nil
+}
+
+// toolArgsDetail 把工具参数摊成一段可读的全文（展开时显示）。
+//
+// 折叠态那行是截断到 72 字符的摘要（"sed -n '95,110p' internal/..."），
+// 展开后要看完整的 —— 长命令被截断时根本认不出跑的是什么。
+func toolArgsDetail(data map[string]any) string {
+	args, ok := data["args"].(map[string]any)
+	if !ok || len(args) == 0 {
+		return ""
+	}
+	// 单参数工具（bash 的 command、read 的 file_path）直接给值，
+	// 不加 "key: " 前缀 —— 一整行都是命令，加前缀反而挤
+	if len(args) == 1 {
+		for _, value := range args {
+			if text, ok := value.(string); ok {
+				return text
+			}
+		}
+	}
+	// 多参数：按键名排序，一行一个
+	keys := make([]string, 0, len(args))
+	for key := range args {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		lines = append(lines, fmt.Sprintf("%s: %s", key, formatArgValue(args[key])))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// formatArgValue 把参数值转成紧凑的可读文本。
+func formatArgValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case nil:
+		return "null"
+	default:
+		if raw, err := json.Marshal(typed); err == nil {
+			return string(raw)
+		}
+		return fmt.Sprintf("%v", typed)
+	}
+}
+
+// renderExecMeta 显示命令执行的元信息（exit_code / 耗时 / 目录）。
+//
+// **单独一行、和输出分开**：原来这些是拼在输出第一行的
+// （"exit_code=0 elapsed=123ms cwd=..."），用户得先跳过它才能看正文。
+// 现在元信息在输出上方自成一行，正文从第一行就是真正的输出。
+func (a *App) renderExecMeta(c *ui.Context, exec *tools.ExecInfo, theme *ui.Theme) {
+	// 元信息：一行小字，**下方一条浅分隔线**把它和输出隔开。
+	//
+	// 试过给它单独加底色：和下面输出的底色一样，反而看不出是两块
+	// （截图里两段糊成一片）。用分隔线更省空间也更清楚。
+	ui.Column(c).FillWidth().Children(func() {
+		ui.Row(c).Gap(10).AlignItems(ui.Center).Padding(0, 2, 3, 2).Children(func() {
+			// 退出码：0 用中性色，非 0 用红色（一眼看出失败）
+			codeColor := theme.TextMuted
+			codeText := fmt.Sprintf("exit %d", exec.ExitCode)
+			if exec.TimedOut {
+				codeText = "超时"
+				codeColor = theme.Danger
+			} else if exec.ExitCode != 0 {
+				codeColor = theme.Danger
+			}
+			ui.Text(c, codeText).Font(dshCodeFontStack).FontSize(11).
+				TextColor(codeColor)
+			if exec.ElapsedMS > 0 {
+				ui.Text(c, formatElapsed(exec.ElapsedMS)).
+					Font(dshCodeFontStack).FontSize(11).TextColor(theme.TextMuted)
+			}
+			if exec.Cwd != "" {
+				ui.Text(c, exec.Cwd).Font(dshCodeFontStack).FontSize(11).
+					TextColor(theme.TextMuted).MaxLines(1)
+			}
+		})
+		ui.Box(c).Height(1).FillWidth().Background(theme.Border)
+	})
+}
+
+// formatElapsed 把毫秒格式化成人读的时长。
+func formatElapsed(ms int64) string {
+	switch {
+	case ms < 1000:
+		return fmt.Sprintf("%dms", ms)
+	case ms < 60_000:
+		return fmt.Sprintf("%.2fs", float64(ms)/1000)
+	default:
+		return fmt.Sprintf("%dm%02ds", ms/60000, (ms%60000)/1000)
+	}
+}
+
+// renderWrittenContent 显示 write 写入的内容（带行号）。
+//
+// 用行号而不是 diff 的红绿：write 是整篇写入，没有"改动"可言，
+// 用户想看的是"文件里现在是什么"。
+func (a *App) renderWrittenContent(c *ui.Context, diff *tools.FileDiff, theme *ui.Theme) {
+	header := diff.Path
+	if diff.Verb != "" {
+		header = diff.Verb + " " + diff.Path
+	}
+	ui.Column(c).FillWidth().Gap(2).Children(func() {
+		ui.Text(c, header).Font(dshCodeFontStack).FontSize(11).
+			TextColor(theme.TextMuted)
+		ui.Column(c).FillWidth().Padding(6, 8).Radius(6).
+			Background(theme.Surface).Children(func() {
+				lines := strings.Split(diff.Content, "\n")
+				// 末尾换行会多出一个空元素，不算一行
+				if n := len(lines); n > 0 && lines[n-1] == "" {
+					lines = lines[:n-1]
+				}
+				for index, line := range lines {
+					text := formatDiffLineNo(index+1) + " " + line
+					ui.Text(c, text).Font(dshCodeFontStack).FontSize(12).
+						TextColor(theme.Text).MaxLines(1)
+				}
+			})
+	})
+}
+
+// stripExecHeader 去掉命令输出开头那行 "exit_code=... elapsed=... cwd=..."。
+//
+// 那行是 bash 工具写给**模型**的（模型拿不到结构化字段，需要知道成败），
+// 界面已经有了 renderExecMeta 画的同一份信息，再显示一遍就是重复。
+//
+// 只在确认存在该行时才去掉：手写的输出、别的工具的输出不该被动。
+func stripExecHeader(output string) string {
+	line, rest, found := strings.Cut(output, "\n")
+	if !found {
+		// 只有一行：整行都是 header 时返回空（没有正文可显示）
+		if strings.HasPrefix(line, "exit_code=") {
+			return ""
+		}
+		return output
+	}
+	if !strings.HasPrefix(line, "exit_code=") {
+		return output
+	}
+	return rest
+}
+
+// diffSummaryForWrite 生成 write 在折叠行的摘要（"12 行"）。
+func diffSummaryForWrite(diff *tools.FileDiff) string {
+	lines := strings.Split(diff.Content, "\n")
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+	return fmt.Sprintf("%d 行", len(lines))
+}
+
 // hasMatchingToolUse 报告某个 call id 是否有配对的 tool_use part。
 //
 // 用来区分"正常结果（已折进调用行）"与"孤儿结果（没找到调用，需要单独显示）"。
@@ -2008,6 +2187,8 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 		name := stringOf(data, "name")
 		key := expansionKey(messageID, partIndex)
 		expanded := a.expandedParts[key]
+		// 参数全文：展开时看完整命令/路径（上面那行是截断摘要）
+		argsText := toolArgsDetail(data)
 
 		arrow := "▸"
 		if expanded {
@@ -2015,19 +2196,16 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 		}
 		row := ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Radius(4).
 			Padding(1, 2)
-		if row.Hovered() && hasResult {
+		if row.Hovered() {
 			row.Background(theme.SurfaceHover)
 		}
 		var toggle bool
 		row.Children(func() {
-			// 展开三角只在有内容可展开时显示，没有结果时留空白对齐
-			if hasResult {
-				if ui.Text(c, arrow).FontSize(10).TextColor(theme.TextMuted).
-					Cursor(ui.CursorPointer).Clicked() {
-					toggle = true
-				}
-			} else {
-				ui.Box(c).Width(8).Shrink(0)
+			// 展开三角**任何时候都在**：不只是有结果才能展开 ——
+			// 命令还在跑（甚至刚发起还没结果）时，用户就想先看看要执行什么。
+			if ui.Text(c, arrow).FontSize(10).TextColor(theme.TextMuted).
+				Cursor(ui.CursorPointer).Clicked() {
+				toggle = true
 			}
 			ui.Icon(c, toolIcon(name)).Size(13, 13).TextColor(theme.TextMuted)
 			ui.Text(c, name).FontSize(11).
@@ -2038,6 +2216,28 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 					TextColor(theme.TextMuted).Grow(1).MaxLines(1)
 			} else {
 				ui.Spacer(c)
+			}
+			// edit/write 的增删数量：折叠态就能看出改了多少
+			// （"+3 -1" 就在行尾，不用点开）。只有真有结果时才显示。
+			if hasResult && !isError {
+				if diff := diffOfPart(resultData); diff != nil {
+					if diff.Content != "" || diff.Verb != "" {
+						// write：显示字节/行数更有意义
+						ui.Text(c, diffSummaryForWrite(diff)).FontSize(11).
+							TextColor(theme.TextMuted)
+					} else if diff.Added > 0 || diff.Removed > 0 {
+						ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+							if diff.Added > 0 {
+								ui.Text(c, fmt.Sprintf("+%d", diff.Added)).
+									FontSize(11).TextColor(diffAddText(theme))
+							}
+							if diff.Removed > 0 {
+								ui.Text(c, fmt.Sprintf("-%d", diff.Removed)).
+									FontSize(11).TextColor(diffDelText(theme))
+							}
+						})
+					}
+				}
 			}
 			// 状态：失败用红色，运行中用强调色，完成用弱化色
 			if status != "" {
@@ -2051,7 +2251,7 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 				ui.Text(c, status).FontSize(11).TextColor(color)
 			}
 			// 点行内空白也能展开（但别和上面的三角重复触发）
-			if hasResult && row.Clicked() {
+			if row.Clicked() {
 				toggle = true
 			}
 		})
@@ -2059,17 +2259,47 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 			a.expandedParts[key] = !expanded
 			expanded = !expanded
 		}
-		// 展开：edit 画 diff，其它工具显示输出
-		if expanded && hasResult {
-			if diff := diffOfPart(resultData); diff != nil {
-				ui.Column(c).FillWidth().Padding(2, 20).Children(func() {
-					a.renderDiff(c, diff, theme)
-				})
-			} else if output := stringOf(resultData, "output"); output != "" {
-				ui.Column(c).FillWidth().Padding(2, 20).Children(func() {
-					a.toolOutput(c, resultData, isError, true, color)
-				})
-			}
+		// 展开：先看**要执行什么/改了什么**，再看结果。
+		//
+		// 顺序有意如此：命令 > 元信息 > 输出。用户点开一个工具调用，
+		// 最常想知道的是"它到底跑了什么"；结果反而次之。
+		if expanded {
+			ui.Column(c).FillWidth().Padding(2, 20).Gap(6).Children(func() {
+				// 1) 参数全文（bash 的命令、read 的路径…）
+				if argsText != "" {
+					ui.Column(c).FillWidth().Padding(6, 8).Radius(6).
+						Background(theme.Surface).Children(func() {
+							ui.Text(c, argsText).Font(dshCodeFontStack).FontSize(12).
+								TextColor(theme.Text)
+						})
+				}
+				if !hasResult {
+					return
+				}
+				// 2) 执行元信息（exit_code / 耗时 / 目录），与输出分开
+				if exec := execOfPart(resultData); exec != nil {
+					a.renderExecMeta(c, exec, theme)
+				}
+				// 3) 结果正文：edit 画 diff，write 显示写入内容，其它显示输出
+				if diff := diffOfPart(resultData); diff != nil {
+					if diff.Content != "" || diff.Verb != "" {
+						a.renderWrittenContent(c, diff, theme)
+					} else {
+						a.renderDiff(c, diff, theme)
+					}
+				} else if output := stringOf(resultData, "output"); output != "" {
+					// 有结构化元信息时，把 Output 开头那行 "exit_code=... cwd=..."
+					// 去掉 —— 它和上面刚画的元信息是同一件事，留着就是重复。
+					// 那行是给**模型**看的（模型拿不到 Exec 字段），界面不需要。
+					if execOfPart(resultData) != nil {
+						output = stripExecHeader(output)
+					}
+					if strings.TrimSpace(output) != "" {
+						a.toolOutput(c, map[string]any{"output": output},
+							isError, true, color)
+					}
+				}
+			})
 		}
 	case render.MediaToolResult:
 		// 结果已经折进对应的 tool_use 行，这里不再单独渲染。

@@ -183,13 +183,24 @@ func runCommand(ctx context.Context, args Args, tc *ToolContext, shell shellKind
 	if cmd.ProcessState != nil {
 		exitCode = cmd.ProcessState.ExitCode()
 	}
+	// 元信息走结构化字段，不再拼进 Output 第一行。
+	//
+	// 但 **Output 里仍要保留一行摘要**给模型：模型看不到 Exec 字段，
+	// 它需要知道命令成没成功、跑了多久（尤其 "exit_code=0 但没有输出"
+	// 和 "命令失败" 是两种完全不同的情况）。
+	//
+	// 区别在于：给模型的是一句人话，给界面的是可排版的结构。
+	exec := &ExecInfo{ExitCode: exitCode, ElapsedMS: elapsed.Milliseconds(), Cwd: workdir}
 	header := fmt.Sprintf("exit_code=%d elapsed=%dms cwd=%s\n", exitCode, elapsed.Milliseconds(), workdir)
 	body := header + output
 	if exitCode != 0 {
 		// 非零退出码当错误：is_error=true 让模型知道要纠正，但输出要完整保留
-		return ToolReturn{}, errors.New(body)
+		ret := ToolReturn{Output: body, Exec: exec}
+		return ret, errors.New(body)
 	}
-	return OutputOf(body), nil
+	ret := OutputOf(body)
+	ret.Exec = exec
+	return ret, nil
 }
 
 // readCapped 只读输出文件的前 maxOutputBytes 字节。

@@ -254,8 +254,18 @@ func writeRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, erro
 	if existed {
 		verb = "已覆写"
 	}
-	return OutputOf(fmt.Sprintf("%s %s（%d 字节，%d 行）",
-		verb, displayPath(tc, path), len(content), len(splitLines(content)))), nil
+	ret := OutputOf(fmt.Sprintf("%s %s（%d 字节，%d 行）",
+		verb, displayPath(tc, path), len(content), len(splitLines(content))))
+	// 把写入的内容挂上去，供界面展开查看。
+	//
+	// 为什么不放进 Output：整篇文件动辄几十 KB，塞进模型上下文纯属浪费
+	// （内容就是它自己刚发的）。界面展开时才有价值 —— 用户想确认到底写了什么。
+	ret.Diff = &FileDiff{
+		Path:    filepath.Base(path),
+		Content: content,
+		Verb:    verb,
+	}
+	return ret, nil
 }
 
 func editTool(fullAccess bool) *ToolDef {

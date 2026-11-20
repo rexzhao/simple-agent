@@ -499,6 +499,11 @@ func (st *replayState) applyToolResult(data ToolResultData, seq uint64) {
 	if result.Diff != nil {
 		fields["diff"] = result.Diff
 	}
+	// 命令元信息同理：不带上，重启后 exit_code / 耗时就不显示了。
+	// （上一个 bug 就是只补了实时路径、漏了这里，diff 重启后消失。）
+	if result.Exec != nil {
+		fields["exec"] = result.Exec
+	}
 	entry.AddPart(message.Part{
 		Content:   message.DataPart{Data: fields},
 		MediaType: render.MediaToolResult,

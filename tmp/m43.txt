@@ -1,0 +1,55 @@
+工具调用详情：运行前可展开看命令；元信息与输出分开；edit 行内显示 +/-
+
+用户的三条要求：
+- "bash 或者 pwsh 应该在运行之前就可以展开，看到要运行的命令"
+- "有结果之后，exit_code elapsed 之类信息和结果分开显示，方便查看"
+- "edit 有结果之后，在 edit 本身那一行显示 +/- 数量"
+- "write 写文件可以再次展开查看写的内容"
+
+## 1. 运行前可展开
+
+展开三角原来只在 `hasResult` 时出现 —— 命令正在跑时根本点不开，
+只能看那行被截断到 72 字符的摘要。现在**任何时候都能展开**，
+展开后第一块就是参数全文（bash 的完整命令、read 的完整路径）。
+
+单参数工具直接给值不加 "key: " 前缀（一整行都是命令，加前缀反而挤）；
+多参数按键名排序、一行一个。
+
+## 2. 元信息与输出分开
+
+原来 `exit_code=0 elapsed=1876ms cwd=...` 是**拼在 Output 第一行**的，
+界面只能当正文一起渲染，用户得先跳过它才看得到真正的输出。
+
+现在拆成 tools.ExecInfo（ExitCode/ElapsedMS/Cwd/TimedOut）走结构化通道，
+界面在输出上方单独一行（+ 一条浅分隔线）：
+`exit 0   1.88s   internal/uiapp`
+
+输出里那行 header 会去掉（stripExecHeader）—— 它和刚画的元信息是同一件事。
+那行仍保留在 Output 里给**模型**看：模型拿不到 Exec 字段，需要知道命令成没成功。
+
+**错误路径也要转发**：bash 非零退出码是"带着 Exec 返回 error"，
+原来 executeOne 的 err 分支直接丢弃 result，Exec 就没了。
+
+## 3. edit 行内显示 +/-
+
+折叠态那一行尾部直接给 `+3 -2`（绿色/红色），不用点开就知道改了多少。
+write 显示 "N 行"。
+
+## 4. write 可展开看内容
+
+FileDiff 加了 Content/Verb 两个字段表示"整篇写入"（edit 不用）。
+展开时按行号渲染写入内容 —— write 没有"改动"可言，用户想看的是
+"文件里现在是什么"，所以不用 diff 的红绿。
+
+## 持久化
+
+Exec 与 Diff 一起走 ToolResultRecord，重放时都要回填 part
+（上次只补实时路径漏了重放，diff 重启后就没了，这次两处都改）。
+
+## 测试
+
+- TestBashRowShowsCommandAndSeparateMeta：命令全文 + exit/耗时 + 输出，
+  且输出里不再重复 exit_code 行
+- TestBashRowExpandableBeforeResult：**没有结果时**也能展开看全文
+- TestEditRowShowsPlusMinusInline：折叠态就有 +3 -2
+- TestWriteRowShowsContent：展开能看到写入内容

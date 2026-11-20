@@ -64,9 +64,11 @@ type ToolResultRecord struct {
 	Images    []tools.ToolImageRef `json:"images,omitempty"`
 	Pending   bool                 `json:"pending,omitempty"`
 	Questions []tools.QuestionSpec `json:"questions,omitempty"`
-	// Diff 是文件修改的结构化差异（edit 用），**只给界面**。
+	// Diff 是文件修改的结构化差异（edit/write 用），**只给界面**。
 	// 旧日志没有该字段，重放后为 nil —— 界面退回只显示 Output。
 	Diff *tools.FileDiff `json:"diff,omitempty"`
+	// Exec 是命令执行的元信息（bash/pwsh），**只给界面**。
+	Exec *tools.ExecInfo `json:"exec,omitempty"`
 }
 
 // ToolResultData 是 tool.result 的载荷：**单条**工具结果。
@@ -286,6 +288,7 @@ func resultRecords(outcomes []tools.ToolOutcome) []ToolResultRecord {
 			Pending:   outcome.IsPending(),
 			Questions: outcome.Pending,
 			Diff:      outcome.Diff,
+			Exec:      outcome.Exec,
 		})
 	}
 	return out
@@ -319,6 +322,7 @@ func partResultRecords(msg *message.Message) []ToolResultRecord {
 			Pending:   pending,
 			Questions: questionsOf(data),
 			Diff:      diffOf(data),
+			Exec:      execOf(data),
 		})
 	}
 	return out
@@ -342,6 +346,27 @@ func diffOf(data map[string]any) *tools.FileDiff {
 			return nil
 		}
 		return &diff
+	}
+	return nil
+}
+
+// execOf 读取 part 里的命令元信息（bash/pwsh）。
+//
+// 与 diffOf 同样的道理：内存里是 *tools.ExecInfo，重放后是 map[string]any。
+func execOf(data map[string]any) *tools.ExecInfo {
+	switch value := data["exec"].(type) {
+	case *tools.ExecInfo:
+		return value
+	case map[string]any:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		var info tools.ExecInfo
+		if err := json.Unmarshal(raw, &info); err != nil {
+			return nil
+		}
+		return &info
 	}
 	return nil
 }

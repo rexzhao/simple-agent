@@ -195,6 +195,24 @@ type ToolReturn struct {
 	// 塞 JSON 进去会污染上下文、也影响缓存命中。这里单独一条通道，
 	// 展示端拿它画 diff，模型仍然只看到那句人话摘要。
 	Diff *FileDiff
+	// Exec 是命令执行的结构化结果（bash/pwsh 用），只给界面看。
+	//
+	// 原来这些信息是**拼在 Output 第一行**的（"exit_code=0 elapsed=123ms
+	// cwd=..."），界面只能把它和正文一起当文本渲染 —— 结果是元信息和
+	// 输出混在一块，眼睛得先跳过那行才能看内容。
+	// 拆成字段后界面能单独排一行，正文从第一行就是真正的输出。
+	Exec *ExecInfo
+}
+
+// ExecInfo 是一次命令执行的摘要（bash/pwsh）。
+type ExecInfo struct {
+	ExitCode int `json:"exit_code"`
+	// ElapsedMS 是实际耗时（毫秒）。
+	ElapsedMS int64 `json:"elapsed_ms,omitempty"`
+	// Cwd 是执行时的工作目录（相对工作区显示）。
+	Cwd string `json:"cwd,omitempty"`
+	// TimedOut 表示超时被杀（此时 ExitCode 无意义）。
+	TimedOut bool `json:"timed_out,omitempty"`
 }
 
 // FileDiff 是一次文件修改的差异（按行）。
@@ -206,6 +224,14 @@ type FileDiff struct {
 	Removed int        `json:"removed,omitempty"`
 	// Truncated 表示差异太大被截断（只保留了前面部分）。
 	Truncated bool `json:"truncated,omitempty"`
+	// Content 是 write 写入的**完整内容**（edit 不用这个字段）。
+	//
+	// write 没有"差异"可言（整篇替换），用户想看的是写进去什么。
+	// 放 Hunks 里硬凑成"全是新增行"也行，但那样会丢掉"这是整篇写入"
+	// 这个语义，而且行数多时和 diff 的截断逻辑混在一起很别扭。
+	Content string `json:"content,omitempty"`
+	// Verb 是操作类型（"已创建" / "已覆写"），只有 write 用。
+	Verb string `json:"verb,omitempty"`
 }
 
 // DiffHunk 是一段连续的改动：若干"删除"行紧跟若干"新增"行。
@@ -358,6 +384,11 @@ type ToolOutcome struct {
 	// Diff 是界面画红绿行用的。分开的理由：模型不需要逐行差异
 	// （它自己刚发的 old/new），而界面需要 —— 塞进 Output 会浪费上下文。
 	Diff *FileDiff
+	// Exec 是命令执行的结构化结果（bash/pwsh），**只给界面**。
+	//
+	// Output 里仍保留一行 "exit_code=0 elapsed=12ms" 给模型看（它需要
+	// 知道命令成没成功），而界面用这个字段单独排版，不和正文混在一起。
+	Exec *ExecInfo
 }
 
 // ToolImageRef 是工具结果里的一张图片引用。
@@ -490,6 +521,11 @@ func executeOne(ctx context.Context, list []*ToolDef, tc *ToolContext, call Call
 			base.Output = "已中止：用户停止了生成。"
 		}
 		base.IsError = true
+		// 工具在报错时也可能带回结构化数据（bash 非零退出码就是这样：
+		// 它把退出码/耗时放进 Exec，同时返回 error 让模型知道要纠正）。
+		// 不转发的话界面就看不到 exit_code 了。
+		base.Exec = result.Exec
+		base.Diff = result.Diff
 		return base
 	}
 
@@ -500,6 +536,7 @@ func executeOne(ctx context.Context, list []*ToolDef, tc *ToolContext, call Call
 	base.Output = result.Output
 	base.RawImages = result.Images
 	base.Diff = result.Diff
+	base.Exec = result.Exec
 	if base.Output == "" && len(base.RawImages) == 0 {
 		base.Output = "（无输出）"
 	}
