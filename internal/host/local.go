@@ -122,6 +122,23 @@ func (l *Local) authorize(token string) bool {
 
 func (l *Local) Sessions() []SessionRef {
 	out := make([]SessionRef, 0, len(l.sessions))
+	// 项目档案：按会话 id 查它的项目和归档状态。
+	//
+	// 一次读全表（项目数很少），比每个会话查一次便宜。
+	projectOf := map[string]string{}   // 会话 id → 项目名
+	projectIDOf := map[string]string{} // 会话 id → 项目 id
+	archivedOf := map[string]bool{}
+	if l.cfg.Catalog != nil {
+		if projects, err := l.cfg.Catalog.ListProjects(); err == nil {
+			for _, project := range projects {
+				for _, record := range project.Sessions {
+					projectOf[record.ID] = project.Name
+					projectIDOf[record.ID] = project.ID
+					archivedOf[record.ID] = record.ArchivedAt != ""
+				}
+			}
+		}
+	}
 	for _, session := range l.sessions {
 		updated := int64(0)
 		if entries := session.Conversation().Entries(); len(entries) > 0 {
@@ -134,7 +151,11 @@ func (l *Local) Sessions() []SessionRef {
 		}
 		out = append(out, SessionRef{
 			ID: session.ID, Title: session.Title,
-			Workspace: session.Workspace, UpdatedAt: updated,
+			Workspace:   session.Workspace,
+			UpdatedAt:   updated,
+			ProjectID:   projectIDOf[session.ID],
+			ProjectName: projectOf[session.ID],
+			Archived:    archivedOf[session.ID],
 		})
 	}
 	return out

@@ -1,7 +1,9 @@
-package uiapp
+﻿package uiapp
 
 import (
+	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -186,10 +188,12 @@ func (a *App) sidebarRail(c *ui.Context, width int, theme *ui.Theme) {
 
 // sidebarNode 是侧栏树的一项：项目（workspace）或会话。
 type sidebarNode struct {
-	// 项目节点：isGroup=true，key 是 workspace 路径（空串 = 「默认」）
+	// 项目节点：isGroup=true，key 是项目 ID（没有档案时是 workspace 路径）
 	// 会话节点：isGroup=false，key 是会话 id
 	isGroup bool
 	key     string
+	// name 是项目节点的显示名（来自项目档案；会话节点不用）。
+	name string
 }
 
 // sidebarBody 渲染展开状态的侧栏内容：品牌行 + 搜索 + 项目/会话树 + 用户区。
@@ -265,29 +269,54 @@ func (a *App) searchField(c *ui.Context) {
 func (a *App) sidebarRows(c *ui.Context) {
 	query := strings.ToLower(strings.TrimSpace(a.sidebarQuery))
 	type group struct {
-		key      string
+		key      string // 项目 ID（没有档案时退回 workspace 路径）
+		name     string // 显示名
 		sessions []*Session
 	}
 	var groups []group
 	byKey := map[string]int{}
-	// 组的出现顺序 = 会话的出现顺序（与 sidebarTree 一致）
+	// 分组按**项目档案**：key 用项目 ID，显示名用档案里的 Name。
+	//
+	// 以前是拿会话的 workspace 反推：名字对了，但**排不出项目顺序**
+	// （反推只有名字，没有先后），而且"移除的项目"也表达不了。
+	// 现在后端给出 ProjectID/ProjectName，顺序跟 projects.json 一致。
 	for _, session := range a.sessions {
-		key := workspaceOr(session.Workspace, "")
+		key := session.ProjectIDForTest()
+		name := session.ProjectNameForTest()
+		if key == "" {
+			// 没有项目档案（内存后端 / 还没登记）：退回按 workspace 分组
+			key = workspaceOr(session.Workspace, "")
+			name = a.workspaceGroupName(key)
+		}
 		index, ok := byKey[key]
 		if !ok {
 			index = len(groups)
 			byKey[key] = index
-			groups = append(groups, group{key: key})
+			groups = append(groups, group{key: key, name: name})
 		}
 		groups[index].sessions = append(groups[index].sessions, session)
+	}
+	// 项目顺序跟 projects.json 一致（后端已按索引顺序返回，这里再排一次
+	// 是为了容忍"同一项目内会话分散在列表各处"的情况）。
+	if order := a.projectOrder(); order != nil {
+		sort.SliceStable(groups, func(i, j int) bool {
+			ri, iok := order[groups[i].key]
+			rj, jok := order[groups[j].key]
+			if !iok || !jok {
+				// 没有档案的组排在后面（内存后端）
+				return iok && !jok
+			}
+			return ri < rj
+		})
 	}
 
 	// 扁平化：项目行 + （展开时的）会话行
 	var rows []sidebarNode
 	for _, g := range groups {
 		var visible []*Session
-		for i := len(g.sessions) - 1; i >= 0; i-- {
-			session := g.sessions[i]
+		// **保持档案里的顺序**，不反转也不按时间重排：
+		// 用户能调整会话顺序，界面就得照它显示。
+		for _, session := range g.sessions {
 			if query != "" && !strings.Contains(strings.ToLower(session.Title), query) {
 				continue
 			}
@@ -307,7 +336,7 @@ func (a *App) sidebarRows(c *ui.Context) {
 			a.sidebarGroupSeen[g.key] = true
 			a.sidebarGroupOpen[g.key] = true
 		}
-		rows = append(rows, sidebarNode{isGroup: true, key: g.key})
+		rows = append(rows, sidebarNode{isGroup: true, key: g.key, name: g.name})
 		if !a.sidebarGroupOpen[g.key] {
 			continue
 		}
@@ -319,7 +348,7 @@ func (a *App) sidebarRows(c *ui.Context) {
 	ui.List(c, &a.sidebarList, len(rows), func(i int) {
 		node := rows[i]
 		if node.isGroup {
-			a.sidebarGroupRow(c, node.key)
+			a.sidebarGroupRow(c, node.key, node.name)
 			return
 		}
 		a.sidebarSessionRow(c, node.key)
@@ -361,11 +390,13 @@ func (a *App) sidebarAddProjectRow(c *ui.Context) {
 	}
 }
 
-// sidebarGroupRow 渲染一个项目行：三角 + 目录名 + 相对时间。
+// sidebarGroupRow 渲染一个项目行：三角 + 项目名 + 「在此项目新建会话」。
 //
 // 三角由我们自己画（不再依赖 Outline 的槽位），所以它可以紧贴文字；
 // 会话行的缩进量也用同一个常量，两行文字因此左对齐。
-func (a *App) sidebarGroupRow(c *ui.Context, key string) {
+//
+// name 由调用方给出（来自项目档案）；没有档案时是 workspace 反推的名字。
+func (a *App) sidebarGroupRow(c *ui.Context, key, name string) {
 	theme := c.Theme()
 	open := a.sidebarGroupOpen[key]
 	var clicked bool
@@ -393,9 +424,9 @@ func (a *App) sidebarGroupRow(c *ui.Context, key string) {
 		if arrowSlot.Clicked() {
 			clicked = true
 		}
-		name := ui.Text(c, a.workspaceGroupName(key)).FontSize(12).Bold().
+		nameText := ui.Text(c, name).FontSize(12).Bold().
 			TextColor(theme.Text).Cursor(ui.CursorPointer)
-		if name.Clicked() {
+		if nameText.Clicked() {
 			clicked = true
 		}
 		ui.Spacer(c)
@@ -412,8 +443,38 @@ func (a *App) sidebarGroupRow(c *ui.Context, key string) {
 	// 新建放到行外执行：iconButton 的点击发生在渲染中，
 	// 立刻 Submit 会让本帧后续的会话列表与索引不同步。
 	if newHere {
-		a.newSessionIn(key)
+		a.newSessionIn(a.workspaceForGroup(key))
 	}
+}
+
+// workspaceForGroup 把侧栏分组的 key 还原成 workspace 路径。
+//
+// key 平时是项目 ID，而新建会话要的是目录路径 —— 从该组下的任一
+// 会话身上取（同组会话的 workspace 相同）。取不到就退回 key 本身
+// （没有项目档案时 key 就是 workspace）。
+func (a *App) workspaceForGroup(key string) string {
+	for _, session := range a.sessions {
+		if session.projectID == key {
+			return session.Workspace
+		}
+	}
+	return key
+}
+
+// sessionIDsText 拼出"项目 id + 会话 id"两行文本（复制用）。
+//
+// 为什么两个一起复制：报问题时要让对方知道"哪个项目、哪个会话"，
+// 只给会话 id 对方还得再问项目。两行文本粘过去能直接看懂，
+// 也不会混淆哪个是哪个。
+func sessionIDsText(session *Session) string {
+	var b strings.Builder
+	if session.projectID != "" {
+		fmt.Fprintf(&b, "project: %s\n", session.projectID)
+	} else {
+		b.WriteString("project: (无)\n")
+	}
+	fmt.Fprintf(&b, "session: %s", session.ID)
+	return b.String()
 }
 
 // setSidebarGroupOpen 记住项目的展开/收起状态（纯界面态，不落盘）。
@@ -515,6 +576,18 @@ func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 			// 走统一入口：草稿的存/取都在里面
 			a.switchTo(index)
 		}
+		// 复制按钮：复制 project 和 session 的 id。
+		//
+		// 用途是"沟通"—— 报问题时对方要知道是哪个会话，而 id 太长没法手打。
+		// 复制的是两行文本（`project: <id>` / `session: <id>`），
+		// 粘到聊天窗口里能直接看懂，也不必让对方猜哪个是哪个。
+		//
+		// **结构每帧固定**：和下面的「⋯」同一道理 —— mygo 的原生菜单靠
+		// 元素 id 匹配，某个兄弟元素"悬停时才有"会让指针一移开元素树就变，
+		// 后面的「⋯」id 位移，菜单再也选不中（实测过）。
+		// 所以按钮常驻，只在悬停时显示文字颜色。
+		a.copyButtonIdle(c, "session-ids:"+session.ID, sessionIDsText(session),
+			a.tr("sidebar.copyIds"), row.Hovered())
 		// 空 Box 代替 Gap：Row 的 gap 设成 0（否则会叠在三角槽上导致错位），
 		// 标题与时间之间的小间距在这里显式给。
 		ui.Box(c).Width(6).Shrink(0)

@@ -1,4 +1,4 @@
-package locale
+﻿package locale
 
 // enTable 是英文文案表（key 与 zhTable 必须完全一致，见 locale_test.go）。
 var enTable = map[string]string{
@@ -42,6 +42,7 @@ var enTable = map[string]string{
 	"session.new":                "New Session",
 	"session.new.label":          "New session",
 	"session.newHere":            "New session in this project",
+	"sidebar.copyIds":              "Copy project and session IDs",
 	"toggle.open":                "Open sidebar",
 	"toggle.collapse":            "Collapse sidebar",
 	"sidebar.search":             "Search sessions",

@@ -221,6 +221,15 @@ type SessionRef struct {
 	Title     string
 	Workspace string
 	UpdatedAt int64
+	// ProjectID/ProjectName 是会话所属的项目（来自项目档案）。
+	//
+	// 界面按它分组，不再自己拿 Workspace 反推 —— 项目顺序由
+	// projects.json 决定，反推只能猜出名字，排不出顺序。
+	// 空表示没有项目档案（内存后端、或还没登记）。
+	ProjectID   string
+	ProjectName string
+	// Archived 表示会话已归档（不能再运行，恢复后才能继续）。
+	Archived bool
 }
 
 // OlderEntry 是归档里的一条消息（只用于显示）。

@@ -160,6 +160,19 @@ type Session struct {
 	renameDraft      string
 	renameWasFocused bool
 
+	// projectID/projectName 来自项目档案（后端每帧同步过来的）。
+	//
+	// 侧栏用它分组和排顺序：项目顺序由 projects.json 决定，
+	// 拿 workspace 反推只能得到名字、排不出先后。
+	// 空表示没有档案（内存后端），退回按 workspace 分组。
+	projectID   string
+	projectName string
+	// archivedSession 表示会话**已归档**：不能再运行，恢复后才能继续。
+	//
+	// 注意与上面的 `archived`（更早历史的显示缓存）区分：那个是日志概念，
+	// 这个是会话级状态。
+	archivedSession bool
+
 	// archived 是按需加载的更早历史：**只用于显示**，永远不进 Conversation、
 	// 也永远不参与请求（用户已确认）。
 	archived []archivedEntry
@@ -767,6 +780,45 @@ func localConfigFromOptions(rt Runtime, opts Options, post func(func()),
 	}
 }
 
+// ProjectIDForTest 返回会话所属项目 ID（供侧栏分组用）。
+func (s *Session) ProjectIDForTest() string { return s.projectID }
+
+// ProjectNameForTest 返回会话所属项目名（显示用）。
+func (s *Session) ProjectNameForTest() string { return s.projectName }
+
+// SetProjectForTest 设置会话的项目信息（测试用：模拟后端同步过来的档案数据）。
+func (s *Session) SetProjectForTest(id, name string) {
+	s.projectID = id
+	s.projectName = name
+}
+
+// ArchivedForTest 报告会话是否已归档。
+func (s *Session) ArchivedForTest() bool { return s.archivedSession }
+
+// projectOrder 返回"项目 ID → 名次"的映射（用于侧栏排序）。
+//
+// 名次就是会话出现的先后：后端 Sessions() 按 projects.json 的顺序返回
+// 会话，所以第一次遇到某个项目的位置就是它的名次。这样界面不需要额外
+// 请求项目列表。
+func (a *App) projectOrder() map[string]int {
+	order := make(map[string]int, 8)
+	next := 0
+	for _, session := range a.sessions {
+		id := session.projectID
+		if id == "" {
+			continue
+		}
+		if _, ok := order[id]; !ok {
+			order[id] = next
+			next++
+		}
+	}
+	if len(order) == 0 {
+		return nil
+	}
+	return order
+}
+
 // syncSessions 让界面壳与执行端会话一一对应（新建/删除/恢复后调用）。
 //
 // 界面壳只保留**本地界面状态**（滚动、展开、草稿、附件…）；执行端状态在
@@ -792,6 +844,11 @@ func (a *App) syncSessions() {
 				return entries[row].ID()
 			}
 		}
+		// 项目信息与归档状态每帧同步：它可能被别的窗口/命令改掉，
+		// 界面上"归到哪个项目、是否已归档"必须跟着变。
+		shell.projectID = ref.ProjectID
+		shell.projectName = ref.ProjectName
+		shell.archivedSession = ref.Archived
 		next = append(next, shell)
 	}
 	a.sessions = next

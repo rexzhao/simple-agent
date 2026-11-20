@@ -1,4 +1,4 @@
-package locale
+﻿package locale
 
 // 文案表。约定（见包注释）：
 //   - dsh 里有的 key 直接沿用（`session.new.label`、`time.*`、`message.stepProcess.*`、
@@ -48,6 +48,7 @@ var zhTable = map[string]string{
 	"session.new":                "新会话",
 	"session.new.label":          "新建会话",
 	"session.newHere":            "在此项目新建会话",
+	"sidebar.copyIds":              "复制项目与会话 ID",
 	"toggle.open":                "打开侧边栏",
 	"toggle.collapse":            "收起侧边栏",
 	"sidebar.search":             "搜索会话",

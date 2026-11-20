@@ -56,6 +56,53 @@ func (a *App) copyButton(c *ui.Context, key, text, a11y string) bool {
 	return true
 }
 
+// copyButtonIdle 与 copyButton 相同，但可以"隐藏"（不悬停时）。
+//
+// 隐藏只改文字颜色（透明），**元素照样创建**：mygo 的原生菜单靠元素 id
+// 匹配，兄弟元素在悬停时出现/消失会让后面的元素 id 位移，菜单就选不中了
+// （侧栏会话行里的「⋯」踩过这个坑）。
+//
+// 优点是不破坏元素树；代价是隐藏时仍占位 —— 所以用它时该行的布局要
+// 能接受这块固定宽度。
+func (a *App) copyButtonIdle(c *ui.Context, key, text, a11y string, visible bool) bool {
+	theme := c.Theme()
+	label := a.tr("common.copy")
+	showingFeedback := false
+	if deadline, ok := a.copiedAt[key]; ok {
+		if remaining := time.Until(deadline); remaining > 0 {
+			label = a.tr("common.copied")
+			showingFeedback = true
+			c.After(remaining)
+		} else {
+			delete(a.copiedAt, key)
+		}
+	}
+	element := ui.Text(c, label).FontSize(10).Padding(1, 4).Radius(6).
+		Cursor(ui.CursorPointer)
+	// 反馈期间即使不悬停也要看得见 —— 否则用户点了没有任何视觉回应
+	if visible || showingFeedback {
+		element.TextColor(theme.TextMuted)
+	} else {
+		element.TextColor(theme.TextMuted.Alpha(0))
+	}
+	if a11y != "" {
+		element.Label(a11y)
+	}
+	if element.Hovered() && visible {
+		element.Background(theme.SurfaceHover)
+	}
+	if !element.Clicked() {
+		return false
+	}
+	text = strings.TrimRight(text, "\n")
+	c.WriteClipboard(text)
+	if a.copiedAt == nil {
+		a.copiedAt = map[string]time.Time{}
+	}
+	a.copiedAt[key] = time.Now().Add(copyFeedback)
+	return true
+}
+
 // messageCopyText 返回一条消息里"可复制"的 markdown 原文。
 //
 // 只取正文文本 part：**不含**推理、工具调用/结果、压缩摘要与图片；
