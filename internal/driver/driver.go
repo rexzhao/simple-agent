@@ -1845,10 +1845,20 @@ func questionFromMap(obj map[string]any) tools.QuestionSpec {
 // nowUTC 返回当前 UTC 时间（便于测试替换）。
 var nowUTC = func() string { return time.Now().UTC().Format(time.RFC3339) }
 
-// isContextOverflow 报告失败原因是否是「上下文超出窗口」。
+// isContextOverflow 报告失败原因是否是「上下文超出窗口 / 请求体太大」。
 //
-// 三家常见说法：OpenAI 的 context_length_exceeded、Anthropic 的
-// "prompt is too long"、兼容实现的 400 + "maximum context length"。
+// 两种说法本质相同：都是"发给模型的内容太多了。三家常见措辞：
+//   - OpenAI：context_length_exceeded
+//   - Anthropic："prompt is too long"
+//   - 兼容实现：400 + "maximum context length"
+//   - 部分网关（含我们实测的 paperhub）：**413 + "Entry too big" /
+//     code=EntryTooBig**。它限制的是**请求体字节数**而不是 token 数，
+//     但处理方式完全一样 —— 折叠历史让它变小。实测 8MB 能过、
+//     32MB 被拒，而长会话的工具输出累积几十 MB 很常见。
+//
+// 漏掉 413 的后果（真实踩过）：上下文涨过上限后每次请求都失败，
+// 而失败不触发压缩，用户就卡在一个永远发不出去的会话里，
+// 界面上只有一行 "HTTP 413"，看不出该做什么。
 func isContextOverflow(reason string) bool {
 	lower := strings.ToLower(reason)
 	for _, marker := range []string{
@@ -1857,6 +1867,12 @@ func isContextOverflow(reason string) bool {
 		"prompt is too long",
 		"context length",
 		"too many tokens",
+		// 请求体过大（按字节，不是 token）
+		"entry too big",
+		"entrytoobig",
+		"request entity too large",
+		"request too large",
+		"payload too large",
 	} {
 		if strings.Contains(lower, marker) {
 			return true
@@ -1864,6 +1880,9 @@ func isContextOverflow(reason string) bool {
 	}
 	return false
 }
+
+// IsContextOverflowForTest 暴露溢出判定（测试用）。
+func IsContextOverflowForTest(reason string) bool { return isContextOverflow(reason) }
 
 // isTruncated 报告停止原因是否是「达到长度上限」。
 func isTruncated(reason string) bool {
