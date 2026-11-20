@@ -537,6 +537,13 @@ func (l *Local) openSession(contextID, title string) (*Session, error) {
 	if workspace == "" {
 		workspace = l.cfg.Workspace
 	}
+	// **把解析出的工作区回写进 driver**。
+	//
+	// Load 时的 opts 用的是 l.cfg.Workspace（启动目录）——那时还不知道
+	// 这个会话真正属于哪个项目。不回写的话，下一次压缩会把启动目录
+	// 当成本会话的工作区写进快照，从此固化下来（真实踩过：
+	// wow-viewer 的会话压一次就永远变成 simple-agent 的了）。
+	drv.SetWorkspace(workspace)
 	toolCtx := tools.NewToolContext(workspace, l.cfg.AllowShell)
 	session := &Session{
 		ID:          contextID,

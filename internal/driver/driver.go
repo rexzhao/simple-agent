@@ -1988,6 +1988,13 @@ func IsContextOverflowForTest(reason string) bool { return isContextOverflow(rea
 // WorkspaceForTest 返回 driver 当前记录的工作区（测试用）。
 func (d *Driver) WorkspaceForTest() string { return d.opts.Workspace }
 
+// SetWorkspace 设置会话的工作区。
+//
+// 用途：host 打开会话时先用启动目录构造 driver（那时还没解析出日志里
+// 记的工作区），解析完再把真值写回来。不回写的话，下一次压缩会拿
+// 启动目录当工作区写进快照，把错误固化下来。
+func (d *Driver) SetWorkspace(workspace string) { d.opts.Workspace = workspace }
+
 // isTruncated 报告停止原因是否是「达到长度上限」。
 func isTruncated(reason string) bool {
 	switch strings.ToLower(reason) {
