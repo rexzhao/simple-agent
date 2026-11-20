@@ -34,6 +34,7 @@ func TestUsageNotBlankedByNewRound(t *testing.T) {
 		InputTokens:     1000,
 		OutputTokens:    50,
 		CacheReadTokens: 900,
+		CacheReported:   true,
 	})
 	if got := d.Usage().CacheReadTokens; got != 900 {
 		t.Fatalf("第一轮应为 900，实际 %d", got)
@@ -59,6 +60,7 @@ func TestUsageNotBlankedByNewRound(t *testing.T) {
 		InputTokens:     2000,
 		OutputTokens:    80,
 		CacheReadTokens: 1900,
+		CacheReported:   true,
 	})
 	if got := d.Usage(); got.CacheReadTokens != 1900 {
 		t.Fatalf("新 usage 到达后应更新为 1900，实际 %d", got.CacheReadTokens)

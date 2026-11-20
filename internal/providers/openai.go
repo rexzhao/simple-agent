@@ -237,7 +237,9 @@ func (p *openAIParser) Parse(sse SSEEvent) []Event {
 			InputTokens:     chunk.Usage.PromptTokens,
 			OutputTokens:    chunk.Usage.CompletionTokens,
 			CacheReadTokens: cached,
-			// OpenAI 是自动缓存，没有"写入费"的概念
+			// OpenAI 是自动缓存，没有"写入费"的概念。
+			// usage 只有一整块，带就等于"缓存字段有效"。
+			CacheReported: true,
 		})
 	}
 

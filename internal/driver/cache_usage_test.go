@@ -50,6 +50,7 @@ func TestUsageCarriesCacheTokens(t *testing.T) {
 		InputTokens:     1000,
 		OutputTokens:    50,
 		CacheReadTokens: 800,
+		CacheReported:   true,
 	})
 
 	usage := d.Usage()
@@ -73,6 +74,7 @@ func TestUsageCacheTokensOverwriteWithZero(t *testing.T) {
 
 	_, _ = d.ApplyEvent(messageID, providers.Event{
 		Kind: providers.EventUsage, InputTokens: 1000, CacheReadTokens: 800,
+		CacheReported: true,
 	})
 	if got := d.Usage().CacheReadTokens; got != 800 {
 		t.Fatalf("第一次应记下 800，实际 %d", got)
@@ -81,6 +83,7 @@ func TestUsageCacheTokensOverwriteWithZero(t *testing.T) {
 	// 同轮再来一个不带缓存字段的 usage 块：应覆盖成 0，而不是留着 800
 	_, _ = d.ApplyEvent(messageID, providers.Event{
 		Kind: providers.EventUsage, InputTokens: 1000,
+		CacheReported: true,
 	})
 	if got := d.Usage().CacheReadTokens; got != 0 {
 		t.Fatalf("没命中时应覆盖成 0，实际 %d（会显示成假的命中率）", got)
@@ -96,6 +99,7 @@ func TestUsageCarriesCacheWriteTokens(t *testing.T) {
 		InputTokens:      120,
 		CacheReadTokens:  900,
 		CacheWriteTokens: 80,
+		CacheReported:    true,
 	})
 	usage := d.Usage()
 	if usage.CacheReadTokens != 900 || usage.CacheWriteTokens != 80 {

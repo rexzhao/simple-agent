@@ -165,6 +165,10 @@ func (p *anthropicParser) Parse(sse SSEEvent) []Event {
 				InputTokens:      usage.InputTokens,
 				CacheReadTokens:  usage.CacheReadInputTokens,
 				CacheWriteTokens: usage.CacheCreationInputTokens,
+				// message_start 带的就是完整输入用量（含缓存字段）。
+				// message_delta 只带 output，那条事件不设这个标记 ——
+				// 否则会把这里已经拿到的缓存数抹成 0。
+				CacheReported: true,
 			}}
 		}
 		return nil

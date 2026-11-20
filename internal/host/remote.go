@@ -84,13 +84,18 @@ type Observer interface {
 
 // ViewState 是一个会话的**瞬时**状态（快照与增量都用它）。
 type ViewState struct {
-	Epoch      string              `json:"epoch"`
-	Generation uint64              `json:"generation"`
-	Seq        uint64              `json:"seq"`
-	Busy       string              `json:"busy"`
-	Queued     []string            `json:"queued"`
-	Asks       []AskView           `json:"asks"`
-	Usage      UsageView           `json:"usage"`
+	Epoch      string    `json:"epoch"`
+	Generation uint64    `json:"generation"`
+	Seq        uint64    `json:"seq"`
+	Busy       string    `json:"busy"`
+	Queued     []string  `json:"queued"`
+	Asks       []AskView `json:"asks"`
+	Usage      UsageView `json:"usage"`
+	// TotalUsage 是会话累计用量（命中率用累计口径，见 driver.TotalUsage）。
+	//
+	// 旧执行端不下发这个字段 → 零值 → 展示端按 0/0 处理（不显示命中率），
+	// 与"旧日志没有累计基线"是同一套降级策略。
+	TotalUsage UsageView           `json:"total_usage,omitzero"`
 	Counts     CountsView          `json:"counts"`
 	Selection  providers.Selection `json:"selection"`
 	Effort     string              `json:"effort"`
@@ -160,6 +165,7 @@ func (l *Local) Snapshot(sessionID string) (ViewState, bool) {
 		return ViewState{}, false
 	}
 	usage := session.Usage()
+	total := session.TotalUsage()
 	view := ViewState{
 		Epoch:      l.epoch,
 		Generation: session.generation,
@@ -171,6 +177,14 @@ func (l *Local) Snapshot(sessionID string) (ViewState, bool) {
 			Output:     usage.OutputTokens,
 			CacheRead:  usage.CacheReadTokens,
 			CacheWrite: usage.CacheWriteTokens,
+		},
+		// 累计用量：展示端据此算命中率（累计口径）。
+		// 旧执行端不发这个字段 → 零值 → 展示端按 0/0 处理，不显示命中率。
+		TotalUsage: UsageView{
+			Input:      total.InputTokens,
+			Output:     total.OutputTokens,
+			CacheRead:  total.CacheReadTokens,
+			CacheWrite: total.CacheWriteTokens,
 		},
 		Counts:     CountsView{Turns: session.Counts().Turns, Steps: session.Counts().Steps},
 		Selection:  session.Selection(),

@@ -217,8 +217,8 @@ type Event struct {
 	Delta string
 
 	// 用量
-	InputTokens         int
-	OutputTokens        int
+	InputTokens  int
+	OutputTokens int
 	// CacheReadTokens 是本次请求里**命中缓存**的输入 token 数。
 	//
 	// 两家语义一致（都是"没花钱重算的那部分"），但字段名不同：
@@ -231,6 +231,16 @@ type Event struct {
 	// 只有 Anthropic 有这个概念（usage.cache_creation_input_tokens）：它按
 	// 额外费率收一次写入费。OpenAI 是自动缓存、不单列，恒为 0。
 	CacheWriteTokens int
+	// CacheReported 表示这条 usage 事件**带了**缓存字段。
+	//
+	// 为什么需要它：Anthropic 分两个事件报用量 —— message_start 带
+	// input 与缓存字段，message_delta 只带 output。若下游按"每次都覆盖
+	// 缓存字段"处理，第二个事件会把已经拿到的缓存数抹成 0
+	// （实测就是这样：命中率显示成 0%）。
+	//
+	// 所以缓存字段要按「带了才覆盖」处理，而这个标记就是"带没带"。
+	// OpenAI 的 usage 只有一块，带就 true。
+	CacheReported bool
 
 	// 结束/错误
 	StopReason string

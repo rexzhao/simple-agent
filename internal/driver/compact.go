@@ -62,10 +62,51 @@ type CompactSnapshotData struct {
 	// 界面不一致。旧快照没有这两个字段，读出来是 0（那时也还没有状态条）。
 	Turns int `json:"turns,omitempty"`
 	Steps int `json:"steps,omitempty"`
+	// TotalUsage 是压缩**之前**的累计用量基线（状态条算缓存命中率用）。
+	//
+	// 为什么要存：命中率用累计口径（见 Driver.totalUsage），而压缩会丢弃
+	// 历史——不存基线的话压缩后累计值会归零，界面上命中率突然从 99% 掉到 0%，
+	// 用户会以为缓存坏了。
+	//
+	// **旧快照没有这个字段**：读出来是零值，等于从 0/0 开始算（只统计压缩
+	// 之后的请求）。这是刻意的：旧日志里本来就没有准确的累计数字，
+	// 编不出来，如实从零算比造一个假基线诚实。
+	TotalUsage UsageData `json:"total_usage,omitempty"`
 	// Todos 是压缩那一刻的任务清单（可选；旧快照没有该字段 → 空）。
 	//
 	// 清单是会话状态而不是历史消息，压缩不能把它抹掉。
 	Todos []conversation.TodoItem `json:"todos,omitempty"`
+}
+
+// UsageData 是快照里记的累计用量（JSON 字段名短，日志里省地方）。
+//
+// 与 driver.Usage 同构，但独立定义：日志格式是**长期契约**，
+// 内部结构改动不该悄悄改掉已经写进盘里的字段名。
+type UsageData struct {
+	Input      int `json:"input,omitempty"`
+	Output     int `json:"output,omitempty"`
+	CacheRead  int `json:"cache_read,omitempty"`
+	CacheWrite int `json:"cache_write,omitempty"`
+}
+
+// toUsageData 把内部用量转成日志格式。
+func toUsageData(usage Usage) UsageData {
+	return UsageData{
+		Input:      usage.InputTokens,
+		Output:     usage.OutputTokens,
+		CacheRead:  usage.CacheReadTokens,
+		CacheWrite: usage.CacheWriteTokens,
+	}
+}
+
+// toUsage 把日志格式转回内部用量。
+func (u UsageData) toUsage() Usage {
+	return Usage{
+		InputTokens:      u.Input,
+		OutputTokens:     u.Output,
+		CacheReadTokens:  u.CacheRead,
+		CacheWriteTokens: u.CacheWrite,
+	}
 }
 
 // KeptEntry 是快照里保留的一条消息（带状态与创建时间）。
@@ -427,8 +468,12 @@ func (d *Driver) ApplyCompact(summary string) ([]Effect, error) {
 	d.hasUsage = false
 	d.usageBase = 0
 	d.historyLenAtUsage = 0
-	// 上一轮的用量也不再代表当前上下文（内容被折叠了），
-	// 留着会显示一个与现状无关的命中率。等下一次真实请求重新填。
+	// 「最近一次请求」的用量不再代表当前上下文（内容被折叠了），清掉，
+	// 等下一次真实请求重新填。
+	//
+	// **totalUsage 不清**：那是会话累计（已经写进快照当基线），
+	// 压缩只是把历史折叠起来，没有改变"这个会话一共用了多少"。
+	// 清掉会让界面上的命中率从 99% 突然掉到 0%。
 	d.lastUsage = Usage{}
 	// 本轮已经压缩过，不再自动重试
 	d.autoCompactUsed = true
@@ -447,6 +492,8 @@ func (d *Driver) ApplyCompact(summary string) ([]Effect, error) {
 		// 摘要消息本身是合成的，不算一次用户输入（turns 里已包含它替代的那些）。
 		Turns: d.turns,
 		Steps: d.steps,
+		// 用量同理：命中率是累计口径，压缩后不能归零。
+		TotalUsage: toUsageData(d.totalUsage),
 		// 任务清单也要进快照：它是会话状态，压缩丢历史不能把它一起丢掉
 		// （否则压一次清单就消失，而界面上一秒还看着它）。
 		Todos: d.conv.Todos(),

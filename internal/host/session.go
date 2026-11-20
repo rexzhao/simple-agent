@@ -1,4 +1,4 @@
-﻿package host
+package host
 
 import (
 	"context"
@@ -304,6 +304,25 @@ func (s *Session) Usage() driver.Usage {
 		}
 	}
 	return s.drv.Usage()
+}
+
+// TotalUsage 返回会话累计用量（所有已完成请求之和）。
+//
+// 缓存命中率用这个口径：单次请求的命中率抖得厉害（新建缓存那轮 0%、
+// 紧接着全命中 99.9%），累计值才反映"这个会话一共省了多少"。
+//
+// 远程展示端：执行端会下发 total_usage；旧执行端没有该字段 → 零值 →
+// 按 0/0 处理（界面不显示命中率），与旧日志的降级策略一致。
+func (s *Session) TotalUsage() driver.Usage {
+	if s.view != nil {
+		return driver.Usage{
+			InputTokens:      s.view.TotalUsage.Input,
+			OutputTokens:     s.view.TotalUsage.Output,
+			CacheReadTokens:  s.view.TotalUsage.CacheRead,
+			CacheWriteTokens: s.view.TotalUsage.CacheWrite,
+		}
+	}
+	return s.drv.TotalUsage()
 }
 
 func (s *Session) Counts() driver.Counts {

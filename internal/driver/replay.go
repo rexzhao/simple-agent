@@ -39,6 +39,13 @@ type Replayed struct {
 	// 直接由全部消息推导，因此「重放 == 在线」在压缩前后都成立。
 	Turns int
 	Steps int
+	// TotalUsage 是重放出来的会话累计用量（状态条算缓存命中率用）。
+	//
+	// 来源：压缩快照里的基线（total_usage 字段）。**没有快照、或快照是
+	// 老版本（没有该字段）时为零值** —— 那等于按 0/0 开始算，只统计之后
+	// 的真实请求。旧日志里本来就没有准确的累计数字，编不出来，
+	// 如实从零算比造一个假基线诚实。
+	TotalUsage Usage
 
 	// RoundSeq 是日志里出现过的最大 roundId。
 	//
@@ -228,6 +235,9 @@ func (st *replayState) apply(event store.Event) {
 		// 快照是压缩后的新起点：计数从它记下的基线接续（旧快照没有这两个
 		// 字段 → 0，等于只统计快照之后的内容）。
 		out.Turns, out.Steps = data.Turns, data.Steps
+		// 累计用量同理。**旧快照没有 total_usage** → 零值 →
+		// 命中率按 0/0 算（不显示），直到这个会话再跑一轮真实的请求。
+		out.TotalUsage = data.TotalUsage.toUsage()
 		if data.Title != "" {
 			out.Title = data.Title
 		}
@@ -642,6 +652,12 @@ func Restore(replayed Replayed, opts Options) *Driver {
 	d.title = replayed.Title
 	d.turns = replayed.Turns
 	d.steps = replayed.Steps
+	// 累计用量从快照接续。旧日志没有这条基线 → 零值，命中率按 0/0 算。
+	//
+	// 顺带把它也塞进 lastUsage：界面在"这个会话还没跑过新请求"时
+	// 也该看到一点数字（否则状态条上的用量整块是空的）。
+	d.totalUsage = replayed.TotalUsage
+	d.lastUsage = replayed.TotalUsage
 	// roundId 从日志里的最大值继续，保证不复用
 	d.roundSeq = replayed.RoundSeq
 	d.opts.ReasoningEffort = replayed.ReasoningEffort

@@ -1,4 +1,4 @@
-﻿package uiapp
+package uiapp
 
 import (
 	"context"
@@ -38,9 +38,9 @@ type Runtime interface {
 
 // Options 是 App 的初始配置。
 type Options struct {
-	Selection     providers.Selection
-	SystemPrompt  string
-	AllowShell    bool
+	Selection    providers.Selection
+	SystemPrompt string
+	AllowShell   bool
 	// WebFetch 决定 web_fetch 是否注册（字段式路径用；生产走 LocalConfig）。
 	//
 	// 这个字段本身是踩过坑的：host.Config 的零值是 false，漏传就等于静默关掉
@@ -49,7 +49,7 @@ type Options struct {
 	WebFetch bool
 	// Token 是执行端自己的访问口令（`--listen` 直连时校验展示端的握手口令）。
 	// 与 relay 的 token 是两套：这里保护"直连执行端"这一跳。
-	Token string
+	Token         string
 	Workspace     string
 	MaxToolRounds int
 	// ContextWindow 是初始模型的上下文窗口（用于自动压缩；0 = 未知，按 32k）
@@ -618,14 +618,14 @@ func NewApp(rt Runtime, opts Options) *App {
 	}
 	locale.SetCurrent(lang) // 进程级默认（图片校验等拿不到 App 的地方用）
 	app := &App{
-		rt:            rt,
-		opts:          opts,
-		post:          post,
-		lang:          lang,
-		mdParser:      markdown.NewParser(),
-		mdCache:       markdown.NewCache(256),
-		images:        newImageStore(),
-		hlCache:       markdown.NewLRU[[]markdown.HighlightLine](128),
+		rt:                rt,
+		opts:              opts,
+		post:              post,
+		lang:              lang,
+		mdParser:          markdown.NewParser(),
+		mdCache:           markdown.NewCache(256),
+		images:            newImageStore(),
+		hlCache:           markdown.NewLRU[[]markdown.HighlightLine](128),
 		expandedParts:     map[string]bool{},
 		expandedFullParts: map[string]bool{},
 	}
@@ -2426,11 +2426,11 @@ func (a *App) ContextPercentForTest() int {
 
 // CacheHitBasisPointsForTest 返回当前会话的缓存命中率（千分比，测试用）。
 //
-// 用千分比而不是百分比：显示保留两位小数（99.93% → 9993），
-// 整数传递不会引入浮点误差。
+// 用累计口径（与状态条一致）。千分比而不是百分比：显示保留两位小数
+// （99.93% → 9993），整数传递不会引入浮点误差。
 func (a *App) CacheHitBasisPointsForTest() int {
 	if session := a.Current(); session != nil {
-		return cacheHitBasisPoints(session.Usage())
+		return cacheHitBasisPoints(session.TotalUsage())
 	}
 	return 0
 }
@@ -2536,12 +2536,17 @@ func (a *App) statusBar(c *ui.Context, session *Session, theme *ui.Theme) {
 			Critical: 95,
 		}).Width(meterWidth).Height(meterHeight).Label(a.tr("composer.usageLabel"))
 
-		// 缓存命中率：只有 provider 报了缓存字段才显示。
+		// 缓存命中率：用**累计口径**（这个会话所有已完成请求之和）。
+		//
+		// 为什么不用单次：单次抖动极大 —— 新建缓存那一轮是 0%，紧接着
+		// 全命中的一轮是 99.9%，看单次会以为缓存时好时坏。累计值才反映
+		// "这个会话一共省了多少"，而且不会因为切换回合而闪烁。
 		//
 		// 判据用 CacheRead > 0 而不是"字段存在"：旧网关压根不发这些字段，
 		// 读出来恒为 0；画面上突然多个"缓存 0%"会让人以为缓存失效了。
 		// 命中过才显示，第一次请求（纯写入、还没得命中）也自然不显示。
-		usage := session.Usage()
+		// 旧日志（没有累计基线）同样是 0/0 → 不显示，等跑一轮真实请求再出现。
+		usage := session.TotalUsage()
 		if usage.CacheReadTokens > 0 {
 			ui.Text(c, a.tr("composer.cacheHit", formatBasisPoints(cacheHitBasisPoints(usage)))).
 				FontSize(11).TextColor(theme.TextMuted).
@@ -2601,8 +2606,7 @@ func cacheHitBasisPoints(usage driver.Usage) int {
 		basisPoints = 9_999
 	}
 	return clampInt(basisPoints, 0, 9_999)
-}// formatBasisPoints 把千分比转成两位小数的百分比字符串（9993 → "99.93"）。
-//
+} // formatBasisPoints 把千分比转成两位小数的百分比字符串（9993 → "99.93"）。
 // 不返回浮点再 fmt：百分比只有两位小数，用整数拆整个/小数部分最直观，
 // 也避免 9993/100 = 99.93000000000001 这种显示。
 func formatBasisPoints(basisPoints int) string {

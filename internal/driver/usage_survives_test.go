@@ -42,6 +42,7 @@ func TestUsageSurvivesRoundEnd(t *testing.T) {
 		InputTokens:     1000,
 		OutputTokens:    50,
 		CacheReadTokens: 800,
+		CacheReported:   true,
 	})
 	if got := d.Usage().CacheReadTokens; got != 800 {
 		t.Fatalf("流式期间应为 800，实际 %d", got)

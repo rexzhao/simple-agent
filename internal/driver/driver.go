@@ -1,4 +1,4 @@
-﻿// Package driver 是会话编排状态机：把用户操作与提供商事件翻译成会话变化，
+// Package driver 是会话编排状态机：把用户操作与提供商事件翻译成会话变化，
 // 并把"接下来该做什么"以 Effect 形式交给调用方（uiapp）。
 //
 // 三条硬约束（方案 §4 / §9）：
@@ -175,7 +175,7 @@ type Driver struct {
 
 	title string
 	busy  Busy
-	round  *Round
+	round *Round
 	// queued 是回合进行中用户插话排队的内容（steer）。
 	//
 	// **不进 Conversation**：忙时若立刻追加 user 消息，会话顺序会变成
@@ -212,6 +212,15 @@ type Driver struct {
 	// 重放历史会话时它同样为「空」——用量不落盘（只有 turn 边界事件），
 	// 旧会话要等下一次真实请求才会有数据。
 	lastUsage Usage
+	// totalUsage 是**会话累计**用量（所有已完成的请求之和）。
+	//
+	// 为什么要有它：命中率要看整体趋势，单次请求的数字抖得厉害 ——
+	// 一轮新建缓存（0%）紧接一轮全命中（99.9%），看单次会以为缓存时好时坏。
+	// 累计值稳定得多，也更符合"这个会话省了多少"的直觉。
+	//
+	// 压缩时会写进 compact.snapshot（total_input 等字段），重放直接从快照
+	// 接着算，不必回翻归档日志。
+	totalUsage Usage
 	// autoCompactUsed 表示本轮用户输入已经自动压缩过一次，不再重试。
 	autoCompactUsed bool
 	// warnedDefaultWindow 表示已经提示过「窗口未知，按默认值处理」。
@@ -411,6 +420,23 @@ func (d *Driver) Usage() Usage {
 		}
 	}
 	return d.lastUsage
+}
+
+// TotalUsage 返回会话累计用量（所有已完成请求之和）。
+//
+// 与 Usage() 的区别：那个是「最近一次请求」，这个是「整个过程」。
+// 命中率用累计口径才有意义 —— 单次请求里新建缓存的那一轮是 0%，
+// 紧接着全命中的一轮是 99.9%，看单次会以为缓存时好时坏。
+func (d *Driver) TotalUsage() Usage { return d.totalUsage }
+
+// addUsage 把一次请求的用量累加进整体。
+func addUsage(total, one Usage) Usage {
+	return Usage{
+		InputTokens:      total.InputTokens + one.InputTokens,
+		OutputTokens:     total.OutputTokens + one.OutputTokens,
+		CacheReadTokens:  total.CacheReadTokens + one.CacheReadTokens,
+		CacheWriteTokens: total.CacheWriteTokens + one.CacheWriteTokens,
+	}
 }
 
 // CanSend 报告现在能否发送。
@@ -1079,14 +1105,20 @@ func (d *Driver) ApplyStreamDelta(messageID string, ev providers.Event) ([]Effec
 		if ev.OutputTokens > 0 {
 			round.usage.OutputTokens = ev.OutputTokens
 		}
-		// 缓存字段：**每次都覆盖，包括 0**。
+		// 缓存字段：**带了才覆盖**，靠 CacheReported 判断。
 		//
-		// 与上面两个不同：input/output 在流里可能分多个事件发（Anthropic 的
-		// message_start 给 input、message_delta 给 output），0 表示"这次没带"，
-		// 所以只在非 0 时写。而缓存字段只在一个事件里出现，0 就是"这次没命中"，
-		// 沿用上一轮的旧值会显示成假的命中率。
-		round.usage.CacheReadTokens = ev.CacheReadTokens
-		round.usage.CacheWriteTokens = ev.CacheWriteTokens
+		// Anthropic 分两个事件报用量：message_start 带 input 与缓存字段，
+		// message_delta 只带 output。若按"每次都覆盖"处理（以前的做法），
+		// 第二个事件会把已经拿到的缓存数抹成 0 —— 实测就是这样：
+		// 网关明明回了 cached=298240，界面却显示 0%。
+		//
+		// 为什么不能简单按"非 0 才写"：那会让"这轮真没命中（确实 0）"
+		// 沿用上一轮的旧值，显示成假的命中率。所以需要一个显式的
+		// "这条事件带了缓存字段"信号。
+		if ev.CacheReported {
+			round.usage.CacheReadTokens = ev.CacheReadTokens
+			round.usage.CacheWriteTokens = ev.CacheWriteTokens
+		}
 		// **同时更新 lastUsage**：有工具调用的回合里 round 会跨多次请求存活，
 		// 但下一轮请求一开始 round 就被换掉了；只在"回合彻底结束"时记一份
 		// 会让状态条在中间那几轮读到旧的（或空的）值。
@@ -1204,6 +1236,13 @@ func (d *Driver) finishStream(messageID, _ string) []Effect {
 		// Turn 边界：这一次请求结束了（后面可能还有工具执行与续轮）
 		recordTurnFinished(round.id, round.turn, time.Since(round.startedAt)),
 	}
+	// 累计这次请求的用量。
+	//
+	// **必须在这里累加**，不能放在 EventUsage 里：Anthropic 的 input 与 output
+	// 分两个事件发（message_start / message_delta），而缓存字段各自覆盖 ——
+	// 在事件里累加会把同一个请求算两遍。finishStream 是「一次请求结束、用量
+	// 已是最终值」的唯一确定时点，一个 turn 恰好累加一次。
+	d.totalUsage = addUsage(d.totalUsage, round.usage)
 
 	if len(calls) == 0 {
 		usage := round.usage
@@ -1669,7 +1708,7 @@ func (d *Driver) Stop() []Effect {
 			// 这条消息在工具执行前已经 Complete 并落过日志，只需补结果
 			if changed {
 				resultRound, resultTurn := d.toolResultOrigin(messageID)
-		effects = append(effects, recordToolResults(resultRound, resultTurn, partResultRecords(entry.Message))...)
+				effects = append(effects, recordToolResults(resultRound, resultTurn, partResultRecords(entry.Message))...)
 			}
 		}
 	}
