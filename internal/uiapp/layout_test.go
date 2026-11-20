@@ -812,9 +812,14 @@ func TestRestoreFailureIsVisible(t *testing.T) {
 	if err := os.MkdirAll(bad, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// session.jsonl 为空（"日志为空" → openSession 失败）；再放一个归档文件，
-	// 免得被 PruneEmpty 当成"没有内容的会话"直接删掉（否则就测不到恢复失败了）。
-	if err := os.WriteFile(filepath.Join(bad, "session.jsonl"), nil, 0o644); err != nil {
+	// 造一个"打开就失败"的会话：把 session.jsonl 做成**目录**。
+	//
+	// 为什么不用"空文件"或"半截 JSON"：
+	//   - 空日志现在被当成"从没产生过内容的残留"静默清掉（用户明确说
+	//     那串 "N sessions failed to restore ... The log is empty" 是噪音）
+	//   - 半截 JSON 会被 readEvents 修复并记成 warning，不报错
+	// 做成目录则 Open 阶段（打开文件）必然失败 —— 这才是"真的恢复不了"。
+	if err := os.MkdirAll(filepath.Join(bad, "session.jsonl"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(bad, "archive-0001.jsonl"), []byte("{}\n"), 0o644); err != nil {

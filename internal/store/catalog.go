@@ -174,6 +174,49 @@ func hasOtherFiles(dir string) bool {
 // 判定**保守**：日志里一条 message.appended / message.finalized / tool.results /
 // ask.* / notice.appended 都没有，并且没有归档文件——也就是用户从没发过消息。
 // 以前每次启动都会建一个这样的空会话，侧栏就会堆满「新会话」。
+// PruneMissing 从项目档案里移除**目录已不存在**的会话记录。
+//
+// 为什么需要它：新建会话时就会登记进档案（为了侧栏分组有稳定的项目 ID），
+// 但空会话不落盘 —— 重启后目录根本不存在，而档案里还留着那条记录，
+// 于是启动时按它去打开日志，得到"Could not restore session: The log is empty"。
+//
+// 和 PruneEmpty 的分工：
+//   - PruneEmpty 扫 sessions/，删**空目录**
+//   - PruneMissing 扫项目档案，删**指向不存在目录的记录**
+//
+// 两个都要跑：前者清文件，后者清记录。只跑一个就会出现"文件没了但档案
+// 还在"（这个 bug）或"档案没了但文件还在"（占空间）。
+//
+// 返回被移除的会话 id（用于日志）。
+func (c *Catalog) PruneMissing() ([]string, error) {
+	projects, err := c.ListProjects()
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	for _, project := range projects {
+		kept := make([]SessionRecord, 0, len(project.Sessions))
+		changed := false
+		for _, record := range project.Sessions {
+			if _, statErr := os.Stat(c.sessionDirFor(project, record)); statErr == nil {
+				kept = append(kept, record)
+				continue
+			}
+			// 目录不在：这条记录已经没有对应数据了
+			removed = append(removed, record.ID)
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+		project.Sessions = kept
+		if err := c.SaveProject(project); err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
+}
+
 func (c *Catalog) PruneEmpty() ([]string, error) {
 	root := c.SessionsDir()
 	entries, err := os.ReadDir(root)
@@ -390,6 +433,34 @@ func (c *Catalog) AddSession(contextID, title, workspace, dir string) error {
 		CreatedAt: nowRFC3339(),
 	})
 	return c.SaveProject(project)
+}
+
+// DropSession 从项目档案里移除一个会话记录（**不动文件**）。
+//
+// 与 Delete 的区别：Delete 连目录一起删。这里只清记录 ——
+// 用在"目录已经没了"或"日志为空、要当作不存在"的场景。
+func (c *Catalog) DropSession(contextID string) error {
+	projects, err := c.ListProjects()
+	if err != nil {
+		return err
+	}
+	for _, project := range projects {
+		kept := make([]SessionRecord, 0, len(project.Sessions))
+		found := false
+		for _, record := range project.Sessions {
+			if record.ID == contextID {
+				found = true
+				continue
+			}
+			kept = append(kept, record)
+		}
+		if !found {
+			continue
+		}
+		project.Sessions = kept
+		return c.SaveProject(project)
+	}
+	return nil
 }
 
 // SessionArchived 报告某个会话是否已归档（第二个返回值为 false 表示查不到）。

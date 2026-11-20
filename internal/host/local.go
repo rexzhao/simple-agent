@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -580,6 +581,12 @@ func (l *Local) deleteSession(id string) CmdResult {
 
 // ---- 启动恢复 ----
 
+// errSessionGone 表示档案里有记录但目录已经不在了。
+//
+// 单独一个哨兵值（不用普通 error）：启动恢复时它要**静默跳过**，
+// 而不是计进"恢复失败"——后者会让界面弹一串没意义的提示。
+var errSessionGone = errors.New("会话目录已不存在")
+
 // restoreSessions 从数据目录恢复已有会话。
 //
 // **一个都没有时不自动新建**（用户选 B：删光会话或全新安装 → 界面显示空态）。
@@ -591,6 +598,15 @@ func (l *Local) restoreSessions() {
 	}
 	if removed, pruneErr := l.cfg.Catalog.PruneEmpty(); pruneErr == nil && len(removed) > 0 {
 		log.Print(l.cfg.Tr("session.pruned", len(removed)))
+	}
+	// 再清档案里"指向不存在目录"的记录。
+	//
+	// 新建会话时会立刻登记进档案（为了侧栏有稳定的项目 ID），但空会话
+	// 不落盘 —— 重启后目录不存在而记录还在，启动时按它去打开就会得到
+	// "Could not restore session: The log is empty" 这类噪音提示。
+	// 顺序在 PruneEmpty 之后：先清空目录，再清指向它们的记录。
+	if removed, pruneErr := l.cfg.Catalog.PruneMissing(); pruneErr == nil && len(removed) > 0 {
+		log.Printf("已从项目档案移除 %d 个目录不存在的会话记录", len(removed))
 	}
 	// 老布局（sessions/<id>/）的会话要先登记进项目档案，
 	// 否则启动只读档案时它们会从侧栏消失（文件还在，只是没人认识）。
@@ -606,6 +622,12 @@ func (l *Local) restoreSessions() {
 	for _, summary := range summaries {
 		session, openErr := l.openSession(summary.ContextID, summary.Title)
 		if openErr != nil {
+			// 目录已经不在了：这不是"恢复失败"，是这条记录本就该消失
+			// （PruneMissing 已尽力清理，这里兜住竞态与手工删除）。
+			// 不计入失败数 —— 否则界面会弹一串"无法恢复"的噪音。
+			if errors.Is(openErr, errSessionGone) {
+				continue
+			}
 			failed++
 			if firstReason == "" {
 				firstReason = l.cfg.Tr("session.restoreFail", summary.ContextID, openErr)
@@ -624,7 +646,19 @@ func (l *Local) restoreSessions() {
 	}
 }
 
+// openSession 打开并重放一个已有会话。
 func (l *Local) openSession(contextID, title string) (*Session, error) {
+	// 目录不存在 = 这条档案记录已经没数据了（空会话没落盘就被登记，
+	// 或者用户手工删了目录）。**直接跳过，不要 Open**：
+	// Open 里有 MkdirAll，会白建一个空目录，然后下一个报"日志为空"，
+	// 下次启动又被 PruneEmpty 删掉 —— 白白制造噪音。
+	if l.cfg.Catalog != nil {
+		if dir, err := l.cfg.Catalog.SessionDirFor(contextID); err == nil {
+			if _, statErr := os.Stat(dir); statErr != nil {
+				return nil, errSessionGone
+			}
+		}
+	}
 	// 旧版本 headless 没设置 locale，把 locale key 直接写成了标题：
 	// 加载时还原成正常的默认标题，免得侧栏一直显示 "session.defaultTitle"。
 	if title == "" || title == "session.defaultTitle" {
@@ -641,7 +675,21 @@ func (l *Local) openSession(contextID, title string) (*Session, error) {
 	}
 	if len(loaded.Events) == 0 {
 		_ = logStore.Close()
-		return nil, errors.New(l.cfg.Tr("session.logEmpty"))
+		// 日志为空 = 这个会话从没产生过内容（新建后没发消息）。
+		//
+		// 不是"恢复失败"，是**该清掉的残留**：Open 里的 MkdirAll 会建出
+		// 空文件，删掉目录即可。删除失败也不报错 —— 下次启动再试，
+		// 否则用户会看到 "N sessions failed to restore" 这种没意义的噪音。
+		//
+		// 注意只删自己刚建的那个目录：有归档/备份文件的会话走不到这里
+		// （那些日志非空）。
+		if dir, err := l.cfg.Catalog.SessionDirFor(contextID); err == nil {
+			_ = os.RemoveAll(dir)
+		}
+		// 档案里也要移除：留着的话下次启动还会试着打开它，
+		// 又走一遍"建目录 → 发现为空 → 删目录"。
+		_ = l.cfg.Catalog.DropSession(contextID)
+		return nil, errSessionGone
 	}
 	drv, replayed, err := driver.Load(loaded.Events, l.driverOptionsFor(l.cfg.Selection, l.cfg.Workspace))
 	if err != nil {
