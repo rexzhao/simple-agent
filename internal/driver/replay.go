@@ -504,6 +504,10 @@ func (st *replayState) applyToolResult(data ToolResultData, seq uint64) {
 	if result.Exec != nil {
 		fields["exec"] = result.Exec
 	}
+	// 图片摘要同理：不带上的话，重启后折叠行就退回显示 XML 信封。
+	if result.ImageInfo != nil {
+		fields["image_info"] = result.ImageInfo
+	}
 	entry.AddPart(message.Part{
 		Content:   message.DataPart{Data: fields},
 		MediaType: render.MediaToolResult,

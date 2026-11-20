@@ -202,6 +202,25 @@ type ToolReturn struct {
 	// 输出混在一块，眼睛得先跳过那行才能看内容。
 	// 拆成字段后界面能单独排一行，正文从第一行就是真正的输出。
 	Exec *ExecInfo
+	// Image 是图片工具（read_image / display_image）的摘要，**只给界面**。
+	//
+	// Output 里那段是给模型的 XML 信封（<path>/<type>/<content>），
+	// 直接摊在折叠行没法读。这里给界面一份人话摘要：
+	// "car.png · 1920x1080 · image/png"。
+	Image *ImageInfo
+}
+
+// ImageInfo 是一张图片的摘要（界面折叠行用）。
+type ImageInfo struct {
+	Path      string `json:"path,omitempty"`
+	Width     int    `json:"width,omitempty"`
+	Height    int    `json:"height,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	Bytes     int    `json:"bytes,omitempty"`
+	// Downscaled 表示发的是缩小后的副本（原尺寸在 OrigWidth/OrigHeight）。
+	Downscaled bool `json:"downscaled,omitempty"`
+	OrigWidth  int  `json:"orig_width,omitempty"`
+	OrigHeight int  `json:"orig_height,omitempty"`
 }
 
 // ExecInfo 是一次命令执行的摘要（bash/pwsh）。
@@ -389,6 +408,8 @@ type ToolOutcome struct {
 	// Output 里仍保留一行 "exit_code=0 elapsed=12ms" 给模型看（它需要
 	// 知道命令成没成功），而界面用这个字段单独排版，不和正文混在一起。
 	Exec *ExecInfo
+	// Image 是图片工具的摘要，**只给界面**（折叠行显示一行人话）。
+	Image *ImageInfo
 }
 
 // ToolImageRef 是工具结果里的一张图片引用。
@@ -537,6 +558,7 @@ func executeOne(ctx context.Context, list []*ToolDef, tc *ToolContext, call Call
 	base.RawImages = result.Images
 	base.Diff = result.Diff
 	base.Exec = result.Exec
+	base.Image = result.Image
 	if base.Output == "" && len(base.RawImages) == 0 {
 		base.Output = "（无输出）"
 	}

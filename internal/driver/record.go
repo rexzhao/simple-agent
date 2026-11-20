@@ -69,6 +69,8 @@ type ToolResultRecord struct {
 	Diff *tools.FileDiff `json:"diff,omitempty"`
 	// Exec 是命令执行的元信息（bash/pwsh），**只给界面**。
 	Exec *tools.ExecInfo `json:"exec,omitempty"`
+	// ImageInfo 是图片工具的摘要，**只给界面**（折叠行一行人话）。
+	ImageInfo *tools.ImageInfo `json:"image_info,omitempty"`
 }
 
 // ToolResultData 是 tool.result 的载荷：**单条**工具结果。
@@ -289,6 +291,7 @@ func resultRecords(outcomes []tools.ToolOutcome) []ToolResultRecord {
 			Questions: outcome.Pending,
 			Diff:      outcome.Diff,
 			Exec:      outcome.Exec,
+			ImageInfo: outcome.Image,
 		})
 	}
 	return out
@@ -323,6 +326,7 @@ func partResultRecords(msg *message.Message) []ToolResultRecord {
 			Questions: questionsOf(data),
 			Diff:      diffOf(data),
 			Exec:      execOf(data),
+			ImageInfo: imageInfoOf(data),
 		})
 	}
 	return out
@@ -346,6 +350,27 @@ func diffOf(data map[string]any) *tools.FileDiff {
 			return nil
 		}
 		return &diff
+	}
+	return nil
+}
+
+// imageInfoOf 读取 part 里的图片摘要（read_image / display_image）。
+//
+// 与 diffOf/execOf 同理：内存里是 *tools.ImageInfo，重放后是 map[string]any。
+func imageInfoOf(data map[string]any) *tools.ImageInfo {
+	switch value := data["image_info"].(type) {
+	case *tools.ImageInfo:
+		return value
+	case map[string]any:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		var info tools.ImageInfo
+		if err := json.Unmarshal(raw, &info); err != nil {
+			return nil
+		}
+		return &info
 	}
 	return nil
 }

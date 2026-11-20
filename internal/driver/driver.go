@@ -1525,6 +1525,11 @@ func (d *Driver) ToolResult(messageID string, outcome tools.ToolOutcome) ([]Effe
 	if outcome.Exec != nil {
 		data["exec"] = outcome.Exec
 	}
+	// 图片工具的摘要：折叠行用它显示一行人话（"x.png · 1920x1080 · 240KB"），
+	// 而不是把 Output 里的 XML 信封摊出来。
+	if outcome.Image != nil {
+		data["image_info"] = outcome.Image
+	}
 	if len(outcome.Images) > 0 {
 		images := make([]any, 0, len(outcome.Images))
 		for _, image := range outcome.Images {

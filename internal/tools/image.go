@@ -175,6 +175,19 @@ func readImageRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, 
 	return ToolReturn{
 		Output: formatImageOutput(displayPath(tc, path), out, width, height, scaled),
 		Images: []ImageOutput{out},
+		// 给界面的摘要：折叠行显示成
+		// "internal/uiapp/x.png · 1920x1080 · 240KB"，
+		// 而不是把上面那段 XML 信封摊出来。
+		Image: &ImageInfo{
+			Path:       displayPath(tc, path),
+			Width:      out.Width,
+			Height:     out.Height,
+			MediaType:  out.MediaType,
+			Bytes:      len(out.Data),
+			Downscaled: scaled,
+			OrigWidth:  width,
+			OrigHeight: height,
+		},
 	}, nil
 }
 

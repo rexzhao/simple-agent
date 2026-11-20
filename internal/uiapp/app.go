@@ -1918,9 +1918,18 @@ func toolArgsDetail(name string, data map[string]any) string {
 	//     下面已经用 diff / 全文画出来了，再罗列一遍就是重复
 	//     （用户看到的就是"diff 之前多了一堆奇怪的东西"）
 	primary := primaryArgKeys(name)
-	if value, ok := args[primary]; ok {
-		if text, isString := value.(string); isString {
-			return text
+	// edit/write 没有"要执行的命令"可言：文件名已在折叠行显示，
+	// 展开区该直接是 diff / 写入内容。所以主参数为空 → 不渲染黑底块。
+	// （曾经把 file_path 当主参数，展开后先冒出一行黑底的文件名，
+	//  紧接着才是 diff —— 用户看到的就是"后面跟着一行多余的文件名"。）
+	if name == "edit" || name == "write" {
+		primary = ""
+	}
+	if primary != "" {
+		if value, ok := args[primary]; ok {
+			if text, isString := value.(string); isString {
+				return text
+			}
 		}
 	}
 	// 其余工具：按键名排序，一行一个（跳过上面那类噪音参数）
@@ -1950,21 +1959,97 @@ const (
 	terminalFg = "#C9C9C9"
 )
 
+// isShellTool 报告这个工具是不是"在终端里跑命令"。
+//
+// 只有它（bash/pwsh）的详情用黑底白字：命令和输出确实是终端里发生的事。
+// 别的工具套同款配色只是"看起来像终端"，反而突兀。
+func isShellTool(name string) bool {
+	return name == "bash" || name == "pwsh"
+}
+
+// renderArgsBlock 渲染参数全文 / 非终端工具的输出。
+//
+// terminal 为真时用终端配色（深底浅字），否则用普通代码块（浅底深字）。
+func (a *App) renderArgsBlock(c *ui.Context, text string, terminal bool, theme *ui.Theme) {
+	if !terminal {
+		a.renderMonoBlock(c, text, theme.Surface, theme.Text)
+		return
+	}
+	a.renderTerminalBlock(c, text, theme)
+}
+
 // renderTerminalBlock 用终端风格渲染一段等宽文本（命令或输出）。
 //
-// 为什么命令和输出都用它：它们是"同一场执行"的两段（跑了什么 → 得到什么），
-// 配色一致才看得出是一对。用浅色底的话，长输出会让整屏发白。
+// **只给 bash/pwsh 用**：黑底白字是终端的语义，命令和它的输出确实是终端里
+// 发生的事。别的工具（edit/write/read）套这个配色只是"看起来像终端"，
+// 实际会显得突兀（用户的原话："除了 bash / pwsh 都不应该显示黑底白字"）。
 func (a *App) renderTerminalBlock(c *ui.Context, text string, theme *ui.Theme) {
+	a.renderMonoBlock(c, text, ui.Hex(terminalBg), ui.Hex(terminalFg))
+}
+
+// renderMonoBlock 渲染一段带行、等宽的代码块（背景/前景由调用方给）。
+func (a *App) renderMonoBlock(c *ui.Context, text string, background, foreground ui.Color) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
 	ui.Column(c).FillWidth().Padding(8, 10).Radius(6).Gap(3).
-		Background(ui.Hex(terminalBg)).Children(func() {
+		Background(background).Children(func() {
 			for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
 				ui.Text(c, line).Font(dshCodeFontStack).FontSize(12).
-					TextColor(ui.Hex(terminalFg)).MaxLines(1)
+					TextColor(foreground).MaxLines(1)
 			}
 		})
+}
+
+// imageInfoOfPart 从工具结果 data 里取出图片摘要。
+func imageInfoOfPart(data map[string]any) *tools.ImageInfo {
+	switch value := data["image_info"].(type) {
+	case *tools.ImageInfo:
+		return value
+	case map[string]any:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		var info tools.ImageInfo
+		if err := json.Unmarshal(raw, &info); err != nil {
+			return nil
+		}
+		return &info
+	}
+	return nil
+}
+
+// imageInfoSummary 生成图片的一行摘要："1920x1080 · 240KB · image/png"。
+//
+// 路径不重复（折叠行前面已经有文件名摘要了），description 也不重复。
+func imageInfoSummary(info *tools.ImageInfo) string {
+	var parts []string
+	if info.Width > 0 && info.Height > 0 {
+		parts = append(parts, fmt.Sprintf("%dx%d", info.Width, info.Height))
+	}
+	if info.Bytes > 0 {
+		parts = append(parts, formatBytes(info.Bytes))
+	}
+	if info.MediaType != "" {
+		parts = append(parts, strings.TrimPrefix(info.MediaType, "image/"))
+	}
+	if info.Downscaled && info.OrigWidth > 0 {
+		parts = append(parts, fmt.Sprintf("原图 %dx%d", info.OrigWidth, info.OrigHeight))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// formatBytes 把字节数格式化成 "240KB" / "1.2MB"。
+func formatBytes(n int) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%dB", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.0fKB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1024*1024))
+	}
 }
 
 // argString 从工具调用的 data 里读一个**参数**的字符串值。
@@ -2136,27 +2221,21 @@ func formatElapsed(ms int64) string {
 // 用行号而不是 diff 的红绿：write 是整篇写入，没有"改动"可言，
 // 用户想看的是"文件里现在是什么"。
 func (a *App) renderWrittenContent(c *ui.Context, diff *tools.FileDiff, theme *ui.Theme) {
-	header := diff.Path
-	if diff.Verb != "" {
-		header = diff.Verb + " " + diff.Path
+	// **不再画"已创建 xxx.txt"那种标题行**：文件名和行数已经在折叠行里
+	// （`write notes.txt 2 行`），这里再来一行是重复。
+	//
+	// 用**普通代码块**（浅色底）而不是终端黑底：黑底是 bash/pwsh 的语义，
+	// write 只是写文件，套黑底会显得像在终端里敲了什么。
+	lines := strings.Split(diff.Content, "\n")
+	// 末尾换行会多出一个空元素，不算一行
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
 	}
-	ui.Column(c).FillWidth().Gap(2).Children(func() {
-		ui.Text(c, header).Font(dshCodeFontStack).FontSize(11).
-			TextColor(theme.TextMuted)
-		ui.Column(c).FillWidth().Padding(6, 8).Radius(6).
-			Background(theme.Surface).Children(func() {
-				lines := strings.Split(diff.Content, "\n")
-				// 末尾换行会多出一个空元素，不算一行
-				if n := len(lines); n > 0 && lines[n-1] == "" {
-					lines = lines[:n-1]
-				}
-				for index, line := range lines {
-					text := formatDiffLineNo(index+1) + " " + line
-					ui.Text(c, text).Font(dshCodeFontStack).FontSize(12).
-						TextColor(theme.Text).MaxLines(1)
-				}
-			})
-	})
+	numbered := make([]string, 0, len(lines))
+	for index, line := range lines {
+		numbered = append(numbered, formatDiffLineNo(index+1)+" "+line)
+	}
+	a.renderMonoBlock(c, strings.Join(numbered, "\n"), theme.Surface, theme.Text)
 }
 
 // stripExecHeader 去掉命令输出开头那行 "exit_code=... elapsed=... cwd=..."。
@@ -2363,6 +2442,15 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 				ui.Text(c, truncateRunes(summary, limit)).FontSize(12).
 					TextColor(theme.TextMuted).MaxLines(1)
 			}
+			// 图片：折叠行给**一行简略信息**（尺寸 + 大小），
+			// 而不是把 Output 里那段 <path>/<type>/<content> 信封摊出来
+			// —— 那是给模型看的，人读不懂。
+			if hasResult {
+				if info := imageInfoOfPart(resultData); info != nil {
+					ui.Text(c, imageInfoSummary(info)).FontSize(11).
+						TextColor(theme.TextMuted).MaxLines(1)
+				}
+			}
 			// edit/write 的增删数量：**紧跟在文件名后面**，折叠态就能看出改了多少。
 			//
 			// 为什么不放行尾：行尾已经被状态（完成/失败）占了，
@@ -2426,9 +2514,18 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 			// 两块黑底贴太近会连成一片，看不出"命令"和"输出"是两段
 			// （截图里它们几乎粘在一起）。
 			ui.Column(c).FillWidth().Padding(2, 20).Gap(8).Children(func() {
+				// **黑底白字只给 bash/pwsh**：那是终端的语义。
+				// 别的工具（read/read_image/ask…）的"参数全文"和"输出"
+				// 套终端配色只会显得突兀 —— 它们本来就不是在终端里发生的。
+				terminal := isShellTool(name)
+
 				// 1) 参数全文（bash 的命令、read 的路径…）
-				if argsText != "" {
-					a.renderTerminalBlock(c, argsText, theme)
+				//
+				// 图片工具**跳过**：文件名已在折叠行，这里再画一块
+				// 显示路径没有意义（用户看到的就是"多跟着一行黑底文件名"）。
+				hasImages := len(toolImagesOf(resultData)) > 0
+				if argsText != "" && !hasImages {
+					a.renderArgsBlock(c, argsText, terminal, theme)
 				}
 				if !hasResult {
 					return
@@ -2444,6 +2541,11 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 					} else {
 						a.renderDiff(c, diff, theme)
 					}
+				} else if images := toolImagesOf(resultData); len(images) > 0 {
+					// 带图片的结果（read_image / display_image）：走 toolOutput，
+					// 它会画缩略图。**不能**用终端块 —— 那只会把 Output 里的
+					// XML 信封画成黑底，图片本体就丢了。
+					a.toolOutput(c, resultData, isError, true, color)
 				} else if output := stringOf(resultData, "output"); output != "" {
 					// 有结构化元信息时，把 Output 开头那行 "exit_code=... cwd=..."
 					// 去掉 —— 它和上面刚画的元信息是同一件事，留着就是重复。
@@ -2452,9 +2554,7 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 						output = stripExecHeader(output)
 					}
 					if strings.TrimSpace(output) != "" {
-						// 命令输出也用终端风格（黑底）：它和上面的命令是
-						// "同一场执行"的两段，配色一致才看得出是一对。
-						a.renderTerminalBlock(c, strings.TrimRight(output, "\n"), theme)
+						a.renderArgsBlock(c, strings.TrimRight(output, "\n"), terminal, theme)
 					}
 				}
 			})
@@ -2570,7 +2670,10 @@ func (a *App) toolOutput(c *ui.Context, data map[string]any, isError, expanded b
 		return
 	}
 	ui.Column(c).FillWidth().Padding(6, 8).Radius(6).Background(theme.Surface).Gap(6).Children(func() {
-		if output != "" {
+		// 有图片时**不显示 Output 文本**：read_image 的 output 是
+		// <path>/<type>/<content> 这种给模型的 XML 信封，人看着是一堆标签。
+		// 图片本身就是全部信息（尺寸/大小已经在折叠行那行摘要里）。
+		if output != "" && len(images) == 0 {
 			shown, _ := truncateOutput(output, expanded)
 			// 失败且折叠时：只留一行要点。
 			//
