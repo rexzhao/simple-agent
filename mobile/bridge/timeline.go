@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -476,11 +477,52 @@ func applyToolResult(step *ProcessStep, part message.Part) {
 	if isError, ok := data["is_error"].(bool); ok {
 		step.IsError = isError
 	}
+	// 结构化摘要（与桌面端同一套）：界面拿它们显示人话，
+	// 而不是把 Output 里给模型的文本（XML 信封/英文指令/续读提示）摊出来。
+	step.Exec = decodeStepExtra[ExecInfoView](data, "exec")
+	step.Diff = decodeStepDiff(data)
+	step.Image = decodeStepExtra[ImageInfoView](data, "image_info")
+	step.Search = decodeStepExtra[SearchView](data, "search")
+	step.Web = decodeStepExtra[WebView](data, "web")
+	step.Read = decodeStepExtra[ReadView](data, "read")
+	step.Todo = decodeStepExtra[TodoProgressView](data, "todo")
+	if args, ok := data["args"].(map[string]any); ok {
+		if desc, ok := args["description"].(string); ok {
+			step.Description = desc
+		}
+	}
 	if pending, ok := data["pending"].(bool); ok && pending {
 		step.Pending = true
 		return
 	}
 	step.Done = true
+}
+
+// decodeStepExtra 把 part 里的结构化字段转成桥接层的视图类型。
+//
+// 内存里是 Go 的指针（*tools.WebInfo 等），重放后是 map[string]any。
+// 两种都要认 —— 只认一种的话，重启后（或刚做完时）有一边会缺。
+// 用 JSON 中转而不是直接类型断言：桥接层不 import internal/tools 的细节，
+// 只依赖字段名（两边都带 json tag）。
+func decodeStepExtra[T any](data map[string]any, key string) *T {
+	value, ok := data[key]
+	if !ok || value == nil {
+		return nil
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var out T
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return &out
+}
+
+// decodeStepDiff 特殊一点：EditInfo 在桌面端叫 FileDiff，桥接层叫 FileDiffView。
+func decodeStepDiff(data map[string]any) *FileDiffView {
+	return decodeStepExtra[FileDiffView](data, "diff")
 }
 
 // toolArgsText 把工具参数转成可读文本（对象则逐行 key: value）。

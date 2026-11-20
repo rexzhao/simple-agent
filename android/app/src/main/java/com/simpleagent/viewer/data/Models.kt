@@ -181,6 +181,125 @@ data class ProcessStep(
     val pending: Boolean = false,
     val done: Boolean = false,
     @SerialName("duration_ms") val durationMs: Long = 0,
+    // 以下是与桌面端对齐的结构化摘要（只给界面看，不发给模型）。
+    // 用来显示人话：「3 个文件 · 12 处命中」「第 1-80 行 / 共 300 行」……
+    // 没有它们就只能照搬 output 里给模型的文本（XML 信封、英文指令）。
+    val description: String = "",
+    val exec: ExecInfoView? = null,
+    val diff: FileDiffView? = null,
+    @SerialName("image_info") val imageInfo: ImageInfoView? = null,
+    val search: SearchView? = null,
+    val web: WebView? = null,
+    val read: ReadView? = null,
+    val todo: TodoProgressView? = null,
+)
+
+/** 命令执行的元信息（bash/pwsh）。 */
+@Serializable
+data class ExecInfoView(
+    @SerialName("exit_code") val exitCode: Int = 0,
+    @SerialName("elapsed_ms") val elapsedMs: Long = 0,
+    val cwd: String = "",
+    @SerialName("timed_out") val timedOut: Boolean = false,
+)
+
+/** diff 的一行。 */
+@Serializable
+data class DiffLineView(
+    val kind: String = "ctx",
+    val text: String = "",
+    @SerialName("old_line") val oldLine: Int = 0,
+    @SerialName("new_line") val newLine: Int = 0,
+)
+
+/** 一段差异（带上下文行）。 */
+@Serializable
+data class DiffHunkView(
+    @SerialName("old_start") val oldStart: Int = 0,
+    @SerialName("new_start") val newStart: Int = 0,
+    val lines: List<DiffLineView> = emptyList(),
+)
+
+/** 文件修改的差异（edit）或写入内容（write）。 */
+@Serializable
+data class FileDiffView(
+    val path: String = "",
+    val hunks: List<DiffHunkView> = emptyList(),
+    val added: Int = 0,
+    val removed: Int = 0,
+    val truncated: Boolean = false,
+    val content: String = "",
+    val verb: String = "",
+)
+
+/** 图片摘要。 */
+@Serializable
+data class ImageInfoView(
+    val path: String = "",
+    val width: Int = 0,
+    val height: Int = 0,
+    @SerialName("media_type") val mediaType: String = "",
+    val bytes: Int = 0,
+)
+
+/** 一条检索命中。 */
+@Serializable
+data class SearchHitView(
+    val line: Int = 0,
+    val text: String = "",
+)
+
+/** 一个文件里的检索命中。 */
+@Serializable
+data class SearchFileView(
+    val path: String = "",
+    val hits: List<SearchHitView> = emptyList(),
+)
+
+/** 检索结果（grep/glob）。 */
+@Serializable
+data class SearchView(
+    val pattern: String = "",
+    val files: List<SearchFileView> = emptyList(),
+    @SerialName("file_count") val fileCount: Int = 0,
+    @SerialName("hit_count") val hitCount: Int = 0,
+    val truncated: Boolean = false,
+)
+
+/** 一条搜索结果。 */
+@Serializable
+data class WebResultView(
+    val title: String = "",
+    val url: String = "",
+    val excerpt: String = "",
+)
+
+/** web 工具的摘要。 */
+@Serializable
+data class WebView(
+    val kind: String = "",
+    val url: String = "",
+    val status: Int = 0,
+    val bytes: Int = 0,
+    val truncated: Boolean = false,
+    val results: List<WebResultView> = emptyList(),
+)
+
+/** read 的行范围。 */
+@Serializable
+data class ReadView(
+    val path: String = "",
+    @SerialName("start_line") val startLine: Int = 0,
+    @SerialName("end_line") val endLine: Int = 0,
+    @SerialName("total_lines") val totalLines: Int = 0,
+    val truncated: Boolean = false,
+)
+
+/** todo_write 的进度摘要。 */
+@Serializable
+data class TodoProgressView(
+    val total: Int = 0,
+    val completed: Int = 0,
 )
 
 @Serializable

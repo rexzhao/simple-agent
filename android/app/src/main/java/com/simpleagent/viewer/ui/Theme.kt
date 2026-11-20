@@ -39,6 +39,12 @@ object ViewerColors {
     val bubble: Color @Composable get() = Color(0xFF23303F)
     val codeBg: Color @Composable get() = Color(0xFF0C1015)
     val accent: Color @Composable get() = Accent
+    // diff 的红绿：手机是深色主题，用低饱和的深色底 + 亮色字，
+    // 和桌面端的浅底配色不是一套（那边是浅色主题）。
+    val diffAddBg: Color get() = Color(0xFF16301C)
+    val diffDelBg: Color get() = Color(0xFF3A1D1D)
+    val diffAddText: Color get() = Color(0xFF7ED492)
+    val diffDelText: Color get() = Color(0xFFF09A9A)
 }
 
 @Composable

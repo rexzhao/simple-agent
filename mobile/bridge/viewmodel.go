@@ -160,6 +160,117 @@ type ProcessStep struct {
 	Pending    bool   `json:"pending,omitempty"`
 	Done       bool   `json:"done,omitempty"`
 	DurationMS int64  `json:"duration_ms,omitempty"`
+
+	// 以下是与桌面端对齐的**结构化摘要**（只给界面，不发给模型）。
+	//
+	// 桌面端把这些渲染成"人话"：grep 显示「3 个文件 · 12 处命中」、
+	// read 显示「第 1-80 行 / 共 300 行」……Android 端按同一套做，
+	// 两端才不会一个说人话、一个摊 XML 信封。
+	Description string         `json:"description,omitempty"` // bash 的意图描述
+	Exec        *ExecInfoView  `json:"exec,omitempty"`        // 命令的 exit/耗时
+	Diff        *FileDiffView  `json:"diff,omitempty"`        // edit/write 的改动
+	Image       *ImageInfoView `json:"image_info,omitempty"`  // 图片摘要
+	Search      *SearchView    `json:"search,omitempty"`      // grep/glob
+	Web         *WebView       `json:"web,omitempty"`         // web_fetch/search
+	Read        *ReadView      `json:"read,omitempty"`        // read 的行范围
+	Todo        *TodoProgressView `json:"todo,omitempty"`      // todo_write 进度
+}
+
+// ExecInfoView 是命令执行的元信息（bash/pwsh）。
+type ExecInfoView struct {
+	ExitCode  int    `json:"exit_code"`
+	ElapsedMS int64  `json:"elapsed_ms,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
+	TimedOut  bool   `json:"timed_out,omitempty"`
+}
+
+// DiffLineView 是 diff 的一行。
+type DiffLineView struct {
+	Kind    string `json:"kind"` // add / del / ctx
+	Text    string `json:"text"`
+	OldLine int    `json:"old_line,omitempty"`
+	NewLine int    `json:"new_line,omitempty"`
+}
+
+// DiffHunkView 是一段差异（带上下文）。
+type DiffHunkView struct {
+	OldStart int            `json:"old_start,omitempty"`
+	NewStart int            `json:"new_start,omitempty"`
+	Lines    []DiffLineView `json:"lines,omitempty"`
+}
+
+// FileDiffView 是文件修改的差异（edit）或写入内容（write）。
+type FileDiffView struct {
+	Path      string         `json:"path,omitempty"`
+	Hunks     []DiffHunkView `json:"hunks,omitempty"`
+	Added     int            `json:"added,omitempty"`
+	Removed   int            `json:"removed,omitempty"`
+	Truncated bool           `json:"truncated,omitempty"`
+	// Content/Verb 只有 write 有（整篇写入，没有"差异"）。
+	Content string `json:"content,omitempty"`
+	Verb    string `json:"verb,omitempty"`
+}
+
+// ImageInfoView 是图片摘要。
+type ImageInfoView struct {
+	Path      string `json:"path,omitempty"`
+	Width     int    `json:"width,omitempty"`
+	Height    int    `json:"height,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	Bytes     int    `json:"bytes,omitempty"`
+}
+
+// SearchHitView 是一条命中。
+type SearchHitView struct {
+	Line int    `json:"line,omitempty"`
+	Text string `json:"text,omitempty"`
+}
+
+// SearchFileView 是一个文件里的命中。
+type SearchFileView struct {
+	Path string          `json:"path"`
+	Hits []SearchHitView `json:"hits,omitempty"`
+}
+
+// SearchView 是检索结果（grep/glob）。
+type SearchView struct {
+	Pattern   string           `json:"pattern,omitempty"`
+	Files     []SearchFileView `json:"files,omitempty"`
+	FileCount int              `json:"file_count,omitempty"`
+	HitCount  int              `json:"hit_count,omitempty"`
+	Truncated bool             `json:"truncated,omitempty"`
+}
+
+// WebResultView 是一条搜索结果。
+type WebResultView struct {
+	Title   string `json:"title,omitempty"`
+	URL     string `json:"url,omitempty"`
+	Excerpt string `json:"excerpt,omitempty"`
+}
+
+// WebView 是 web 工具的摘要。
+type WebView struct {
+	Kind      string          `json:"kind,omitempty"`
+	URL       string          `json:"url,omitempty"`
+	Status    int             `json:"status,omitempty"`
+	Bytes     int             `json:"bytes,omitempty"`
+	Truncated bool            `json:"truncated,omitempty"`
+	Results   []WebResultView `json:"results,omitempty"`
+}
+
+// ReadView 是 read 的行范围。
+type ReadView struct {
+	Path       string `json:"path,omitempty"`
+	StartLine  int    `json:"start_line,omitempty"`
+	EndLine    int    `json:"end_line,omitempty"`
+	TotalLines int    `json:"total_lines,omitempty"`
+	Truncated  bool   `json:"truncated,omitempty"`
+}
+
+// TodoProgressView 是 todo_write 的进度摘要（与任务清单的 TodoView 区分）。
+type TodoProgressView struct {
+	Total     int `json:"total"`
+	Completed int `json:"completed,omitempty"`
 }
 
 // NoticeView 是一条本地提示。

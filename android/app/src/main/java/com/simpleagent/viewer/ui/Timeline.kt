@@ -37,15 +37,19 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.simpleagent.viewer.data.FileDiffView
 import com.simpleagent.viewer.data.FooterView
 import com.simpleagent.viewer.data.ItemView
 import com.simpleagent.viewer.data.MessageView
 import com.simpleagent.viewer.data.NoticeView
 import com.simpleagent.viewer.data.ProcessStep
 import com.simpleagent.viewer.data.ProcessView
+import com.simpleagent.viewer.data.SearchView
 import com.simpleagent.viewer.data.TimelineView
+import com.simpleagent.viewer.data.WebView
 
 /**
  * 对话流：把 Go 算好的时间线条目逐条画出来。
@@ -410,12 +414,28 @@ private fun ToolStep(step: ProcessStep) {
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(
-                imageVector = Icons.Outlined.Build,
+                imageVector = activityIcon(step.toolName.ifEmpty { "tools" }),
                 contentDescription = null,
                 tint = statusColor,
                 modifier = Modifier.size(13.dp),
             )
             Text(step.toolTitle, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = statusColor)
+            // 摘要（与桌面端同一套规则）：
+            //   bash  → description + 命令截断
+            //   edit  → 文件名 + "+N -N"
+            //   read  → 文件 + "第 1-80 行 / 共 300 行"
+            //   其它  → 各自的摘要
+            val summary = toolSummaryLine(step)
+            if (summary.isNotEmpty()) {
+                Text(
+                    text = summary,
+                    fontSize = 11.sp,
+                    color = ViewerColors.muted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+            }
             Text(
                 text = when {
                     step.isError -> "失败"
@@ -426,25 +446,12 @@ private fun ToolStep(step: ProcessStep) {
                 fontSize = 11.sp,
                 color = ViewerColors.muted,
             )
-            if (step.args.isNotEmpty()) {
-                Text(
-                    text = if (showArgs) "收起参数" else "参数",
-                    fontSize = 11.sp,
-                    color = ViewerColors.accent,
-                    modifier = Modifier.clickable { showArgs = !showArgs },
-                )
-            }
         }
-        if (showArgs && step.args.isNotEmpty()) {
-            Text(
-                text = step.args,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                color = ViewerColors.muted,
-                lineHeight = 16.sp,
-            )
-        }
-        if (step.output.isNotEmpty()) {
+        // 有结构化结果时不再显示纯文本 output（里面掺着给模型的指令），
+        // 改成按结构渲染。
+        if (step.hasStructuredResult()) {
+            ToolStructuredBody(step)
+        } else if (step.output.isNotEmpty()) {
             Text(
                 text = step.output,
                 fontFamily = FontFamily.Monospace,
@@ -453,8 +460,251 @@ private fun ToolStep(step: ProcessStep) {
                 color = if (step.isError) ViewerColors.danger else MaterialTheme.colorScheme.onSurface,
             )
         }
+        if (step.args.isNotEmpty() && !step.hasStructuredResult()) {
+            Text(
+                text = if (showArgs) "收起参数" else "参数",
+                fontSize = 11.sp,
+                color = ViewerColors.accent,
+                modifier = Modifier.clickable { showArgs = !showArgs },
+            )
+            if (showArgs) {
+                Text(
+                    text = step.args,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    color = ViewerColors.muted,
+                    lineHeight = 16.sp,
+                )
+            }
+        }
     }
 }
+
+/** 有结构化摘要就不必再摊 output 文本。 */
+private fun ProcessStep.hasStructuredResult(): Boolean =
+    diff != null || search != null || web != null || read != null ||
+        todo != null || imageInfo != null
+
+/**
+ * 折叠行的一行摘要（与桌面端 uiapp.toolSummaryLine 同一套规则）。
+ */
+private fun toolSummaryLine(step: ProcessStep): String {
+    step.imageInfo?.let {
+        val size = if (it.width > 0) "${it.width}x${it.height}" else ""
+        val bytes = formatBytes(it.bytes)
+        val type = it.mediaType.removePrefix("image/")
+        return listOf(size, bytes, type).filter { part -> part.isNotEmpty() }.joinToString(" · ")
+    }
+    step.search?.let {
+        if (it.fileCount == 0 && it.hitCount == 0) return ""
+        // glob 每个文件一条命中：说"处命中"没意义
+        return if (it.hitCount == it.fileCount) "${it.fileCount} 个文件"
+        else "${it.fileCount} 个文件 · ${it.hitCount} 处命中"
+    }
+    step.web?.let {
+        if (it.kind == "search") return "${it.results.size} 条结果"
+        val parts = mutableListOf<String>()
+        if (it.status > 0) parts += "HTTP ${it.status}"
+        if (it.bytes > 0) parts += formatBytes(it.bytes)
+        return parts.joinToString(" · ")
+    }
+    step.read?.let {
+        if (it.totalLines == 0) return ""
+        if (it.endLine == 0) return "共 ${it.totalLines} 行"
+        if (it.startLine == it.endLine) return "第 ${it.startLine} 行 / 共 ${it.totalLines} 行"
+        return "第 ${it.startLine}-${it.endLine} 行 / 共 ${it.totalLines} 行"
+    }
+    step.todo?.let {
+        return if (it.total == 0) "已清空" else "${it.completed}/${it.total} 完成"
+    }
+    step.diff?.let { diff ->
+        // write：整篇写入，给行数
+        if (diff.content.isNotEmpty() || diff.verb.isNotEmpty()) {
+            val lines = diff.content.trimEnd('\n').split('\n').size
+            return "$lines 行"
+        }
+        if (diff.added > 0 || diff.removed > 0) {
+            return listOfNotNull(
+                if (diff.added > 0) "+${diff.added}" else null,
+                if (diff.removed > 0) "-${diff.removed}" else null,
+            ).joinToString(" ")
+        }
+    }
+    return ""
+}
+
+/** 把字节数格式化成 "240KB" / "1.2MB"。 */
+private fun formatBytes(n: Int): String = when {
+    n <= 0 -> ""
+    n < 1024 -> "${n}B"
+    n < 1024 * 1024 -> "${n / 1024}KB"
+    else -> String.format("%.1fMB", n / (1024.0 * 1024.0))
+}
+
+/** 按结构渲染工具结果（对应桌面端的 renderStructuredResult）。 */
+@Composable
+private fun ToolStructuredBody(step: ProcessStep) {
+    step.search?.let { SearchBody(it); return }
+    step.web?.let {
+        // fetch 的正文有价值，仍显示（去掉给模型的指令头）
+        if (it.kind != "search") {
+            val body = step.output.substringAfter("\n\n", step.output)
+                .substringBeforeLast("\n\n(Content truncated")
+            if (body.isNotBlank()) CodeText(body)
+        } else {
+            WebSearchBody(it)
+        }
+        return
+    }
+    step.read?.let { read ->
+        // 去掉末尾那句 "…（共 300 行，已返回第 1-80 行；用 offset=81 继续）"
+        val body = step.output.substringBeforeLast("\n…（共 ", step.output)
+        if (body.isNotBlank()) CodeText(body)
+        return
+    }
+    step.todo?.let {
+        CodeText(if (it.total == 0) "任务列表已清空" else "任务列表：${it.completed}/${it.total} 完成")
+        return
+    }
+    step.diff?.let { diff ->
+        if (diff.content.isNotEmpty()) WriteBody(diff) else DiffBody(diff)
+        return
+    }
+}
+
+/** 检索结果：按文件分组。 */
+@Composable
+private fun SearchBody(search: SearchView) {
+    if (search.files.isEmpty()) {
+        Text("没有匹配", fontSize = 11.sp, color = ViewerColors.muted)
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        search.files.forEach { file ->
+            Column {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(file.path, fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (file.hits.size > 1) {
+                        Text("${file.hits.size} 处", fontSize = 10.sp, color = ViewerColors.muted)
+                    }
+                }
+                file.hits.forEach { hit ->
+                    Text(
+                        text = "%4d  %s".format(hit.line.trimText(100)),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        color = ViewerColors.muted,
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+        if (search.truncated) {
+            Text("… 已达上限，结果被截断", fontSize = 10.sp, color = ViewerColors.muted)
+        }
+    }
+}
+
+/** 搜索结果列表。 */
+@Composable
+private fun WebSearchBody(web: WebView) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        web.results.forEachIndexed { index, result ->
+            Column {
+                Text("${index + 1}. ${result.title}", fontSize = 12.sp, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis)
+                if (result.url.isNotEmpty()) {
+                    Text(result.url, fontFamily = FontFamily.Monospace, fontSize = 10.sp,
+                        color = ViewerColors.muted, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis)
+                }
+                if (result.excerpt.isNotEmpty()) {
+                    Text(result.excerpt.trimText(120), fontSize = 11.sp,
+                        color = ViewerColors.muted, maxLines = 2)
+                }
+            }
+        }
+        if (web.truncated) {
+            Text("… 只显示了前面的结果", fontSize = 10.sp, color = ViewerColors.muted)
+        }
+    }
+}
+
+/** edit 的 diff：行号两列 + 红绿行。 */
+@Composable
+private fun DiffBody(diff: FileDiffView) {
+    Column {
+        diff.hunks.forEach { hunk ->
+            hunk.lines.forEach { line ->
+                val bg = when (line.kind) {
+                    "add" -> ViewerColors.diffAddBg
+                    "del" -> ViewerColors.diffDelBg
+                    else -> Color.Transparent
+                }
+                val fg = when (line.kind) {
+                    "add" -> ViewerColors.diffAddText
+                    "del" -> ViewerColors.diffDelText
+                    else -> ViewerColors.muted
+                }
+                val mark = when (line.kind) {
+                    "add" -> "+"
+                    "del" -> "-"
+                    else -> " "
+                }
+                Text(
+                    text = "%4s %4s %s %s".format(
+                        line.oldLine.takeIf { it > 0 }?.toString() ?: "",
+                        line.newLine.takeIf { it > 0 }?.toString() ?: "",
+                        mark,
+                        line.text,
+                    ),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    color = fg,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(bg),
+                )
+            }
+        }
+        if (diff.truncated) {
+            Text("… 差异过大，只显示前面部分", fontSize = 10.sp, color = ViewerColors.muted)
+        }
+    }
+}
+
+/** write 写入的内容（带行号）。 */
+@Composable
+private fun WriteBody(diff: FileDiffView) {
+    Column {
+        diff.content.trimEnd('\n').split('\n').forEachIndexed { index, line ->
+            Text(
+                text = "%4d  %s".format(index + 1, line),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
+private fun CodeText(text: String) {
+    Text(
+        text = text,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp,
+        lineHeight = 16.sp,
+        color = ViewerColors.muted,
+    )
+}
+
+/** 截断到 n 个字符（按 code point，中文不会被切一半）。 */
+private fun String.trimText(n: Int): String =
+    if (codePointCount(0, length) <= n) this
+    else substring(0, offsetByCodePoints(0, n)) + "…"
 
 /** 活动分类 → 图标（分类名来自 Go 的 activityName）。 */
 private fun activityIcon(activity: String): ImageVector = when (activity) {
