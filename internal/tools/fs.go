@@ -357,9 +357,29 @@ func editRun(ctx context.Context, args Args, tc *ToolContext) (ToolReturn, error
 		return ToolReturn{}, fmt.Errorf("写入失败 %s: %w", displayPath(tc, path), err)
 	}
 
-	line := strings.Count(text[:strings.Index(text, matchOld)], "\n") + 1
-	return OutputOf(fmt.Sprintf("已在 %s 替换 %d 处（起始第 %d 行）：%q → %q",
-		displayPath(tc, path), replaced, line, clip(oldString), clip(newString))), nil
+	// 差异用**修改前后的全文**对比算，而不是只对比 old/new 两段字符串。
+	//
+	// 只对比那两段的话，界面看到的是"这段删了、那段加了"，没有任何上下文，
+	// 用户不知道改动落在文件的哪个位置。用全文对比才能得到带行号的
+	// 上下文行（24 end / 25 ... / -26 / +26 / 28 end），一眼看出改在哪。
+	diff := BuildLineDiff(path, text, updated, LineDiffOptions{})
+	// 返回给模型的**只有结果和增删行数**：
+	//   "已编辑 foo.go（+3 -1）"
+	//   "已编辑 foo.go 共 5 处（+3 -1）"   ← replace_all 且不止一处
+	//
+	// 不回显 old_string/new_string 全文：那是模型自己刚发的内容，
+	// 重复一遍既浪费上下文、又会让结果看起来像 diff 而干扰判断。
+	// 详细差异走 Diff 字段，只给界面渲染。
+	summary := fmt.Sprintf("已编辑 %s", displayPath(tc, path))
+	if replaced > 1 {
+		// 替换了多处时必须说出来：diff 只反映第一处，
+		// 不告诉模型次数，它会以为只改了一行。
+		summary += fmt.Sprintf(" 共 %d 处", replaced)
+	}
+	summary += fmt.Sprintf("（+%d -%d）", diff.Added, diff.Removed)
+	out := OutputOf(summary)
+	out.Diff = diff
+	return out, nil
 }
 
 // toCRLF 把 LF 换成 CRLF（已经是 CRLF 的不重复加 \r）。

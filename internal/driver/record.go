@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"encoding/json"
 	"time"
 
 	"simple-agent/internal/conversation"
@@ -63,6 +64,9 @@ type ToolResultRecord struct {
 	Images    []tools.ToolImageRef `json:"images,omitempty"`
 	Pending   bool                 `json:"pending,omitempty"`
 	Questions []tools.QuestionSpec `json:"questions,omitempty"`
+	// Diff 是文件修改的结构化差异（edit 用），**只给界面**。
+	// 旧日志没有该字段，重放后为 nil —— 界面退回只显示 Output。
+	Diff *tools.FileDiff `json:"diff,omitempty"`
 }
 
 // ToolResultData 是 tool.result 的载荷：**单条**工具结果。
@@ -281,6 +285,7 @@ func resultRecords(outcomes []tools.ToolOutcome) []ToolResultRecord {
 			Images:    outcome.Images,
 			Pending:   outcome.IsPending(),
 			Questions: outcome.Pending,
+			Diff:      outcome.Diff,
 		})
 	}
 	return out
@@ -313,7 +318,30 @@ func partResultRecords(msg *message.Message) []ToolResultRecord {
 			Images:    imagesOf(data),
 			Pending:   pending,
 			Questions: questionsOf(data),
+			Diff:      diffOf(data),
 		})
 	}
 	return out
+}
+
+// diffOf 读取 part 里的结构化差异（edit 用）。
+//
+// 内存里是 *tools.FileDiff 指针；重放时是 map[string]any（JSON 解出来的）。
+// 两条路都要认 —— 只认一种的话，重启后 diff 就没了。
+func diffOf(data map[string]any) *tools.FileDiff {
+	switch value := data["diff"].(type) {
+	case *tools.FileDiff:
+		return value
+	case map[string]any:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		var diff tools.FileDiff
+		if err := json.Unmarshal(raw, &diff); err != nil {
+			return nil
+		}
+		return &diff
+	}
+	return nil
 }

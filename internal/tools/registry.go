@@ -189,6 +189,47 @@ type ToolReturn struct {
 	// Images 是工具返回的图片（read_image 用）。调用方负责写入 blob 存储，
 	// 并把引用挂进工具结果，模型才能在请求里真正"看到"它。
 	Images []ImageOutput
+	// Diff 是这次修改的**结构化差异**（edit 用），只给界面看。
+	//
+	// 为什么不塞进 Output：Output 是模型看到的内容，不该为渲染服务 ——
+	// 塞 JSON 进去会污染上下文、也影响缓存命中。这里单独一条通道，
+	// 展示端拿它画 diff，模型仍然只看到那句人话摘要。
+	Diff *FileDiff
+}
+
+// FileDiff 是一次文件修改的差异（按行）。
+type FileDiff struct {
+	Path    string     `json:"path"`
+	Line    int        `json:"line,omitempty"` // 改动起始行（1 基，0 表示未知）
+	Hunks   []DiffHunk `json:"hunks,omitempty"`
+	Added   int        `json:"added,omitempty"`
+	Removed int        `json:"removed,omitempty"`
+	// Truncated 表示差异太大被截断（只保留了前面部分）。
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// DiffHunk 是一段连续的改动：若干"删除"行紧跟若干"新增"行。
+//
+// 用这种最简形态而不是完整的 unified diff：界面只需要"哪几行变成了什么"，
+// 不需要 @@ 头和文件头，解析 unified diff 反而是多余的复杂度。
+type DiffHunk struct {
+	// OldStart/NewStart 是这一块的起始行号（1 基），界面画行号用。
+	OldStart int        `json:"old_start,omitempty"`
+	NewStart int        `json:"new_start,omitempty"`
+	Lines    []DiffLine `json:"lines,omitempty"`
+}
+
+// DiffLine 是一行（改动或上下文）。
+type DiffLine struct {
+	// Kind 是 "add" / "del" / "ctx"（上下文）。
+	Kind string `json:"kind"`
+	Text string `json:"text"`
+	// OldLine/NewLine 是这一行在旧/新文件里的行号（1 基）。
+	//
+	// 删除行只有 OldLine，新增行只有 NewLine，上下文行两个都有 ——
+	// 界面按它画两列行号，才能像 diff 工具那样左右对齐。
+	OldLine int `json:"old_line,omitempty"`
+	NewLine int `json:"new_line,omitempty"`
 }
 
 // IsAsk 报告是否需要向用户提问。
@@ -311,6 +352,12 @@ type ToolOutcome struct {
 	DisplayParts []message.Part
 	// Pending 非空表示需要用户回答（此时 Output 为空，作答后回填）。
 	Pending []QuestionSpec
+	// Diff 是这次修改的结构化差异（edit 用），**只给界面**。
+	//
+	// Output 是模型看到的内容（"已编辑 foo.go（+3 -1）"），
+	// Diff 是界面画红绿行用的。分开的理由：模型不需要逐行差异
+	// （它自己刚发的 old/new），而界面需要 —— 塞进 Output 会浪费上下文。
+	Diff *FileDiff
 }
 
 // ToolImageRef 是工具结果里的一张图片引用。
@@ -452,6 +499,7 @@ func executeOne(ctx context.Context, list []*ToolDef, tc *ToolContext, call Call
 	}
 	base.Output = result.Output
 	base.RawImages = result.Images
+	base.Diff = result.Diff
 	if base.Output == "" && len(base.RawImages) == 0 {
 		base.Output = "（无输出）"
 	}

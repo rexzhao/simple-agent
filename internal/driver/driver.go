@@ -1515,6 +1515,11 @@ func (d *Driver) ToolResult(messageID string, outcome tools.ToolOutcome) ([]Effe
 		"output":   outcome.Output,
 		"is_error": outcome.IsError,
 	}
+	// edit 的结构化差异：**只给界面渲染**，组装请求时不会发给模型
+	// （providers 那边只取 output/is_error）。
+	if outcome.Diff != nil {
+		data["diff"] = outcome.Diff
+	}
 	if len(outcome.Images) > 0 {
 		images := make([]any, 0, len(outcome.Images))
 		for _, image := range outcome.Images {

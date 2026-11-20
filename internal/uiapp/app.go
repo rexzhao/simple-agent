@@ -1853,6 +1853,88 @@ func (a *App) renderProcessItem(c *ui.Context, item chatItem) {
 	})
 }
 
+// hasMatchingToolUse 报告某个 call id 是否有配对的 tool_use part。
+//
+// 用来区分"正常结果（已折进调用行）"与"孤儿结果（没找到调用，需要单独显示）"。
+func (a *App) hasMatchingToolUse(chat *conversation.ChatEntry, callID string) bool {
+	for _, part := range chat.Message.Parts {
+		if part.MediaType != render.MediaToolUse {
+			continue
+		}
+		if data, ok := partData(part); ok && stringOf(data, "id") == callID {
+			return true
+		}
+	}
+	return false
+}
+
+// renderOrphanToolResult 显示找不到配对调用的工具结果。
+//
+// 什么时候会出现：旧日志只记了结果、异常中断导致调用缺失。
+// 直接吞掉等于丢数据，所以仍然画出来，只是没有调用信息可合并。
+func (a *App) renderOrphanToolResult(c *ui.Context, data map[string]any, theme *ui.Theme) {
+	isError, _ := data["is_error"].(bool)
+	statusText := a.tr("chat.toolResult")
+	color := theme.TextMuted
+	if isError {
+		statusText = a.tr("chat.toolFailed")
+		color = theme.Danger
+	}
+	ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+		ui.Icon(c, toolIcon(stringOf(data, "name"))).Size(13, 13).TextColor(theme.TextMuted)
+		ui.Text(c, stringOf(data, "name")).FontSize(11).
+			Padding(1, 5).Radius(4).
+			Background(theme.SurfaceHover).TextColor(theme.Text)
+		ui.Spacer(c)
+		ui.Text(c, statusText).FontSize(11).TextColor(color)
+	})
+	if output := stringOf(data, "output"); output != "" {
+		ui.Column(c).FillWidth().Padding(2, 20).Children(func() {
+			a.toolOutput(c, data, isError, false, color)
+		})
+	}
+}
+
+// diffOfPart 从工具结果的 data 里取出结构化差异。
+//
+// 内存里是 *tools.FileDiff；重放后是 map[string]any（JSON 解出来的）。
+func diffOfPart(data map[string]any) *tools.FileDiff {
+	switch value := data["diff"].(type) {
+	case *tools.FileDiff:
+		return value
+	case map[string]any:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		var diff tools.FileDiff
+		if err := json.Unmarshal(raw, &diff); err != nil {
+			return nil
+		}
+		return &diff
+	}
+	return nil
+}
+
+// toolResultOf 找到与某次工具调用配对的 result part 的 data。
+//
+// 返回的 bool 表示"已经有结果了"（可能成功也可能失败）—— 用它替代
+// 原来"只看 status 字符串"的判断，因为要把结果**折叠进 tool call 行**，
+// 需要拿到 result 的内容（output / diff）。
+func (a *App) toolResultOf(chat *conversation.ChatEntry, callID string) (map[string]any, bool) {
+	for _, part := range chat.Message.Parts {
+		if part.MediaType != render.MediaToolResult {
+			continue
+		}
+		data, ok := partData(part)
+		if !ok || stringOf(data, "id") != callID {
+			continue
+		}
+		return data, true
+	}
+	return nil, false
+}
+
 // toolCallStatusFor 判断某次工具调用是否已经有结果。
 func (a *App) toolCallStatusFor(chat *conversation.ChatEntry, callID string) string {
 	for _, part := range chat.Message.Parts {
@@ -1882,69 +1964,99 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 		if !ok {
 			return
 		}
-		// 一行式：图标 + 工具名（胶囊）+ 参数摘要（弱化色）+ 状态
+		// 一行式：图标 + 工具名（胶囊）+ 参数摘要 + 结果状态
 		//
-		// 为什么把工具名做成胶囊：原来名称和参数同样大小、同样颜色，
-		// 只靠一个空格隔开 ——「grep func (l *Local)」看不出哪是工具、
-		// 哪是搜索词。给名字加一层底色后，眼睛先扫到工具类型，
-		// 再决定要不要看参数。
+		// **结果折进这一行**：原来 tool_use 和 tool_result 是两行 ——
+		// 一行"调用了什么"、一行"工具结果 · read（展开）"，
+		// 读起来割裂，而且结果那行的按钮占了半行。现在一行看完：
+		// 调用 + 成败，点这行展开详情（edit 显示 diff，其它显示输出全文）。
 		id := stringOf(data, "id")
+		resultData, hasResult := a.toolResultOf(chat, id)
 		status := a.toolCallStatus(chat, id, streaming)
-		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-			ui.Icon(c, toolIcon(stringOf(data, "name"))).
-				Size(13, 13).TextColor(theme.TextMuted)
-			ui.Text(c, stringOf(data, "name")).FontSize(11).
+		isError := false
+		if hasResult {
+			isError, _ = resultData["is_error"].(bool)
+		}
+		name := stringOf(data, "name")
+		key := expansionKey(messageID, partIndex)
+		expanded := a.expandedParts[key]
+
+		arrow := "▸"
+		if expanded {
+			arrow = "▾"
+		}
+		row := ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Radius(4).
+			Padding(1, 2)
+		if row.Hovered() && hasResult {
+			row.Background(theme.SurfaceHover)
+		}
+		var toggle bool
+		row.Children(func() {
+			// 展开三角只在有内容可展开时显示，没有结果时留空白对齐
+			if hasResult {
+				if ui.Text(c, arrow).FontSize(10).TextColor(theme.TextMuted).
+					Cursor(ui.CursorPointer).Clicked() {
+					toggle = true
+				}
+			} else {
+				ui.Box(c).Width(8).Shrink(0)
+			}
+			ui.Icon(c, toolIcon(name)).Size(13, 13).TextColor(theme.TextMuted)
+			ui.Text(c, name).FontSize(11).
 				Padding(1, 5).Radius(4).
 				Background(theme.SurfaceHover).TextColor(theme.Text)
 			if summary := toolArgSummary(data); summary != "" {
-				// 参数可能是很长的命令/路径：截断并靠右留白，
-				// 不让它把状态挤没（超长内容展开后还能看到完整结果）
 				ui.Text(c, truncateRunes(summary, 72)).FontSize(12).
 					TextColor(theme.TextMuted).Grow(1).MaxLines(1)
 			} else {
 				ui.Spacer(c)
 			}
+			// 状态：失败用红色，运行中用强调色，完成用弱化色
 			if status != "" {
 				color := theme.TextMuted
-				if status == a.tr("chat.toolRunning") {
+				switch {
+				case isError:
+					color = theme.Danger
+				case status == a.tr("chat.toolRunning"):
 					color = theme.Accent
 				}
 				ui.Text(c, status).FontSize(11).TextColor(color)
 			}
+			// 点行内空白也能展开（但别和上面的三角重复触发）
+			if hasResult && row.Clicked() {
+				toggle = true
+			}
 		})
+		if toggle {
+			a.expandedParts[key] = !expanded
+			expanded = !expanded
+		}
+		// 展开：edit 画 diff，其它工具显示输出
+		if expanded && hasResult {
+			if diff := diffOfPart(resultData); diff != nil {
+				ui.Column(c).FillWidth().Padding(2, 20).Children(func() {
+					a.renderDiff(c, diff, theme)
+				})
+			} else if output := stringOf(resultData, "output"); output != "" {
+				ui.Column(c).FillWidth().Padding(2, 20).Children(func() {
+					a.toolOutput(c, resultData, isError, true, color)
+				})
+			}
+		}
 	case render.MediaToolResult:
+		// 结果已经折进对应的 tool_use 行，这里不再单独渲染。
+		//
+		// 但**不能什么都不做**：配对信息缺失时（旧日志、异常中断）结果会
+		// 变成孤儿，直接吞掉等于丢数据。所以只在"找不到配对调用"时才画。
 		data, ok := partData(part)
 		if !ok {
 			return
 		}
-		status := "toolResult"
-		isError, _ := data["is_error"].(bool)
-		if isError {
-			status = "toolFailed"
+		if a.hasMatchingToolUse(chat, stringOf(data, "id")) {
+			return
 		}
-		if inProgress, _ := data["pending"].(bool); inProgress {
-			status = "toolWaiting"
-		}
-		key := expansionKey(messageID, partIndex)
-		expanded := a.expandedParts[key]
-		// 用静态 key（动态拼 key 会让"表里有没有这条文案"无法静态检查）
-		statusText := a.tr("chat.toolResult")
-		switch status {
-		case "toolFailed":
-			statusText = a.tr("chat.toolFailed")
-		case "toolWaiting":
-			statusText = a.tr("chat.toolWaiting")
-		}
-		toggle := outputIndicator(status) + " " + statusText + " · " + stringOf(data, "name")
-		if expanded {
-			toggle += a.tr("chat.collapse")
-		} else {
-			toggle += a.tr("chat.expand")
-		}
-		if textButton(c, toggle, 12, theme.TextMuted) {
-			a.expandedParts[key] = !expanded
-		}
-		a.toolOutput(c, data, isError, expanded, color)
+		a.renderOrphanToolResult(c, data, theme)
+		return
 	case render.MediaSummary:
 		text, _ := part.AsText()
 		label := a.tr("chat.summary")

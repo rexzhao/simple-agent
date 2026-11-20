@@ -787,7 +787,9 @@ func TestEditHandlesCRLFFile(t *testing.T) {
 		"old_string": "line one\nline two",
 		"new_string": "changed\nalso",
 	})
-	if !strings.Contains(out, "替换 1 处") {
+	// 输出现在是"已编辑 文件（+2 -2）"，不再回显替换次数（只在多处时才提）。
+	// CRLF 匹配成功等价于"确实改到了" → 用增删行数断言。
+	if !strings.Contains(out, "+2 -2") {
 		t.Fatalf("CRLF 文件应能匹配 LF 串：%q", out)
 	}
 

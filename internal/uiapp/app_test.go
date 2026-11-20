@@ -509,10 +509,16 @@ func TestAppRendersParts(t *testing.T) {
 	}
 	clickProcessGroup(t, tester)
 	pump(tester, p)
-	for _, want := range []string{"先想一下", "read", "文件内容"} {
+	for _, want := range []string{"先想一下", "read"} {
 		if !tester.HasText(want) {
 			t.Fatalf("展开后缺少 %q：%v", want, tester.Texts())
 		}
+	}
+	// 工具结果现在**折进调用行**，要再点一次那一行才看到输出
+	clickToolRow(t, tester, "read")
+	pump(tester, p)
+	if !tester.HasText("文件内容") {
+		t.Fatalf("展开工具行后应看到输出：%v", tester.Texts())
 	}
 }
 
@@ -633,6 +639,9 @@ func TestToolsNotCancelledWhenStreamCloses(t *testing.T) {
 	})
 	waitFor(t, tester, p, "过程组出现", func() bool { return hasProcessGroup(tester) })
 	clickProcessGroup(t, tester)
+	pump(tester, p)
+	// 结果折进工具行，再点一次才看到输出
+	clickToolRow(t, tester, "read")
 	pump(tester, p)
 	waitFor(t, tester, p, "工具结果上屏", func() bool { return tester.HasText("工具真的跑了") })
 }
@@ -855,6 +864,9 @@ func TestAskCustomAnswerViaComposer(t *testing.T) {
 	// 答案写进了工具结果（过程默认折叠，展开后可见）
 	clickProcessGroup(t, tester)
 	pump(tester, p)
+	// 结果折进工具行，再点一次才看到作答
+	clickToolRow(t, tester, "ask_user_question")
+	pump(tester, p)
 	waitFor(t, tester, p, "作答出现在界面", func() bool { return tester.HasText("张三") })
 }
 
@@ -891,8 +903,10 @@ func TestAskDismiss(t *testing.T) {
 		defer rt.mu.Unlock()
 		return len(rt.streams) == 2
 	})
-	// 过程默认折叠成一组，展开后再看工具结果
+	// 过程默认折叠成一组，展开后再点工具行看结果
 	clickProcessGroup(t, tester)
+	pump(tester, p)
+	clickToolRow(t, tester, "ask_user_question")
 	pump(tester, p)
 	waitFor(t, tester, p, "dismissed 结果上屏", func() bool { return tester.HasText("dismissed") })
 }
@@ -2305,6 +2319,22 @@ func clickProcessGroup(t *testing.T, tester *ui.Tester) string {
 	}
 	t.Fatalf("界面上没有过程组：%v", tester.Texts())
 	return ""
+}
+
+// clickToolRow 点开某次工具调用的详情行（结果折进调用行之后需要二次展开）。
+//
+// 行内文本形如「read a.txt 完成」，工具名是独立文本，参数是另一段 ——
+// 所以按"包含工具名"找最像那一行的文本点。
+func clickToolRow(t *testing.T, tester *ui.Tester, toolName string) {
+	t.Helper()
+	for _, text := range tester.Texts() {
+		if text == toolName || strings.HasPrefix(text, toolName+" ") {
+			if err := tester.Click(text); err == nil {
+				return
+			}
+		}
+	}
+	t.Fatalf("点不到工具行 %q：%v", toolName, tester.Texts())
 }
 
 // clickExpandAll 点过程组底部的"展开全部 N 步"，让整组的步骤都可见。
