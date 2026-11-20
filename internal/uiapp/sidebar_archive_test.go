@@ -92,6 +92,52 @@ func sideHasText(tester *ui.Tester, text string, sidebarWidth float32) bool {
 	return false
 }
 
+// 归档小节**只显示一个灰色小三角**，不写文字。
+//
+// 用户的原话："show archived 太抢眼了，就简单显示一个灰色向下箭头应该就可以了"。
+// 它和项目行长一样、又是粗体小字，视觉权重太高；归档本来就该收着，
+// 一个小三角足够表达"这里能展开"。
+func TestArchivedSectionShowsOnlyArrow(t *testing.T) {
+	app, _, p, tester := newLayoutApp(t, -1, 1200, 700)
+
+	active := app.Current()
+	active.Title = "正常会话"
+	archived := app.NewSession()
+	archived.Title = "归档会话"
+	pump(tester, p)
+	pump(tester, p)
+
+	active.SetProjectForTest("proj-1", "项目甲")
+	archived.SetProjectForTest("proj-1", "项目甲")
+	archived.SetArchivedForTest(true)
+	tester.Frame()
+
+	// 「显示已归档」**不该作为可见文字出现**（它只是无障碍名）。
+	//
+	// 不能用 HasText 判断：a11y 名也会进文本索引。查它有没有占据独立的
+	// 文本元素——归档小节现在只有三角，那段文字不存在。
+	foundText := false
+	for _, text := range tester.Texts() {
+		if text == locShowArchived {
+			// 若存在，应只是标签而不是一段独立文字：检查它的宽度
+			if rect, ok := tester.Find(text); ok && rect.W > 20 {
+				foundText = true
+			}
+		}
+	}
+	if foundText {
+		t.Fatalf("归档小节不该显示文字（宽度 > 20），只留三角：%v", tester.Texts())
+	}
+	// 三角可点（能展开）
+	if err := tester.Click(locShowArchived); err != nil {
+		t.Fatalf("归档三角应可点：%v", err)
+	}
+	tester.Frame()
+	if !tester.HasText("归档会话") {
+		t.Fatalf("点了三角应展开归档：%v", tester.Texts())
+	}
+}
+
 // 没有归档会话时，不该出现「显示已归档」这个小节。
 func TestNoArchivedSectionWhenEmpty(t *testing.T) {
 	app, _, p, tester := newLayoutApp(t, -1, 1200, 700)

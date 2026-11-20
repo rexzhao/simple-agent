@@ -445,7 +445,33 @@ func (a *App) sidebarGroupRow(c *ui.Context, key, name string, isArchive bool) {
 	open := a.sidebarGroupOpen[key]
 	var clicked bool
 	var newHere bool
-	ui.Row(c).FillWidth().Gap(0).Padding(3, 6, 3, 6).Radius(6).AlignItems(ui.Center).Children(func() {
+	// 项目行**比会话行重**：更大的字、更大的内边距、加一层底色。
+	//
+	// 用户的原话："会话加上前面的运行状态，比项目还要靠前，把项目高度/字体
+	// 都稍微变大点并且加个底"。原来是两者同字号同内边距，只有名字粗体，
+	// 层级全靠缩进撑着 —— 而缩进当时还是对齐的，看起来会话比项目还靠前。
+	//
+	// 底色只用最淡的一档（SurfaceHover，bluish-75）：既能把项目行连成
+	// 一块，又不会让侧栏变成一堆色块。归档小节的三角不该有底色（它只是
+	// 一个小开关），所以分开判断。
+	rowPaddingY := float32(5)
+	padLeft := float32(6)
+	nameSize := float32(13)
+	nameColor := theme.Text
+	if isArchive {
+		// 比会话行**浅一点点**：三角和图标的左边缘对齐会话的状态点，
+		// 这样整块内容看起来是"项目下的一个层级"，而不是另一个项目。
+		rowPaddingY = 2
+		padLeft = 6 + sidebarSessionIndent - sidebarArrowSlot
+		nameSize = 12
+		nameColor = theme.TextMuted
+	}
+	row := ui.Row(c).FillWidth().Gap(0).Padding(rowPaddingY, padLeft, rowPaddingY, 6).
+		Radius(6).AlignItems(ui.Center)
+	if !isArchive {
+		row.Background(dsh.SurfaceHover)
+	}
+	row.Children(func() {
 		// 三角槽：**固定宽度**，宽度与 sidebarArrowSlot 相同。
 		//
 		// 不用"字符宽度 + 补偿 Box"那种估算法：▸ 的实际宽度随字体变化，
@@ -457,28 +483,49 @@ func (a *App) sidebarGroupRow(c *ui.Context, key, name string, isArchive bool) {
 		if open {
 			glyph = "▾"
 		}
+		if isArchive {
+			// 归档只有一个三角，用**实心**符号（▶/▼）：细的 ▸/▾ 在小字号下
+			// 几乎是个点，放大字号也不明显（实测）。但实心符号视觉分量重，
+			// 用 11px + 弱化色，既看得见又不抢眼 —— 它本来就该收着。
+			glyph = "▶"
+			if open {
+				glyph = "▼"
+			}
+		}
 		arrowSlot := ui.Row(c).Size(sidebarArrowSlot, sidebarArrowSlot).Center().
 			Cursor(ui.CursorPointer)
+		if isArchive {
+			// 归档小节只有一个三角、没有文字，测试和读屏都需要一个名字。
+			// 标在槽位（不是里面的文字）上：文字仍参与可见文本索引，不会被替换。
+			arrowSlot.Label(a.tr("sidebar.showArchived"))
+		}
 		arrowSlot.Children(func() {
-			ui.Text(c, glyph).FontSize(12).TextColor(theme.TextMuted)
+			arrowSize := float32(12)
+			arrowColor := theme.TextMuted
+			if isArchive {
+				arrowSize = 11
+			}
+			ui.Text(c, glyph).FontSize(arrowSize).TextColor(arrowColor)
 		})
 		if arrowSlot.Hovered() {
-			arrowSlot.Background(dsh.SurfaceHover).Radius(4)
+			arrowSlot.Background(theme.SurfacePressed).Radius(4)
 		}
 		if arrowSlot.Clicked() {
 			clicked = true
 		}
-		nameColor := theme.Text
-		nameSize := float32(12)
-		if isArchive {
-			// 归档小节用弱化色 + 小一号：它是次要分组，不该和项目抢注意力
-			nameColor = theme.TextMuted
-			nameSize = 11
-		}
-		nameText := ui.Text(c, name).FontSize(nameSize).
-			Bold().TextColor(nameColor).Cursor(ui.CursorPointer)
-		if nameText.Clicked() {
-			clicked = true
+		// 归档小节**不写文字**，只留一个灰色三角。
+		//
+		// 原先是小号粗体的「显示已归档」，但它和项目行长得太像、
+		// 又占一整行的注意力 —— 用户的原话是"太抢眼了"。归档本来就该
+		// 收着，一个小三角足够表达"这里能展开"，具体内容展开后自然可见。
+		//
+		// 不设 Label：设了会替换可见文本索引，点击命中路径不同（踩过）。
+		if !isArchive {
+			nameText := ui.Text(c, name).FontSize(nameSize).
+				Bold().TextColor(nameColor).Cursor(ui.CursorPointer)
+			if nameText.Clicked() {
+				clicked = true
+			}
 		}
 		ui.Spacer(c)
 		// 项目行**不显示时间**：它在树上只是分组，用户关心的是"这个项目
@@ -540,12 +587,18 @@ func (a *App) setSidebarGroupOpen(key string, open bool) {
 	a.sidebarGroupOpen[key] = open
 }
 
-// sidebarArrowSlot 是三角的槽位宽度（也是会话行的前导留白宽度）。
+// sidebarArrowSlot 是三角槽位的宽度。
 //
-// 两者用同一个常量，是"会话文字与项目文字左对齐"的实现方式：
-// 项目行 = [三角槽][名字]，会话行 = [同宽留白][标题]，文字自然落在同一条线上。
-// 这正是用户要的效果——会话文字与项目文字左对齐，且项目那个三角不参与对齐。
+// 项目行 = [三角槽][名字]。会话行在此基础上**再缩进一档**
+// （sidebarSessionIndent），让内容明显归属在项目之下 ——
+// 原先两者同宽、都从 Padding 起算，结果会话的状态点和项目的三角
+// 落在同一条竖线上，看上去会话比项目还靠前，层级是反的。
 const sidebarArrowSlot = 14
+
+// sidebarSessionIndent 是会话行相对项目行的额外缩进。
+//
+// 拿到状态点、标题都和项目名错开，视觉上"缩在里面"。
+const sidebarSessionIndent = 12
 
 // sidebarSessionRow 渲染一条会话：状态点 + 标题 + 相对时间，右键菜单做改名/复制/删除。
 func (a *App) sidebarSessionRow(c *ui.Context, id string) {
@@ -590,10 +643,11 @@ func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 	}
 
 	active := index == a.active
-	// 两行的左右内边距相同（3,6）；对齐靠会话行开头补一个 sidebarArrowSlot
-	// 宽的空白（项目行那里放的是三角），这样两种行的文字起点一致，
-	// 选中背景的左右边距也一致。
-	row := ui.Row(c).FillWidth().Gap(0).Padding(3, 6).Radius(6)
+	// 会话行在项目行基础上**再缩进一档**（左侧多 sidebarSessionIndent），
+	// 让层级一眼可见：项目在上、会话缩在里面。右侧内边距保持不变，
+	// 这样选中背景的右边缘仍与项目行对齐。
+	row := ui.Row(c).FillWidth().Gap(0).
+		Padding(3, 6+sidebarSessionIndent, 3, 6).Radius(6)
 	switch {
 	case active:
 		row.Background(dsh.SurfaceActive)
