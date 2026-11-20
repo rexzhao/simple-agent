@@ -477,6 +477,18 @@ func (d *Driver) Enqueue(text string) ([]Effect, error) {
 	if text == "" {
 		return nil, fmt.Errorf("消息为空")
 	}
+	// 空闲时没有"插话"这回事：直接当普通消息发出去。
+	//
+	// 真实踩到的：手机端新会话刚建好，状态数据还没拉回来（canSend=false），
+	// 于是走了 enqueue 这条路径；而 idle 会话 CanSteer() 为 false，
+	// 返回 ErrBusy（"当前状态不支持该操作"）—— 用户看到的就是
+	// "点了发送没反应"。
+	//
+	// 客户端判断 canSend 依赖一次状态拉取，有时序窗口；后端兜住更可靠，
+	// 而且语义也对：空闲时候队等于立刻发送。
+	if d.busy == BusyIdle {
+		return d.SendWithAttachments(text, nil)
+	}
 	if !d.CanSteer() {
 		return nil, ErrBusy
 	}
@@ -559,7 +571,9 @@ func (d *Driver) Send(text string) ([]Effect, error) {
 // 读成字节。模型不支持图片时直接拒绝：这是界面的兜底守卫，不能只靠按钮禁用。
 func (d *Driver) SendWithAttachments(text string, attachments []message.Part) ([]Effect, error) {
 	if d.busy != BusyIdle {
-		return nil, ErrBusy
+		// 带上当前状态：只说"当前状态不接受该操作"，用户和排查的人都不知道
+		// 到底卡在哪（是还在生成？在等回答？在压缩？）
+		return nil, fmt.Errorf("%w（当前状态：%s）", ErrBusy, d.busy)
 	}
 	if len(attachments) > 0 && !d.opts.Vision {
 		return nil, fmt.Errorf("当前模型不支持图片")

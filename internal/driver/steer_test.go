@@ -296,13 +296,26 @@ func TestEnqueueRejectedWhenNotSteerable(t *testing.T) {
 	if d.CanSteer() {
 		t.Fatal("空闲时不应可插话")
 	}
-	if _, err := d.Enqueue("x"); err == nil {
-		t.Fatal("空闲时插话应被拒绝")
+	// **空闲时的 enqueue 降级成普通发送**（不再报错）。
+	//
+	// 真实踩到的：手机端新会话的状态数据还没拉回来（canSend=false），
+	// 于是走了 enqueue；而空闲会话不能插话，返回 ErrBusy ——
+	// 用户看到"点发送没反应 / 当前状态不支持该操作"。
+	// 空闲时候队本来就等于立刻发送，所以这里直接发出去。
+	effects, err := d.Enqueue("x")
+	if err != nil {
+		t.Fatalf("空闲时 enqueue 应降级为发送，实际报错：%v", err)
 	}
+	start := startStream(t, effects)
+	if d.Busy() != driver.BusyStreaming {
+		t.Fatalf("降级后应开流，实际 %v", d.Busy())
+	}
+	// 让这一轮结束，回到空闲再测后面的"等待回答"分支
+	d.ApplyEvent(start.MessageID, providers.Event{Kind: providers.EventDone, StopReason: "stop"})
 
 	// 等待回答：输入框里是自定义答案，不能当插话
-	effects, _ := d.Send("问")
-	start := startStream(t, effects)
+	effects, _ = d.Send("问")
+	start = startStream(t, effects)
 	d.ApplyEvent(start.MessageID, providers.Event{Kind: providers.EventToolStart, Index: 0, ID: "ask1", Name: "ask_user_question"})
 	d.ApplyEvent(start.MessageID, providers.Event{Kind: providers.EventToolArgs, Index: 0,
 		Delta: `{"questions":[{"question":"选哪个","options":[{"label":"A"}]}]}`})

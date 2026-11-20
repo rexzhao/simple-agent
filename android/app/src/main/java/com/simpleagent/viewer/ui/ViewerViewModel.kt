@@ -729,7 +729,15 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
-        val error = if (current.timeline.runtime.canSend) {
+        // 忙时才排队（插话）；空闲时一律走 send。
+        //
+        // 不能只看 canSend：它是**上一次拉取的状态**，新会话刚建好时还没更新，
+        // 会是 false —— 于是走了 enqueue，而空闲会话不能插话，
+        // 后端报"当前状态不支持该操作"，用户看到的就是"点发送没反应"。
+        // 用 busy 兜一层：只要不是生成中/跑工具，就当普通消息发。
+        val busy = current.timeline.runtime.busy
+        val streaming = busy == "streaming" || busy == "running_tools" || busy == "compacting"
+        val error = if (current.timeline.runtime.canSend || !streaming) {
             core.sendText(id, text)
         } else {
             core.enqueue(id, text)
