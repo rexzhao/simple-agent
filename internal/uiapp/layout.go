@@ -506,7 +506,8 @@ func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 		title := ui.Text(c, session.Title).FontSize(12).TextColor(theme.Text).
 			MaxLines(1).Grow(1).Cursor(ui.CursorPointer)
 		if title.Clicked() {
-			a.active = index
+			// 走统一入口：草稿的存/取都在里面
+			a.switchTo(index)
 		}
 		// 空 Box 代替 Gap：Row 的 gap 设成 0（否则会叠在三角槽上导致错位），
 		// 标题与时间之间的小间距在这里显式给。

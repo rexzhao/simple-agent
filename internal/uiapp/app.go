@@ -178,6 +178,16 @@ type Session struct {
 	// 切回这个会话（且输入框为空）时放回去——否则提示里说"请切回该会话查看"，
 	// 用户切回去却什么都看不到。
 	restoreDraft string
+	// draft 是这个会话**未发送**的输入（切走时存、切回来时取）。
+	//
+	// 为什么放在会话上而不是 App 上：草稿天然属于某个会话。以前是 App 上一个
+	// 全局字符串，切会话时没人动它，于是 A 会话打了一半的字会跟着到 B
+	// （附件早就是按会话存的，只有草稿漏了）。
+	//
+	// 与 restoreDraft 的区别：那个是「发送失败、且用户已经切走」时留下的，
+	// 只在输入框为空时才放回；draft 是用户正常切换会话时要原样带回的内容。
+	// 两者语义不同，不能合并。
+	draft string
 	// attachments 是待发送的图片（粘贴/拖入）。
 	attachments []*attachment
 	// askTab 是提问面板当前显示的问题下标（多个问题用 tab 切换，不竖着堆）
@@ -278,12 +288,48 @@ func (a *App) SubmitSendForTest() {
 func (a *App) SelectSessionForTest(id string) {
 	for index, shell := range a.sessions {
 		if shell.ID == id {
-			a.active = index
-			a.host.SetActive(id)
-			a.restoreDraftIfIdle(shell)
+			a.switchTo(index)
 			return
 		}
 	}
+}
+
+// switchTo 切到第 index 个会话——**所有切换入口都必须走这里**。
+//
+// 为什么收敛成一个函数：以前"切会话"散落在 5 处（侧栏点击、新建会话、
+// 删除后定位、执行端切换、测试入口），每处各做各的事，于是漏了草稿。
+// 以后要加"切换时的副作用"（保存滚动位置、落盘草稿…）也只需改这一处。
+func (a *App) switchTo(index int) {
+	if index < 0 || index >= len(a.sessions) {
+		return
+	}
+	next := a.sessions[index]
+	if next == nil {
+		return
+	}
+	// 离开当前会话：把输入框里的内容存到**它自己**身上
+	if current := a.currentShell(); current != nil && current != next {
+		current.draft = a.draft
+	}
+	a.active = index
+	a.host.SetActive(next.ID)
+	// 进入新会话：先放回"失败留下的草稿"（仅当它是唯一来源），
+	// 再恢复用户自己没发出去的内容。两者不会同时有内容 —— 
+	// restoreDraft 只在输入框为空时生效。
+	a.draft = ""
+	a.restoreDraftIfIdle(next)
+	if a.draft == "" {
+		a.draft = next.draft
+	}
+	a.pendingCaret = -1
+}
+
+// currentShell 返回当前会话对应的界面壳（a.sessions 里的元素）。
+func (a *App) currentShell() *Session {
+	if a.active < 0 || a.active >= len(a.sessions) {
+		return nil
+	}
+	return a.sessions[a.active]
 }
 
 // SetFlashErrForTest 设置下一帧要 Toast 的错误（测试用）。
@@ -770,8 +816,17 @@ func (a *App) syncSessions() {
 	a.active = active
 	// 执行端的"当前会话"跟着界面走（命令要落到用户正在看的这个会话上）
 	if a.active < len(a.sessions) {
-		a.host.SetActive(a.sessions[a.active].ID)
-		a.restoreDraftIfIdle(a.sessions[a.active])
+		shell := a.sessions[a.active]
+		a.host.SetActive(shell.ID)
+		// 这里不是"用户切换会话"，而是列表刷新后的重新定位：
+		// **不保存**当前草稿（否则会把刚输入的内容误存到别的会话上），
+		// 只在输入框为空时把该会话自己的内容放回去。
+		if strings.TrimSpace(a.draft) == "" {
+			a.restoreDraftIfIdle(shell)
+			if a.draft == "" {
+				a.draft = shell.draft
+			}
+		}
 	}
 }
 
@@ -872,8 +927,7 @@ func (a *App) handleCmdResult(change host.Change) {
 			a.syncSessions()
 			for i, shell := range a.sessions {
 				if shell.ID == data.SessionID {
-					a.active = i
-					a.host.SetActive(shell.ID)
+					a.switchTo(i)
 					break
 				}
 			}
@@ -885,8 +939,7 @@ func (a *App) handleCmdResult(change host.Change) {
 		a.activeAfterDelete = ""
 		for i, shell := range a.sessions {
 			if shell.ID == want {
-				a.active = i
-				a.host.SetActive(shell.ID)
+				a.switchTo(i)
 				break
 			}
 		}
@@ -1040,6 +1093,14 @@ func (a *App) deleteSession(index int) {
 	}
 	id := a.sessions[index].ID
 	a.activeAfterDelete = nextID
+	// 删的是当前会话：输入框里那份草稿也要一起丢掉。
+	// （别的会话的草稿挂在各自的 Session 上，随对象一起被回收。）
+	if index == a.active {
+		a.draft = ""
+		if index < len(a.sessions) {
+			a.sessions[index].draft = ""
+		}
+	}
 	_, _ = a.host.Submit(host.Command{SessionID: id, Kind: "deleteSession"})
 }
 
@@ -2724,6 +2785,9 @@ func (a *App) submitSend(session *Session, text string, attachments []message.Pa
 		attachments: session.attachments,
 	}
 	a.draft = ""
+	// 会话自己存的那份也要清：否则切走再切回来，
+	// 已经发出去的内容会重新出现在输入框里。
+	session.draft = ""
 	a.history.reset()
 	session.attachments = nil
 	return cmdID
