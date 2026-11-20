@@ -474,6 +474,25 @@ func (l *Local) NewSession(workspace string) *Session {
 	}
 	l.sessions = append(l.sessions, session)
 	l.active = len(l.sessions) - 1
+	// **立刻登记进项目档案**，不等第一条消息。
+	//
+	// 为什么：界面的侧栏分组用项目 ID。不登记的话新会话没有 ProjectID，
+	// 界面只好退回按 workspace 分组 —— 而它和其它已登记会话用的是项目 ID，
+	// 同一个项目就显示成**两个同名分组**（真实踩过：手机新建几个会话，
+	// 桌面侧栏出现两组 simple-agent / wow-viewer）。
+	//
+	// 登记只是往 project.json 里加一条 id，很快；空会话重启后本来就会被
+	// PruneEmpty 清掉，档案里多一条记录无害（Catalog.Delete 会一并移除）。
+	//
+	// **登记前先打开日志**：让会话落在老布局 `sessions/<id>/`，
+	// 与已有会话一致。反过来的话 Catalog.Open 会按"项目目录"建路径，
+	// 把新会话塞进 projects/<uuid>/sessions/ 下 —— 用户的数据位置
+	// 不该因为这次改动而变。
+	if l.cfg.Catalog != nil {
+		if dir, err := l.cfg.Catalog.SessionDirFor(session.ID); err == nil {
+			_ = l.cfg.Catalog.AddSession(session.ID, session.Title, workspace, dir)
+		}
+	}
 	for _, obs := range l.observersSnapshot() {
 		obs.SessionsChanged()
 	}

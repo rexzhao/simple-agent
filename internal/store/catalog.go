@@ -288,6 +288,21 @@ func (c *Catalog) projectSessionDir(projectID, contextID string) string {
 // ProjectDir 返回项目目录（供界面显示"数据在哪"）。
 func (c *Catalog) ProjectDir(projectID string) string { return c.projectPath(projectID) }
 
+// SessionDirFor 返回会话日志的目录（不要求它已存在）。
+//
+// 与 Open 的区别：Open 会真的建目录；这个只算路径。
+// 用途：新建会话时要在"还没落盘"的情况下先把它登记进档案，
+// 登记得知道它将来在哪 —— 老布局 `sessions/<id>/`。
+func (c *Catalog) SessionDirFor(contextID string) (string, error) {
+	if contextID == "" {
+		return "", fmt.Errorf("会话 id 为空")
+	}
+	if dir, ok := c.sessionLocation(contextID); ok {
+		return dir, nil
+	}
+	return filepath.Join(c.SessionsDir(), contextID), nil
+}
+
 // Open 打开指定会话的日志。
 func (c *Catalog) Open(contextID string) (SessionStore, error) {
 	if contextID == "" {
@@ -348,9 +363,22 @@ func (c *Catalog) AddSession(contextID, title, workspace, dir string) error {
 		if project.Sessions[i].ID != contextID {
 			continue
 		}
-		// 已登记：只补缺失的 dir（老档案没有这个字段）
+		// 已登记：补上缺失的信息。
+		//
+		// 新建会话时会先登记一次（那时还没有标题、也没落盘目录），
+		// 首条消息后 ensurePersisted 再调一次 —— 这次要把 dir 和自动标题补上。
+		changed := false
 		if project.Sessions[i].Dir == "" && recordDir != "" {
 			project.Sessions[i].Dir = recordDir
+			changed = true
+		}
+		// 标题：只在调用方给了非空标题且与档案不同时更新
+		// （新建时的占位标题是"新会话"，首条消息后变成首行文字）
+		if title != "" && project.Sessions[i].Title != title {
+			project.Sessions[i].Title = title
+			changed = true
+		}
+		if changed {
 			return c.SaveProject(project)
 		}
 		return nil

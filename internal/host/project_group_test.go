@@ -43,19 +43,37 @@ func TestUnregisteredSessionJoinsExistingProject(t *testing.T) {
 	}
 }
 
-// 没有对应项目档案时（全新目录），ProjectID 保持为空，
-// 界面退回按 workspace 分组 —— 这是合理的降级，不该崩。
-func TestUnregisteredSessionWithoutProject(t *testing.T) {
+// 全新目录建会话：会**自动登记**一个新项目，ProjectID 不为空。
+//
+// 这是有意的行为变化（原来打算"没有项目档案就降级为空"）：
+// 新会话一建出来就登记进档案，界面从一开始就有项目 ID，
+// 不会出现"同一个项目两个分组"的中间态。
+func TestNewSessionCreatesProjectWhenMissing(t *testing.T) {
 	catalog := store.NewCatalog(t.TempDir())
 	l := newHostWithCatalog(t, catalog)
-	l.NewSession(`F:\brand-new-dir`)
+	created := l.NewSession(`F:\brand-new-dir`)
 
 	refs := l.Sessions()
 	if len(refs) != 1 {
 		t.Fatalf("应有 1 个会话，实际 %d", len(refs))
 	}
-	if refs[0].ProjectID != "" {
-		t.Fatalf("没有项目档案时 ProjectID 应为空，实际 %q", refs[0].ProjectID)
+	if refs[0].ProjectID == "" {
+		t.Fatal("新会话应自动登记到一个新项目，ProjectID 不该为空")
+	}
+	if refs[0].ProjectName != "brand-new-dir" {
+		t.Fatalf("项目名应取自目录末级，实际 %q", refs[0].ProjectName)
+	}
+
+	// 项目确实落进了档案
+	projects, err := catalog.ListProjects()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 || projects[0].ID != refs[0].ProjectID {
+		t.Fatalf("档案里应有该项目，实际 %+v", projects)
+	}
+	if len(projects[0].Sessions) != 1 || projects[0].Sessions[0].ID != created.ID {
+		t.Fatalf("会话应已登记，实际 %+v", projects[0].Sessions)
 	}
 }
 
