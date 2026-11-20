@@ -1,4 +1,4 @@
-package uiapp_test
+﻿package uiapp_test
 
 import (
 	"bytes"
@@ -2029,13 +2029,21 @@ func TestEmptySessionIsNotPersisted(t *testing.T) {
 		t.Fatalf("空会话不应落盘，实际有 %d 个目录", len(entries))
 	}
 
-	// 再点几次「新建」也不该产生目录
+	// 再点几次「新建」也不该产生目录。
+	//
+	// 第一次点走空态入口；之后有了会话，空态入口消失，得走项目行右侧那个
+	// —— 两个入口的 label 不同，按当前状态选。
 	for i := 0; i < 3; i++ {
-		if err := tester.Click(locNewSession); err != nil {
+		label := locNewSession
+		if app.Current() == nil {
+			label = locNewSessionRail
+		}
+		if err := tester.Click(label); err != nil {
 			t.Fatal(err)
 		}
 		p2.Drain()
 		tester.Frame()
+		pump(tester, p2)
 	}
 	if entries, err := os.ReadDir(catalog.SessionsDir()); err == nil && len(entries) != 0 {
 		t.Fatalf("空会话不应落盘，实际有 %d 个目录", len(entries))
@@ -3265,15 +3273,18 @@ func TestNarrationRendersLikeFinalAnswer(t *testing.T) {
 
 // ensureSession 在"全新数据目录 → 空态"的情况下先建一个会话（决策 #54 之后，
 // 启动时不再自动新建空会话）。已经有会话时什么都不做。
+//
+// 空态没有项目行，所以用的是空态专用入口（locNewSessionRail）；
+// 有会话之后才走项目行右侧那个（locNewSession）。
 func ensureSession(t *testing.T, tester *ui.Tester, p *poster, app *uiapp.App) {
 	t.Helper()
 	if app.Current() != nil {
 		return
 	}
-	if !tester.HasText(locNewSession) {
+	if !tester.HasText(locNewSessionRail) {
 		t.Fatalf("空态下应有新建入口：%v", tester.Texts())
 	}
-	if err := tester.Click(locNewSession); err != nil {
+	if err := tester.Click(locNewSessionRail); err != nil {
 		t.Fatalf("点不到新建会话：%v", err)
 	}
 	pump(tester, p)

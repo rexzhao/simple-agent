@@ -1,4 +1,4 @@
-package uiapp_test
+﻿package uiapp_test
 
 import (
 	"fmt"
@@ -104,7 +104,7 @@ func TestSidebarAutoCollapses(t *testing.T) {
 		t.Fatalf("900 宽窗口应自动收起：%v", tester.Texts())
 	}
 	// 图标栏里只有「新建会话」「打开侧边栏」两个图标按钮，品牌行与会话行都不在
-	if !tester.HasText(locNewSession) || !tester.HasText(locSidebarShow) {
+	if !tester.HasText(locNewSessionRail) || !tester.HasText(locSidebarShow) {
 		t.Fatalf("收起后应显示图标栏：%v", tester.Texts())
 	}
 	if tester.HasText("simple-agent") {
@@ -193,7 +193,7 @@ func TestDefaultCollapsedRailCanSendMessage(t *testing.T) {
 		t.Fatalf("默认配置下 900 宽窗口应收起成图标栏：%v", tester.Texts())
 	}
 
-	if err := tester.Click(locNewSession); err != nil {
+	if err := tester.Click(locNewSessionRail); err != nil {
 		t.Fatalf("点不到图标栏的新建：%v", err)
 	}
 	pump(tester, p)
@@ -722,7 +722,7 @@ func TestEmptyStateNewSessionCanSend(t *testing.T) {
 	}
 	pump(tester, p)
 
-	if err := tester.Click(locNewSession); err != nil {
+	if err := tester.Click(locNewSessionRail); err != nil {
 		t.Fatalf("点不到空态的新建：%v", err)
 	}
 	pump(tester, p)

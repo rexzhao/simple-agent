@@ -47,6 +47,7 @@ var zhTable = map[string]string{
 	// 侧栏（dsh: session.new / session.new.label / toggle.* / time.*）
 	"session.new":                "新会话",
 	"session.new.label":          "新建会话",
+	"session.newHere":            "在此项目新建会话",
 	"toggle.open":                "打开侧边栏",
 	"toggle.collapse":            "收起侧边栏",
 	"sidebar.search":             "搜索会话",

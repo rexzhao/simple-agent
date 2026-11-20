@@ -167,6 +167,9 @@ func (a *App) sidebarCollapsedAt(width float32) (bool, int) {
 // sidebarRail 渲染收起后的 56px 图标栏：只放新建与展开两个图标按钮。
 //
 // 图标用 dsh 的 SVG（icons.go）；24px 图标列 + 两侧 16px 留白 = 56px。
+//
+// 这里的「新建」**保留**而展开状态下顶部那个去掉了：折叠时看不到项目行，
+// 没有别的地方能新建；它用默认工作区（NewSession 的行为）。
 func (a *App) sidebarRail(c *ui.Context, width int, theme *ui.Theme) {
 	_ = theme
 	ui.Column(c).Width(float32(width)).FillHeight().Background(dsh.SidebarFill).
@@ -200,9 +203,8 @@ func (a *App) sidebarBody(c *ui.Context) {
 		ui.Row(c).Padding(2, 4).Gap(4).FillWidth().AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "simple-agent").FontSize(13).Bold().TextColor(theme.Text)
 			ui.Spacer(c)
-			if iconButton(c, iconNewChatSVG, a.tr("session.new.label"), 16, 4) {
-				a.NewSession()
-			}
+			// 新建会话按钮已经移到各个项目行的右侧（在那里才知道新会话
+			// 该归到哪个项目）；顶部只留收起侧栏。
 			if iconButton(c, iconPanelLeftSVG, a.tr("toggle.collapse"), 16, 4) {
 				a.sidebarUserCollapsed = true
 			}
@@ -214,8 +216,14 @@ func (a *App) sidebarBody(c *ui.Context) {
 		ui.Box(c).Height(1).FillWidth().Background(dsh.BorderL1)
 
 		if len(a.sessions) == 0 {
+			// 空态：没有任何项目行，也就没有行内的新建按钮 ——
+			// 这里必须给一个入口，否则用户卡在"还没有会话"出不来。
+			// 它开在默认工作区（与折叠成图标栏时那个按钮同一语义）。
 			ui.Text(c, a.tr("sidebar.empty")).FontSize(11).
 				TextColor(theme.TextMuted).Padding(4, 6)
+			if iconButton(c, iconNewChatSVG, a.tr("session.new.label"), 13, 3) {
+				a.NewSession()
+			}
 		}
 		// 项目 → 会话 的两级树；会话多了它在 List 里滚
 		a.sidebarRows(c)
@@ -359,19 +367,9 @@ func (a *App) sidebarAddProjectRow(c *ui.Context) {
 // 会话行的缩进量也用同一个常量，两行文字因此左对齐。
 func (a *App) sidebarGroupRow(c *ui.Context, key string) {
 	theme := c.Theme()
-	count := 0
-	var newest time.Time
-	for _, session := range a.sessions {
-		if workspaceOr(session.Workspace, "") != key {
-			continue
-		}
-		count++
-		if updated := sessionUpdatedAt(session); updated.After(newest) {
-			newest = updated
-		}
-	}
 	open := a.sidebarGroupOpen[key]
 	var clicked bool
+	var newHere bool
 	ui.Row(c).FillWidth().Gap(0).Padding(3, 6, 3, 6).Radius(6).AlignItems(ui.Center).Children(func() {
 		// 三角槽：**固定宽度**，宽度与 sidebarArrowSlot 相同。
 		//
@@ -401,12 +399,20 @@ func (a *App) sidebarGroupRow(c *ui.Context, key string) {
 			clicked = true
 		}
 		ui.Spacer(c)
-		if count > 0 && !newest.IsZero() {
-			ui.Text(c, a.relativeTime(newest)).FontSize(11).TextColor(theme.TextMuted)
+		// 项目行**不显示时间**：它在树上只是分组，用户关心的是"这个项目
+		// 有几个会话"，时间要看会话行或悬停的提示。显示时间还会跟这里的
+		// 新建按钮抢位置（两者挤在一起，项目名被压窄）。
+		if iconButton(c, iconNewChatSVG, a.tr("session.newHere"), 13, 3) {
+			newHere = true
 		}
 	})
 	if clicked {
 		a.setSidebarGroupOpen(key, !open)
+	}
+	// 新建放到行外执行：iconButton 的点击发生在渲染中，
+	// 立刻 Submit 会让本帧后续的会话列表与索引不同步。
+	if newHere {
+		a.newSessionIn(key)
 	}
 }
 

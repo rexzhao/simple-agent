@@ -41,6 +41,7 @@ var enTable = map[string]string{
 	// Sidebar
 	"session.new":                "New Session",
 	"session.new.label":          "New session",
+	"session.newHere":            "New session in this project",
 	"toggle.open":                "Open sidebar",
 	"toggle.collapse":            "Collapse sidebar",
 	"sidebar.search":             "Search sessions",
