@@ -795,6 +795,9 @@ func (s *Session) SetProjectForTest(id, name string) {
 // ArchivedForTest 报告会话是否已归档。
 func (s *Session) ArchivedForTest() bool { return s.archivedSession }
 
+// SetArchivedForTest 设置会话的归档状态（测试用：模拟后端同步过来的状态）。
+func (s *Session) SetArchivedForTest(archived bool) { s.archivedSession = archived }
+
 // projectOrder 返回"项目 ID → 名次"的映射（用于侧栏排序）。
 //
 // 名次就是会话出现的先后：后端 Sessions() 按 projects.json 的顺序返回

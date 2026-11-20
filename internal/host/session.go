@@ -67,6 +67,71 @@ type Session struct {
 
 	cfg  *Config
 	host *Local
+
+	// archived 表示会话**已归档**：还能看历史，但不能再运行。
+	//
+	// 语义与"压缩"不同：压缩是日志层面的折叠（继续可用），归档是会话层面的
+	// 封存（必须显式恢复才能发消息）。存的项目档案里的 archived_at。
+	archived bool
+}
+
+// Archived 报告会话是否已归档。
+func (s *Session) Archived() bool { return s.archived }
+
+// SetArchived 设置归档状态并落盘。
+//
+// 归档只是状态位：**不动任何日志文件**。恢复就是清掉它。
+func (s *Session) SetArchived(archived bool) error {
+	if s.cfg.Catalog == nil {
+		s.archived = archived
+		return nil
+	}
+	var stamp string
+	if archived {
+		stamp = time.Now().UTC().Format(time.RFC3339)
+	}
+	err := s.cfg.Catalog.UpdateSession(s.ID, func(record *store.SessionRecord) {
+		record.ArchivedAt = stamp
+	})
+	if err != nil {
+		return err
+	}
+	s.archived = archived
+	return nil
+}
+
+// canRun 报告这个会话现在能不能执行（发消息、压缩、改名等）。
+//
+// 返回的字符串为空表示可以，否则是给用户看的原因。
+func (s *Session) canRun() string {
+	if s.archived {
+		return s.cfg.Tr("session.archivedHint")
+	}
+	return ""
+}
+
+// blockedByArchive 报告某个命令是否因为会话已归档而被拒绝。
+//
+// **白名单式**：只有明确列出的"只读"命令放行，其余一律拦。
+// 反过来（列黑名单）只要新增一个会改状态的命令就会漏 ——
+// "归档了还能跑"比"归档后某个只读操作被误拦"严重得多。
+func (s *Session) blockedByArchive(command string) string {
+	// session 为 nil：命令不针对具体会话（新建会话走的就是这条）。
+	// 没有会话可归档，自然不该拦。
+	if s == nil || !s.archived {
+		return ""
+	}
+	switch command {
+	case "loadOlder", "backfill":
+		// 翻历史是纯读：归档的会话也可以往回看
+		return ""
+	case "archiveSession", "restoreSession":
+		// 归档自身：恢复必须能做（否则永远出不来）
+		return ""
+	}
+	// 其余全部拒绝：send/enqueue/compact/rename/deleteSession/
+	// selectModel/setEffort/answer/dismissAsk/stop…
+	return s.cfg.Tr("session.archivedHint")
 }
 
 // ---- 读接口（全部读本地状态，无网络等待）----

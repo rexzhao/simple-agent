@@ -364,6 +364,31 @@ func (c *Catalog) AddSession(contextID, title, workspace, dir string) error {
 	return c.SaveProject(project)
 }
 
+// SessionArchived 报告某个会话是否已归档（第二个返回值为 false 表示查不到）。
+func (c *Catalog) SessionArchived(contextID string) (bool, bool) {
+	projects, err := c.ListProjects()
+	if err != nil {
+		return false, false
+	}
+	for _, project := range projects {
+		for _, record := range project.Sessions {
+			if record.ID == contextID {
+				return record.ArchivedAt != "", true
+			}
+		}
+	}
+	return false, false
+}
+
+// SetSessionArchived 归档/恢复一个会话（stamp 为空表示恢复）。
+//
+// 只改档案里的状态位，**不动日志文件**。
+func (c *Catalog) SetSessionArchived(contextID, stamp string) error {
+	return c.UpdateSession(contextID, func(record *SessionRecord) {
+		record.ArchivedAt = stamp
+	})
+}
+
 // UpdateSession 更新档案里某个会话的标题/时间/压缩次数。
 //
 // 找不到时静默返回：档案可能还没建（老数据），不该因为"更新列表项失败"

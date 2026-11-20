@@ -10,6 +10,7 @@ import (
 	"github.com/egoist/mygo/ui"
 
 	"simple-agent/internal/driver"
+	"simple-agent/internal/host"
 )
 
 // 布局与视觉常量（单一来源）。
@@ -194,7 +195,17 @@ type sidebarNode struct {
 	key     string
 	// name 是项目节点的显示名（来自项目档案；会话节点不用）。
 	name string
+	// isArchive 表示这是项目下的「已归档」小节（默认折叠）。
+	//
+	// 它和项目行一样是可折叠的分组，但不算一个项目：不显示「新建会话」，
+	// 也不参与项目排序。
+	isArchive bool
 }
+
+// archivedKey 返回某个项目下「已归档」小节的分组 key。
+//
+// 加前缀是为了不与项目 key 冲突（项目 key 是 UUID，前缀不会被撞上）。
+func archivedKey(projectKey string) string { return "archive:" + projectKey }
 
 // sidebarBody 渲染展开状态的侧栏内容：品牌行 + 搜索 + 项目/会话树 + 用户区。
 func (a *App) sidebarBody(c *ui.Context) {
@@ -310,19 +321,23 @@ func (a *App) sidebarRows(c *ui.Context) {
 		})
 	}
 
-	// 扁平化：项目行 + （展开时的）会话行
+	// 扁平化：项目行 + （展开时的）会话行 + 已归档小节
 	var rows []sidebarNode
 	for _, g := range groups {
-		var visible []*Session
+		var active, archived []*Session
 		// **保持档案里的顺序**，不反转也不按时间重排：
 		// 用户能调整会话顺序，界面就得照它显示。
 		for _, session := range g.sessions {
 			if query != "" && !strings.Contains(strings.ToLower(session.Title), query) {
 				continue
 			}
-			visible = append(visible, session)
+			if session.archivedSession {
+				archived = append(archived, session)
+				continue
+			}
+			active = append(active, session)
 		}
-		if len(visible) == 0 {
+		if len(active) == 0 && len(archived) == 0 {
 			continue // 搜索把这一组过滤空了：整组隐藏
 		}
 		// 新出现的项目默认展开（用户收起过的保持收起）
@@ -340,15 +355,44 @@ func (a *App) sidebarRows(c *ui.Context) {
 		if !a.sidebarGroupOpen[g.key] {
 			continue
 		}
-		for _, session := range visible {
+		for _, session := range active {
 			rows = append(rows, sidebarNode{key: session.ID})
+		}
+		// 已归档的会话挂在这个项目下，但**单独一个默认折叠的小节**：
+		// 归档的意图就是"别占地方"，混在正常会话里等于没归档；
+		// 但也不能整个藏掉 —— 用户要能看见它们还在、能恢复。
+		if len(archived) > 0 {
+			key := archivedKey(g.key)
+			// **默认折叠**：归档的意义就是"收起来不占地方"。
+			// 只在第一次见到时置 false，用户展开过的保持展开。
+			if !a.sidebarGroupSeen[key] {
+				if a.sidebarGroupSeen == nil {
+					a.sidebarGroupSeen = map[string]bool{}
+				}
+				if a.sidebarGroupOpen == nil {
+					a.sidebarGroupOpen = map[string]bool{}
+				}
+				a.sidebarGroupSeen[key] = true
+				a.sidebarGroupOpen[key] = false
+			}
+			rows = append(rows, sidebarNode{
+				isGroup:   true,
+				isArchive: true,
+				key:       key,
+				name:      a.tr("sidebar.showArchived"),
+			})
+			if a.sidebarGroupOpen[key] {
+				for _, session := range archived {
+					rows = append(rows, sidebarNode{key: session.ID})
+				}
+			}
 		}
 	}
 
 	ui.List(c, &a.sidebarList, len(rows), func(i int) {
 		node := rows[i]
 		if node.isGroup {
-			a.sidebarGroupRow(c, node.key, node.name)
+			a.sidebarGroupRow(c, node.key, node.name, node.isArchive)
 			return
 		}
 		a.sidebarSessionRow(c, node.key)
@@ -396,7 +440,7 @@ func (a *App) sidebarAddProjectRow(c *ui.Context) {
 // 会话行的缩进量也用同一个常量，两行文字因此左对齐。
 //
 // name 由调用方给出（来自项目档案）；没有档案时是 workspace 反推的名字。
-func (a *App) sidebarGroupRow(c *ui.Context, key, name string) {
+func (a *App) sidebarGroupRow(c *ui.Context, key, name string, isArchive bool) {
 	theme := c.Theme()
 	open := a.sidebarGroupOpen[key]
 	var clicked bool
@@ -424,8 +468,15 @@ func (a *App) sidebarGroupRow(c *ui.Context, key, name string) {
 		if arrowSlot.Clicked() {
 			clicked = true
 		}
-		nameText := ui.Text(c, name).FontSize(12).Bold().
-			TextColor(theme.Text).Cursor(ui.CursorPointer)
+		nameColor := theme.Text
+		nameSize := float32(12)
+		if isArchive {
+			// 归档小节用弱化色 + 小一号：它是次要分组，不该和项目抢注意力
+			nameColor = theme.TextMuted
+			nameSize = 11
+		}
+		nameText := ui.Text(c, name).FontSize(nameSize).
+			Bold().TextColor(nameColor).Cursor(ui.CursorPointer)
 		if nameText.Clicked() {
 			clicked = true
 		}
@@ -433,8 +484,12 @@ func (a *App) sidebarGroupRow(c *ui.Context, key, name string) {
 		// 项目行**不显示时间**：它在树上只是分组，用户关心的是"这个项目
 		// 有几个会话"，时间要看会话行或悬停的提示。显示时间还会跟这里的
 		// 新建按钮抢位置（两者挤在一起，项目名被压窄）。
-		if iconButton(c, iconNewChatSVG, a.tr("session.newHere"), 13, 3) {
-			newHere = true
+		//
+		// 归档小节没有「新建会话」：那里不是项目，新建该归到项目本身。
+		if !isArchive {
+			if iconButton(c, iconNewChatSVG, a.tr("session.newHere"), 13, 3) {
+				newHere = true
+			}
 		}
 	})
 	if clicked {
@@ -570,7 +625,12 @@ func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 			// 与项目行的三角槽等宽的空白：让两种行的文字起点对齐
 			ui.Box(c).Width(sidebarArrowSlot).Shrink(0)
 		}
-		title := ui.Text(c, session.Title).FontSize(12).TextColor(theme.Text).
+		// 归档的会话用弱化色：一眼看出它不能跑（点进去也只能看历史）
+		titleColor := theme.Text
+		if session.archivedSession {
+			titleColor = theme.TextMuted
+		}
+		title := ui.Text(c, session.Title).FontSize(12).TextColor(titleColor).
 			MaxLines(1).Grow(1).Cursor(ui.CursorPointer)
 		if title.Clicked() {
 			// 走统一入口：草稿的存/取都在里面
@@ -651,16 +711,42 @@ func statusDotFor(busy driver.Busy) (string, ui.Color) {
 
 // sidebarSessionMenu 填会话行的菜单项（右键菜单与「⋯」共用）。
 func (a *App) sidebarSessionMenu(m *ui.Menu, session *Session) {
+	// 归档的会话只能恢复，别的一律不给（改名、删除都拦着）——
+	// 菜单里灰着也容易点错，直接不提供更省事。
+	if session.archivedSession {
+		if m.Item(a.tr("sidebar.restore")).Chosen() {
+			a.setSessionArchived(session, false)
+		}
+		return
+	}
 	if m.Item(a.tr("sidebar.rename")).Chosen() {
 		session.renaming = true
 		session.renameDraft = session.Title
 		session.renameWasFocused = false
+	}
+	if m.Item(a.tr("sidebar.archive")).Chosen() {
+		a.setSessionArchived(session, true)
 	}
 	m.Separator()
 	if m.Item(a.tr("common.delete")).Chosen() {
 		a.deleteTarget = session.ID
 		a.deleteConfirm = true
 	}
+}
+
+// setSessionArchived 归档/恢复一个会话。
+//
+// 归档 = 封存：历史还能看，但不能发消息、压缩、改名，必须恢复才能继续。
+// 不动任何文件，只改项目档案里的状态位。
+func (a *App) setSessionArchived(session *Session, archived bool) {
+	if session == nil {
+		return
+	}
+	kind := "restoreSession"
+	if archived {
+		kind = "archiveSession"
+	}
+	_, _ = a.host.Submit(host.Command{SessionID: session.ID, Kind: kind})
 }
 
 // userName 返回底部用户区显示的名字。

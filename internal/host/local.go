@@ -244,6 +244,15 @@ func (l *Local) Close() error {
 // 语义是**异步**的：立即返回 CmdID，结果通过 Subscribe 的 `cmdResult` 回来。
 // 进程内实现可以直接在当前线程执行（没有网络往返，也不会阻塞界面），
 // 但调用方**不能**依赖"Submit 返回时已经生效"——远程实现会真的延后。
+// DispatchForTest 同步执行一条命令并返回结果（测试用）。
+//
+// 正常入口 Submit 是异步的（结果经 Change 回调），测试里要断言
+// "命令被拒绝"就必须拿到返回值。
+func (l *Local) DispatchForTest(sessionID string, cmd Command) CmdResult {
+	session := l.Session(sessionID)
+	return l.dispatch(session, cmd)
+}
+
 func (l *Local) Submit(cmd Command) (string, error) {
 	if cmd.CmdID == "" {
 		cmd.CmdID = l.newCmdID()
@@ -287,6 +296,14 @@ func (l *Local) newCmdID() string {
 }
 
 func (l *Local) dispatch(session *Session, cmd Command) CmdResult {
+	// 归档的会话**不能运行**：发消息、压缩、改名等一律拒绝，必须显式恢复。
+	//
+	// 在这里统一拦而不是散在各个方法里：入口有十几个，逐个加判断
+	// 迟早会漏一个（漏了就是"归档了还能跑"，比不做更糟）。
+	// 只读操作（翻历史、加载更早归档）不受影响。
+	if reason := session.blockedByArchive(cmd.Kind); reason != "" {
+		return CmdResult{Error: reason}
+	}
 	switch cmd.Kind {
 	case "send":
 		var payload SendPayload
@@ -346,6 +363,10 @@ func (l *Local) dispatch(session *Session, cmd Command) CmdResult {
 			newSession.rename(payload.Title)
 		}
 		return CmdResult{OK: true, Data: NewSessionData{SessionID: newSession.ID}}
+	case "archiveSession":
+		return l.setArchived(cmd.SessionID, true)
+	case "restoreSession":
+		return l.setArchived(cmd.SessionID, false)
 	case "deleteSession":
 		return l.deleteSession(cmd.SessionID)
 	case "setVision":
@@ -449,6 +470,28 @@ func (l *Local) StartupError() string { return l.startupErr }
 
 // Notices 返回某个会话的显示型提示（展示端连上时随快照带过去）。
 func (l *Local) Notices(sessionID string) []Notice { return l.notices[sessionID] }
+
+// setArchived 归档/恢复一个会话。
+//
+// 归档 = 封存：历史仍可查看，但不能发消息、压缩、改名，必须恢复才能继续。
+// **不移动、不删除任何文件**，只是项目档案里的一个状态位。
+func (l *Local) setArchived(id string, archived bool) CmdResult {
+	session := l.Session(id)
+	if session == nil {
+		return CmdResult{Error: "会话不存在"}
+	}
+	// 正在跑的时候不让归档：归档后运行中的回合会失去归属，
+	// 而它还会继续写日志（状态自相矛盾）。让用户先停。
+	if archived && session.Busy() != driver.BusyIdle {
+		return CmdResult{Error: l.cfg.Tr("session.archiveBusy")}
+	}
+	if err := session.SetArchived(archived); err != nil {
+		return CmdResult{Error: err.Error()}
+	}
+	// 让侧栏重画："sessions" 这类变更会让界面重新同步列表与项目信息
+	l.emit(Change{SessionID: session.ID, Kind: "sessions"})
+	return CmdResult{OK: true}
+}
 
 func (l *Local) deleteSession(id string) CmdResult {
 	for index, session := range l.sessions {
@@ -587,6 +630,14 @@ func (l *Local) openSession(contextID, title string) (*Session, error) {
 	}
 	// driver 的 Selection 来自重放（可能不是默认模型）：窗口/输出/vision/档位按它同步
 	session.syncModelOptions(drv.Selection())
+
+	// 归档状态来自项目档案：**不读它的话，重启后归档的会话又能跑了**
+	// （档案是唯一权威，日志里没有这个状态）。
+	if l.cfg.Catalog != nil {
+		if archived, ok := l.cfg.Catalog.SessionArchived(contextID); ok {
+			session.archived = archived
+		}
+	}
 
 	// 修复事件必须在接受任何新事件之前写进日志，否则下次加载又会重新计算
 	for _, repair := range replayed.Repairs {
