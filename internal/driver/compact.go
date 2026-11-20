@@ -55,6 +55,14 @@ type CompactSnapshotData struct {
 	Title           string              `json:"title,omitempty"`
 	CompactedAt     string              `json:"compacted_at"`
 	KeptFromSeq     uint64              `json:"kept_from_seq"`
+	// Workspace 是会话的工作区（侧栏按它分组）。
+	//
+	// **必须进快照**：压缩会把 session.created 归档掉，而工作区只记在那条
+	// 事件里。不存的话压缩后重放读不到，会话会掉回"启动目录"那个分组
+	// （真实踩过：wow-viewer 的会话压缩后跑到了 simple-agent 下面）。
+	//
+	// 旧快照没有该字段 → 空 → 仍按旧行为回退（不制造假数据）。
+	Workspace string `json:"workspace,omitempty"`
 	// Turns/Steps 是压缩**之前**的累计计数基线（状态条用）。
 	//
 	// 为什么只能存在这里：轮数/步数由会话内容推导（见 Counts），而压缩丢弃了
@@ -494,6 +502,8 @@ func (d *Driver) ApplyCompact(summary string) ([]Effect, error) {
 		Steps: d.steps,
 		// 用量同理：命中率是累计口径，压缩后不能归零。
 		TotalUsage: toUsageData(d.totalUsage),
+		// 工作区要进快照：session.created 会被归档掉，而它是唯一记工作区的地方。
+		Workspace: d.opts.Workspace,
 		// 任务清单也要进快照：它是会话状态，压缩丢历史不能把它一起丢掉
 		// （否则压一次清单就消失，而界面上一秒还看着它）。
 		Todos: d.conv.Todos(),

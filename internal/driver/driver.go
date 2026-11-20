@@ -1985,6 +1985,9 @@ func hasStatus413(reason string) bool {
 // IsContextOverflowForTest 暴露溢出判定（测试用）。
 func IsContextOverflowForTest(reason string) bool { return isContextOverflow(reason) }
 
+// WorkspaceForTest 返回 driver 当前记录的工作区（测试用）。
+func (d *Driver) WorkspaceForTest() string { return d.opts.Workspace }
+
 // isTruncated 报告停止原因是否是「达到长度上限」。
 func isTruncated(reason string) bool {
 	switch strings.ToLower(reason) {

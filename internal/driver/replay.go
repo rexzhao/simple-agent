@@ -251,6 +251,11 @@ func (st *replayState) apply(event store.Event) {
 		if data.ContextID != "" {
 			out.ContextID = data.ContextID
 		}
+		// 工作区也进快照：session.created 被归档后，它是唯一的来源。
+		// 旧快照没有该字段 → 保持空 → 调用方按旧行为回退。
+		if data.Workspace != "" {
+			out.Workspace = data.Workspace
+		}
 
 	case store.TypeMessageInput:
 		var data MessageEventData
@@ -663,6 +668,11 @@ func Restore(replayed Replayed, opts Options) *Driver {
 	d.opts.ReasoningEffort = replayed.ReasoningEffort
 	if replayed.HasSelection {
 		d.opts.Selection = replayed.Selection
+	}
+	// 工作区从日志/快照恢复（提交时要用它对下次压缩写快照）。
+	// 恢复不出来就保持调用方给的值（host 会回退到配置）。
+	if replayed.Workspace != "" {
+		d.opts.Workspace = replayed.Workspace
 	}
 	if len(replayed.PendingAsks) > 0 {
 		messageID := replayed.PendingAsks[0].MessageID
