@@ -591,7 +591,7 @@ private fun SearchBody(search: SearchView) {
                 }
                 file.hits.forEach { hit ->
                     Text(
-                        text = "%4d  %s".format(hit.line.trimText(100)),
+                        text = "%4d  %s".format(hit.line, hit.text.trim().trimText(100)),
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.sp,
                         color = ViewerColors.muted,
