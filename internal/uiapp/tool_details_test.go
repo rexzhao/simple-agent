@@ -160,6 +160,168 @@ func TestEditRowShowsPlusMinusInline(t *testing.T) {
 	}
 }
 
+// 展开区不该出现"实现细节"参数：
+//   - bash 不要 "command:" 前缀（用户明确要求）
+//   - edit 不要 file_path/old_string/new_string（内容和 diff 已经画了）
+//   - write 不要 content（整篇内容已经显示）
+func TestExpandedArgsHideNoise(t *testing.T) {
+	app, _, p := newApp(t)
+	conv := app.Current().Conversation()
+
+	diff := tools.BuildLineDiff("app.go", "a\nb\n", "a\nc\n", tools.LineDiffOptions{})
+	if _, err := conv.AddMessage(message.Message{
+		MessageID: "a1", Role: message.RoleAgent,
+		Parts: []message.Part{
+			// bash：带 workdir / timeoutMs（这两个**要**显示，但在行内）
+			{Content: message.DataPart{Data: map[string]any{
+				"id": "c1", "name": "bash",
+				"args": map[string]any{
+					"command":   "go build ./...",
+					"workdir":   "internal",
+					"timeoutMs": 120000,
+				},
+			}}, MediaType: render.MediaToolUse},
+			{Content: message.DataPart{Data: map[string]any{
+				"id": "c1", "name": "bash", "is_error": false,
+				"output": "exit_code=0 elapsed=100ms cwd=.\ndone",
+				"exec":   &tools.ExecInfo{ExitCode: 0, ElapsedMS: 100},
+			}}, MediaType: render.MediaToolResult},
+			// edit：old_string/new_string 不该出现在展开区
+			{Content: message.DataPart{Data: map[string]any{
+				"id": "c2", "name": "edit",
+				"args": map[string]any{
+					"file_path": "app.go", "old_string": "旧", "new_string": "新",
+				},
+			}}, MediaType: render.MediaToolUse},
+			{Content: message.DataPart{Data: map[string]any{
+				"id": "c2", "name": "edit", "is_error": false,
+				"output": "已编辑 app.go（+1 -1）", "diff": diff,
+			}}, MediaType: render.MediaToolResult},
+		},
+	}, conversation.StatusComplete); err != nil {
+		t.Fatal(err)
+	}
+
+	tester := ui.NewTester(app.View, 1000, 700)
+	pump(tester, p)
+	clickProcessGroup(t, tester)
+	pump(tester, p)
+	// 展开两个
+	for _, want := range []string{"go build", "app.go"} {
+		for _, text := range tester.Texts() {
+			if strings.Contains(text, want) {
+				_ = tester.Click(text)
+				break
+			}
+		}
+		pump(tester, p)
+	}
+
+	all := strings.Join(tester.Texts(), "\n")
+	if strings.Contains(all, "command:") {
+		t.Fatalf("bash 不该有 command: 前缀：%v", tester.Texts())
+	}
+	if strings.Contains(all, "old_string") || strings.Contains(all, "file_path") {
+		t.Fatalf("edit 不该罗列 old_string/file_path：%v", tester.Texts())
+	}
+	// workdir / timeout 显示在行内（折叠行里），不展开也在
+	if !strings.Contains(all, "internal") {
+		t.Fatalf("应显示 workdir：%v", tester.Texts())
+	}
+	if !strings.Contains(all, "2m00s") && !strings.Contains(all, "120s") {
+		t.Fatalf("应显示 timeout：%v", tester.Texts())
+	}
+}
+
+// edit 的 +N 要紧跟在文件名后面，而不是被推到行尾。
+func TestEditPlusMinusFollowsFileName(t *testing.T) {
+	app, _, p := newApp(t)
+	conv := app.Current().Conversation()
+
+	diff := tools.BuildLineDiff("app.go", "a\nb\n", "a\nc\n", tools.LineDiffOptions{})
+	if _, err := conv.AddMessage(message.Message{
+		MessageID: "a1", Role: message.RoleAgent,
+		Parts: []message.Part{
+			{Content: message.DataPart{Data: map[string]any{
+				"id": "c1", "name": "edit",
+				"args": map[string]any{"file_path": "app.go"},
+			}}, MediaType: render.MediaToolUse},
+			{Content: message.DataPart{Data: map[string]any{
+				"id": "c1", "name": "edit", "is_error": false,
+				"output": "已编辑 app.go（+1 -1）", "diff": diff,
+			}}, MediaType: render.MediaToolResult},
+		},
+	}, conversation.StatusComplete); err != nil {
+		t.Fatal(err)
+	}
+
+	tester := ui.NewTester(app.View, 1000, 700)
+	pump(tester, p)
+	clickProcessGroup(t, tester)
+	pump(tester, p)
+
+	// 界面把它们渲染成相邻的独立元素（"app.go" / "+1" / "-1"），
+	// 所以按"整行拼接后紧邻"来断言。
+	joined := strings.Join(tester.Texts(), " ")
+	if !strings.Contains(joined, "app.go +1 -1") {
+		t.Fatalf("+N -N 应紧跟文件名（期望 \"app.go +1 -1\"）：%v", tester.Texts())
+	}
+}
+// bash 的 description 要显示在行内，和命令摘要**并存**。
+//
+// 用户的要求："如果有 description 的话，description 紧跟着 bash 显示，
+// 方便了解干什么的，bash 行的命令内容如果太长可以截断"。
+func TestBashRowShowsDescriptionAndClippedCommand(t *testing.T) {
+	app, _, p := newApp(t)
+	conv := app.Current().Conversation()
+
+	longCommand := "go test ./internal/uiapp/ -run 'TestProcessGroup|TestBashRow' -count=1 -v 2>&1 | grep -E 'RUN|PASS|FAIL'"
+	if _, err := conv.AddMessage(message.Message{
+		MessageID: "a1", Role: message.RoleAgent,
+		Parts: []message.Part{
+			{Content: message.DataPart{Data: map[string]any{
+				"id": "c1", "name": "bash",
+				"args": map[string]any{
+					"command":     longCommand,
+					"description": "跑过程组相关测试",
+				},
+			}}, MediaType: render.MediaToolUse},
+		},
+	}, conversation.StatusComplete); err != nil {
+		t.Fatal(err)
+	}
+
+	tester := ui.NewTester(app.View, 900, 620)
+	pump(tester, p)
+
+	all := strings.Join(tester.Texts(), "\n")
+	// 描述要出现（它在 args 里，容易读成 data 顶层而静默丢失）
+	if !strings.Contains(all, "跑过程组相关测试") {
+		t.Fatalf("应显示 description：%v", tester.Texts())
+	}
+	// 命令摘要也在，但**被截断**（不是完整长命令）
+	if !strings.Contains(all, "go test ./internal/uiapp/") {
+		t.Fatalf("应显示命令摘要：%v", tester.Texts())
+	}
+	if strings.Contains(all, longCommand) {
+		t.Fatalf("折叠行里的命令应被截断：%v", tester.Texts())
+	}
+	// 展开后能看到完整命令：点命令摘要那一段（描述是另一个元素）
+	tester.Frame()
+	for _, text := range tester.Texts() {
+		if strings.HasPrefix(text, "go test ./internal/uiapp/") {
+			if err := tester.Click(text); err != nil {
+				t.Fatalf("点不到命令摘要 %q：%v", text, err)
+			}
+			break
+		}
+	}
+	pump(tester, p)
+	if !strings.Contains(strings.Join(tester.Texts(), "\n"), longCommand) {
+		t.Fatalf("展开后应看到完整命令：%v", tester.Texts())
+	}
+}
+
 // write 展开后能看到写入的内容。
 func TestWriteRowShowsContent(t *testing.T) {
 	app, _, p := newApp(t)

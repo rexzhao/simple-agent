@@ -1905,25 +1905,31 @@ func execOfPart(data map[string]any) *tools.ExecInfo {
 
 // toolArgsDetail 把工具参数摊成一段可读的全文（展开时显示）。
 //
-// 折叠态那行是截断到 72 字符的摘要（"sed -n '95,110p' internal/..."），
-// 展开后要看完整的 —— 长命令被截断时根本认不出跑的是什么。
-func toolArgsDetail(data map[string]any) string {
+// 折叠态那行是截断到 72 字符的摘要，展开后要看完整的 ——
+// 长命令被截断时根本认不出跑的是什么。
+func toolArgsDetail(name string, data map[string]any) string {
 	args, ok := data["args"].(map[string]any)
 	if !ok || len(args) == 0 {
 		return ""
 	}
-	// 单参数工具（bash 的 command、read 的 file_path）直接给值，
-	// 不加 "key: " 前缀 —— 一整行都是命令，加前缀反而挤
-	if len(args) == 1 {
-		for _, value := range args {
-			if text, ok := value.(string); ok {
-				return text
-			}
+	// 有些参数是**给工具用的实现细节**，不该出现在"要执行什么"这一段里：
+	//   - bash 的 timeoutMs/workdir：元信息里已经有 cwd 了
+	//   - edit/write 的 old_string/new_string/content：那就是改动本身，
+	//     下面已经用 diff / 全文画出来了，再罗列一遍就是重复
+	//     （用户看到的就是"diff 之前多了一堆奇怪的东西"）
+	primary := primaryArgKeys(name)
+	if value, ok := args[primary]; ok {
+		if text, isString := value.(string); isString {
+			return text
 		}
 	}
-	// 多参数：按键名排序，一行一个
+	// 其余工具：按键名排序，一行一个（跳过上面那类噪音参数）
+	skipped := noiseArgKeys(name)
 	keys := make([]string, 0, len(args))
 	for key := range args {
+		if skipped[key] {
+			continue
+		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
@@ -1932,6 +1938,129 @@ func toolArgsDetail(data map[string]any) string {
 		lines = append(lines, fmt.Sprintf("%s: %s", key, formatArgValue(args[key])))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// terminalBg / terminalFg 是"终端块"的底色与文字色。
+//
+// 深灰底 + 浅灰字，但**字不要纯白**：纯白（#FFF）在深底上对比过强，
+// 长时间盯着很刺眼。用 #C9C9C9 —— 足够清楚，又不会"发光"。
+// 底色也不用纯黑：#1C1C1C 比 #000 柔和，和界面的浅色底衔接更自然。
+const (
+	terminalBg = "#1C1C1C"
+	terminalFg = "#C9C9C9"
+)
+
+// renderTerminalBlock 用终端风格渲染一段等宽文本（命令或输出）。
+//
+// 为什么命令和输出都用它：它们是"同一场执行"的两段（跑了什么 → 得到什么），
+// 配色一致才看得出是一对。用浅色底的话，长输出会让整屏发白。
+func (a *App) renderTerminalBlock(c *ui.Context, text string, theme *ui.Theme) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	ui.Column(c).FillWidth().Padding(8, 10).Radius(6).Gap(3).
+		Background(ui.Hex(terminalBg)).Children(func() {
+			for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+				ui.Text(c, line).Font(dshCodeFontStack).FontSize(12).
+					TextColor(ui.Hex(terminalFg)).MaxLines(1)
+			}
+		})
+}
+
+// argString 从工具调用的 data 里读一个**参数**的字符串值。
+//
+// 参数都在 data["args"] 里（不是顶层）：容易写成 stringOf(data, key)
+// 而静默拿到空串 —— description 就这么丢过一次。
+func argString(data map[string]any, key string) string {
+	args, ok := data["args"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	value, _ := args[key].(string)
+	return value
+}
+
+// execArgsSummary 生成 bash/pwsh 调用行尾的补充信息（workdir / 超时）。
+//
+// 只显示**用户显式设过**的项：默认 workdir 就是会话目录、默认超时不用提，
+// 全都显示反而让这一行变长。
+func execArgsSummary(data map[string]any) string {
+	args, ok := data["args"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	if workdir, ok := args["workdir"].(string); ok && workdir != "" {
+		parts = append(parts, workdir)
+	}
+	// timeoutMs 可能是 float64（JSON 解出来）也可能是 int
+	if value, ok := args["timeoutMs"]; ok {
+		if ms := intOf(value); ms > 0 {
+			parts = append(parts, formatElapsed(int64(ms)))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+// intOf 尽力把 JSON 数值转成 int（float64/int/json.Number/字符串都认）。
+func intOf(value any) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case json.Number:
+		if n, err := typed.Int64(); err == nil {
+			return int(n)
+		}
+	}
+	return 0
+}
+
+// primaryArgKeys 是每种工具"要执行什么"的那个主参数。
+//
+// 有它就直接显示它的值，不加 "key: " 前缀 —— 一整行都是命令，
+// 加前缀反而挤（用户明确要求 bash/pwsh 不要 command: 前缀）。
+func primaryArgKeys(name string) string {
+	switch name {
+	case "bash", "pwsh":
+		return "command"
+	case "read", "read_image":
+		return "file_path"
+	case "edit", "write":
+		return "file_path"
+	case "grep":
+		return "pattern"
+	case "glob":
+		return "pattern"
+	case "web_fetch":
+		return "url"
+	case "web_search":
+		return "query"
+	default:
+		return ""
+	}
+}
+
+// noiseArgKeys 是**不展示**的参数（它们要么已在别处显示，要么就是改动本身）。
+func noiseArgKeys(name string) map[string]bool {
+	switch name {
+	case "bash", "pwsh":
+		// 只跳过 command：它作为主参数显示在正文里（不带前缀）。
+		// workdir / timeoutMs **要保留显示** —— 用户需要知道这条命令
+		// 在哪个目录、限时多久跑的。
+		return map[string]bool{"command": true}
+	case "edit":
+		// old/new 就是改动，diff 里已经画了
+		return map[string]bool{"file_path": true, "old_string": true, "new_string": true}
+	case "write":
+		// content 就是写入内容，下面整篇显示
+		return map[string]bool{"file_path": true, "content": true}
+	default:
+		return nil
+	}
 }
 
 // formatArgValue 把参数值转成紧凑的可读文本。
@@ -2188,7 +2317,7 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 		key := expansionKey(messageID, partIndex)
 		expanded := a.expandedParts[key]
 		// 参数全文：展开时看完整命令/路径（上面那行是截断摘要）
-		argsText := toolArgsDetail(data)
+		argsText := toolArgsDetail(name, data)
 
 		arrow := "▸"
 		if expanded {
@@ -2211,18 +2340,37 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 			ui.Text(c, name).FontSize(11).
 				Padding(1, 5).Radius(4).
 				Background(theme.SurfaceHover).TextColor(theme.Text)
-			if summary := toolArgSummary(data); summary != "" {
-				ui.Text(c, truncateRunes(summary, 72)).FontSize(12).
-					TextColor(theme.TextMuted).Grow(1).MaxLines(1)
-			} else {
-				ui.Spacer(c)
+			// description 优先显示：模型写的描述通常比命令好懂。
+			//
+			// **description 在 args 里面**（bash 的一个参数），不在 data 顶层。
+			// 描述和命令摘要**都显示**：描述说明意图，命令说明具体动作，
+			// 少哪个都不完整。但有描述时命令摘要让位 —— 截短到 36 字符，
+			// 把宽度留给描述（完整命令展开可见）。
+			desc := argString(data, "description")
+			if desc != "" {
+				// 描述用正文色（重），命令摘要用弱化色（轻）：两者语义不同
+				// ——"要做什么"是意图，"跑什么命令"是细节，同色会读成一整句。
+				ui.Text(c, truncateRunes(desc, 48)).FontSize(12).
+					TextColor(theme.Text).MaxLines(1)
 			}
-			// edit/write 的增删数量：折叠态就能看出改了多少
-			// （"+3 -1" 就在行尾，不用点开）。只有真有结果时才显示。
+			if summary := toolArgSummary(data); summary != "" {
+				// 摘要（文件名/命令）不 Grow：让后面的 +/- 紧跟在它后面，
+				// 而不是被推到行尾（用户要求"edit 的 +/- 紧跟文件名后面"）。
+				limit := 56
+				if desc != "" {
+					limit = 36
+				}
+				ui.Text(c, truncateRunes(summary, limit)).FontSize(12).
+					TextColor(theme.TextMuted).MaxLines(1)
+			}
+			// edit/write 的增删数量：**紧跟在文件名后面**，折叠态就能看出改了多少。
+			//
+			// 为什么不放行尾：行尾已经被状态（完成/失败）占了，
+			// 而 "+3 -2" 是在说"这个文件"，贴着文件名才有归属感。
 			if hasResult && !isError {
 				if diff := diffOfPart(resultData); diff != nil {
 					if diff.Content != "" || diff.Verb != "" {
-						// write：显示字节/行数更有意义
+						// write：显示行数更有意义
 						ui.Text(c, diffSummaryForWrite(diff)).FontSize(11).
 							TextColor(theme.TextMuted)
 					} else if diff.Added > 0 || diff.Removed > 0 {
@@ -2238,6 +2386,16 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 						})
 					}
 				}
+			}
+			ui.Spacer(c)
+			// bash/pwsh 的 workdir 与 timeout：**显示在这一行**。
+			//
+			// 它们是"这条命令怎么跑的"的一部分，和命令本身一起看才顺；
+			// 放进展开区会离得太远（用户明确要求放这一行）。
+			// 只在设了的时候显示 —— 默认值时是噪音。
+			if meta := execArgsSummary(data); meta != "" {
+				ui.Text(c, meta).FontSize(11).TextColor(theme.TextMuted).
+					MaxLines(1)
 			}
 			// 状态：失败用红色，运行中用强调色，完成用弱化色
 			if status != "" {
@@ -2264,14 +2422,13 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 		// 顺序有意如此：命令 > 元信息 > 输出。用户点开一个工具调用，
 		// 最常想知道的是"它到底跑了什么"；结果反而次之。
 		if expanded {
-			ui.Column(c).FillWidth().Padding(2, 20).Gap(6).Children(func() {
+			// Gap 8：命令块、元信息、输出块之间要留出**明显**的间隔。
+			// 两块黑底贴太近会连成一片，看不出"命令"和"输出"是两段
+			// （截图里它们几乎粘在一起）。
+			ui.Column(c).FillWidth().Padding(2, 20).Gap(8).Children(func() {
 				// 1) 参数全文（bash 的命令、read 的路径…）
 				if argsText != "" {
-					ui.Column(c).FillWidth().Padding(6, 8).Radius(6).
-						Background(theme.Surface).Children(func() {
-							ui.Text(c, argsText).Font(dshCodeFontStack).FontSize(12).
-								TextColor(theme.Text)
-						})
+					a.renderTerminalBlock(c, argsText, theme)
 				}
 				if !hasResult {
 					return
@@ -2295,8 +2452,9 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 						output = stripExecHeader(output)
 					}
 					if strings.TrimSpace(output) != "" {
-						a.toolOutput(c, map[string]any{"output": output},
-							isError, true, color)
+						// 命令输出也用终端风格（黑底）：它和上面的命令是
+						// "同一场执行"的两段，配色一致才看得出是一对。
+						a.renderTerminalBlock(c, strings.TrimRight(output, "\n"), theme)
 					}
 				}
 			})
