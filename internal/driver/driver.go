@@ -223,6 +223,20 @@ type Driver struct {
 	totalUsage Usage
 	// autoCompactUsed 表示本轮用户输入已经自动压缩过一次，不再重试。
 	autoCompactUsed bool
+	// overflowRetryArmed 表示"压缩是因为超限触发的，压缩完要自动重试一次"。
+	//
+	// 对齐 pi 的 _overflowRecoveryAttempted：撞到上下文/体积上限后，
+	// 只压缩不重试的话用户还得自己再点一次发送 —— 而这时他刚刚才发过，
+	// 很容易以为是程序卡住了。压缩完直接替他重发一次，失败再多说。
+	//
+	// 用单独的字段而不是复用 autoCompactUsed：后者是"这一轮已经压过了"的
+	// 防重入标志，语义不同；两层判断各有各的用处。
+	overflowRetryArmed bool
+	// overflowRetryDone 表示已经自动重试过一次，防止无限循环。
+	//
+	// 压缩后仍超限（比如单条工具结果本身就超过体积上限）时，
+	// 不能一直 "压缩→重发→还超限→再压缩"。
+	overflowRetryDone bool
 	// warnedDefaultWindow 表示已经提示过「窗口未知，按默认值处理」。
 	warnedDefaultWindow bool
 
@@ -1253,7 +1267,15 @@ func (d *Driver) finishStream(messageID, _ string) []Effect {
 		d.reset()
 		// 正常结束：记住真实用量，并检查是否该自动压缩（driver 决策，UI 只执行）
 		d.recordUsage(usage)
-		compact := d.autoCompactEffects(false)
+		// **静默溢出**：网关没报错就接受了超限请求，但真实用量已经吃满窗口。
+		//
+		// 对齐 pi 的 Case 2：z.ai 这类网关超限不报错，而是默默接受，
+		// 等到下一轮才突然失败（甚至开始静默截断上下文）。
+		// 判据用**服务端回的真实 usage**（不是本地估算）：
+		// input + cacheRead 就是这次实际喂进去的量。
+		silentOverflow := d.effectiveWindow() > 0 &&
+			usage.InputTokens+usage.CacheReadTokens > d.effectiveWindow()
+		compact := d.autoCompactEffects(silentOverflow)
 		if len(compact) > 0 {
 			// 回合结束的边界也是插话的投递点，但**自动压缩优先**：
 			// 排队的插话留在队列里，压缩完成后由 ApplyCompact 再投递。
@@ -1405,9 +1427,14 @@ func (d *Driver) failStream(messageID, reason string) []Effect {
 		overflow := isContextOverflow(reason)
 		d.reset()
 		if overflow {
-			// 用户的决定：回合中途因超窗失败 → 回到 Idle 后自动压缩一次，并提示重试。
-			// 以**服务端的判断为准**强制压缩（本地估算偏低正是超窗的原因）。
+			// 回合中途因超窗/超体积失败 → 自动压缩一次，压缩完**自动重试**。
+			// 以**服务端的判断为准**强制压缩（本地估算偏低正是超限的原因）。
 			if compactEffects := d.autoCompactEffects(true); len(compactEffects) > 0 {
+				// 压缩完成后替我重发一次：用户刚刚才发过，让他再点一次
+				// 很容易被当成"卡住了"。
+				if !d.overflowRetryDone {
+					d.overflowRetryArmed = true
+				}
 				text := d.tr("notice.overflowCompact")
 				_, _ = d.conv.AddNotice(conversation.NoticeInfo, text)
 				effects = append(effects, recordNotice(conversation.NoticeInfo, text))
@@ -1847,34 +1874,108 @@ var nowUTC = func() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // isContextOverflow 报告失败原因是否是「上下文超出窗口 / 请求体太大」。
 //
-// 两种说法本质相同：都是"发给模型的内容太多了。三家常见措辞：
+// 两种说法本质相同：都是"发给模型的内容太多了。各家措辞：
 //   - OpenAI：context_length_exceeded
-//   - Anthropic："prompt is too long"
+//   - Anthropic："prompt is too long" / 413 request_too_large
 //   - 兼容实现：400 + "maximum context length"
-//   - 部分网关（含我们实测的 paperhub）：**413 + "Entry too big" /
-//     code=EntryTooBig**。它限制的是**请求体字节数**而不是 token 数，
-//     但处理方式完全一样 —— 折叠历史让它变小。实测 8MB 能过、
-//     32MB 被拒，而长会话的工具输出累积几十 MB 很常见。
+//   - 部分网关（含实测的 paperhub）：413 + "Entry too big" / EntryTooBig
+//   - GitHub Copilot：413 "failed to parse request"（请求体字节超限）
 //
-// 漏掉 413 的后果（真实踩过）：上下文涨过上限后每次请求都失败，
-// 而失败不触发压缩，用户就卡在一个永远发不出去的会话里，
-// 界面上只有一行 "HTTP 413"，看不出该做什么。
+// **HTTP 413 一律算体积溢出**，不看 body 文本 —— 对齐 pi 的
+// packages/ai/src/utils/overflow.ts：不同网关对同一个限制有十几种写法，
+// 逐个枚举必然漏；而 413 语义明确（Payload Too Large），没有歧义。
+//
+// 先查"非溢出"再查"溢出"：限流信息里常带 "too many tokens" 之类的字样
+// （如实测到的 Bedrock："ThrottlingException: Too many tokens, please wait"），
+// 不排除的话会白白压缩一次。
 func isContextOverflow(reason string) bool {
 	lower := strings.ToLower(reason)
-	for _, marker := range []string{
-		"context_length_exceeded",
-		"maximum context length",
-		"prompt is too long",
-		"context length",
-		"too many tokens",
-		// 请求体过大（按字节，不是 token）
-		"entry too big",
-		"entrytoobig",
-		"request entity too large",
-		"request too large",
-		"payload too large",
-	} {
+	// 先排除：这些是限流/服务端错误，跟"内容太多"无关
+	for _, marker := range nonOverflowMarkers {
 		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	for _, marker := range overflowMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	// HTTP 413 = Payload Too Large，不看 body
+	if hasStatus413(reason) {
+		return true
+	}
+	return false
+}
+
+// overflowMarkers 是"内容太多"的各种说法（小写匹配）。
+var overflowMarkers = []string{
+	// token 超窗口
+	"context_length_exceeded",
+	"context length exceeded",
+	"maximum context length",
+	"prompt is too long",
+	"prompt too long",
+	"context window exceeded",
+	"exceeds the context window",
+	"exceeded model token limit",
+	"too many tokens",
+	"token limit exceeded",
+	"reduce the length of the messages",
+	"input is too long",
+	"exceeds the available context size",
+	"greater than the context length",
+	// 请求体过大（按字节，不是 token）
+	"entry too big",
+	"entrytoobig",
+	"request entity too large",
+	"request_too_large",
+	"payload too large",
+	"request too large",
+}
+
+// nonOverflowMarkers 是**不能**当成溢出的情况（限流、服务不可用）。
+//
+// 必须放在溢出判定之前：这些报错里常夹带 "too many tokens" 之类的措辞，
+// 而它们要的是"等一会儿重试"，压缩历史毫无帮助、还会白白丢掉上下文。
+var nonOverflowMarkers = []string{
+	"rate limit",
+	"ratelimit",
+	"too many requests",
+	"throttling",
+	"throttlingexception",
+	"slow down",
+	"quota exceeded",
+	"service unavailable",
+}
+
+// hasStatus413 报告错误里是否以 HTTP 413 的形式出现。
+//
+// 只看"状态码位置"，不能简单 contains("413")：
+// request id、token 数里都可能出现 413，误判会白白压缩一次。
+// 接受的形态（对齐 pi 的 /^(?:[\w -]+ API error \(413\):|413(?:\s|:|$))/）：
+//
+//	http (HTTP 413): ...      ← 我们自己的 FailStreamWith 前缀
+//	some-provider API error (413): ...
+//	413 {"error":...}
+//	... 413（结尾）
+func hasStatus413(reason string) bool {
+	lower := strings.ToLower(reason)
+	// "(413)" 覆盖 "API error (413)"；
+	// "(http 413)" 覆盖我们自己的 "http (HTTP 413): ..." 前缀
+	// —— 注意这里 413 前面是空格不是括号，不能用同一个子串匹配。
+	if strings.Contains(lower, "(413)") || strings.Contains(lower, "http 413") {
+		return true
+	}
+	trimmed := strings.TrimSpace(lower)
+	if strings.HasPrefix(trimmed, "413") {
+		// 要求 413 后面不是数字（4130 不是 413）
+		rest := trimmed[3:]
+		if rest == "" {
+			return true
+		}
+		switch rest[0] {
+		case ' ', ':', '(', '{', '-':
 			return true
 		}
 	}

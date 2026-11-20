@@ -506,6 +506,26 @@ func (d *Driver) ApplyCompact(summary string) ([]Effect, error) {
 	// 快照已经先写进 effects，落盘顺序因此是「快照 → 插话消息 → 新流」。
 	if delivery, delivered := d.deliverQueued(); delivered {
 		effects = append(effects, delivery...)
+		return append(effects, Changed{}), nil
+	}
+	// 这次压缩是"超限触发"的：压缩完**自动替用户重发一次**。
+	//
+	// 对齐 pi 的 overflow recovery：撞到上下文/体积上限后只压缩不重试的话，
+	// 用户还得自己再点一次发送 —— 而他刚刚才发过，很容易以为程序卡住了。
+	//
+	// 只重试一次（overflowRetryDone）：压缩后仍超限说明问题不在历史长度
+	// （比如单条工具结果本身就超过网关体积上限），再压也没用，得让用户看见。
+	if d.overflowRetryArmed && !d.overflowRetryDone {
+		d.overflowRetryArmed = false
+		d.overflowRetryDone = true
+		d.depth = 0
+		// 压缩额度随重试重置：否则 autoCompactUsed 还是 true，
+		// 重试若再撞上限就压不动了。
+		d.autoCompactUsed = false
+		if retry, err := d.startTurn(d.nextTurnIndex()); err == nil {
+			effects = append(effects, retry...)
+		}
+		return append(effects, Changed{}), nil
 	}
 	return append(effects, Changed{}), nil
 }
