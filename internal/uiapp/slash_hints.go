@@ -6,6 +6,28 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
+// slashHintShown 报告斜杠候选这一帧是否会画出来。
+//
+// 与 slashHintsPanel 的判断保持一致（否则计数和实际渲染对不上，
+// 焦点会在不该重设的时候被重设）。抽出来的原因：面板插在输入框**前面**，
+// 它出现/消失会丢焦点，而重新聚焦要在渲染输入框之前决定。
+func (a *App) slashHintShown() bool {
+	prefix, ok := a.slashPrefix()
+	if !ok {
+		return false
+	}
+	matches := matchCommands(prefix)
+	if len(matches) == 0 {
+		// 没有匹配也会画一条提示
+		return true
+	}
+	// 只有一个匹配且命令名已打全：不画（见 slashHintsPanel）
+	if len(matches) == 1 && strings.EqualFold(matches[0].Name, prefix) {
+		return false
+	}
+	return true
+}
+
 // slashHintsPanel 在输入框内容以 / 开头时，浮出一张候选命令列表。
 //
 // 交互：点一条即把命令补全进输入框（并带上空格，方便接着打参数）。

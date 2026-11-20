@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"simple-agent/internal/driver"
 	"simple-agent/internal/host"
 	"simple-agent/internal/relay"
 	"simple-agent/internal/tlsx"
@@ -68,6 +69,11 @@ func init() {
 			Name: "relay",
 			Help: "查看 relay 连接状态（含上次保存的地址）",
 			Run:  runRelayStatus,
+		},
+		{
+			Name: "compact",
+			Help: "压缩当前会话的上下文（把较早的历史折叠成摘要）",
+			Run:  runCompact,
 		},
 		{
 			Name: "help",
@@ -190,6 +196,38 @@ func runDisconnect(a *App, args []string) string {
 		return "当前没有连接 relay"
 	}
 	return "已断开 relay 注册"
+}
+
+// runCompact 主动压缩当前会话（不用等自动压缩阈值）。
+//
+// 为什么要手动入口：自动压缩只在**超过窗口 80%** 后才会触发，而用户
+// 常常在更早的时候就知道"这段历史已经没用了"——比如刚聊完一个话题要换。
+// 让他自己按一下比等着撞上限舒服得多，也省 token。
+//
+// 每种失败都要说清原因：只有一句"压缩失败"等于没说，用户还得猜。
+func runCompact(a *App, _ []string) string {
+	session := a.Current()
+	if session == nil {
+		return "没有打开的会话"
+	}
+	switch session.Busy() {
+	case driver.BusyIdle:
+		// 继续
+	case driver.BusyCompacting:
+		return "正在压缩中，请稍等"
+	default:
+		return "会话正在运行，等这一轮结束再压缩"
+	}
+	// 没有可压的内容时提前说清楚：BeginCompact 会因为"只有一轮问答"
+	// 之类的理由直接拒绝，让用户等到"压缩没反应"不如现在告诉他。
+	if session.TokensInUse() == 0 && len(session.Todos()) == 0 {
+		return "当前会话还没有可压缩的内容"
+	}
+	_, err := a.host.Submit(host.Command{SessionID: session.ID, Kind: "compact"})
+	if err != nil {
+		return fmt.Sprintf("压缩请求没发出去：%v", err)
+	}
+	return "正在压缩上下文…"
 }
 
 func runRelayStatus(a *App, _ []string) string {

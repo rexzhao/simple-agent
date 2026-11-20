@@ -29,6 +29,14 @@ const (
 	todoDotSize = 6
 )
 
+// todoPanelShown 报告任务清单这一帧是否会画出来（不画则不占位）。
+//
+// 抽出来是给"输入框前的兄弟元素计数"用的：数量变化会丢焦点，
+// 必须能在**渲染之前**判断，而不是靠 todoPanel 内部提前 return。
+func (a *App) todoPanelShown(session *Session) bool {
+	return session != nil && len(session.Todos()) > 0
+}
+
 // todoPanel 渲染任务清单；没有清单时什么都不画（dsh 的 `todos.length === 0
 // return null`）。
 func (a *App) todoPanel(c *ui.Context, session *Session, theme *ui.Theme) {

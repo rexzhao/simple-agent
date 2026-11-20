@@ -525,9 +525,16 @@ type App struct {
 	copiedAt map[string]time.Time
 	// refocusComposer 表示下一帧把焦点还给输入框。
 	//
-	// 附件条是插在输入框**前面**的兄弟元素：它出现/消失会让元素树变化、焦点丢失
-	// （实测贴完图后输入框就不再聚焦，用户得再点一下才能继续打字）。
+	// 插在输入框**前面**的兄弟元素（附件条、任务清单、斜杠候选、排队条…）
+	// 出现/消失会让元素树变化、焦点丢失（实测贴完图后输入框就不再聚焦，
+	// 用户得再点一下才能继续打字）；斜杠候选也是同一个毛病：
+	// 打 "/" 时它冒出来，输入框就失焦了。
 	refocusComposer bool
+	// composerSiblings 是上一帧"插在输入框前面的兄弟元素"数量。
+	//
+	// 拿它跟本帧比：**只要数量变了就重新聚焦**。比逐个条件判断稳 ——
+	// 以后再加一个插在输入框前的面板（比如审批条）不需要改这里。
+	composerSiblings int
 	// PasteImagesForTest 覆盖剪贴板读取（测试用：headless 里没有真实剪贴板图片）。
 	PasteImagesForTest func() ([][]byte, error)
 	// pendingCaret/pendingCaretArmed 是"下一帧把输入框光标放到这里"的请求。
@@ -2206,6 +2213,31 @@ func (a *App) composer(c *ui.Context) {
 	// 底部一行是控制区（提示 + 上下文用量 + 发送/停止）。
 	ui.Column(c).FillWidth().Padding(chatSidePadding, 8).Children(func() {
 		ui.Column(c).MaxWidth(a.contentWidth()).AlignSelf(ui.Center).FillWidth().Children(func() {
+			// 先数这一帧有几个元素插在输入卡**前面**（含错误条、排队条、
+			// 任务清单、斜杠候选）。数量一变，输入框在树里的位置就变了，
+			// 焦点会丢 —— 下一帧还给输入框。
+			//
+			// 为什么按"数量"而不是逐个判断：这些面板各有各的显示条件，
+			// 逐个写容易漏（斜杠候选就是这么漏掉的）；按数量比对新加面板
+			// 不需要改这里。
+			before := 0
+			if session.errMsg != "" {
+				before++
+			}
+			if len(session.Queued()) > 0 {
+				before++
+			}
+			if a.todoPanelShown(session) {
+				before++
+			}
+			if a.slashHintShown() {
+				before++
+			}
+			if before != a.composerSiblings {
+				a.composerSiblings = before
+				a.refocusComposer = true
+			}
+
 			if session.errMsg != "" {
 				ui.Text(c, session.errMsg).FontSize(12).TextColor(theme.Danger).Padding(2, 8)
 			}
