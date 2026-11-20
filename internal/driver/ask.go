@@ -143,8 +143,35 @@ func (g *AskGroup) Custom(index int) string {
 }
 
 // Answered 报告某题是否已作答（选了选项或写了文字）。
+// Answered 报告某题是否已有答案（选了选项或正在以文字作答）。
 func (g *AskGroup) Answered(index int) bool {
 	return g.CustomActive(index) || g.picked(index) > 0
+}
+
+// AllAnswered 报告**每一题**是否都已有答案。
+//
+// 用途：多个问题时，「提交」要等全部答完才可用 —— 否则用户容易漏答一题
+// 就提交，模型拿到一个空答案还要反问一次，白跑一个回合。
+//
+// 没有选项的开放题也算"未答"：那种题只能靠输入框作答。
+func (g *AskGroup) AllAnswered() bool {
+	for index := range g.Questions {
+		if !g.Answered(index) {
+			return false
+		}
+	}
+	return true
+}
+
+// AnsweredCount 返回已作答的题数（界面显示进度用）。
+func (g *AskGroup) AnsweredCount() int {
+	count := 0
+	for index := range g.Questions {
+		if g.Answered(index) {
+			count++
+		}
+	}
+	return count
 }
 
 // picked 返回某题选了几个选项。

@@ -550,26 +550,31 @@ func (s *Session) submitAsks(payload AnswerPayload) CmdResult {
 		return CmdResult{Notice: s.cfg.Tr("ask.answeredElsewhere")}
 	}
 	// 来自展示端的答案：先把选择应用回执行端自己的提问组，再统一提交。
-	for _, answer := range payload.Answers {
-		for _, group := range s.drv.AskGroups() {
-			if group.CallID != answer.CallID {
-				continue
-			}
-			for index, question := range group.Questions {
-				// **顺序不能反：先写文字，再勾选项。**
-				//
-				// SetCustom（文字非空时）会清掉该题已选的选项 —— 这是有意的：
-				// 用户开始写文字就说明这题以文字作答，界面上的选中标记也该消失。
-				// 如果先 Toggle 再 SetCustom，刚勾好的选项会被全部清空，
-				// 模型收到的是"用户只写了文字" —— 正是"多选的选择没发给模型"。
-				//
-				// 反过来先 SetCustom 再 Toggle 就对了：勾选会把 customActive
-				// 置回 false，语义是"以勾选的选项为准"。
-				if text := answer.Custom[question.ID]; text != "" {
-					group.SetCustom(index, text)
+	//
+	// **只在展示端做**（s.view != nil）。本地界面与执行端共享同一个 driver，
+	// 它勾选的选项已经在 driver 里了；再 Toggle 一遍等于把每项**切换回未选**
+	// —— 模型收到的就是 selected:[]（这正是「多选没发给 LLM」的根因）。
+	if s.view != nil {
+		for _, answer := range payload.Answers {
+			for _, group := range s.drv.AskGroups() {
+				if group.CallID != answer.CallID {
+					continue
 				}
-				for _, option := range answer.Selected[question.ID] {
-					group.Toggle(index, option)
+				for index, question := range group.Questions {
+					// **顺序不能反：先写文字，再勾选项。**
+					//
+					// SetCustom（文字非空时）会清掉该题已选的选项 —— 这是有意的：
+					// 用户开始写文字就说明这题以文字作答，界面上的选中标记也该消失。
+					// 如果先 Toggle 再 SetCustom，刚勾好的选项会被全部清空。
+					//
+					// 反过来先 SetCustom 再 Toggle 就对了：勾选会把 customActive
+					// 置回 false，语义是"以勾选的选项为准"。
+					if text := answer.Custom[question.ID]; text != "" {
+						group.SetCustom(index, text)
+					}
+					for _, option := range answer.Selected[question.ID] {
+						group.Toggle(index, option)
+					}
 				}
 			}
 		}

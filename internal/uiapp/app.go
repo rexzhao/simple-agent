@@ -2122,7 +2122,18 @@ func (a *App) askPanel(c *ui.Context) {
 				if ui.Button(c, a.tr("ask.skip")).Clicked() {
 					a.dismissAsks()
 				}
-				if ui.PrimaryButton(c, a.tr("ask.submit")).Clicked() {
+				// 「提交」要等**每一题**都答完才可用：
+				// 多问题时用户容易漏答一题就提交，模型拿到空答案还得反问一次，
+				// 白跑一个回合。所有组都要答完（一个回合可能有多个 ask 调用）。
+				ready := true
+				for _, group := range session.AskGroups() {
+					if !group.AllAnswered() {
+						ready = false
+						break
+					}
+				}
+				submit := ui.PrimaryButton(c, a.tr("ask.submit")).Disabled(!ready)
+				if ready && submit.Clicked() {
 					a.submitAsks("")
 				}
 			})
