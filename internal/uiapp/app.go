@@ -1757,6 +1757,27 @@ func (a *App) renderContent(c *ui.Context, refs []partRef) {
 	})
 }
 
+// stepRefs 过滤出"算一步"的 part：思考与工具调用。
+//
+// **tool_result 不算一步**：它已经折进对应的调用行显示（见 partView 的
+// MediaToolUse 分支），再计一次就会出现两套数字 —— 标题按调用数说
+// 「6 步」，而"上面还有 N 步"/"展开全部 N 步"按 part 数算出 13，
+// 同一组里自相矛盾。
+//
+// 数量同样用 timeline.StepCount 的算法（思考 + tool_use），
+// 保证标题与展开按钮永远是同一个数字。
+func stepRefs(refs []partRef) []partRef {
+	out := make([]partRef, 0, len(refs))
+	for _, ref := range refs {
+		switch ref.Chat.Message.Parts[ref.Index].MediaType {
+		case render.MediaToolResult:
+			continue
+		}
+		out = append(out, ref)
+	}
+	return out
+}
+
 // processPreviewSteps 是一级展开时默认显示的过程步骤数。
 //
 // 一个长回合的过程组动辄几十步，全展开会把时间线撑得很长（往上翻要划很多屏）。
@@ -1825,7 +1846,14 @@ func (a *App) renderProcessItem(c *ui.Context, item chatItem) {
 		ui.Box(c).Width(2).MarginX(5).AlignSelf(ui.Stretch).
 			Background(theme.Border.Mix(theme.Text, 0.25)).Radius(1)
 		ui.Column(c).Grow(1).Gap(6).Children(func() {
-			total := len(item.Refs)
+			// 只渲染**步骤**：tool_use（一次调用 = 一步）与思考。
+			//
+			// tool_result 不算一步 —— 它已经折进对应的调用行里显示，
+			// 再计一次会让三个数字互相打架：标题说「6 步」（只数调用）、
+			// 「上面还有 10 步」和「展开全部 13 步」用的是 part 数，
+			// 同一组里出现 6 / 13 两个口径（用户一眼就看出来了）。
+			steps := stepRefs(item.Refs)
+			total := len(steps)
 			// 只显示最后 N 步：用切片下标，避免把前面的 refs 也遍历一遍。
 			start := 0
 			if !expandedFull && total > processPreviewSteps {
@@ -1836,7 +1864,7 @@ func (a *App) renderProcessItem(c *ui.Context, item chatItem) {
 				ui.Text(c, fmt.Sprintf("⋯ 上面还有 %d 步", start)).
 					FontSize(11).TextColor(theme.TextMuted)
 			}
-			for _, ref := range item.Refs[start:] {
+			for _, ref := range steps[start:] {
 				a.partView(c, ref.Chat, ref.Index, ref.Chat.Message.Parts[ref.Index], theme.Text)
 			}
 			// 切换按钮：只有真的被截断（或已全展开）时才出现。

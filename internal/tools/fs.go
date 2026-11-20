@@ -387,15 +387,6 @@ func toCRLF(text string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\n", "\r\n")
 }
 
-// clip 把多行文本压成单行短摘要（工具结果里回显改动内容）。
-func clip(text string) string {
-	runes := []rune(text)
-	if len(runes) > 60 {
-		text = string(runes[:60]) + "…"
-	}
-	return strings.ReplaceAll(text, "\n", "⏎")
-}
-
 func workingDirectoryTool(fullAccess bool) *ToolDef {
 	description := "Read the current working directory, or change it with cd. Relative paths use the " +
 		"current directory. Existing shells and running processes keep their own directories."

@@ -147,22 +147,27 @@ func GroupTitle(refs []Ref, streaming bool, lang locale.Lang) string {
 	// 末尾补「· N 步」，让折叠态也能判断这组有多重：
 	// 「执行了命令，读取文件，搜索代码」看不出是 3 步还是 30 步。
 	//
-	// 只在多步时加（1 步时"1 步"是废话）。用 refs 而不是调用次数：
-	// 一个工具调用会产生 tool_use 与 tool_result 两个 part，
-	// 按 part 数会虚高 —— 这里数 tool_use 的个数。
-	if steps := countToolUses(refs); steps > 1 {
+	// 只在多步时加（1 步时"1 步"是废话）。
+	if steps := StepCount(refs); steps > 1 {
 		title += fmt.Sprintf(" · %d 步", steps)
 	}
 	return title
 }
 
-// countToolUses 数这一组里有多少次工具调用。
+// StepCount 数一组过程有多少"步"。
 //
-// 只数 MediaToolUse：tool_result 是配对的另一半，数进去会翻倍。
-func countToolUses(refs []Ref) int {
+// 口径 = **界面上会渲染成行的那几种 part**：思考 + 工具调用。
+// tool_result 不计 —— 它已经折进对应的调用行里显示（见 uiapp 的
+// partView），算进去会让标题与"展开全部 N 步"对不上：
+// 一个调用产生 tool_use + tool_result 两个 part，本该是 1 步却数成 2。
+//
+// 导出是为了让 uiapp 用它统一两处显示（标题 / 展开按钮），
+// 免得再出现"标题 6 步、展开全部 13 步"这种自相矛盾。
+func StepCount(refs []Ref) int {
 	n := 0
 	for _, ref := range refs {
-		if ref.Part().MediaType == render.MediaToolUse {
+		switch ref.Part().MediaType {
+		case render.MediaReasoning, render.MediaToolUse:
 			n++
 		}
 	}

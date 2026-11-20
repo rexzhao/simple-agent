@@ -20,7 +20,11 @@ func TestProcessGroupTwoLevelExpand(t *testing.T) {
 	app, _, p := newApp(t)
 	conv := app.Current().Conversation()
 
-	// 造 6 步：3 个（思考 + 工具调用 + 工具结果）循环。
+	// 造 3 组（思考 + 工具调用 + 工具结果），共 **6 步**：
+	// 思考算一步、工具调用算一步，tool_result 不算（折进调用行显示）。
+	//
+	// 口径必须与标题一致，否则同一组里出现两套数字 ——
+	// 这正是用户报的问题（标题 6 步、展开全部 13 步）。
 	// 工具名带序号，方便断言"哪些步可见、哪些被折叠"。
 	var parts []message.Part
 	for i := 1; i <= 3; i++ {
@@ -65,10 +69,10 @@ func TestProcessGroupTwoLevelExpand(t *testing.T) {
 	if tester.HasText("想第 1 步") {
 		t.Fatalf("一级展开不该显示最早的步骤：%v", tester.Texts())
 	}
-	if !tester.HasText("⋯ 上面还有 6 步") {
+	if !tester.HasText("⋯ 上面还有 3 步") {
 		t.Fatalf("应提示上方还有多少步被折叠：%v", tester.Texts())
 	}
-	if !tester.HasText("展开全部 9 步") {
+	if !tester.HasText("展开全部 6 步") {
 		t.Fatalf("应给出展开全部按钮：%v", tester.Texts())
 	}
 
@@ -95,7 +99,7 @@ func TestProcessGroupTwoLevelExpand(t *testing.T) {
 	if tester.HasText("想第 1 步") {
 		t.Fatalf("收起后不该再显示最早的步骤：%v", tester.Texts())
 	}
-	if !tester.HasText("展开全部 9 步") {
+	if !tester.HasText("展开全部 6 步") {
 		t.Fatalf("收起后应回到一级展开：%v", tester.Texts())
 	}
 }
