@@ -284,7 +284,7 @@ func parseTokens(text string) (Tokens, error) {
 // requestParams 返回这个模型要合并进请求体的参数。
 //
 // "reasoning_effort: off" 表示默认关闭思考：不把这个键发出去。
-func (m ModelEntry) requestParams() map[string]any {
+func (m ModelEntry) requestParams(kind string) map[string]any {
 	if len(m.params) == 0 && len(m.ExtraBody) == 0 {
 		return nil
 	}
@@ -297,6 +297,25 @@ func (m ModelEntry) requestParams() map[string]any {
 	}
 	if effort, ok := out["reasoning_effort"].(string); ok && effort == "off" {
 		delete(out, "reasoning_effort")
+	}
+	// Anthropic 不认 reasoning_effort（顶层未知字段会 400）。
+	//
+	// 各家的思考参数位置不同：OpenAI 兼容协议用顶层的 reasoning_effort，
+	// Anthropic 用 output_config.effort。配置里统一写 reasoning_effort
+	// （最直观），在这里按协议搬到正确的位置 —— 不然用户得为每个协议
+	// 记一套写法，写错了还只看到 400。
+	if kind == string(providers.KindAnthropic) {
+		if effort, ok := out["reasoning_effort"].(string); ok && effort != "" {
+			delete(out, "reasoning_effort")
+			config, _ := out["output_config"].(map[string]any)
+			if config == nil {
+				config = map[string]any{}
+			}
+			if _, set := config["effort"]; !set {
+				config["effort"] = effort
+			}
+			out["output_config"] = config
+		}
 	}
 	return out
 }
@@ -543,7 +562,7 @@ func (c Config) Registry() *providers.Registry {
 				MaxOutput:        int(model.MaxOutput),
 				ReasoningEfforts: model.ReasoningEfforts,
 				Vision:           model.Vision,
-				ExtraBody:        model.requestParams(),
+				ExtraBody:        model.requestParams(item.Kind),
 			})
 		}
 		override := providers.Override{

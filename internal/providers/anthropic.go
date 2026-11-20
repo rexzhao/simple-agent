@@ -94,6 +94,22 @@ func buildAnthropicBody(req ChatRequest, extraBody, modelExtra map[string]any) (
 	for key, value := range modelExtra {
 		body[key] = value
 	}
+	// 思考档位：Anthropic 用 `output_config.effort`（不是顶层的
+	// reasoning_effort —— 那个字段它不认，会 400）。
+	//
+	// 只在这一层写，而且**允许被 extra_body 覆盖**：不同网关支持的档位
+	// 集合不一样（有的只有 low/high/max），配置里用 extra_body 能压掉。
+	if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
+		config, _ := body["output_config"].(map[string]any)
+		if config == nil {
+			config = map[string]any{}
+		}
+		// 已经由 extra_body/modelExtra 显式给了 effort 就不覆盖
+		if _, set := config["effort"]; !set {
+			config["effort"] = effort
+			body["output_config"] = config
+		}
+	}
 	// 注意：**不要**写 reasoning_effort。Anthropic Messages API 没有这个字段，
 	// 未知的顶层字段会被拒（400）。要开思考请通过 extra_body 传
 	// thinking: {type: enabled, budget_tokens: N}——厂商特有的参数走那条路。
