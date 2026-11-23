@@ -2041,8 +2041,11 @@ func (a *App) renderMonoBlock(c *ui.Context, text string, background, foreground
 	ui.Column(c).FillWidth().Padding(8, 10).Radius(6).Gap(3).
 		Background(background).Children(func() {
 		for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+			// **不限行数**（MaxLines(0)）：命令行经常很长（管道、一长串参数），
+			// 限成一行就会被截掉，用户根本看不到完整命令 ——
+			// 而这正是展开这一块的目的。超宽的行走自动折行。
 			ui.Text(c, line).Font(dshCodeFontStack).FontSize(12).
-				TextColor(foreground).MaxLines(1)
+				TextColor(foreground)
 		}
 	})
 }
@@ -2351,26 +2354,6 @@ func argString(data map[string]any, key string) string {
 	}
 	value, _ := args[key].(string)
 	return value
-}
-
-// shellCommandMaxLines 是折叠行里命令最多显示几行。
-//
-// 给到 4 行：常见的多行命令（heredoc、几条 && 串起来、管道）基本都在
-// 这个范围里；再多就说明是个大脚本，那时展开看更合适
-// （展开区是完整内容，不受这个限制）。
-const shellCommandMaxLines = 4
-
-// shellCommandText 返回 shell 工具的原始命令（不截断）。
-//
-// 与 toolArgSummary 的区别：那个为了"一行摘要"固定截到 60 字符，
-// 对命令来说太短了 —— 多行命令会被压成一行且只剩开头。
-func shellCommandText(data map[string]any) string {
-	args, ok := data["args"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	command, _ := args["command"].(string)
-	return strings.TrimRight(command, "\n")
 }
 
 // defaultShellTimeoutMs 与 tools.defaultTimeoutMs 保持同步（那里未导出）。
@@ -2773,24 +2756,16 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 				// 摘要（文件名/命令）不 Grow：让后面的 +/- 紧跟在它后面，
 				// 而不是被推到行尾（用户要求"edit 的 +/- 紧跟文件名后面"）。
 				//
-				// **shell 命令不截断、允许换行**：命令经常是多行的
-				// （heredoc、一连串 && 、管道），截到一行等于只看到开头，
-				// 用户没法判断这条命令到底要干什么。
-				//
-				// 注意这里绕开了 toolArgSummary —— 它内部固定 ClipLine(60)，
-				// 拿到的已经是截断过的。shell 直接读原始 command。
-				if isShellTool(name) && !isError {
-					ui.Text(c, shellCommandText(data)).Font(dshCodeFontStack).
-						FontSize(12).TextColor(theme.TextMuted).
-						MaxLines(shellCommandMaxLines)
-				} else {
-					limit := 56
-					if desc != "" {
-						limit = 36
-					}
-					ui.Text(c, truncateRunes(summary, limit)).FontSize(12).
-						TextColor(theme.TextMuted).MaxLines(1)
+				// shell 命令在**折叠行只给一行摘要**：折叠行的作用是"扫一眼
+				// 知道调了什么"，不是读完整命令。多行命令在这里换行会把
+				// 时间线撑得很长（一屏看不到几条），完整内容在展开区的
+				// 黑底块里给（那里不限行、长行自动折行）。
+				limit := 56
+				if desc != "" {
+					limit = 36
 				}
+				ui.Text(c, truncateRunes(summary, limit)).FontSize(12).
+					TextColor(theme.TextMuted).MaxLines(1)
 			}
 			// 各工具的结构化摘要（折叠行一行）。
 			//

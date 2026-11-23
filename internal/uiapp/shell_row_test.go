@@ -52,35 +52,16 @@ func TestExecArgsSummaryTimeoutLabel(t *testing.T) {
 	}
 }
 
-// shell 命令在折叠行里**保留完整内容与换行**。
+// 折叠行仍然只给一行摘要（不换行）。
 //
-// 用户明确要求："命令的内容应该可以换行，现在不换行根本看不全内容"。
-// 多行命令（heredoc、&& 串联、管道）截到一行等于只看到开头。
-func TestShellCommandTextKeepsNewlines(t *testing.T) {
+// 用户澄清："bash 的换行不是概要里面换行，是展开之后的黑底白字的那个地方换行"。
+// 折叠行的作用是扫一眼知道调了什么，多行命令在这里换行会把时间线撑长。
+func TestCollapsedShellRowStaysOneLine(t *testing.T) {
 	command := "cd /a && \\\ncargo build && \\\nls -la"
-	data := map[string]any{
+	summary := toolArgSummary(map[string]any{
 		"args": map[string]any{"command": command},
-	}
-
-	got := shellCommandText(data)
-	if got != command {
-		t.Fatalf("应原样返回（含换行），实际 %q", got)
-	}
-	if !strings.Contains(got, "\n") {
-		t.Fatal("换行不能被压掉")
-	}
-
-	// 对比：toolArgSummary 会截到 60 字符且只有一行
-	if summary := toolArgSummary(data); strings.Contains(summary, "\n") {
-		t.Fatalf("toolArgSummary 本来就该是一行：%q", summary)
-	}
-}
-
-// 非 shell 工具仍然取截断摘要（它们本来就是短路径/模式）。
-func TestShellCommandTextIgnoresOtherTools(t *testing.T) {
-	if got := shellCommandText(map[string]any{
-		"args": map[string]any{"file_path": "a.go"},
-	}); got != "" {
-		t.Fatalf("非 shell 工具不该走这条路，实际 %q", got)
+	})
+	if strings.Contains(summary, "\n") {
+		t.Fatalf("折叠行摘要不该含换行：%q", summary)
 	}
 }

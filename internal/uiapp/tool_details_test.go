@@ -302,18 +302,19 @@ func TestBashRowShowsDescriptionAndClippedCommand(t *testing.T) {
 	if !strings.Contains(all, "跑过程组相关测试") {
 		t.Fatalf("应显示 description：%v", tester.Texts())
 	}
-	// **命令完整显示、不截断**：单行命令以前被截到 36/56 字符，
-	// 现在 shell 命令保留完整内容（多行的还能换行到 4 行）。
-	// 用户明确要求"命令的内容应该可以换行，现在不换行根本看不全内容"。
-	if !strings.Contains(all, longCommand) {
-		t.Fatalf("shell 命令应完整显示（不截断）：%v", tester.Texts())
+	// 折叠行里的命令**截断**（概要的作用是扫一眼，完整内容在展开区）
+	if !strings.Contains(all, "go test ./internal/uiapp/") {
+		t.Fatalf("应显示命令摘要：%v", tester.Texts())
 	}
-	// 展开后同样能看到完整命令（展开区一直是完整的，这里顺带确认没回归）
+	if strings.Contains(all, longCommand) {
+		t.Fatalf("折叠行里的命令应被截断：%v", tester.Texts())
+	}
+	// 展开后能看到完整命令
 	tester.Frame()
 	for _, text := range tester.Texts() {
 		if strings.HasPrefix(text, "go test ./internal/uiapp/") {
 			if err := tester.Click(text); err != nil {
-				break // 已经完整显示时可能点不到单独的元素，不算失败
+				t.Fatalf("点不到命令摘要 %q：%v", text, err)
 			}
 			break
 		}
