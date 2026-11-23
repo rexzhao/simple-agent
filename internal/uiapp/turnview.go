@@ -102,8 +102,17 @@ func (a *App) renderRoundFooter(c *ui.Context, item chatItem) {
 	label := a.tr("message.turnProcess.worked")
 	switch {
 	case failed:
-		// 失败原因要**一眼看到**（用户不必先展开），展开后是完整原因 + 建议
-		reason := clipLine(chat.FailureReason(), 60)
+		// 折叠行显示**人话**（failureHint 认得的场景），认不出才退回原始原因。
+		//
+		// 原始原因带着内部错误码前缀（"network: Post ... wsarecv: An existing
+		// connection was forcibly closed..."），直接摆在折叠行里用户看不懂。
+		// 完整原因仍然展开可见 —— 那时是要排查的人在看，细节才有价值。
+		//
+		// 用户不必先展开：网络断了的下一句话是"怎么办"，不是"wsarecv 是什么"。
+		reason := a.failureHint(chat.FailureReason())
+		if reason == "" {
+			reason = clipLine(chat.FailureReason(), 60)
+		}
 		label = a.tr("message.turnProcess.failed")
 		if reason != "" {
 			label += " · " + reason

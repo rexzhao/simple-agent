@@ -1932,10 +1932,13 @@ func TestFailureHints(t *testing.T) {
 		}
 		tester := ui.NewTester(app.View, 900, 620)
 		pump(tester, p)
-		if !tester.HasText(c.reason) {
-			t.Fatalf("原始错误应保留：%v", tester.Texts())
+		// 折叠行给**人话**（用户不必先展开就知道怎么办）
+		if !tester.HasText(c.want) {
+			t.Fatalf("%q 应在折叠行给出提示 %q：%v", c.reason, c.want, tester.Texts())
 		}
-		// 失败建议在回合结束行展开后显示（dsh 的 turn footer 也是这个结构）
+		// 原始错误在**展开后**保留 —— 排查的人需要它。
+		// （以前折叠行直接摆原始错误，用户看不懂；
+		//  现在折叠行是人话，细节留在展开区。）
 		for _, text := range tester.Texts() {
 			if strings.HasPrefix(text, "▸ 处理失败") {
 				if err := tester.Click(text); err != nil {
@@ -1945,8 +1948,8 @@ func TestFailureHints(t *testing.T) {
 			}
 		}
 		pump(tester, p)
-		if !tester.HasText(c.want) {
-			t.Fatalf("%q 应给出提示 %q：%v", c.reason, c.want, tester.Texts())
+		if !tester.HasText(c.reason) {
+			t.Fatalf("展开后应保留原始错误：%v", tester.Texts())
 		}
 	}
 }
