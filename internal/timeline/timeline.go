@@ -74,6 +74,8 @@ type Item struct {
 	// TurnStart / TurnEntries 只在回合结束行上有值：回合起点与该回合的所有 agent 消息。
 	TurnStart   time.Time
 	TurnEntries []*conversation.ChatEntry
+	// Usage 是本轮的 token 用量（只在结束行上有值；nil 表示拿不到）。
+	Usage *Usage
 }
 
 // Build 把一份会话条目列表切成渲染条目。
@@ -87,7 +89,22 @@ type Item struct {
 //     （模型的每段正式输出都是独立内容，不该被折叠掉）。
 //
 // 于是一个回合可能是「组 → 旁白 → 组 → 回答」的样子。
-func Build(entries []conversation.Entry, idle bool) []Item {
+// Build 把一份会话条目列表切成渲染条目。
+//
+// idle 表示会话当前空闲（决定最后一个回合算不算"已结束"：还在流式输出时
+// 不该显示「已完成」）。
+//
+// usage 是本轮的 token 用量（含缓存字段），用于回合结束行显示缓存命中率。
+// 传 nil 表示拿不到（重放的历史会话没有这个数据）——那时不显示缓存率，
+// 比显示一个编出来的 0% 诚实。
+//
+// 分组对齐 dsh 的 turn process：
+//   - 思考 / 工具调用 / 工具结果进**过程组**，连续的一段过程合成一组；
+//   - 正文**不进组**，它留在会话流里，并且会结束当前组
+//     （模型的每段正式输出都是独立内容，不该被折叠掉）。
+//
+// 于是一个回合可能是「组 → 旁白 → 组 → 回答」的样子。
+func Build(entries []conversation.Entry, idle bool, usage *Usage) []Item {
 	var items []Item
 	var turn []*conversation.ChatEntry
 
@@ -98,7 +115,9 @@ func Build(entries []conversation.Entry, idle bool) []Item {
 		if len(turn) == 0 {
 			return
 		}
-		items = append(items, roundItems(turn, RoundInfo{Closed: closed, StartedAt: roundStart})...)
+		items = append(items, roundItems(turn, RoundInfo{
+			Closed: closed, StartedAt: roundStart, Usage: usage,
+		})...)
 		turn = nil
 		roundStart = time.Time{}
 		userStart = time.Time{}
@@ -149,12 +168,53 @@ func Build(entries []conversation.Entry, idle bool) []Item {
 }
 
 // RoundInfo 是一个回合的边界信息（回合结束行用）。
+// RoundInfo 是构建一个回合条目时需要的上下文。
 type RoundInfo struct {
 	// Closed 表示回合真的结束了（后面已有新的 user 消息，或会话已空闲）。
 	// 工具轮之间、等待回答时都还没结束——那时不该显示「已完成」。
 	Closed bool
 	// StartedAt 是回合开始时间：回合前那条 user 消息的 CreatedAt；没有就用第一条消息的。
 	StartedAt time.Time
+	// Usage 是本轮的 token 用量（含缓存字段），用于结束行的缓存率。
+	// nil 表示拿不到（重放的历史会话）——那时不显示缓存率。
+	Usage *Usage
+}
+
+// Usage 是本轮的 token 用量。
+//
+// 单独定义而不是复用 driver.Usage：timeline 包不依赖 driver
+// （它要能编到手机上，依赖面越小越好）。
+type Usage struct {
+	InputTokens      int
+	OutputTokens     int
+	CacheReadTokens  int
+	CacheWriteTokens int
+}
+
+// CacheHitBasisPoints 返回缓存命中率（千分比，0..1000）。
+//
+// 口径：命中 / (命中 + 未命中)。
+//   - 命中 = CacheReadTokens（读缓存的部分，按 10% 计价）
+//   - 未命中 = InputTokens（真正重新计算的部分）
+//
+// **不把 CacheWriteTokens 算进分母**：它是"写缓存的量"，费用和普通输入不同，
+// 混进命中率里会让第一次请求（全写入）显示成 0%，看着像缓存没用。
+//
+// 没有任何输入时返回 -1（调用方据此不显示）。
+func (u Usage) CacheHitBasisPoints() int {
+	if u.CacheReadTokens <= 0 {
+		return -1
+	}
+	total := u.CacheReadTokens + u.InputTokens
+	if total <= 0 {
+		return -1
+	}
+	return u.CacheReadTokens * 1000 / total
+}
+
+// TotalTokens 返回本轮的总 token 数（输入 + 输出，含缓存部分）。
+func (u Usage) TotalTokens() int {
+	return u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens
 }
 
 // roundItems 把一个回合切成按顺序排列的条目：过程组与正文交替。
@@ -200,17 +260,28 @@ func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 	}
 	// 末尾剩下的这一组是本回合的最后一组：只有它可能还在进行。
 	flushGroup(true)
-	// 回合结束行：只有**回合真的结束**时才显示（dsh 的 turn footer）。
-	// 工具轮之间、等待回答时回合还没结束，显示「已完成」会一闪一闪。
+	// 回合结束行：dsh 的 turn footer。
+	//
+	// **流式期间也生成**（标记 Live）：用户要在执行过程中看到
+	// 运行时间、token 和缓存率，而不是等跑完才有这一行。
+	// 结束后同一个 item 变成"已完成 + 总计"，**始终只有一条**。
 	last := turn[len(turn)-1]
-	if info.Closed && last != nil && !last.Status().IsStreaming() {
-		items = append(items, Item{
-			Kind:        KindRoundFooter,
-			Key:         last.Message.MessageID + "#footer",
-			Refs:        []Ref{{Chat: last}},
-			TurnStart:   info.StartedAt,
-			TurnEntries: turn,
-		})
+	if last != nil {
+		streaming := last.Status().IsStreaming()
+		// 非流式时要求回合已闭合（后面已有新 user 消息，或会话空闲）：
+		// 工具轮之间、等待回答时回合还没结束，显示「已完成」会一闪一闪。
+		// 流式时无条件显示——那时它表达的是"正在跑"。
+		if streaming || info.Closed {
+			items = append(items, Item{
+				Kind:        KindRoundFooter,
+				Key:         last.Message.MessageID + "#footer",
+				Refs:        []Ref{{Chat: last}},
+				TurnStart:   info.StartedAt,
+				TurnEntries: turn,
+				Usage:       info.Usage,
+				Live:        streaming,
+			})
+		}
 	}
 	return items
 }

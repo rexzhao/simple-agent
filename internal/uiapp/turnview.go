@@ -35,8 +35,34 @@ type chatItem = timeline.Item
 type partRef = timeline.Ref
 
 // buildChatItems 把会话切成渲染条目（规则在 timeline.Build）。
+//
+// 把**本轮**的用量一起传下去：结束行要显示缓存命中率。
+// 会话忙碌时（还在跑）传的是当前这一轮的实时数据，空闲后是最后一轮的。
 func (a *App) buildChatItems(session *Session) []chatItem {
-	return timeline.Build(session.Conversation().Entries(), session.Busy() == driver.BusyIdle)
+	usage := sessionUsaget(session)
+	return timeline.Build(session.Conversation().Entries(),
+		session.Busy() == driver.BusyIdle, usage)
+}
+
+// sessionUsaget 把 host 侧的用量转成 timeline 的口径（nil 表示拿不到）。
+//
+// 没有任何 token 时返回 nil：重放的历史会话拿不到用量，那时显示
+// "缓存 0%" 会误导（看着像缓存失效，其实只是没数据）。
+func sessionUsaget(session *Session) *timeline.Usage {
+	if session == nil {
+		return nil
+	}
+	u := session.Usage()
+	if u.InputTokens == 0 && u.OutputTokens == 0 &&
+		u.CacheReadTokens == 0 && u.CacheWriteTokens == 0 {
+		return nil
+	}
+	return &timeline.Usage{
+		InputTokens:      u.InputTokens,
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.CacheReadTokens,
+		CacheWriteTokens: u.CacheWriteTokens,
+	}
 }
 
 // renderRoundFooter 渲染回合结束行（dsh 的 turn footer）：
@@ -52,8 +78,11 @@ func (a *App) buildChatItems(session *Session) []chatItem {
 func (a *App) renderRoundFooter(c *ui.Context, item chatItem) {
 	theme := c.Theme()
 	chat := item.Refs[0].Chat
-	if chat.Status().IsStreaming() {
-		return // 还在生成：结束行没有意义
+	// 流式期间**也渲染**：用户要在跑的时候就看到时间/token/缓存率。
+	// 结束后同一个位置变成"已完成 + 本轮总计"，始终只有这一行。
+	if item.Live {
+		a.renderLiveFooter(c, item, theme)
+		return
 	}
 	failed := chat.Status() == conversation.StatusFailed
 	cancelled := chat.Status() == conversation.StatusCancelled
@@ -101,6 +130,19 @@ func (a *App) renderRoundFooter(c *ui.Context, item chatItem) {
 		if tokens := timeline.Tokens(item); tokens > 0 {
 			ui.Text(c, a.tr("turn.usage", tokens)).FontSize(11).TextColor(theme.TextMuted)
 		}
+		// 本轮缓存命中率：紧跟 token 用量。
+		//
+		// 只在命中过时显示（CacheHitBasisPoints 返回 -1 表示没有数据）：
+		// 第一轮纯写缓存时显示 "缓存 0%" 会让人以为缓存失效。
+		//
+		// 与状态条的**累计**命中率是两回事：那里看的是"这个会话一共省了多少"，
+		// 这里看的是"这一轮省了多少"。两者都要，因为累计值看不出单轮退步。
+		if item.Usage != nil {
+			if bp := item.Usage.CacheHitBasisPoints(); bp >= 0 {
+				ui.Text(c, a.tr("composer.cacheHit", formatBasisPoints(bp))).
+					FontSize(11).TextColor(theme.TextMuted)
+			}
+		}
 		a.messageActionsRow(c, actions, true)
 	})
 	if detail {
@@ -113,6 +155,38 @@ func (a *App) renderRoundFooter(c *ui.Context, item chatItem) {
 	}
 	// 注意：这里**不画**分隔线。dsh 的 turn footer 只有一行文字，没有横线；
 	// 之前那条 Box(Height(1)) 是多余的视觉噪音。
+}
+
+// renderLiveFooter 渲染**执行中**的回合行：运行时间 + 实时 token + 当前缓存率。
+//
+// 与结束行是**同一个位置**（同一个 Item.Key），只是内容不同：
+// 跑的时候说"正在跑多久、用了多少"，跑完换成"总计"。
+// 这样用户不用等结束就能判断"这轮会不会太久 / 缓存有没有生效"。
+//
+// 时间用 StartedAt 到现在：回合结束行用的是 finished-started，
+// 两者在结束时会对上（结束的瞬间 现在 ≈ FinishedAt）。
+func (a *App) renderLiveFooter(c *ui.Context, item chatItem, theme *ui.Theme) {
+	// 用实体圆点 + 强调色表示"在跑"：mygo 没有内建动画组件，
+// 与其画一个静态的"加载图标"（看着像卡住了），不如用颜色明确标示活动态
+// ——和侧栏会话行的状态点、todo 面板的 StateDot 是同一套做法。
+	ui.Row(c).Gap(8).Padding(2, 2).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "●").FontSize(9).TextColor(theme.Accent)
+		ui.Text(c, a.tr("turn.running")).FontSize(12).TextColor(theme.Accent)
+		if elapsed := time.Since(item.TurnStart); elapsed >= time.Second {
+			ui.Text(c, a.formatDuration(elapsed)).FontSize(11).TextColor(theme.TextMuted)
+		}
+		// 实时 token：本轮已经产生的输出（含缓存读，那是真实消耗过的）
+		if item.Usage != nil {
+			if total := item.Usage.TotalTokens(); total > 0 {
+				ui.Text(c, a.tr("turn.usage", total)).FontSize(11).TextColor(theme.TextMuted)
+			}
+			// 实时缓存率：只在这一轮已经命中过时显示
+			if bp := item.Usage.CacheHitBasisPoints(); bp >= 0 {
+				ui.Text(c, a.tr("composer.cacheHit", formatBasisPoints(bp))).
+					FontSize(11).TextColor(theme.TextMuted)
+			}
+		}
+	})
 }
 
 // footerActions 返回回合结束行右侧的按钮组。

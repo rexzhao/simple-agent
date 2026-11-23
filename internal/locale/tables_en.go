@@ -221,6 +221,7 @@ var enTable = map[string]string{
 	"duration.seconds":           "%ds",
 	"duration.minutes":           "%dm%ds",
 	"turn.usage":                 "%d tokens",
+	"turn.running":               "Running",
 
 	// Process groups
 	"message.stepProcess.thinking":       "Analyzing the request",

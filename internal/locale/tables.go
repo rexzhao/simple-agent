@@ -230,6 +230,7 @@ var zhTable = map[string]string{
 	"duration.seconds":           "%d秒",
 	"duration.minutes":           "%d分%d秒",
 	"turn.usage":                 "%d tokens",
+	"turn.running":               "运行中",
 
 	// 过程组（dsh: message.stepProcess.*）
 	"message.stepProcess.thinking":       "正在分析请求",

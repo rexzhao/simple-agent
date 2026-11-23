@@ -64,7 +64,18 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 	}
 	view.Asks = c.asksOf(session)
 
-	raw := timeline.Build(entries, idle)
+	// 把本轮用量传下去：结束行要显示缓存命中率（与桌面端同一套口径）。
+	var usage *timeline.Usage
+	if u := session.Usage(); u.InputTokens > 0 || u.OutputTokens > 0 ||
+		u.CacheReadTokens > 0 || u.CacheWriteTokens > 0 {
+		usage = &timeline.Usage{
+			InputTokens:      u.InputTokens,
+			OutputTokens:     u.OutputTokens,
+			CacheReadTokens:  u.CacheReadTokens,
+			CacheWriteTokens: u.CacheWriteTokens,
+		}
+	}
+	raw := timeline.Build(entries, idle, usage)
 	for _, item := range raw {
 		view.Items = append(view.Items, c.itemView(item, conv, idle, busy))
 	}

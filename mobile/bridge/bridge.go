@@ -754,7 +754,8 @@ func (c *Client) ProcessDetailJSON(sessionID, key string) string {
 	busy := session.Busy()
 	idle := busy == driver.BusyIdle
 	// 同样要带补拉的历史：否则点开"更早那段"里的过程组会找不到
-	for _, item := range timeline.Build(session.EntriesWithHistory(), idle) {
+	// 这里只用过程组（不涉及回合结束行），用量传 nil 即可。
+	for _, item := range timeline.Build(session.EntriesWithHistory(), idle, nil) {
 		if item.Key != key || item.Kind != timeline.KindProcess {
 			continue
 		}

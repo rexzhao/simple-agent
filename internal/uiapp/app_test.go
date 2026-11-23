@@ -2662,8 +2662,19 @@ func TestToolCallStatusLive(t *testing.T) {
 	if tester.HasText("已完成") {
 		t.Fatalf("回合进行中不该显示结束行：%v", tester.Texts())
 	}
-	if tester.HasText("运行中") {
-		t.Fatalf("完成后不应再显示运行中：%v", tester.Texts())
+	// 工具行的"运行中"应该没了（调用已完成）。
+	//
+	// 注意：现在**回合结束行**在流式期间也会显示「● 运行中」——
+	// 那是"整个回合还在跑"的意思，和工具行的状态是两回事。
+	// 所以这里检查的是工具那一行，而不是全局有没有"运行中"。
+	toolRow := ""
+	for _, text := range tester.Texts() {
+		if strings.Contains(text, "a.txt") {
+			toolRow = text
+		}
+	}
+	if strings.Contains(toolRow, "运行中") {
+		t.Fatalf("工具完成后不该再显示运行中（工具行：%q）：%v", toolRow, tester.Texts())
 	}
 }
 

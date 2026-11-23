@@ -1,4 +1,4 @@
-package timeline_test
+﻿package timeline_test
 
 import (
 	"strings"
@@ -53,7 +53,7 @@ func buildConversation(t *testing.T) *conversation.Conversation {
 // 分组规则：过程进组、正文在组外、回合结束时补一行 footer。
 func TestBuildSplitsProcessAndContent(t *testing.T) {
 	conv := buildConversation(t)
-	items := timeline.Build(conv.Entries(), true)
+	items := timeline.Build(conv.Entries(), true, nil)
 
 	var kinds []string
 	for _, item := range items {
@@ -72,7 +72,7 @@ func TestBuildSplitsProcessAndContent(t *testing.T) {
 // 会话还在忙时，最后一个回合不算结束（不显示「已完成」）。
 func TestBuildNoFooterWhileBusy(t *testing.T) {
 	conv := buildConversation(t)
-	items := timeline.Build(conv.Entries(), false)
+	items := timeline.Build(conv.Entries(), false, nil)
 	last := items[len(items)-1]
 	if last.Kind == timeline.KindRoundFooter {
 		t.Fatal("会话还没空闲，不该出现回合结束行")
@@ -82,7 +82,7 @@ func TestBuildNoFooterWhileBusy(t *testing.T) {
 // 过程组标题：进行中显示当前活动，已完成按次数拼句子。
 func TestGroupTitle(t *testing.T) {
 	conv := buildConversation(t)
-	items := timeline.Build(conv.Entries(), true)
+	items := timeline.Build(conv.Entries(), true, nil)
 	var group timeline.Item
 	for _, item := range items {
 		if item.Kind == timeline.KindProcess {
@@ -129,7 +129,7 @@ func TestToolArgSummaryFromPartialJSON(t *testing.T) {
 // 回合耗时与 token 汇总。
 func TestDurationAndTokens(t *testing.T) {
 	conv := buildConversation(t)
-	items := timeline.Build(conv.Entries(), true)
+	items := timeline.Build(conv.Entries(), true, nil)
 	footer := items[len(items)-1]
 	if footer.Kind != timeline.KindRoundFooter {
 		t.Fatalf("最后一条应是回合结束行，实际 %s", footer.Kind)
@@ -194,7 +194,7 @@ func TestOnlyLastProcessGroupIsLive(t *testing.T) {
 	}
 
 	// idle=false：会话正在跑（这正是触发 bug 的条件）
-	items := timeline.Build(conv.Entries(), false)
+	items := timeline.Build(conv.Entries(), false, nil)
 
 	var liveKeys []string
 	var processCount int
@@ -214,20 +214,28 @@ func TestOnlyLastProcessGroupIsLive(t *testing.T) {
 		t.Fatalf("只有最后一个过程组该转圈，实际 %d 个在转：%v", len(liveKeys), liveKeys)
 	}
 
-	// 活着的那一组必须是最后那个（含 c3 工具调用的第二轮）
-	last := items[len(items)-1]
-	if last.Kind != timeline.KindProcess {
-		t.Fatalf("最后一条应是过程组（回合没结束，不该有 footer），实际 %s", last.Kind)
+	// 活着的那一组必须是最后那个（含 c3 工具调用的第二轮）。
+	//
+	// 注意：流式期间**也会有一条回合行**（Live，显示运行时间/用量），
+	// 所以不能假设"最后一条是过程组"——要找最后一条**过程组**。
+	var lastProcess *timeline.Item
+	for index := range items {
+		if items[index].Kind == timeline.KindProcess {
+			lastProcess = &items[index]
+		}
 	}
-	if !last.Live {
+	if lastProcess == nil {
+		t.Fatal("应有过程组")
+	}
+	if !lastProcess.Live {
 		t.Fatal("最后一个过程组应标记为进行中")
 	}
-	if len(last.Refs) == 0 || last.Refs[len(last.Refs)-1].Chat.Message.MessageID != "a2" {
+	if len(lastProcess.Refs) == 0 || lastProcess.Refs[len(lastProcess.Refs)-1].Chat.Message.MessageID != "a2" {
 		t.Fatal("活着的应该是第二轮的过程组")
 	}
 
 	// 会话空闲后，一个都不该转圈
-	for _, item := range timeline.Build(conv.Entries(), true) {
+	for _, item := range timeline.Build(conv.Entries(), true, nil) {
 		if item.Kind == timeline.KindProcess && item.Live {
 			t.Fatalf("会话空闲后不该有过程组仍在转圈：%s", item.Key)
 		}
