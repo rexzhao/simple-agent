@@ -54,7 +54,7 @@ func TestStreamContentTimeoutWithHeartbeats(t *testing.T) {
 				t.Fatal("通道关闭但没有错误事件")
 			}
 			if event.Kind == EventError {
-				if event.Err == nil || !strings.Contains(event.Err.Error(), "仍未收到任何响应") {
+				if event.Err == nil || !strings.Contains(event.Err.Error(), "仍未产出任何内容") {
 					t.Fatalf("错误原因不对：%v", event.Err)
 				}
 				return

@@ -143,16 +143,12 @@ func postStream(ctx context.Context, opts streamOptions) (<-chan Event, error) {
 		})
 		defer watchdog.Stop()
 		reader := NewSSEReader(body)
-		// sawEvent 让超时消息说清"是没等到首字节"还是"输出到一半停了"——
-		// 两者排查方向完全不同（前者看服务端/网络，后者看内容长度/限流）。
-		sawEvent := false
+		// sawContent 决定超时消息说清"卡在哪一段"：
+		//   false → 还没开始产出（排队/prefill/思考），用的是宽超时
+		//   true  → 已经在产出，之后长时间没新内容才是真卡住
+		sawContent := false
 		for {
 			sse, err := reader.Next()
-			// 收到事件就把计时重置为**内容超时**（比首字节超时短）：
-			// 第一个事件到达说明服务端已经开始产出，之后就该按
-			// "多久没有新内容"来判断是不是卡住了。
-			watchdog.Reset(contentTimeout)
-			sawEvent = sawEvent || err == nil
 
 			if err != nil {
 				// 取消：不产生任何事件，直接关通道（Cancelled 不进模型历史）
@@ -161,13 +157,13 @@ func postStream(ctx context.Context, opts streamOptions) (<-chan Event, error) {
 				}
 				// 空闲超时：报错误，不能当成正常结束
 				if aborted.Load() {
+					// 两种情况用同一段宽超时（firstEventTimeout），但用户看到的话
+					// 要能分清"连都没连上"和"连上了但模型一直没出声"——
+					// 前者查网络/代理，后者查模型负载或换档位。
 					message := fmt.Sprintf("超过 %s 没有收到任何模型输出，已中止", contentTimeout)
-					if !sawEvent {
-						// 一个事件都没等到：这是"首字节前"的超时，
-						// 上限比 contentTimeout 宽得多，要把真实时长说出来，
-						// 否则用户会以为 90 秒就断了。
+					if !sawContent {
 						message = fmt.Sprintf(
-							"等待 %s 仍未收到任何响应（服务端可能过载或网络不通），已中止",
+							"等待 %s 模型仍未产出任何内容（服务端可能在排队或思考，也可能是网络问题），已中止",
 							firstEventTimeout)
 					}
 					emit(ctx, out, Event{Kind: EventError, Err: &Error{
@@ -192,6 +188,20 @@ func postStream(ctx context.Context, opts streamOptions) (<-chan Event, error) {
 			}
 
 			for _, event := range opts.Parser.Parse(sse) {
+				// **只有真正的输出内容**才算"开始产出了"，此后把计时从
+				// firstEventTimeout 切到 contentTimeout（更严格）。
+				//
+				// 为什么不能用"收到任意 SSE 事件"当信号（真实踩过的坑）：
+				// Anthropic 的 message_start / content_block_start 在响应一开头
+				// 就到了（它们带 usage 与缓存字段），于是 sawEvent 立刻为真、
+				// watchdog 立刻切到 90 秒的内容超时 —— 但那时模型还在 thinking
+				// （effort=high 时可能想很久），一个内容块都没产出。
+				// 结果就是"大上下文 + 长思考"被自己的 90 秒掐断，
+				// 报错却是"没有收到任何模型输出"，看着像网关的问题。
+				if !sawContent && isContentEvent(event.Kind) {
+					sawContent = true
+					watchdog.Reset(contentTimeout)
+				}
 				if !emit(ctx, out, event) {
 					return
 				}
@@ -203,6 +213,22 @@ func postStream(ctx context.Context, opts streamOptions) (<-chan Event, error) {
 	}()
 
 	return out, nil
+}
+
+// isContentEvent 报告这个事件是不是"模型真的产出了东西"。
+//
+// 只认文本/思考/工具调用。**不认 EventUsage**：Anthropic 的 message_start
+// 就带着 input_tokens 与缓存字段，它是**握手事件**，在模型还没想的时候
+// 就到手了 —— 把它当"已开始产出"会让严格超时立刻生效，正是这个 bug 的
+// 另一个入口（第一版修复就是这么又踩了一次）。
+//
+// 未知类型默认不算，保守地继续用宽超时：宁可多等，也不要误杀正在思考的请求。
+func isContentEvent(kind EventKind) bool {
+	switch kind {
+	case EventText, EventReasoning, EventToolStart, EventToolArgs:
+		return true
+	}
+	return false
 }
 
 // emit 写一个事件；ctx 取消时返回 false。
