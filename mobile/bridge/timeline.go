@@ -75,7 +75,9 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 			CacheWriteTokens: u.CacheWriteTokens,
 		}
 	}
-	raw := timeline.Build(entries, idle, usage)
+	// running 单独传：**工具执行期间会话不空闲、但消息已不流式**，
+	// 只看 idle 会让「运行中」那一行消失（与桌面端同一个 bug）。
+	raw := timeline.Build(entries, idle, busy != driver.BusyIdle, usage)
 	for _, item := range raw {
 		view.Items = append(view.Items, c.itemView(item, conv, idle, busy))
 	}

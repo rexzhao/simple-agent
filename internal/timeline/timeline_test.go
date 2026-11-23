@@ -53,7 +53,7 @@ func buildConversation(t *testing.T) *conversation.Conversation {
 // 分组规则：过程进组、正文在组外、回合结束时补一行 footer。
 func TestBuildSplitsProcessAndContent(t *testing.T) {
 	conv := buildConversation(t)
-	items := timeline.Build(conv.Entries(), true, nil)
+	items := timeline.Build(conv.Entries(), true, false, nil)
 
 	var kinds []string
 	for _, item := range items {
@@ -72,7 +72,7 @@ func TestBuildSplitsProcessAndContent(t *testing.T) {
 // 会话还在忙时，最后一个回合不算结束（不显示「已完成」）。
 func TestBuildNoFooterWhileBusy(t *testing.T) {
 	conv := buildConversation(t)
-	items := timeline.Build(conv.Entries(), false, nil)
+	items := timeline.Build(conv.Entries(), false, false, nil)
 	last := items[len(items)-1]
 	if last.Kind == timeline.KindRoundFooter {
 		t.Fatal("会话还没空闲，不该出现回合结束行")
@@ -82,7 +82,7 @@ func TestBuildNoFooterWhileBusy(t *testing.T) {
 // 过程组标题：进行中显示当前活动，已完成按次数拼句子。
 func TestGroupTitle(t *testing.T) {
 	conv := buildConversation(t)
-	items := timeline.Build(conv.Entries(), true, nil)
+	items := timeline.Build(conv.Entries(), true, false, nil)
 	var group timeline.Item
 	for _, item := range items {
 		if item.Kind == timeline.KindProcess {
@@ -129,7 +129,7 @@ func TestToolArgSummaryFromPartialJSON(t *testing.T) {
 // 回合耗时与 token 汇总。
 func TestDurationAndTokens(t *testing.T) {
 	conv := buildConversation(t)
-	items := timeline.Build(conv.Entries(), true, nil)
+	items := timeline.Build(conv.Entries(), true, false, nil)
 	footer := items[len(items)-1]
 	if footer.Kind != timeline.KindRoundFooter {
 		t.Fatalf("最后一条应是回合结束行，实际 %s", footer.Kind)
@@ -194,7 +194,7 @@ func TestOnlyLastProcessGroupIsLive(t *testing.T) {
 	}
 
 	// idle=false：会话正在跑（这正是触发 bug 的条件）
-	items := timeline.Build(conv.Entries(), false, nil)
+	items := timeline.Build(conv.Entries(), false, false, nil)
 
 	var liveKeys []string
 	var processCount int
@@ -235,7 +235,7 @@ func TestOnlyLastProcessGroupIsLive(t *testing.T) {
 	}
 
 	// 会话空闲后，一个都不该转圈
-	for _, item := range timeline.Build(conv.Entries(), true, nil) {
+	for _, item := range timeline.Build(conv.Entries(), true, false, nil) {
 		if item.Kind == timeline.KindProcess && item.Live {
 			t.Fatalf("会话空闲后不该有过程组仍在转圈：%s", item.Key)
 		}

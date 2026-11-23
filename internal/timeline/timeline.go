@@ -94,6 +94,15 @@ type Item struct {
 // idle 表示会话当前空闲（决定最后一个回合算不算"已结束"：还在流式输出时
 // 不该显示「已完成」）。
 //
+// running 表示这一轮**还在进行**（模型在流式，或工具正在执行）。
+// 它和 idle 不是简单的取反：工具执行期间会话不空闲，但消息已经不流式了
+// —— 只看消息状态会让「● 运行中」这一行**突然消失**，
+// 用户以为任务结束了（实际工具还在跑）。三种状态的真实含义：
+//
+//	idle=true                 → 回合已结束，显示「已完成 + 总计」
+//	running=true              → 回合进行中，显示「● 运行中 + 实时数据」
+//	两者都 false（如重放历史）→ 当作已结束
+//
 // usage 是本轮的 token 用量（含缓存字段），用于回合结束行显示缓存命中率。
 // 传 nil 表示拿不到（重放的历史会话没有这个数据）——那时不显示缓存率，
 // 比显示一个编出来的 0% 诚实。
@@ -104,7 +113,7 @@ type Item struct {
 //     （模型的每段正式输出都是独立内容，不该被折叠掉）。
 //
 // 于是一个回合可能是「组 → 旁白 → 组 → 回答」的样子。
-func Build(entries []conversation.Entry, idle bool, usage *Usage) []Item {
+func Build(entries []conversation.Entry, idle, running bool, usage *Usage) []Item {
 	var items []Item
 	var turn []*conversation.ChatEntry
 
@@ -116,7 +125,7 @@ func Build(entries []conversation.Entry, idle bool, usage *Usage) []Item {
 			return
 		}
 		items = append(items, roundItems(turn, RoundInfo{
-			Closed: closed, StartedAt: roundStart, Usage: usage,
+			Closed: closed, StartedAt: roundStart, Usage: usage, Running: running && !closed,
 		})...)
 		turn = nil
 		roundStart = time.Time{}
@@ -127,7 +136,9 @@ func Build(entries []conversation.Entry, idle bool, usage *Usage) []Item {
 		if len(turn) == 0 {
 			return
 		}
-		items = append(items, roundItems(turn, RoundInfo{Closed: false, StartedAt: roundStart})...)
+		items = append(items, roundItems(turn, RoundInfo{
+			Closed: false, StartedAt: roundStart, Running: running,
+		})...)
 		turn = nil
 		// roundStart 保留：整个回合仍然从同一条 user 消息起算
 	}
@@ -178,6 +189,14 @@ type RoundInfo struct {
 	// Usage 是本轮的 token 用量（含缓存字段），用于结束行的缓存率。
 	// nil 表示拿不到（重放的历史会话）——那时不显示缓存率。
 	Usage *Usage
+	// Running 表示这一轮**还在进行**（模型在流式，或工具正在执行）。
+	//
+	// 与 Closed 是两件事：
+	//   - Closed 说"这个回合结束了没有"
+	//   - Running 说"现在有没有在跑"
+	// 工具执行期间两者都是 false/true 的组合：回合没结束、但确实在跑。
+	// 只看消息的 streaming 状态会让「运行中」那一行消失（用户以为结束了）。
+	Running bool
 }
 
 // Usage 是本轮的 token 用量。
@@ -191,7 +210,14 @@ type Usage struct {
 	CacheWriteTokens int
 }
 
-// CacheHitBasisPoints 返回缓存命中率（千分比，0..1000）。
+// CacheHitBasisPoints 返回缓存命中率（**万分比**，0..9999）。
+//
+// 单位是万分比而不是千分比：显示要保留两位小数，`9993` → `99.93%`。
+// 与 uiapp.cacheHitBasisPoints（状态栏累计命中率）同一个口径，
+// 两边都交给 formatBasisPoints 渲染（它按 /100 与 %100 拆整数小数位）。
+//
+// ⚠️ 曾经写成 `* 1000`：算出 974，被 formatBasisPoints 解释成 9.74%，
+// 实际应是 97.4% —— 整整差 10 倍。
 //
 // 口径：命中 / (命中 + 未命中)。
 //   - 命中 = CacheReadTokens（读缓存的部分，按 10% 计价）
@@ -209,7 +235,13 @@ func (u Usage) CacheHitBasisPoints() int {
 	if total <= 0 {
 		return -1
 	}
-	return u.CacheReadTokens * 1000 / total
+	points := u.CacheReadTokens * 10_000 / total
+	// 上限压到 99.99%：本轮新增的提示词必然要重新计算，
+	// 显示 100% 会让人以为"一分钱没花"，反而不可信（与状态栏同一条规则）。
+	if points > 9_999 {
+		points = 9_999
+	}
+	return points
 }
 
 // TotalTokens 返回本轮的总 token 数（输入 + 输出，含缓存部分）。
@@ -262,16 +294,20 @@ func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 	flushGroup(true)
 	// 回合结束行：dsh 的 turn footer。
 	//
-	// **流式期间也生成**（标记 Live）：用户要在执行过程中看到
-	// 运行时间、token 和缓存率，而不是等跑完才有这一行。
-	// 结束后同一个 item 变成"已完成 + 总计"，**始终只有一条**。
+	// **进行中也生成**（标记 Live）：用户要在执行过程中看到运行时间、
+	// token 和缓存率，而不是等跑完才有这一行。结束后同一个 item
+	// 变成"已完成 + 总计"，**始终只有一条**。
+	//
+	// 判定用 info.Running 而不是消息的 streaming 状态：**工具执行期间
+	// 消息已经不流式了**，只看 streaming 会让这一行突然消失，
+	// 用户以为任务结束（实际工具还在跑）。
 	last := turn[len(turn)-1]
 	if last != nil {
-		streaming := last.Status().IsStreaming()
-		// 非流式时要求回合已闭合（后面已有新 user 消息，或会话空闲）：
-		// 工具轮之间、等待回答时回合还没结束，显示「已完成」会一闪一闪。
-		// 流式时无条件显示——那时它表达的是"正在跑"。
-		if streaming || info.Closed {
+		live := info.Running && !info.Closed
+		// live：这一轮在跑（模型流式或工具执行中）→ 显示"运行中 + 实时数据"
+		// info.Closed：回合已结束 → 显示"已完成 + 本轮总计"
+		// 两者都不成立（工具轮之间等）→ 不显示，避免"已完成"一闪一闪
+		if live || info.Closed {
 			items = append(items, Item{
 				Kind:        KindRoundFooter,
 				Key:         last.Message.MessageID + "#footer",
@@ -279,7 +315,7 @@ func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 				TurnStart:   info.StartedAt,
 				TurnEntries: turn,
 				Usage:       info.Usage,
-				Live:        streaming,
+				Live:        live,
 			})
 		}
 	}

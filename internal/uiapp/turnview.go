@@ -38,10 +38,13 @@ type partRef = timeline.Ref
 //
 // 把**本轮**的用量一起传下去：结束行要显示缓存命中率。
 // 会话忙碌时（还在跑）传的是当前这一轮的实时数据，空闲后是最后一轮的。
+//
+// running 单独传：**工具执行期间会话不空闲、但消息已不流式**，
+// 只看 idle 会让「● 运行中」那一行消失（用户以为任务结束了）。
 func (a *App) buildChatItems(session *Session) []chatItem {
-	usage := sessionUsaget(session)
+	busy := session.Busy()
 	return timeline.Build(session.Conversation().Entries(),
-		session.Busy() == driver.BusyIdle, usage)
+		busy == driver.BusyIdle, busy != driver.BusyIdle, sessionUsaget(session))
 }
 
 // sessionUsaget 把 host 侧的用量转成 timeline 的口径（nil 表示拿不到）。
