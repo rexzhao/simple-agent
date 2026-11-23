@@ -464,6 +464,25 @@ func (s *Session) send(payload SendPayload) CmdResult {
 	return CmdResult{OK: true}
 }
 
+// retry 重发这一轮请求（界面上"失败 → 重试"按钮）。
+//
+// 与 send 的关键区别：**不追加用户消息**。模型看到的前缀和失败前完全一样，
+// 缓存照常命中；对话历史里也不会多出"继续"这种噪声消息。
+//
+// autoRetry 清零：这是用户主动重试，不是自动续跑，次数应重新计。
+func (s *Session) retry() CmdResult {
+	if s.drv.Busy() != driver.BusyIdle {
+		return CmdResult{Error: s.cfg.Tr("session.retryBusy")}
+	}
+	s.autoRetry = 0
+	effects, err := s.drv.Retry()
+	if err != nil {
+		return CmdResult{Error: err.Error()}
+	}
+	s.host.applyEffects(s, effects)
+	return CmdResult{OK: true}
+}
+
 // ensurePersisted 在会话产生第一条内容时才建立日志目录并写入 session.created。
 //
 // 标题取第一条用户消息的首行（截断），与 harness 的习惯一致：侧栏里一眼能看出

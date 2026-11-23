@@ -360,6 +360,10 @@ func (l *Local) dispatch(session *Session, cmd Command) CmdResult {
 		return session.dropQueued(payload.Index)
 	case "stop":
 		return session.stop()
+	case "retry":
+		// 重发这一轮请求（网络失败后的一键重试）：
+		// **不追加用户消息**，所以不会弄脏历史、也不会让缓存前缀失效。
+		return session.retry()
 	case "answer":
 		var payload AnswerPayload
 		if err := json.Unmarshal(cmd.Payload, &payload); err != nil {

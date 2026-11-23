@@ -166,6 +166,7 @@ var zhTable = map[string]string{
 	"chat.assistant":         "助手",
 	"chat.earlier":           "（更早）",
 	"chat.aborted":           "已中止",
+	"chat.retry":             "重试",
 	"chat.failed":            "失败：%s",
 	"chat.summary":           "以上内容已压缩",
 	"chat.summary.expanded":  "以上内容已压缩（点击收起）",
@@ -229,7 +230,7 @@ var zhTable = map[string]string{
 	"message.turnProcess.failed": "处理失败",
 	"duration.seconds":           "%d秒",
 	"duration.minutes":           "%d分%d秒",
-	"turn.usage":                 "%d tokens",
+	"turn.usage":                 "%s tokens",
 	"turn.running":               "运行中",
 
 	// 过程组（dsh: message.stepProcess.*）
@@ -298,6 +299,7 @@ var zhTable = map[string]string{
 	"session.writeFail":    "写入会话日志失败：%s",
 	"session.deleteFail":   "删除会话失败：%s",
 	"session.switchBusy":   "切换模型失败：只有空闲时才能切换",
+	"session.retryBusy":    "重试失败：这一轮还在进行中",
 
 	// 压缩
 	"compact.failed":           "压缩失败：%s",

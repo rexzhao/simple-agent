@@ -7,6 +7,7 @@ import (
 
 	"simple-agent/internal/conversation"
 	"simple-agent/internal/driver"
+	"simple-agent/internal/host"
 	"simple-agent/internal/timeline"
 )
 
@@ -138,7 +139,9 @@ func (a *App) renderRoundFooter(c *ui.Context, item chatItem) {
 			ui.Text(c, label).FontSize(12).TextColor(theme.TextMuted)
 		}
 		if tokens := timeline.Tokens(item); tokens > 0 {
-			ui.Text(c, a.tr("turn.usage", tokens)).FontSize(11).TextColor(theme.TextMuted)
+			// 用 k/M 缩写：一轮几十万 token 时原文是 "456789 tokens"，
+			// 挤在状态行里既占宽又难一眼读出量级。
+			ui.Text(c, a.tr("turn.usage", compactTokens(tokens))).FontSize(11).TextColor(theme.TextMuted)
 		}
 		// 本轮缓存命中率：紧跟 token 用量。
 		//
@@ -152,6 +155,13 @@ func (a *App) renderRoundFooter(c *ui.Context, item chatItem) {
 				ui.Text(c, a.tr("composer.cacheHit", formatBasisPoints(bp))).
 					FontSize(11).TextColor(theme.TextMuted)
 			}
+		}
+	// 失败且"重发有意义"时，在按钮组前给一个「重试」文字按钮。
+		//
+		// 位置在这一行（不必展开看详情就能点）：网络断了的第一反应是
+		// 再试一次，不该逼用户先展开再找按钮。
+		if failed && isRetryable(chat.FailureReason()) {
+			a.retryButton(c, theme)
 		}
 		a.messageActionsRow(c, actions, true)
 	})
@@ -185,10 +195,11 @@ func (a *App) renderLiveFooter(c *ui.Context, item chatItem, theme *ui.Theme) {
 		if elapsed := time.Since(item.TurnStart); elapsed >= time.Second {
 			ui.Text(c, a.formatDuration(elapsed)).FontSize(11).TextColor(theme.TextMuted)
 		}
-		// 实时 token：本轮已经产生的输出（含缓存读，那是真实消耗过的）
+		// 实时 token：本轮已经产生的量（含缓存读，那是真实消耗过的）。
+		// 同样用 k/M 缩写 —— 长会话一轮就是几十万，原文挤爆状态行。
 		if item.Usage != nil {
 			if total := item.Usage.TotalTokens(); total > 0 {
-				ui.Text(c, a.tr("turn.usage", total)).FontSize(11).TextColor(theme.TextMuted)
+				ui.Text(c, a.tr("turn.usage", compactTokens(total))).FontSize(11).TextColor(theme.TextMuted)
 			}
 			// 实时缓存率：只在这一轮已经命中过时显示
 			if bp := item.Usage.CacheHitBasisPoints(); bp >= 0 {
@@ -202,13 +213,60 @@ func (a *App) renderLiveFooter(c *ui.Context, item chatItem, theme *ui.Theme) {
 // footerActions 返回回合结束行右侧的按钮组。
 //
 // 目前只有「复制」，且**只复制本回合的最终输出**（不是整个回合的旁白堆叠）。
-// 以后加「重新生成」这类按钮时在这里追加，渲染顺序即切片顺序。
+// 失败且可重试时前面再加一个「重试」。以后加「重新生成」这类按钮时
+// 在这里追加，渲染顺序即切片顺序。
 func (a *App) footerActions(item chatItem) []messageAction {
 	chat := tailMessage(item)
 	if chat == nil {
 		return nil
 	}
+	// 重试不放在这里：messageActions 那套按钮是**图标按钮**
+	// （尺寸固定、带"已复制"反馈），硬塞一个文字按钮会破坏一致性。
+	// 重试在 renderRoundFooter 里单独画（见下方 retryButton）。
 	return []messageAction{a.copyAction(chat, a.tr("common.copyAnswer"))}
+}
+
+// retryButton 在失败行画一个「重试」文字按钮。
+//
+// **重试 ≠ 发"继续"**：后者会在对话里多出一条用户消息，既弄脏历史
+// 又让缓存前缀失效（整段缓存作废）。重试是原样重发这一轮请求。
+//
+// 只对"重发有意义"的失败出现（见 isRetryable）：401、上下文超限
+// 重发一万次也一样，给按钮只会让人白点。
+func (a *App) retryButton(c *ui.Context, theme *ui.Theme) {
+	session := a.Current()
+	if session == nil {
+		return
+	}
+	label := a.tr("chat.retry")
+	if !session.CanSend() {
+		// 忙碌时按钮仍在（位置别跳），但点了没反应 —— 用弱化色表达不可用
+		ui.Text(c, label).FontSize(11).TextColor(theme.TextMuted)
+		return
+	}
+	if textButtonLines(c, label, 11, theme.Accent, 1) {
+		if err := a.Retry(); err != nil {
+			a.flashErr = err.Error()
+		}
+	}
+}
+
+// Retry 重发这一轮请求（不追加用户消息）。
+func (a *App) Retry() error {
+	session := a.Current()
+	if session == nil {
+		return nil
+	}
+	// 忙碌时不能重试：会让两个流同时跑。
+	// 界面上按钮本就显示为不可用，这里是兜底（双击、快捷键都可能绕过）。
+	if !session.CanSend() {
+		return nil
+	}
+	_, err := a.host.Submit(host.Command{
+		SessionID: session.ID,
+		Kind:      "retry",
+	})
+	return err
 }
 
 // formatDuration 把耗时格式化成本地化短文本（22s / 1m5s / 22秒 / 1分5秒）。

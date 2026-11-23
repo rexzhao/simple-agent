@@ -565,6 +565,44 @@ func (d *Driver) Send(text string) ([]Effect, error) {
 	return append(append(effects, cleared...), turnEffects...), nil
 }
 
+// Retry 重新发起**这一轮请求**：不追加任何用户消息，直接开新一轮。
+//
+// 与 Send 的区别（这是为什么要单独做一个方法）：
+//   - Send("继续") 会在对话里**多出一条用户消息**。那既弄脏历史
+//     （模型会看到一句莫名的话），也会**改变缓存前缀** —— 整段缓存作废。
+//   - Retry 沿用历史里最后那条用户消息，模型看到的前缀完全一样，
+//     缓存照常命中。
+//
+// 用在"网络失败/断流"这类**重发就能好**的场合（界面的失败行给按钮）。
+// 真正的错误（401、上下文超限）重发也没用，调用方不该给这个按钮。
+func (d *Driver) Retry() ([]Effect, error) {
+	if d.busy != BusyIdle {
+		return nil, ErrBusy
+	}
+	// 必须有可重发的起点：历史里得有一条用户消息。
+	// （没有的话说明状态异常，直接拒绝比发一个空请求好。）
+	if !d.hasUserMessage() {
+		return nil, fmt.Errorf("没有可重发的消息")
+	}
+	d.roundSeq++
+	d.roundStartedAt = time.Now()
+	d.queued = nil
+	d.depth = 0
+	d.autoCompactUsed = false
+	return d.startTurn(0)
+}
+
+// hasUserMessage 报告历史里有没有用户消息。
+func (d *Driver) hasUserMessage() bool {
+	for _, entry := range d.conv.Entries() {
+		if entry.Message != nil && entry.Message.Message != nil &&
+			entry.Message.Message.Role == message.RoleUser {
+			return true
+		}
+	}
+	return false
+}
+
 // SendWithAttachments 追加一条"文字 + 图片"的 user 消息并开始新一轮。
 //
 // 图片以 `blob:sha256:` 引用进入消息（字节已经在 blob 存储里），请求组装时才

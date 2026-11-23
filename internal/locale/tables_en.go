@@ -157,6 +157,7 @@ var enTable = map[string]string{
 	"chat.assistant":         "Assistant",
 	"chat.earlier":           "(earlier)",
 	"chat.aborted":           "Stopped",
+	"chat.retry":             "Retry",
 	"chat.failed":            "Failed: %s",
 	"chat.summary":           "Earlier content compacted",
 	"chat.summary.expanded":  "Earlier content compacted (click to collapse)",
@@ -220,7 +221,7 @@ var enTable = map[string]string{
 	"message.turnProcess.failed": "Failed",
 	"duration.seconds":           "%ds",
 	"duration.minutes":           "%dm%ds",
-	"turn.usage":                 "%d tokens",
+	"turn.usage":                 "%s tokens",
 	"turn.running":               "Running",
 
 	// Process groups
@@ -289,6 +290,7 @@ var enTable = map[string]string{
 	"session.writeFail":    "Could not write the session log: %s",
 	"session.deleteFail":   "Could not delete the session: %s",
 	"session.switchBusy":   "Cannot switch models while busy",
+	"session.retryBusy":    "Cannot retry while this turn is running",
 
 	// Compaction
 	"compact.failed":           "Compaction failed: %s",

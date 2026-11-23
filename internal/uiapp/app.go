@@ -3878,9 +3878,25 @@ func formatBasisPoints(basisPoints int) string {
 func compactTokens(tokens int) string {
 	switch {
 	case tokens >= 1_000_000:
-		return itoa(tokens/1_000_000) + "M"
+		// 1.9M 而不是 1M：整数截断会把 1,999,999 说成"1M"，
+		// 差了近一倍，看起来像少算了一半。
+		tenths := tokens / 100_000 // 1.9M → 19
+		if tenths%10 == 0 {
+			return itoa(tenths/10) + "M"
+		}
+		return itoa(tenths/10) + "." + itoa(tenths%10) + "M"
 	case tokens >= 1_000:
-		return itoa(tokens/1_000) + "k"
+		// 同样保留一位：9999 → 9.9k（而不是 9k）。
+		// 但 10k 以上不再带小数 —— 那个量级差 100 个 token 无所谓，
+		// 多一位小数反而让状态栏变长、抖动更多。
+		if tokens >= 10_000 {
+			return itoa(tokens/1_000) + "k"
+		}
+		tenths := tokens / 100 // 9.9k → 99
+		if tenths%10 == 0 {
+			return itoa(tenths/10) + "k"
+		}
+		return itoa(tenths/10) + "." + itoa(tenths%10) + "k"
 	default:
 		return itoa(tokens)
 	}
@@ -4073,6 +4089,47 @@ func (a *App) commitRename(session *Session) {
 // failureHint 把常见失败原因翻译成可操作的提示。
 //
 // 原始错误（服务端返回的 JSON/状态码）仍然原样显示在前面——排查问题需要它。
+// isRetryable 报告这个失败原因**重发有没有意义**。
+//
+// 只对"重发就可能好"的失败给重试按钮：
+//   - 网络抖动、超时、断流、5xx —— 重发大概率能过
+//   - 401/403/402（鉴权、余额）—— 重发一万次也一样
+//   - 上下文超限 —— 要压缩或换模型，不是重发
+//   - 429 限流 —— 稍等会好，但也算"重发有用"，给按钮
+//
+// 判据与 failureHint 用同一套关键词，但语义不同：
+// 那个是"给人看的建议"，这个是"要不要显示按钮"，别混用。
+func isRetryable(reason string) bool {
+	if reason == "" {
+		return false
+	}
+	lower := strings.ToLower(reason)
+	// 先排除明确的"重发无用"
+	for _, hopeless := range []string{
+		"401", "403", "402", "invalid api key", "unauthorized",
+		"authentication", "permission", "insufficient", "balance",
+		"context_length_exceeded", "maximum context length",
+		"prompt is too long", "too many tokens", "max_tokens",
+		"400", "404",
+	} {
+		if strings.Contains(lower, hopeless) {
+			return false
+		}
+	}
+	for _, retryable := range []string{
+		"timeout", "deadline exceeded", "connection refused",
+		"no such host", "network", "eof", "reset by peer",
+		"broken pipe", "stream", "502", "503", "504", "429",
+		"rate limit", "quota", "unexpected",
+	} {
+		if strings.Contains(lower, retryable) {
+			return true
+		}
+	}
+	return false
+}
+
+// failureHint 返回失败原因对应的建议文案（空表示没有更具体的建议）。
 func (a *App) failureHint(reason string) string {
 	lower := strings.ToLower(reason)
 	switch {
