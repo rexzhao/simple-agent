@@ -28,6 +28,9 @@ func (a *App) loadUIState() {
 	if state.ChatContentWidth > 0 {
 		a.contentWidthPreference = float32(state.ChatContentWidth)
 	}
+	// 上次打开的会话：启动时优先切到它。
+	// 找不到（已删除 / 被归档过滤掉）就按原顺序选第一个 —— 不能因此启动失败。
+	a.lastSessionID = state.LastSessionID
 }
 
 // saveUIState 把当前偏好写回磁盘。
@@ -45,6 +48,7 @@ func (a *App) saveUIState() {
 	if a.contentWidthPreference > 0 {
 		state.ChatContentWidth = int(a.contentWidthPreference)
 	}
+	state.LastSessionID = a.lastSessionID
 	if err := uistate.Save(a.uiStatePath, state); err != nil {
 		if !a.uiStateSaveFailed {
 			a.uiStateSaveFailed = true

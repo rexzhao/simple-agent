@@ -308,6 +308,47 @@ func (a *App) SelectSessionForTest(id string) {
 	}
 }
 
+// pickActiveSession 决定同步列表后该选中哪个会话（返回下标，-1 表示没得选）。
+//
+// 优先级（原来这段内联在 syncSessions 里，抽出来才测得了）：
+//  1. previous —— 当前正在看的那个（列表刷新不该跳走）
+//  2. lastID   —— **上次打开的那个**（仅在刚启动、previous 为空时用）
+//  3. hostID   —— 执行端的当前会话
+//  4. 最后一个
+//
+// 第 2 条是后加的：以前启动时直接落到执行端的当前会话，而那个取决于
+// 它自己恢复列表的顺序，于是"每次打开默认会话不确定"。
+func pickActiveSession(sessions []*Session, previous, lastID, hostID string) int {
+	find := func(id string) int {
+		if id == "" {
+			return -1
+		}
+		for index, shell := range sessions {
+			if shell != nil && shell.ID == id {
+				return index
+			}
+		}
+		return -1
+	}
+	if index := find(previous); index >= 0 {
+		return index
+	}
+	// 只在**首次同步**（没有 previous）时用上次打开的会话：
+	// 运行期间用户主动切走的会话不该被它拉回来。
+	if previous == "" {
+		if index := find(lastID); index >= 0 {
+			return index
+		}
+	}
+	if index := find(hostID); index >= 0 {
+		return index
+	}
+	if len(sessions) > 0 {
+		return len(sessions) - 1
+	}
+	return -1
+}
+
 // switchTo 切到第 index 个会话——**所有切换入口都必须走这里**。
 //
 // 为什么收敛成一个函数：以前"切会话"散落在 5 处（侧栏点击、新建会话、
@@ -327,8 +368,17 @@ func (a *App) switchTo(index int) {
 	}
 	a.active = index
 	a.host.SetActive(next.ID)
+	// 记住"上次打开的是哪个"：下次启动切回这里。
+	//
+	// 放在 switchTo 而不是各个入口：切会话的入口有 5 处（侧栏点击、
+	// 新建会话、删除后定位、执行端切换…），散着写一定漏。
+	// 只在真的变了时写盘，避免重复切同一个会话也刷盘。
+	if a.lastSessionID != next.ID {
+		a.lastSessionID = next.ID
+		a.saveUIState()
+	}
 	// 进入新会话：先放回"失败留下的草稿"（仅当它是唯一来源），
-	// 再恢复用户自己没发出去的内容。两者不会同时有内容 —— 
+	// 再恢复用户自己没发出去的内容。两者不会同时有内容 ——
 	// restoreDraft 只在输入框为空时生效。
 	a.draft = ""
 	a.restoreDraftIfIdle(next)
@@ -354,6 +404,12 @@ func (a *App) FlashErrForTest() string { return a.flashErr }
 
 // SessionsForTest 返回会话列表（测试用）。
 func (a *App) SessionsForTest() []*Session { return a.sessions }
+
+// SwitchToForTest 切到第 index 个会话（测试用）。
+func (a *App) SwitchToForTest(index int) { a.switchTo(index) }
+
+// LastSessionForTest 返回从本机偏好读到的"上次打开的会话 ID"（测试用）。
+func (a *App) LastSessionForTest() string { return a.lastSessionID }
 
 // SetPickDirectoryForTest 替换目录选择器（测试用：模拟用户选了另一个目录）。
 func (a *App) SetPickDirectoryForTest(pick func() (string, error)) {
@@ -524,6 +580,11 @@ type App struct {
 	uiStatePath string
 	// uiStateSaveFailed 记录"这次运行已经提示过保存失败"，避免拖动时刷屏。
 	uiStateSaveFailed bool
+	// lastSessionID 是上次打开的那个会话（本机偏好，启动时切回去）。
+	//
+	// 存的是 ID 而不是下标：会话列表顺序会变（新建、归档、项目排序），
+	// 下标隔一次启动就指向别的会话了。
+	lastSessionID string
 	// widthDragging 记录这一帧是否正在拖正文宽度（Draw 里要用：光标离开热区
 	// 但手指还按着时，光条要一直显示）。
 	widthDragging bool
@@ -876,27 +937,12 @@ func (a *App) syncSessions() {
 	}
 	a.sessions = next
 
-	// 优先保持原来的当前会话；它被删了才跟随执行端的当前会话
-	active := -1
-	for index, shell := range a.sessions {
-		if previous != "" && shell.ID == previous {
-			active = index
-			break
-		}
+	// 决定选中哪个：优先级与理由见 pickActiveSession 的注释。
+	hostID := ""
+	if current := a.host.Active(); current != nil {
+		hostID = current.ID
 	}
-	if active < 0 {
-		if current := a.host.Active(); current != nil {
-			for index, shell := range a.sessions {
-				if shell.ID == current.ID {
-					active = index
-					break
-				}
-			}
-		}
-	}
-	if active < 0 {
-		active = len(a.sessions) - 1
-	}
+	active := pickActiveSession(a.sessions, previous, a.lastSessionID, hostID)
 	if active < 0 {
 		active = 0
 	}
@@ -1994,11 +2040,11 @@ func (a *App) renderMonoBlock(c *ui.Context, text string, background, foreground
 	}
 	ui.Column(c).FillWidth().Padding(8, 10).Radius(6).Gap(3).
 		Background(background).Children(func() {
-			for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
-				ui.Text(c, line).Font(dshCodeFontStack).FontSize(12).
-					TextColor(foreground).MaxLines(1)
-			}
-		})
+		for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+			ui.Text(c, line).Font(dshCodeFontStack).FontSize(12).
+				TextColor(foreground).MaxLines(1)
+		}
+	})
 }
 
 // renderStructuredResult 用结构化数据渲染工具结果（检索/web/read/todo）。
@@ -2037,31 +2083,31 @@ func (a *App) renderSearchResult(c *ui.Context, info *tools.SearchInfo, theme *u
 	}
 	ui.Column(c).FillWidth().Padding(6, 8).Radius(6).
 		Background(theme.Surface).Gap(4).Children(func() {
-			for _, file := range info.Files {
-				ui.Column(c).FillWidth().Gap(1).Children(func() {
-					// 文件路径 + 该文件命中数
-					ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, file.Path).Font(dshCodeFontStack).FontSize(11).
-							TextColor(theme.Text).MaxLines(1)
-						if len(file.Hits) > 1 {
-							ui.Text(c, fmt.Sprintf("%d 处", len(file.Hits))).
-								FontSize(10).TextColor(theme.TextMuted)
-						}
-					})
-					// 命中行：行号 + 内容
-					for _, hit := range file.Hits {
-						text := fmt.Sprintf("%4d  %s", hit.Line,
-							truncateRunes(strings.TrimSpace(hit.Text), 100))
-						ui.Text(c, text).Font(dshCodeFontStack).FontSize(11).
-							TextColor(theme.TextMuted).MaxLines(1)
+		for _, file := range info.Files {
+			ui.Column(c).FillWidth().Gap(1).Children(func() {
+				// 文件路径 + 该文件命中数
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, file.Path).Font(dshCodeFontStack).FontSize(11).
+						TextColor(theme.Text).MaxLines(1)
+					if len(file.Hits) > 1 {
+						ui.Text(c, fmt.Sprintf("%d 处", len(file.Hits))).
+							FontSize(10).TextColor(theme.TextMuted)
 					}
 				})
-			}
-			if info.Truncated {
-				ui.Text(c, "… 已达上限，结果被截断").
-					FontSize(10).TextColor(theme.TextMuted)
-			}
-		})
+				// 命中行：行号 + 内容
+				for _, hit := range file.Hits {
+					text := fmt.Sprintf("%4d  %s", hit.Line,
+						truncateRunes(strings.TrimSpace(hit.Text), 100))
+					ui.Text(c, text).Font(dshCodeFontStack).FontSize(11).
+						TextColor(theme.TextMuted).MaxLines(1)
+				}
+			})
+		}
+		if info.Truncated {
+			ui.Text(c, "… 已达上限，结果被截断").
+				FontSize(10).TextColor(theme.TextMuted)
+		}
+	})
 }
 
 // renderWebResult 显示抓取摘要或搜索结果列表。
@@ -2073,25 +2119,25 @@ func (a *App) renderWebResult(c *ui.Context, info *tools.WebInfo, theme *ui.Them
 	}
 	ui.Column(c).FillWidth().Padding(6, 8).Radius(6).
 		Background(theme.Surface).Gap(4).Children(func() {
-			for index, result := range info.Results {
-				ui.Column(c).FillWidth().Gap(1).Children(func() {
-					ui.Text(c, fmt.Sprintf("%d. %s", index+1, result.Title)).
-						FontSize(12).TextColor(theme.Text).MaxLines(1)
-					if result.URL != "" {
-						ui.Text(c, result.URL).Font(dshCodeFontStack).FontSize(10).
-							TextColor(theme.TextMuted).MaxLines(1)
-					}
-					if result.Excerpt != "" {
-						ui.Text(c, truncateRunes(result.Excerpt, 120)).FontSize(11).
-							TextColor(theme.TextMuted).MaxLines(2)
-					}
-				})
-			}
-			if info.Truncated {
-				ui.Text(c, "… 只显示了前面的结果").
-					FontSize(10).TextColor(theme.TextMuted)
-			}
-		})
+		for index, result := range info.Results {
+			ui.Column(c).FillWidth().Gap(1).Children(func() {
+				ui.Text(c, fmt.Sprintf("%d. %s", index+1, result.Title)).
+					FontSize(12).TextColor(theme.Text).MaxLines(1)
+				if result.URL != "" {
+					ui.Text(c, result.URL).Font(dshCodeFontStack).FontSize(10).
+						TextColor(theme.TextMuted).MaxLines(1)
+				}
+				if result.Excerpt != "" {
+					ui.Text(c, truncateRunes(result.Excerpt, 120)).FontSize(11).
+						TextColor(theme.TextMuted).MaxLines(2)
+				}
+			})
+		}
+		if info.Truncated {
+			ui.Text(c, "… 只显示了前面的结果").
+				FontSize(10).TextColor(theme.TextMuted)
+		}
+	})
 }
 
 // renderReadResult 显示文件内容（保留行号），去掉末尾的续读指令。

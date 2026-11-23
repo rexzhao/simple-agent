@@ -37,6 +37,14 @@ type State struct {
 	// 这个值由“会话宽度把手”拖动产生，与 dsh 的
 	// `dsh.conversation.contentWidth` 对应。
 	ChatContentWidth int `json:"chat_content_width,omitempty"`
+	// LastSessionID 是**上次打开的那个会话**，启动时优先切到它。
+	//
+	// 为什么放在这里而不是会话档案里：这是"我这台客户端上次在看哪个"
+	// —— 纯客户端状态。同一份会话在电脑和手机上可以各自停在不同位置，
+	// 不该互相覆盖，也不该让执行端替所有客户端记一个值。
+	//
+	// 空表示没记录过（首次启动 / 记录已被清理），此时按原来的顺序选第一个。
+	LastSessionID string `json:"last_session_id,omitempty"`
 }
 
 // Default 返回默认偏好（全部“没设置”）。
