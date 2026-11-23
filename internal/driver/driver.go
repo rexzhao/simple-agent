@@ -1237,6 +1237,15 @@ func (d *Driver) ensureToolPart(entry *conversation.ChatEntry, round *Round, ind
 	data := map[string]any{
 		"id": buf.id, "name": buf.name, "args": map[string]any{},
 		"stream_index": index,
+		// started_at 是工具**开始执行**的时刻（Unix 毫秒）。
+		//
+		// 为什么要它：折叠行要显示"已经跑了多久"。没有起点就只能显示
+		// 一个静止的"运行中"——用户看到转圈半天也不知道是 3 秒还是 3 分钟，
+		// 这正是"是不是卡住了"的焦虑来源。
+		//
+		// 只给界面用（providers 组装请求时不读它），重放时保留 ——
+		// 重启后看历史也能知道那次工具跑了多久。
+		"started_at": time.Now().UnixMilli(),
 	}
 	partIndex := entry.AddPart(message.Part{
 		Content:   message.DataPart{Data: data},

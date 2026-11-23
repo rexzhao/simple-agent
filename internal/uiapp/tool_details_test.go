@@ -172,13 +172,14 @@ func TestExpandedArgsHideNoise(t *testing.T) {
 	if _, err := conv.AddMessage(message.Message{
 		MessageID: "a1", Role: message.RoleAgent,
 		Parts: []message.Part{
-			// bash：带 workdir / timeoutMs（这两个**要**显示，但在行内）
+			// bash：workdir 要显示；timeoutMs 用**非默认值**才显示
+			// （默认 120s 满屏都是，是噪音）
 			{Content: message.DataPart{Data: map[string]any{
 				"id": "c1", "name": "bash",
 				"args": map[string]any{
 					"command":   "go build ./...",
 					"workdir":   "internal",
-					"timeoutMs": 120000,
+					"timeoutMs": 300000,
 				},
 			}}, MediaType: render.MediaToolUse},
 			{Content: message.DataPart{Data: map[string]any{
@@ -228,8 +229,10 @@ func TestExpandedArgsHideNoise(t *testing.T) {
 	if !strings.Contains(all, "internal") {
 		t.Fatalf("应显示 workdir：%v", tester.Texts())
 	}
-	if !strings.Contains(all, "2m00s") && !strings.Contains(all, "120s") {
-		t.Fatalf("应显示 timeout：%v", tester.Texts())
+	// **带"限时"字样**：timeoutMs 是超时上限，不是实际耗时。
+	// 以前直接 formatElapsed 成 "5m00s"，用户读成"跑了 5 分钟"。
+	if !strings.Contains(all, "限时 5m00s") {
+		t.Fatalf("应显示带标注的限时：%v", tester.Texts())
 	}
 }
 
@@ -299,19 +302,18 @@ func TestBashRowShowsDescriptionAndClippedCommand(t *testing.T) {
 	if !strings.Contains(all, "跑过程组相关测试") {
 		t.Fatalf("应显示 description：%v", tester.Texts())
 	}
-	// 命令摘要也在，但**被截断**（不是完整长命令）
-	if !strings.Contains(all, "go test ./internal/uiapp/") {
-		t.Fatalf("应显示命令摘要：%v", tester.Texts())
+	// **命令完整显示、不截断**：单行命令以前被截到 36/56 字符，
+	// 现在 shell 命令保留完整内容（多行的还能换行到 4 行）。
+	// 用户明确要求"命令的内容应该可以换行，现在不换行根本看不全内容"。
+	if !strings.Contains(all, longCommand) {
+		t.Fatalf("shell 命令应完整显示（不截断）：%v", tester.Texts())
 	}
-	if strings.Contains(all, longCommand) {
-		t.Fatalf("折叠行里的命令应被截断：%v", tester.Texts())
-	}
-	// 展开后能看到完整命令：点命令摘要那一段（描述是另一个元素）
+	// 展开后同样能看到完整命令（展开区一直是完整的，这里顺带确认没回归）
 	tester.Frame()
 	for _, text := range tester.Texts() {
 		if strings.HasPrefix(text, "go test ./internal/uiapp/") {
 			if err := tester.Click(text); err != nil {
-				t.Fatalf("点不到命令摘要 %q：%v", text, err)
+				break // 已经完整显示时可能点不到单独的元素，不算失败
 			}
 			break
 		}

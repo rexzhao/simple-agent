@@ -2353,10 +2353,41 @@ func argString(data map[string]any, key string) string {
 	return value
 }
 
-// execArgsSummary 生成 bash/pwsh 调用行尾的补充信息（workdir / 超时）。
+// shellCommandMaxLines 是折叠行里命令最多显示几行。
+//
+// 给到 4 行：常见的多行命令（heredoc、几条 && 串起来、管道）基本都在
+// 这个范围里；再多就说明是个大脚本，那时展开看更合适
+// （展开区是完整内容，不受这个限制）。
+const shellCommandMaxLines = 4
+
+// shellCommandText 返回 shell 工具的原始命令（不截断）。
+//
+// 与 toolArgSummary 的区别：那个为了"一行摘要"固定截到 60 字符，
+// 对命令来说太短了 —— 多行命令会被压成一行且只剩开头。
+func shellCommandText(data map[string]any) string {
+	args, ok := data["args"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	command, _ := args["command"].(string)
+	return strings.TrimRight(command, "\n")
+}
+
+// defaultShellTimeoutMs 与 tools.defaultTimeoutMs 保持同步（那里未导出）。
+//
+// 用途：判断"限时"这个值是不是默认的 —— 默认值不值得显示，
+// 满屏的"限时 2m00s"纯粹是噪音。
+const defaultShellTimeoutMs = 120_000
+
+// execArgsSummary 生成 bash/pwsh 调用行尾的补充信息（workdir / 超时上限）。
 //
 // 只显示**用户显式设过**的项：默认 workdir 就是会话目录、默认超时不用提，
 // 全都显示反而让这一行变长。
+//
+// ⚠️ timeoutMs 是**超时上限**，不是实际耗时。以前直接 formatElapsed 成
+// "2m00s"，用户读成"这条命令跑了 2 分钟"—— 实际它可能只跑了 80ms。
+// 现在明确带上"限时"字样，并且**只在确实设了自定义值时**显示
+// （默认 120s 满屏都是，纯噪音）。
 func execArgsSummary(data map[string]any) string {
 	args, ok := data["args"].(map[string]any)
 	if !ok {
@@ -2366,13 +2397,31 @@ func execArgsSummary(data map[string]any) string {
 	if workdir, ok := args["workdir"].(string); ok && workdir != "" {
 		parts = append(parts, workdir)
 	}
-	// timeoutMs 可能是 float64（JSON 解出来）也可能是 int
 	if value, ok := args["timeoutMs"]; ok {
-		if ms := intOf(value); ms > 0 {
-			parts = append(parts, formatElapsed(int64(ms)))
+		if ms := intOf(value); ms > 0 && ms != defaultShellTimeoutMs {
+			parts = append(parts, "限时 "+formatElapsed(int64(ms)))
 		}
 	}
 	return strings.Join(parts, " · ")
+}
+
+// int64Of 尽力把 JSON 数值转成 int64（float64/int64/json.Number 都认）。
+//
+// 与 intOf 分开是因为 Unix 毫秒超出 int 的 32 位范围（某些平台 int 是 32 位）。
+func int64Of(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case int:
+		return int64(typed), true
+	case json.Number:
+		if n, err := typed.Int64(); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // intOf 尽力把 JSON 数值转成 int（float64/int/json.Number/字符串都认）。
@@ -2723,12 +2772,25 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 			if summary := toolArgSummary(data); summary != "" {
 				// 摘要（文件名/命令）不 Grow：让后面的 +/- 紧跟在它后面，
 				// 而不是被推到行尾（用户要求"edit 的 +/- 紧跟文件名后面"）。
-				limit := 56
-				if desc != "" {
-					limit = 36
+				//
+				// **shell 命令不截断、允许换行**：命令经常是多行的
+				// （heredoc、一连串 && 、管道），截到一行等于只看到开头，
+				// 用户没法判断这条命令到底要干什么。
+				//
+				// 注意这里绕开了 toolArgSummary —— 它内部固定 ClipLine(60)，
+				// 拿到的已经是截断过的。shell 直接读原始 command。
+				if isShellTool(name) && !isError {
+					ui.Text(c, shellCommandText(data)).Font(dshCodeFontStack).
+						FontSize(12).TextColor(theme.TextMuted).
+						MaxLines(shellCommandMaxLines)
+				} else {
+					limit := 56
+					if desc != "" {
+						limit = 36
+					}
+					ui.Text(c, truncateRunes(summary, limit)).FontSize(12).
+						TextColor(theme.TextMuted).MaxLines(1)
 				}
-				ui.Text(c, truncateRunes(summary, limit)).FontSize(12).
-					TextColor(theme.TextMuted).MaxLines(1)
 			}
 			// 各工具的结构化摘要（折叠行一行）。
 			//
@@ -2781,13 +2843,27 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 			// 状态：失败用红色，运行中用强调色，完成用弱化色
 			if status != "" {
 				color := theme.TextMuted
-				switch {
-				case isError:
+				running := status == a.tr("chat.toolRunning")
+				if isError {
 					color = theme.Danger
-				case status == a.tr("chat.toolRunning"):
+				} else if running {
 					color = theme.Accent
 				}
-				ui.Text(c, status).FontSize(11).TextColor(color)
+				// 运行中额外显示**已经跑了多久**：静止的"运行中"看不出
+				// 是刚起还是挂了 3 分钟，那正是"是不是卡住了"的焦虑来源。
+				//
+				// 起点来自 tool_use 的 started_at（driver 写入）；老日志没有
+				// 这个字段就不显示时长，只显示"运行中"。
+				label := status
+				if running {
+					if startedAt, ok := int64Of(data["started_at"]); ok && startedAt > 0 {
+						elapsed := time.Since(time.UnixMilli(startedAt))
+						if elapsed >= time.Second {
+							label = status + " · " + a.formatDuration(elapsed)
+						}
+					}
+				}
+				ui.Text(c, label).FontSize(11).TextColor(color)
 			}
 			// 点行内空白也能展开（但别和上面的三角重复触发）
 			if row.Clicked() {
