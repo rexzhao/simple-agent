@@ -1,4 +1,4 @@
-package providers
+﻿package providers
 
 import (
 	"strings"
@@ -82,12 +82,12 @@ func TestRequestBodyKeyOrder(t *testing.T) {
 // Anthropic 的请求体同样要稳定。
 func TestAnthropicBodyIsByteStable(t *testing.T) {
 	req := ChatRequest{Model: "m", System: "你是助手", Messages: buildStabilityMessages()}
-	first, err := buildAnthropicBody(req, nil, nil)
+	first, err := buildAnthropicBody(req, nil, nil, CacheControlConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 30; i++ {
-		again, err := buildAnthropicBody(req, nil, nil)
+		again, err := buildAnthropicBody(req, nil, nil, CacheControlConfig{})
 		if err != nil {
 			t.Fatal(err)
 		}

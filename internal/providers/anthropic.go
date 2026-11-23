@@ -32,7 +32,7 @@ const defaultMaxTokens = 4096
 
 // Stream 发起流式对话。
 func (p *AnthropicProvider) Stream(ctx context.Context, req ChatRequest) (<-chan Event, error) {
-	body, err := buildAnthropicBody(req, p.config.ExtraBody, p.config.ModelExtra(req.Model))
+	body, err := buildAnthropicBody(req, p.config.ExtraBody, p.config.ModelExtra(req.Model), p.config.CacheControl)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +50,8 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req ChatRequest) (<-chan
 }
 
 // buildAnthropicBody 构造请求体。
-func buildAnthropicBody(req ChatRequest, extraBody, modelExtra map[string]any) ([]byte, error) {
+func buildAnthropicBody(req ChatRequest, extraBody, modelExtra map[string]any,
+	cache CacheControlConfig) ([]byte, error) {
 	messages, err := ToAnthropicMessages(req.Messages, req.Blobs)
 	if err != nil {
 		return nil, err
@@ -69,23 +70,54 @@ func buildAnthropicBody(req ChatRequest, extraBody, modelExtra map[string]any) (
 		"max_tokens": maxTokens,
 		"stream":     true,
 	}
+	cacheControl := cache.control()
 	if strings.TrimSpace(req.System) != "" {
-		// Anthropic 的 system 是顶层字段，不是消息
-		body["system"] = req.System
+		// Anthropic 的 system 是顶层字段，不是消息。
+		//
+		// **显式打缓存断点**（cache_control）：Anthropic 的 prompt caching
+		// 默认不开，必须在某个 block 上标 `cache_control` 才会去建缓存。
+		// 不标的话服务端返回的 cache_read/cache_creation 恒为 0
+		// （实测这个网关就是这样：跑 8 轮全是 0，界面因此永远不显示命中率）。
+		//
+		// 打在 system 上：它最长、最稳定（每轮都一样），命中率最高。
+		block := map[string]any{"type": "text", "text": req.System}
+		if cacheControl != nil {
+			block["cache_control"] = cacheControl
+		}
+		body["system"] = []any{block}
 	}
 	if req.Temperature != nil {
 		body["temperature"] = float64(int(*req.Temperature*1000+0.5)) / 1000
 	}
 	if len(req.Tools) > 0 {
 		tools := make([]any, 0, len(req.Tools))
-		for _, tool := range req.Tools {
-			tools = append(tools, map[string]any{
+		for index, tool := range req.Tools {
+			entry := map[string]any{
 				"name":         tool.Name,
 				"description":  tool.Description,
 				"input_schema": tool.Parameters,
-			})
+			}
+			// **只在最后一个 tool 上打点**：缓存按前缀生效，标记最后一个
+			// 就等于"把整段 tools 定义都缓存起来"。
+			//
+			// 单独缓存 tools 的价值：工具定义（schema）很长，而对话历史
+			// 每轮都在变。分开打点后，历史变化不会让 tools 那段失效。
+			// 这是 pi 的做法（anthropic-messages.ts 的 index === length-1）。
+			if cacheControl != nil && !cache.NoTools && index == len(req.Tools)-1 {
+				entry["cache_control"] = cacheControl
+			}
+			tools = append(tools, entry)
 		}
 		body["tools"] = tools
+	}
+	// 最后一条消息打点：让**多轮对话**每轮都命中上一轮的前缀 ——
+	// 这是省钱的大头（回合越多，累积的上下文越大，缓存省得越多）。
+	//
+	// 打在最后一条 user/assistant 消息的**最后一个 content block** 上。
+	// 只标最后一条：Anthropic 按"标记之前的内容"做缓存前缀，
+	// 标最后一条就等于"把整个对话历史缓存起来"。
+	if cacheControl != nil && !cache.NoMessages {
+		markLastMessageCacheControl(messages, cacheControl)
 	}
 	// 厂商特有参数（如 thinking）最后合并；模型级覆盖厂商级
 	for key, value := range extraBody {
@@ -117,6 +149,50 @@ func buildAnthropicBody(req ChatRequest, extraBody, modelExtra map[string]any) (
 	// **必须用确定性序列化**：messages/system 是 map，json/v2 默认按随机
 	// 迭代顺序输出键，每次请求前缀都不一样，prompt caching 永远不命中。
 	return marshalDeterministic(body)
+}
+
+// control 生成请求里用的 cache_control 标记；Disabled 时返回 nil（不发）。
+func (c CacheControlConfig) control() map[string]any {
+	if c.Disabled {
+		return nil
+	}
+	marker := map[string]any{"type": "ephemeral"}
+	// ttl 只在要 1h 时写：默认 5 分钟不打这个字段，请求体更干净
+	// （网关对未知字段宽容度不一，能不写就不写）。
+	if c.TTL == "1h" {
+		marker["ttl"] = "1h"
+	}
+	return marker
+}
+
+// markLastMessageCacheControl 在最后一条 user/assistant 消息的末尾打缓存断点。
+//
+// 只在最后一条上标：Anthropic 的缓存是**前缀式**的 —— 标记点之前的内容
+// 会被缓存。标在最后一条的最后一个 block 上，等于"把整个对话历史缓存起来"，
+// 下一轮追加新消息时，之前的部分就全部命中。
+//
+// 跳过的位置：
+//   - 最后一条是 assistant（预填充场景）：不标，等下一轮 user 消息再说
+//   - 消息没有 content block（空消息）
+func markLastMessageCacheControl(messages []map[string]any, marker map[string]any) {
+	for index := len(messages) - 1; index >= 0; index-- {
+		message := messages[index]
+		role, _ := message["role"].(string)
+		if role != "user" && role != "assistant" {
+			continue
+		}
+		blocks, ok := message["content"].([]any)
+		if !ok || len(blocks) == 0 {
+			return
+		}
+		// 标在最后一个 block 上（文本/图片/工具结果都行）
+		last, ok := blocks[len(blocks)-1].(map[string]any)
+		if !ok {
+			return
+		}
+		last["cache_control"] = marker
+		return
+	}
 }
 
 // anthropicParser 是有状态的解析器：只有 tool_use 块的 stop 才算工具调用结束。

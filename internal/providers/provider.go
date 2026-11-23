@@ -49,6 +49,32 @@ type ProviderConfig struct {
 	// IdleTimeout 是流空闲超时（超过这个时间没有任何字节就断开）。0 用默认 180s。
 	// 做成配置项是为了能用短超时做测试，也让高级用户能按网络情况调整。
 	IdleTimeout time.Duration
+
+	// CacheControl 控制 Anthropic 的 prompt caching 断点（只对 KindAnthropic 生效）。
+	//
+	// 默认（零值）= 全部打开：system + 最后一个 tool + 最后一条消息。
+	// Anthropic 默认**不缓存**，必须在请求里显式标 `cache_control`，
+	// 否则 cache_read/cache_creation 恒为 0（界面上的命中率永远不出现）。
+	CacheControl CacheControlConfig
+}
+
+// CacheControlConfig 是缓存断点的开关。
+//
+// 为什么要可配：`cache_control` 是 Anthropic 独有的字段，某些兼容网关
+// 在 tools 上不认它（pi 专门为此留了 supportsCacheControlOnTools 开关）。
+// 这家网关实测三处都支持，但留着开关方便遇到 400 时逐个关掉排查。
+type CacheControlConfig struct {
+	// Disabled 全关（不发任何 cache_control）。
+	Disabled bool
+	// NoTools 不在 tools 上打点（网关不支持 tools.cache_control 时用）。
+	NoTools bool
+	// NoMessages 不在消息上打点。
+	NoMessages bool
+	// TTL 是缓存存活时间："5m"（默认，等价于不写）或 "1h"。
+	//
+	// 1h 的写入费更贵（2x 而非 1.25x），但命中仍按 10% 计价；
+	// 适合长时间连续对话。默认 5m 对"停一会儿再聊"更划算。
+	TTL string
 }
 
 // ModelConfig 是单个模型的配置。

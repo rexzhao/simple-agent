@@ -137,6 +137,8 @@ type Override struct {
 	Models []ModelSpec
 	// ExtraBody 是这家厂商对所有模型共用的请求体参数（模型的同名参数优先）。
 	ExtraBody map[string]any
+	// CacheControl 是 Anthropic 缓存断点的开关（只对 KindAnthropic 生效）。
+	CacheControl CacheControlConfig
 }
 
 // ModelSpec 是配置文件里的一个模型：id + 该模型自己的参数。
@@ -185,6 +187,7 @@ func (r *Registry) ApplyOverrides(overrides []Override) {
 			if len(o.Models) > 0 {
 				cfg.Models = mergeModelExtras(o.Models, o.ExtraBody)
 			}
+			cfg.CacheControl = o.CacheControl
 			if len(o.ExtraBody) > 0 && len(o.Models) == 0 {
 				cfg.ExtraBody = o.ExtraBody
 			}

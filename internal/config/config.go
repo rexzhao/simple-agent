@@ -86,6 +86,42 @@ type ProviderOverride struct {
 	Models []ModelEntry `toml:"models" yaml:"models"`
 	// ExtraBody 是这家厂商对所有模型共用的请求体参数（模型自身的同名参数优先）。
 	ExtraBody map[string]any `toml:"extra_body" yaml:"extra_body"`
+	// CacheControl 控制 Anthropic 的 prompt caching 断点（只对 kind=anthropic 生效）。
+	//
+	// 不写 = 全部打开（system + 最后一个 tool + 最后一条消息）。
+	// 写成 cache_control: none 可整体关闭。
+	CacheControl *CacheControlEntry `toml:"cache_control" yaml:"cache_control"`
+}
+
+// CacheControlEntry 是缓存断点的配置。
+//
+// 默认全开：Anthropic 不开缓存的话 cache_read 恒为 0（白花钱）。
+// 留这些开关是为了排查"某个网关不认某个位置的 cache_control"——
+// 那种情况会直接 400，只能逐个位置关掉试。
+type CacheControlEntry struct {
+	// Enabled 显式开关。**nil = 开**（不写就是默认开启）；
+	// 显式写 false（或 `cache_control: none`）才关闭。
+	Enabled *bool `toml:"enabled" yaml:"enabled"`
+	// Tools 为 false 时不在 tools 上打点（nil = 打）。
+	Tools *bool `toml:"tools" yaml:"tools"`
+	// Messages 为 false 时不在消息上打点（nil = 打）。
+	Messages *bool `toml:"messages" yaml:"messages"`
+	// TTL 是缓存存活时间："5m"（默认）或 "1h"。
+	TTL string `toml:"ttl" yaml:"ttl"`
+}
+
+// resolve 把配置转成 providers 侧的结构。
+func (c *CacheControlEntry) resolve() providers.CacheControlConfig {
+	if c == nil {
+		return providers.CacheControlConfig{} // 默认全开
+	}
+	out := providers.CacheControlConfig{
+		Disabled:   c.Enabled != nil && !*c.Enabled,
+		NoTools:    c.Tools != nil && !*c.Tools,
+		NoMessages: c.Messages != nil && !*c.Messages,
+		TTL:        c.TTL,
+	}
+	return out
 }
 
 // ModelEntry 描述一个模型以及它自己的参数。
@@ -566,12 +602,13 @@ func (c Config) Registry() *providers.Registry {
 			})
 		}
 		override := providers.Override{
-			ID:        id,
-			Label:     item.Label,
-			Kind:      providers.Kind(item.Kind),
-			BaseURL:   item.BaseURL,
-			Models:    specs,
-			ExtraBody: item.ExtraBody,
+			ID:           id,
+			Label:        item.Label,
+			Kind:         providers.Kind(item.Kind),
+			BaseURL:      item.BaseURL,
+			Models:       specs,
+			ExtraBody:    item.ExtraBody,
+			CacheControl: item.CacheControl.resolve(),
 		}
 		if item.APIKeyEnv != "" {
 			env := item.APIKeyEnv

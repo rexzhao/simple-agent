@@ -478,7 +478,14 @@ func TestRequestBodyShapes(t *testing.T) {
 	}
 	drain(t, events)
 	body = string(captured)
-	for _, want := range []string{`"system":"你是助手"`, `"input_schema":`, `"max_tokens":4096`} {
+	// system 现在是 block 数组（带 cache_control 断点）：
+	// Anthropic 的 prompt caching 必须显式标记 cachel_control 才会启用，
+	// 否则 cache_read/cache_creation 恒为 0。
+	for _, want := range []string{
+		`"system":[{"cache_control":{"type":"ephemeral"},"text":"你是助手","type":"text"}]`,
+		`"input_schema":`,
+		`"max_tokens":4096`,
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("Anthropic 请求体应包含 %s，实际 %s", want, body)
 		}

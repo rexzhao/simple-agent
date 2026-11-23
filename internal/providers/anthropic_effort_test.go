@@ -1,4 +1,4 @@
-package providers
+﻿package providers
 
 import (
 	"strings"
@@ -16,7 +16,7 @@ func TestAnthropicBodyUsesOutputConfigEffort(t *testing.T) {
 		Messages:        buildStabilityMessages(),
 		ReasoningEffort: "xhigh",
 	}
-	body, err := buildAnthropicBody(req, nil, nil)
+	body, err := buildAnthropicBody(req, nil, nil, CacheControlConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestAnthropicBodyOmitsOutputConfigWhenNoEffort(t *testing.T) {
 		Model:    "claude-opus-5-5",
 		Messages: buildStabilityMessages(),
 	}
-	body, err := buildAnthropicBody(req, nil, nil)
+	body, err := buildAnthropicBody(req, nil, nil, CacheControlConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestAnthropicExtraBodyEffortWins(t *testing.T) {
 	modelExtra := map[string]any{
 		"output_config": map[string]any{"effort": "max"},
 	}
-	body, err := buildAnthropicBody(req, nil, modelExtra)
+	body, err := buildAnthropicBody(req, nil, modelExtra, CacheControlConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
