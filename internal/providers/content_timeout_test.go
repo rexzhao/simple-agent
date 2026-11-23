@@ -10,11 +10,15 @@ import (
 	"time"
 )
 
-// 网关只发心跳注释、一直不给真正的 chunk：必须按"无输出"超时中止，
+// 网关只发心跳注释、一直不给真正的 chunk：必须按超时中止，
 // 不能因为字节不断而永远挂着（用户看到"停止按钮还在、没有输出"）。
+//
+// 注意这里走的是**首字节超时**：心跳行不是"事件"，所以在收到第一个
+// 真正的事件之前，计时器用的是 firstEventTimeout（比 contentTimeout 宽）。
+// 两种超时都必须能中止 —— 区别只是上限与报错文案。
 func TestStreamContentTimeoutWithHeartbeats(t *testing.T) {
-	SetContentTimeoutForTest(150 * time.Millisecond)
-	defer SetContentTimeoutForTest(90 * time.Second)
+	SetFirstEventTimeoutForTest(150 * time.Millisecond)
+	defer SetFirstEventTimeoutForTest(300 * time.Second)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -50,7 +54,7 @@ func TestStreamContentTimeoutWithHeartbeats(t *testing.T) {
 				t.Fatal("通道关闭但没有错误事件")
 			}
 			if event.Kind == EventError {
-				if event.Err == nil || !strings.Contains(event.Err.Error(), "没有收到任何模型输出") {
+				if event.Err == nil || !strings.Contains(event.Err.Error(), "仍未收到任何响应") {
 					t.Fatalf("错误原因不对：%v", event.Err)
 				}
 				return
@@ -58,5 +62,5 @@ func TestStreamContentTimeoutWithHeartbeats(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	t.Fatal("只有心跳时没有按无输出超时中止")
+	t.Fatal("只有心跳时没有按超时中止")
 }

@@ -23,8 +23,26 @@ const idleTimeout = 180 * time.Second
 // 一直没有输出"）。所以按"解析出事件"计时。
 var contentTimeout = 90 * time.Second
 
+// firstEventTimeout 是"**首字节之前**"的等待上限，比 contentTimeout 宽松得多。
+//
+// 为什么必须分开（真实的坑）：contentTimeout 原本从请求发出就开始计时，
+// 于是"首字节前的等待"也被当成"没有输出"。对大上下文 + 慢网关，首字节
+// 本来就慢 —— 实测 101 条消息的会话首字节要 41 秒，网关再稍慢一点就撞上
+// 90 秒被自己掐断，日志里表现为"卡 95 秒后失败、out=0"，看着像网关挂了，
+// 其实是我们在服务端还在思考时就断了它。
+//
+// 首字节之前的等待是"服务端在处理"（排队、prefill、思考），长是正常的；
+// 传出第一个事件之后，再长时间没新事件才真叫卡住。
+//
+// 取 5 分钟：与 idleTimeout 相比它更长，因为 prefill 大上下文确实可能很慢；
+// 但也不能无限 —— 网关彻底不回时用户至少能在几分钟后看到失败。
+var firstEventTimeout = 300 * time.Second
+
 // SetContentTimeoutForTest 调整"无输出"上限（测试用）。
 func SetContentTimeoutForTest(d time.Duration) { contentTimeout = d }
+
+// SetFirstEventTimeoutForTest 调整"首字节之前"的等待上限（测试用）。
+func SetFirstEventTimeoutForTest(d time.Duration) { firstEventTimeout = d }
 
 // sharedClient 是包级共享的 HTTP 客户端。
 //
@@ -33,8 +51,13 @@ func SetContentTimeoutForTest(d time.Duration) { contentTimeout = d }
 // 不设总超时（长回答合法），只设「响应头」超时与流空闲超时。
 var sharedClient = &http.Client{
 	Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		ResponseHeaderTimeout: 120 * time.Second,
+		Proxy: http.ProxyFromEnvironment,
+		// 响应头超时：必须**大于** firstEventTimeout，否则它会先于我们的
+		// watchdog 触发，用户看到的错误来自 net/http（"timeout awaiting
+		// response headers"），既没人话解释、也没法区分"首字节慢"和"真卡住"。
+		//
+		// 大上下文 + 慢网关时首字节实测要 41 秒；原来的 120 秒余量太薄。
+		ResponseHeaderTimeout: firstEventTimeout + 30*time.Second,
 		DisableCompression:    true, // SSE 不压缩，避免中间层缓冲
 		MaxIdleConnsPerHost:   4,
 	},
@@ -108,15 +131,28 @@ func postStream(ctx context.Context, opts streamOptions) (<-chan Event, error) {
 		defer resp.Body.Close()
 
 		var aborted atomic.Bool
-		watchdog := time.AfterFunc(contentTimeout, func() {
+		// 首字节之前用**更宽**的超时：那时服务端还在排队/prefill/思考，
+		// 长是正常的（实测大上下文首字节要 41 秒）。收到第一个事件后
+		// 才切到 contentTimeout —— 那时"长时间没新事件"才真叫卡住。
+		//
+		// 不这么分的话，90 秒的阈值会把"慢但正常"的请求掐死，
+		// 表现成"卡 95 秒后失败、out=0"，看着像网关挂了。
+		watchdog := time.AfterFunc(firstEventTimeout, func() {
 			aborted.Store(true)
 			_ = resp.Body.Close() // 让阻塞中的读立刻返回
 		})
 		defer watchdog.Stop()
 		reader := NewSSEReader(body)
+		// sawEvent 让超时消息说清"是没等到首字节"还是"输出到一半停了"——
+		// 两者排查方向完全不同（前者看服务端/网络，后者看内容长度/限流）。
+		sawEvent := false
 		for {
 			sse, err := reader.Next()
+			// 收到事件就把计时重置为**内容超时**（比首字节超时短）：
+			// 第一个事件到达说明服务端已经开始产出，之后就该按
+			// "多久没有新内容"来判断是不是卡住了。
 			watchdog.Reset(contentTimeout)
+			sawEvent = sawEvent || err == nil
 
 			if err != nil {
 				// 取消：不产生任何事件，直接关通道（Cancelled 不进模型历史）
@@ -125,9 +161,18 @@ func postStream(ctx context.Context, opts streamOptions) (<-chan Event, error) {
 				}
 				// 空闲超时：报错误，不能当成正常结束
 				if aborted.Load() {
+					message := fmt.Sprintf("超过 %s 没有收到任何模型输出，已中止", contentTimeout)
+					if !sawEvent {
+						// 一个事件都没等到：这是"首字节前"的超时，
+						// 上限比 contentTimeout 宽得多，要把真实时长说出来，
+						// 否则用户会以为 90 秒就断了。
+						message = fmt.Sprintf(
+							"等待 %s 仍未收到任何响应（服务端可能过载或网络不通），已中止",
+							firstEventTimeout)
+					}
 					emit(ctx, out, Event{Kind: EventError, Err: &Error{
 						Kind:    "timeout",
-						Message: fmt.Sprintf("超过 %s 没有收到任何模型输出，已中止", contentTimeout),
+						Message: message,
 					}})
 					return
 				}
