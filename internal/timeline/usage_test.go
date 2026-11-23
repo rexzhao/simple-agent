@@ -8,13 +8,13 @@ import (
 	"simple-agent/internal/timeline"
 )
 
-// 缓存命中率的口径：命中 / (命中 + 未命中)，**不含写入**。
+// 缓存命中率的口径：按协议区分分母。
 //
-// 单位是**万分比**（9993 → 99.93%）。曾经写成千分比，界面显示成 9.74%
-// 而实际是 97.4% —— 差 10 倍，用户一眼就看出来了。
+// ⚠️ 这是踩过两次的坑：DeepSeek/OpenAI 的 `prompt_tokens` **已含**命中部分，
+// 若再算 `read/(read+input)` 就等于把命中重复计入分母 ——
+// 真实 99.53% 会显示成 49.92%（用户一眼看出不对）。
 //
-// 为什么不含 cache_write：它是"写缓存的量"，费用和普通输入不同；
-// 混进分母会让第一次请求（全写入）显示成 0%，看着像缓存没用。
+// 单位是万分比（9993 → 99.93%）。
 func TestUsageCacheHitBasisPoints(t *testing.T) {
 	cases := []struct {
 		name string
@@ -22,20 +22,37 @@ func TestUsageCacheHitBasisPoints(t *testing.T) {
 		want int
 	}{
 		{
-			// 45000/(45000+1200) = 97.4% → 9740 万分比
-			name: "接近全命中",
-			used: timeline.Usage{InputTokens: 1200, CacheReadTokens: 45000},
-			want: 9740,
+			// 真实数据（DeepSeek）：input 已含命中
+			// 656006016 / 659079718 = 99.53%
+			name: "DeepSeek input 已含命中",
+			used: timeline.Usage{
+				InputTokens: 659079718, CacheReadTokens: 656006016,
+			},
+			want: 9953,
+		},
+		{
+			// 同样两个数字，若按 Anthropic 口径（input 不含命中）
+			// 完整输入 = read + input，命中率约 49.89% —— 那是**错的**，
+			// 但只有当 InputExcludesCache=true 才该这么算。
+			name: "Anthropic input 不含命中",
+			used: timeline.Usage{
+				InputTokens: 1200, CacheReadTokens: 45000, InputExcludesCache: true,
+			},
+			want: 9740, // 45000/(45000+1200)
+		},
+		{
+			name: "Anthropic 有写入也算进分母",
+			used: timeline.Usage{
+				InputTokens: 4, CacheReadTokens: 120000, CacheWriteTokens: 9902,
+				InputExcludesCache: true,
+			},
+			// 120000/(120000+9902+4) = 92.37%
+			want: 9237,
 		},
 		{
 			name: "全命中封顶 99.99%",
-			used: timeline.Usage{InputTokens: 2, CacheReadTokens: 120000},
-			want: 9999, // 向下取整，且不显示 100%
-		},
-		{
-			name: "一半",
-			used: timeline.Usage{InputTokens: 500, CacheReadTokens: 500},
-			want: 5000,
+			used: timeline.Usage{InputTokens: 120000, CacheReadTokens: 120000},
+			want: 9999,
 		},
 		{
 			name: "只写不读 → 不显示",
@@ -47,15 +64,11 @@ func TestUsageCacheHitBasisPoints(t *testing.T) {
 			used: timeline.Usage{},
 			want: -1,
 		},
-		{
-			name: "命中为 0 但未命中很大",
-			used: timeline.Usage{InputTokens: 50000},
-			want: -1,
-		},
 	}
 	for _, c := range cases {
 		if got := c.used.CacheHitBasisPoints(); got != c.want {
-			t.Fatalf("%s：期望 %d，实际 %d", c.name, c.want, got)
+			t.Fatalf("%s：期望 %d（%.2f%%），实际 %d（%.2f%%）",
+				c.name, c.want, float64(c.want)/100, got, float64(got)/100)
 		}
 	}
 }

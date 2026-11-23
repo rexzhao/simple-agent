@@ -208,30 +208,43 @@ type Usage struct {
 	OutputTokens     int
 	CacheReadTokens  int
 	CacheWriteTokens int
+	// InputExcludesCache 表示 InputTokens **不含**缓存命中的部分。
+	//
+	// 两种协议的 usage 语义不同，算命中率时分母也不一样：
+	//   - Anthropic：input 只算没命中缓存的，完整输入 = read+write+input
+	//   - DeepSeek/OpenAI：prompt_tokens **已含**命中部分，完整输入 = input
+	//
+	// 混用的后果：DeepSeek 的命中部分被重复计入分母，命中率凭空减半
+	// （实测 99.53% 被算成 49.92%）。
+	InputExcludesCache bool
 }
 
 // CacheHitBasisPoints 返回缓存命中率（**万分比**，0..9999）。
 //
 // 单位是万分比而不是千分比：显示要保留两位小数，`9993` → `99.93%`。
-// 与 uiapp.cacheHitBasisPoints（状态栏累计命中率）同一个口径，
-// 两边都交给 formatBasisPoints 渲染（它按 /100 与 %100 拆整数小数位）。
+// 与 uiapp.cacheHitBasisPoints（状态栏累计命中率）同一个口径。
 //
-// ⚠️ 曾经写成 `* 1000`：算出 974，被 formatBasisPoints 解释成 9.74%，
-// 实际应是 97.4% —— 整整差 10 倍。
-//
-// 口径：命中 / (命中 + 未命中)。
-//   - 命中 = CacheReadTokens（读缓存的部分，按 10% 计价）
-//   - 未命中 = InputTokens（真正重新计算的部分）
-//
-// **不把 CacheWriteTokens 算进分母**：它是"写缓存的量"，费用和普通输入不同，
-// 混进命中率里会让第一次请求（全写入）显示成 0%，看着像缓存没用。
+// ⚠️ 曾经写成 `read / (read + input)`：对 Anthropic 是对的，
+// 但 DeepSeek 的 input 已含命中部分，等于把命中重复计入分母 ——
+// 真实的 99.53% 被显示成 49.92%。必须按 InputExcludesCache 分支。
 //
 // 没有任何输入时返回 -1（调用方据此不显示）。
 func (u Usage) CacheHitBasisPoints() int {
 	if u.CacheReadTokens <= 0 {
 		return -1
 	}
-	total := u.CacheReadTokens + u.InputTokens
+	var total int
+	if u.InputExcludesCache {
+		// Anthropic：三者相加才是完整输入
+		total = u.CacheReadTokens + u.CacheWriteTokens + u.InputTokens
+	} else {
+		// OpenAI 兼容：input 已含命中部分。**不能**再加 read。
+		total = u.InputTokens
+		if total < u.CacheReadTokens {
+			// 防御：个别网关的 input 不含缓存，以较大值为准
+			total = u.CacheReadTokens
+		}
+	}
 	if total <= 0 {
 		return -1
 	}

@@ -73,6 +73,9 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 			OutputTokens:     u.OutputTokens,
 			CacheReadTokens:  u.CacheReadTokens,
 			CacheWriteTokens: u.CacheWriteTokens,
+			// 判据与桌面端一致：Anthropic 报告写入 → 它的 input 不含缓存；
+			// 其余协议 prompt_tokens 已含命中部分。
+			InputExcludesCache: u.CacheWriteTokens > 0,
 		}
 	}
 	// running 单独传：**工具执行期间会话不空闲、但消息已不流式**，

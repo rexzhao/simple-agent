@@ -51,6 +51,10 @@ func (a *App) buildChatItems(session *Session) []chatItem {
 //
 // 没有任何 token 时返回 nil：重放的历史会话拿不到用量，那时显示
 // "缓存 0%" 会误导（看着像缓存失效，其实只是没数据）。
+//
+// InputExcludesCache 的判据与状态栏 cacheHitBasisPoints 一致：
+// Anthropic 会报告 cache_creation（>0），它的 input 不含命中部分；
+// 其余（DeepSeek/OpenAI 兼容）的 input **已含**命中，不能重复计入分母。
 func sessionUsaget(session *Session) *timeline.Usage {
 	if session == nil {
 		return nil
@@ -65,6 +69,9 @@ func sessionUsaget(session *Session) *timeline.Usage {
 		OutputTokens:     u.OutputTokens,
 		CacheReadTokens:  u.CacheReadTokens,
 		CacheWriteTokens: u.CacheWriteTokens,
+		// Anthropic 的 input 不含缓存（要三者相加）；
+		// 其它协议 prompt_tokens 已含命中部分（分母就是 input）。
+		InputExcludesCache: u.CacheWriteTokens > 0,
 	}
 }
 
