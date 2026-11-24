@@ -1,4 +1,4 @@
-﻿package timeline_test
+package timeline_test
 
 import (
 	"testing"
@@ -99,9 +99,14 @@ func TestRoundFooterShownWhileLive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	usage := &timeline.Usage{InputTokens: 5, CacheReadTokens: 500}
+	// 用量挂在消息上（不再是会话级传参）
+	for _, e := range conv.Entries() {
+		if e.Message != nil {
+			e.Message.SetUsage(conversation.Usage{InputTokens: 5, CacheReadTokens: 500})
+		}
+	}
 	// idle=false, running=true：会话还在跑
-	items := timeline.Build(conv.Entries(), false, true, usage)
+	items := timeline.Build(conv.Entries(), false, true)
 
 	footer := findFooter(items)
 	if footer == nil {
@@ -138,9 +143,14 @@ func TestRoundFooterShownWhileRunningTools(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 用量挂在消息上（不再是会话级传参）
+	for _, e := range conv.Entries() {
+		if e.Message != nil {
+			e.Message.SetUsage(conversation.Usage{InputTokens: 5, CacheReadTokens: 500})
+		}
+	}
 	// idle=false（会话不空闲，工具在跑）、running=true
-	items := timeline.Build(conv.Entries(), false, true,
-		&timeline.Usage{InputTokens: 5, CacheReadTokens: 500})
+	items := timeline.Build(conv.Entries(), false, true)
 
 	footer := findFooter(items)
 	if footer == nil {
@@ -170,8 +180,12 @@ func TestRoundFooterSingleAfterDone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	items := timeline.Build(conv.Entries(), true, false,
-		&timeline.Usage{InputTokens: 5, CacheReadTokens: 500})
+	for _, e := range conv.Entries() {
+		if e.Message != nil {
+			e.Message.SetUsage(conversation.Usage{InputTokens: 5, CacheReadTokens: 500})
+		}
+	}
+	items := timeline.Build(conv.Entries(), true, false)
 
 	count := 0
 	for _, item := range items {

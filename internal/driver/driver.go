@@ -453,6 +453,19 @@ func addUsage(total, one Usage) Usage {
 	}
 }
 
+// toConversationUsage 把用量转成 conversation 包的类型。
+//
+// 两个包各自定义了一份（conversation 更底层，不能依赖 driver），
+// 字段名一致，转换是逐字段赋值 —— 不复制聚合逻辑，只有类型转换。
+func toConversationUsage(u Usage) conversation.Usage {
+	return conversation.Usage{
+		InputTokens:      u.InputTokens,
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.CacheReadTokens,
+		CacheWriteTokens: u.CacheWriteTokens,
+	}
+}
+
 // CanSend 报告现在能否发送。
 func (d *Driver) CanSend() bool { return d.busy == BusyIdle }
 
@@ -1304,6 +1317,12 @@ func (d *Driver) finishStream(messageID, _ string) []Effect {
 		d.reset()
 		return []Effect{Changed{}}
 	}
+
+	// 按轮留存完整用量：回合结束行要显示**这一轮**的缓存命中率，
+	// 而不是整个会话的平均（以前界面拿会话累计值，每轮显示都一样）。
+	//
+	// 放在这里而不是各分支里：有工具调用与没工具调用两条路都要记。
+	entry.SetUsage(toConversationUsage(round.usage))
 
 	// 最终内容一次性写入（流式增量不落日志；参数非法产生的错误结果也在其中）
 	effects := []Effect{

@@ -64,23 +64,12 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 	}
 	view.Asks = c.asksOf(session)
 
-	// 把本轮用量传下去：结束行要显示缓存命中率（与桌面端同一套口径）。
-	var usage *timeline.Usage
-	if u := session.Usage(); u.InputTokens > 0 || u.OutputTokens > 0 ||
-		u.CacheReadTokens > 0 || u.CacheWriteTokens > 0 {
-		usage = &timeline.Usage{
-			InputTokens:      u.InputTokens,
-			OutputTokens:     u.OutputTokens,
-			CacheReadTokens:  u.CacheReadTokens,
-			CacheWriteTokens: u.CacheWriteTokens,
-			// 判据与桌面端一致：Anthropic 报告写入 → 它的 input 不含缓存；
-			// 其余协议 prompt_tokens 已含命中部分。
-			InputExcludesCache: u.CacheWriteTokens > 0,
-		}
-	}
 	// running 单独传：**工具执行期间会话不空闲、但消息已不流式**，
 	// 只看 idle 会让「运行中」那一行消失（与桌面端同一个 bug）。
-	raw := timeline.Build(entries, idle, busy != driver.BusyIdle, usage)
+	//
+	// 用量不再传：timeline 从**每一轮自己的消息**汇总（以前传的是
+	// 会话累计值，导致每个回合显示同一个数字）。
+	raw := timeline.Build(entries, idle, busy != driver.BusyIdle)
 	for _, item := range raw {
 		view.Items = append(view.Items, c.itemView(item, conv, idle, busy))
 	}

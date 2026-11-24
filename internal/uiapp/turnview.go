@@ -45,7 +45,7 @@ type partRef = timeline.Ref
 func (a *App) buildChatItems(session *Session) []chatItem {
 	busy := session.Busy()
 	return timeline.Build(session.Conversation().Entries(),
-		busy == driver.BusyIdle, busy != driver.BusyIdle, sessionUsaget(session))
+		busy == driver.BusyIdle, busy != driver.BusyIdle)
 }
 
 // sessionUsaget 把 host 侧的用量转成 timeline 的口径（nil 表示拿不到）。

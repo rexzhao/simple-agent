@@ -404,7 +404,16 @@ func (st *replayState) apply(event store.Event) {
 		// 逐条累加真实用量：没压缩过的会话靠这个还原累计值
 		// （以前只有压缩快照存累计，于是"刚打开旧会话看不到命中率"）。
 		if data.Usage != nil {
-			out.TotalUsage = addUsage(out.TotalUsage, data.Usage.toUsage())
+			used := data.Usage.toUsage()
+			out.TotalUsage = addUsage(out.TotalUsage, used)
+			// 同时挂到**这一轮最后一条 agent 消息**上：回合结束行要显示
+			// 该轮的缓存命中率，不是整个会话的平均。
+			//
+			// 为什么是"最后一条"：一轮请求对应一条 agent 消息
+			// （工具调用会在同一条消息上续 part），turn.finished 紧跟它。
+			if last := lastAgentEntry(conv); last != nil {
+				last.SetUsage(toConversationUsage(used))
+			}
 		}
 
 	case store.TypeNotice:
@@ -534,6 +543,21 @@ func (st *replayState) findMessageByCallID(callID string) string {
 		}
 	}
 	return ""
+}
+
+// lastAgentEntry 返回最后一条 agent 消息（没有则 nil）。
+func lastAgentEntry(conv *conversation.Conversation) *conversation.ChatEntry {
+	entries := conv.Entries()
+	for index := len(entries) - 1; index >= 0; index-- {
+		entry := entries[index].Message
+		if entry == nil || entry.Message == nil {
+			continue
+		}
+		if entry.Message.Role == message.RoleAgent {
+			return entry
+		}
+	}
+	return nil
 }
 
 // settleAsk 用最终答案覆盖 pending 占位。

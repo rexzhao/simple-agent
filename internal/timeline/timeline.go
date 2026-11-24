@@ -113,7 +113,7 @@ type Item struct {
 //     （模型的每段正式输出都是独立内容，不该被折叠掉）。
 //
 // 于是一个回合可能是「组 → 旁白 → 组 → 回答」的样子。
-func Build(entries []conversation.Entry, idle, running bool, usage *Usage) []Item {
+func Build(entries []conversation.Entry, idle, running bool) []Item {
 	var items []Item
 	var turn []*conversation.ChatEntry
 
@@ -125,7 +125,7 @@ func Build(entries []conversation.Entry, idle, running bool, usage *Usage) []Ite
 			return
 		}
 		items = append(items, roundItems(turn, RoundInfo{
-			Closed: closed, StartedAt: roundStart, Usage: usage, Running: running && !closed,
+			Closed: closed, StartedAt: roundStart, Running: running && !closed,
 		})...)
 		turn = nil
 		roundStart = time.Time{}
@@ -327,12 +327,52 @@ func roundItems(turn []*conversation.ChatEntry, info RoundInfo) []Item {
 				Refs:        []Ref{{Chat: last}},
 				TurnStart:   info.StartedAt,
 				TurnEntries: turn,
-				Usage:       info.Usage,
-				Live:        live,
+				// 用量从**这一轮自己的消息**汇总，不是会话累计。
+				//
+				// 以前界面传进来的是 session.Usage()（会话累计值），
+				// 于是每个回合的结束行都显示同一个数字 —— 用户一眼看出
+				// "所有轮都一样"是错的。现在每轮的用量随消息一起留存，
+				// 这里按轮汇总。
+				Usage: turnUsage(turn),
+				Live:  live,
 			})
 		}
 	}
 	return items
+}
+
+// turnUsage 汇总这一轮所有消息的用量（没有数据时返回 nil）。
+//
+// 一轮可能跨多条 agent 消息（工具调用会有多次请求），每条的用量
+// 各自留存，这里相加 —— 用户看到的是"这一轮一共用了多少/省了多少"。
+//
+// 返回 nil 表示拿不到数据（重放的老日志没有 usage 字段）：
+// 那时不显示缓存率，比显示一个编出来的 0% 诚实。
+func turnUsage(turn []*conversation.ChatEntry) *Usage {
+	var total Usage
+	found := false
+	for _, entry := range turn {
+		if entry == nil {
+			continue
+		}
+		used := entry.UsageFor()
+		if used.InputTokens == 0 && used.OutputTokens == 0 &&
+			used.CacheReadTokens == 0 && used.CacheWriteTokens == 0 {
+			continue
+		}
+		found = true
+		total.InputTokens += used.InputTokens
+		total.OutputTokens += used.OutputTokens
+		total.CacheReadTokens += used.CacheReadTokens
+		total.CacheWriteTokens += used.CacheWriteTokens
+	}
+	if !found {
+		return nil
+	}
+	// Anthropic 会报告 cache_creation，它的 input 不含命中部分；
+	// 其余协议（DeepSeek/OpenAI 兼容）的 input 已含命中。
+	total.InputExcludesCache = total.CacheWriteTokens > 0
+	return &total
 }
 
 // anyRefStreaming 报告这一组里是否还有消息在流式。

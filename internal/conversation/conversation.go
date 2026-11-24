@@ -24,6 +24,18 @@ import (
 	"simple-agent/internal/message"
 )
 
+// Usage 是一次请求的 token 用量（含缓存字段）。
+//
+// 定义在这里而不是复用 driver.Usage：conversation 是更底层的包
+// （driver 依赖它），不能反过来依赖 driver。
+// 字段名与 driver.Usage 保持一致，转换是逐字段赋值。
+type Usage struct {
+	InputTokens      int
+	OutputTokens     int
+	CacheReadTokens  int
+	CacheWriteTokens int
+}
+
 // EntryStatus 是条目的本地生命周期状态。
 type EntryStatus string
 
@@ -87,6 +99,11 @@ type ChatEntry struct {
 	finishedAt time.Time
 	// tokens 是这条消息的输出 token 数（重放时为 0：事件里没有 usage）。
 	tokens int
+	// usage 是这一轮请求的完整用量（输入/输出/缓存读写）。
+	//
+	// 与 tokens 并存：tokens 是历史字段（只记输出），usage 才有缓存字段。
+	// 新代码一律读 usage；tokens 留着是因为有地方按它判断"有没有数据"。
+	usage Usage
 	// streamingPart 是流式增量合并的目标 part 下标；-1 表示应新建。
 	streamingPart int
 	// firstSeq / lastSeq 是这条消息在日志里覆盖的事件序号区间。
@@ -130,6 +147,16 @@ func (e *ChatEntry) Tokens() int { return e.tokens }
 
 // SetTokens 记录这一轮输出的 token 数。
 func (e *ChatEntry) SetTokens(n int) { e.tokens = n }
+
+// Usage 返回**这一轮**的完整用量（含缓存字段；零值表示未知）。
+//
+// 为什么要按轮存：回合结束行要显示"这一轮省了多少缓存"。
+// 以前界面拿的是会话累计值，于是每一轮都显示同一个数字 ——
+// 看着像"每轮命中率都一样"，其实那是整个会话的平均。
+func (e *ChatEntry) UsageFor() Usage { return e.usage }
+
+// SetUsage 记录这一轮的完整用量。
+func (e *ChatEntry) SetUsage(u Usage) { e.usage = u }
 
 // Status 返回条目状态。
 func (e *ChatEntry) Status() EntryStatus { return e.status }
