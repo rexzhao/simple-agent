@@ -76,6 +76,12 @@ func init() {
 			Run:  runCompact,
 		},
 		{
+			Name: "skill",
+			Args: "[NAME]",
+			Help: "选择当前项目的 skill，把它的完整说明注入这一轮（不带参数则弹出列表）",
+			Run:  runSkill,
+		},
+		{
 			Name: "help",
 			Help: "列出所有命令",
 			Run: func(a *App, args []string) string {

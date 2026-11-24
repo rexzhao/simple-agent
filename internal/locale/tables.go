@@ -32,7 +32,16 @@ var zhTable = map[string]string{
 	"project.pickFailed": "无法打开文件夹：%s",
 
 	// 通用
-	"common.ok":     "确定",
+	"skill.pick.title":      "选择技能",
+	"skill.pick.scope":      "项目与他人共享的 .agents/skills",
+	"skill.pick.empty":      "这个项目还没有技能。在 .agents/skills/<名字>/SKILL.md 里写一份即可（~/.agents/skills 也认）。",
+	"skill.pick.hint":       "选中后会把它的完整说明发到当前会话；平时不会加载。",
+	"skill.injected":        "已注入技能「%s」",
+	"skill.injectFailed":    "注入技能失败",
+	"skill.sendFailed":      "发送失败",
+	"skill.unknown":         "没有名为 %s 的技能。可用：%s",
+	"skill.none":            "这个项目还没有技能。",
+	"skill.noSession":       "没有当前会话",	"common.ok":     "确定",
 	"common.cancel": "取消",
 	"common.delete": "删除",
 	"common.copy":   "复制",

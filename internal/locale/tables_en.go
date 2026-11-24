@@ -26,7 +26,16 @@ var enTable = map[string]string{
 	"project.pickFailed": "Cannot open the folder: %s",
 
 	// Common
-	"common.ok":     "OK",
+	"skill.pick.title":      "Choose a skill",
+	"skill.pick.scope":      "from .agents/skills (project and shared)",
+	"skill.pick.empty":      "No skills in this project yet. Add .agents/skills/<name>/SKILL.md (~/.agents/skills works too).",
+	"skill.pick.hint":       "Picking one sends its full instructions to this session; nothing is loaded otherwise.",
+	"skill.injected":        "Injected skill %q",
+	"skill.injectFailed":    "Failed to inject skill",
+	"skill.sendFailed":      "Failed to send",
+	"skill.unknown":         "No skill named %s. Available: %s",
+	"skill.none":            "No skills in this project yet.",
+	"skill.noSession":       "No active session",	"common.ok":     "OK",
 	"common.cancel": "Cancel",
 	"common.delete": "Delete",
 	"common.copy":   "Copy",

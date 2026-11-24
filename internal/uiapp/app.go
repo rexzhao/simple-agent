@@ -598,6 +598,8 @@ type App struct {
 	executors   ExecutorSource
 	pickerOpen  bool
 	pickerIndex int
+	// skillPicker 是 /skill 的选择器状态（见 skill.go）。
+	skillPicker skillPickerState
 	// executorList 是后台拉来的执行端列表缓存（渲染只读它，绝不发网络请求）。
 	executorList     []ExecutorRef
 	executorErr      string
@@ -1314,6 +1316,12 @@ func (a *App) View(c *ui.Context) {
 func (a *App) mainPane(c *ui.Context) {
 	if a.pickerOpen && a.executors != nil {
 		a.executorPickerPane(c)
+		return
+	}
+	// skill 选择器优先于会话视图：它是**当前会话上的一次选择**，
+	// 选完立刻注入并回到会话。
+	if a.skillPicker.open {
+		a.skillPickerPane(c)
 		return
 	}
 	if a.Current() == nil {
