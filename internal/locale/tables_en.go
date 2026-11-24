@@ -43,6 +43,7 @@ var enTable = map[string]string{
 	"session.new.label":          "New session",
 	"session.newHere":            "New session in this project",
 	"sidebar.copyIds":              "Copy project and session IDs",
+	"sidebar.mailUnread":           "%d unread mail",
 	"session.archivedHint":        "Session is archived; restore it to continue",
 	"session.archiveBusy":        "Session is running; archive after this turn ends",
 	"sidebar.archive":             "Archive session",

@@ -107,6 +107,17 @@ type Options struct {
 	// 能跑掉几十轮、烧掉大量 token。达到上限时给一条通知并回到 Idle
 	// （Rust 阶段修过的 P0 就是这么处理的）。
 	MaxToolRounds int
+	// MailboxNotice 在**组装请求前**被调用，返回一条要追加到本次请求末尾的
+	// 用户消息（空串表示没有）。
+	//
+	// 为什么在组装前而不是走 Enqueue：
+	//   - Enqueue 是"用户插话"的队列，每条都开一个 user 消息并真正落盘；
+	//     邮件通知可能一次来好几封，堆进去会在历史里留下多条噪声消息。
+	//   - 这里**不写 Conversation、不落盘**：只在发给模型的 Messages 里追加一条。
+	//     历史不变 ⇒ 缓存前缀不变（除了最后那条通知本身），也不会重复注入。
+	//
+	// 由 host 注入：它知道未读邮件与"哪些已经通知过"。
+	MailboxNotice func() string
 }
 
 // Usage 是本轮 token 用量。
@@ -378,6 +389,11 @@ func (d *Driver) SetReasoningEffort(effort string) []Effect {
 	d.opts.ReasoningEffort = effort
 	return []Effect{recordSelectionWithEffort(d.opts.Selection, effort)}
 }
+
+// SetMailboxNotice 设置"未读邮件通知"的取值函数（见 Options.MailboxNotice）。
+//
+// 传 nil 表示关闭（例如会话被移出项目、或展示端镜像）。
+func (d *Driver) SetMailboxNotice(fn func() string) { d.opts.MailboxNotice = fn }
 
 // ReasoningEffort 返回当前思考档位。
 func (d *Driver) ReasoningEffort() string { return d.opts.ReasoningEffort }
@@ -958,6 +974,23 @@ func (d *Driver) buildRequest() providers.ChatRequest {
 	}
 	if replacedImages > 0 {
 		d.noteVisionImages(replacedImages)
+	}
+	// 未读邮件通知：追加成**最后一条 user 消息**，但不写进 Conversation。
+	//
+	// 三个要点：
+	//  1. 只在这里追加 ⇒ 历史不变 ⇒ 下次请求不会重复带上它
+	//     （host 侧还会记录"哪些已通知过"，避免同一封反复提醒）
+	//  2. 追加在末尾（user 角色）⇒ 两家协议都接受，不会出现"以 assistant 结尾"
+	//  3. 内容只列清单、不含正文：正文让模型自己用 mailbox_read 取，
+	//     这样邮件正文不会长期占据上下文
+	if d.opts.MailboxNotice != nil {
+		if notice := strings.TrimSpace(d.opts.MailboxNotice()); notice != "" {
+			history = append(history, message.Message{
+				MessageID: "mailbox-notice",
+				Role:      message.RoleUser,
+				Parts:     []message.Part{message.NewTextPart(notice)},
+			})
+		}
 	}
 	req := providers.ChatRequest{
 		Model:       d.opts.Selection.Model,

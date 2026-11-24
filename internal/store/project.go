@@ -114,6 +114,36 @@ func (c *Catalog) projectPath(id string) string {
 	return filepath.Join(c.dataDir, projectsDirName, id)
 }
 
+// MailboxDir 返回某个项目的会话邮箱目录（`<项目>/mailbox/`）。
+//
+// 放在项目目录下而不是全局：邮件本来就是项目内的协作产物，
+// 与会话日志同源，删项目时一并消失，也不会和别的项目串味。
+func (c *Catalog) MailboxDir(projectID string) string {
+	if projectID == "" {
+		return ""
+	}
+	return filepath.Join(c.projectPath(projectID), "mailbox")
+}
+
+// ProjectOfSession 反查某个会话属于哪个项目（找不到返回空串）。
+//
+// 用途：新建会话时先登记再回填 ProjectID —— 登记那一步才知道它在哪个项目，
+// 而会话对象在此之前就构造好了。
+func (c *Catalog) ProjectOfSession(sessionID string) (string, error) {
+	projects, err := c.ListProjects()
+	if err != nil {
+		return "", err
+	}
+	for _, project := range projects {
+		for _, record := range project.Sessions {
+			if record.ID == sessionID {
+				return project.ID, nil
+			}
+		}
+	}
+	return "", nil
+}
+
 // projectFilePath 返回某个项目的档案文件。
 func (c *Catalog) projectFilePath(id string) string {
 	return filepath.Join(c.projectPath(id), projectFileName)

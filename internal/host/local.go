@@ -498,6 +498,7 @@ func (l *Local) NewSession(workspace string) *Session {
 			_ = l.cfg.Catalog.AddSession(session.ID, session.Title, workspace, dir)
 		}
 	}
+	l.attachMailbox(session)
 	for _, obs := range l.observersSnapshot() {
 		obs.SessionsChanged()
 	}
@@ -757,6 +758,9 @@ func (l *Local) openSession(contextID, title string) (*Session, error) {
 		_, _ = drv.Conversation().AddNotice(conversation.NoticeWarn,
 			l.cfg.Tr("session.logCorrupt")+strings.Join(replayed.Warnings, "；"))
 	}
+	// 会话通讯：填项目 ID + 挂工具 + 挂请求注入钩子。
+	// 恢复路径也要挂 —— 否则重启后老会话收不到也发不出邮件（真实会踩）。
+	l.attachMailbox(session)
 	return session, nil
 }
 

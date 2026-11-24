@@ -24,6 +24,12 @@ type Session struct {
 	ID        string
 	Title     string
 	Workspace string
+	// ProjectID 是所属项目（邮件按项目隔离，靠它拼邮箱目录）。
+	//
+	// 在 host 里赋值而不是构造参数：Session 的构造点有好几处（新建、恢复、
+	// 展示端镜像），项目 ID 只有 host 知道，零值表示"不属于任何项目"
+	// —— 那时会话通讯直接不可用。
+	ProjectID string
 
 	drv     *driver.Driver
 	journal store.SessionStore

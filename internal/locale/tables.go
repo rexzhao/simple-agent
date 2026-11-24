@@ -49,6 +49,7 @@ var zhTable = map[string]string{
 	"session.new.label":          "新建会话",
 	"session.newHere":            "在此项目新建会话",
 	"sidebar.copyIds":              "复制项目与会话 ID",
+	"sidebar.mailUnread":           "%d 封未读邮件",
 	"session.archivedHint":        "会话已归档，恢复后才能继续",
 	"session.archiveBusy":        "会话正在运行，等这一轮结束再归档",
 	"sidebar.archive":             "归档会话",

@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"simple-agent/internal/message"
 	"simple-agent/internal/web"
@@ -119,9 +120,50 @@ type ToolContext struct {
 	AllowShell bool
 	// Vision 表示当前模型是否接受图片输入（read_image 据此决定能否工作）。
 	Vision bool
+	// Mailbox 是会话通讯的宿主能力（nil 表示不可用，例如测试或未接入）。
+	//
+	// 用**接口**而不是具体类型：tools 包不能依赖 host（host 依赖 tools，
+	// 会成环）。这里只声明工具需要的最小能力。
+	Mailbox MailboxHost
 
 	mu    sync.Mutex
 	state SessionState
+}
+
+// MailboxHost 是 tools 包对"会话通讯"的最小要求（由 host 实现）。
+//
+// 只暴露工具真正用得上的三件事：列出可收信会话、投递一封邮件、查/读自己的邮箱。
+// 具体存储、归档判断、唤醒策略都在 host 侧 —— 工具只管"用户/模型要发了什么"。
+type MailboxHost interface {
+	// MailboxPeers 返回本项目内**可收信**的会话（已归档的不在列表里）。
+	MailboxPeers() []MailboxPeer
+	// MailboxSelf 返回当前会话的 ID 与标题（发件人信息）。
+	MailboxSelf() MailboxPeer
+	// MailboxDeliver 投递一封邮件；返回错误表示投递失败（收件人不存在等）。
+	MailboxDeliver(to string, subject, body string, refs []string) (string, error)
+	// MailboxInbox 返回当前会话的邮件（新→旧）。
+	MailboxInbox(unreadOnly bool, limit int) []MailboxMail
+	// MailboxReadMail 读一封邮件并标记已读。
+	MailboxReadMail(id string) (MailboxMail, error)
+}
+
+// MailboxPeer 是一个可通讯的会话（发件人/收件人的最小信息）。
+type MailboxPeer struct {
+	ID     string
+	Title  string
+	Archived bool
+}
+
+// MailboxMail 是工具层看到的邮件。
+type MailboxMail struct {
+	ID        string
+	From      string
+	FromTitle string
+	Subject   string
+	Body      string
+	At        time.Time
+	Read      bool
+	Refs      []string
 }
 
 // NewToolContext 构造上下文（cwd 初始为工作区根）。
@@ -616,6 +658,11 @@ func BuiltinWith(opts Options) []*ToolDef {
 		todoWriteTool(),
 		workingDirectoryTool(opts.AllowShell),
 		askUserQuestionTool(),
+		// 会话通讯：只在本项目内、且宿主接入了 Mailbox 时才真正可用
+		// （tools 注册不区分——没有 Mailbox 时工具会明确报错，而不是静默消失）。
+		mailboxSendTool(),
+		mailboxListTool(),
+		mailboxReadTool(),
 	}
 	if opts.WebFetch {
 		list = append(list, webFetchTool())
