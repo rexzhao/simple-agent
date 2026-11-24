@@ -57,6 +57,21 @@ type Session struct {
 	// 为什么需要这个标志：自动重试有退避（最多 8 秒）。如果界面照常显示
 	// 红色失败，用户会看到失败闪一下又变回来，以为程序出毛病了。
 	retryPending bool
+	// lastWakeAt 是上一次因收到邮件而唤醒本会话的时间。
+	//
+	// 用途：冷却（wakeCooldown）。两个 agent 互相回信时，每次唤醒都会
+	// 触发新的发信，没有冷却就会变成一条极快的开销循环。
+	lastWakeAt time.Time
+	// wokenUnread 是上次唤醒时看到的未读数。
+	//
+	// 用途：只有未读**变多**才再次唤醒。否则同一批邮件会被反复叫醒
+	// （比如用户手动点了一下会话又回来）。
+	wokenUnread int
+	// wakeTimer 是已排队的唤醒（去抖窗口内）。
+	//
+	// 用途：连续来信只唤醒一次 —— 已有待执行的唤醒时，新来信不再排新的。
+	// 关闭会话时它会被取消，避免向已销毁的会话投递。
+	wakeTimer *time.Timer
 	// keptFromSeq 是快照的归档截断点（更早的归档在界面上只显示、不参与请求）。
 	keptFromSeq uint64
 	// history 是 backfill 补拉进来的**更早**条目（展示端专用）。
@@ -889,7 +904,7 @@ func (s *Session) finishInterrupted(messageID string, received int, lastKind str
 //     缓存照常命中
 //   - Send("继续") 会在对话里多一条用户消息：弄脏历史，且让缓存前缀
 //     失效（整段缓存作废）
-//   以前这里用的就是 Send("继续")，改掉。
+//     以前这里用的就是 Send("继续")，改掉。
 //
 // 只对**重发有意义**的失败重试（reason 见 isRetryableReason）：
 // 401、上下文超限这些重发一万次也一样，重试只会白等两轮。

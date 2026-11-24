@@ -2,9 +2,13 @@ package host
 
 import (
 	"fmt"
+	"log"
 	"strings"
+	"time"
 
+	"simple-agent/internal/driver"
 	"simple-agent/internal/mailbox"
+	"simple-agent/internal/message"
 	"simple-agent/internal/tools"
 )
 
@@ -100,7 +104,9 @@ func (h *mailboxHost) MailboxDeliver(to, subject, body string, refs []string) (s
 		return "", err
 	}
 
-	h.local.notifyMail(target)
+	// 信已落盘（离线也不会丢）。至于"要不要现在把收件人叫起来"，
+	// 是另一件事：唤醒会让它真的花 token 跑一轮，得谨慎。
+	h.local.wakeForMail(target)
 	return mail.ID, nil
 }
 
@@ -196,18 +202,132 @@ func (l *Local) attachMailbox(session *Session) {
 	})
 }
 
-// notifyMail 在收到新邮件时通知收件会话。
+// wakeForMail 决定要不要把收件会话叫起来，以及怎么叫。
 //
-// 这里**只发一个界面通知 + 记未读**，不碰对话历史。真正把"你有未读邮件"
-// 送进模型的是 driver 的 MailboxNotice 钩子（在组装请求时注入一条 user
-// 消息，不落盘）。两者配合的结果：
-//   - 收件会话空闲时：徽标 +1；等它下一次被唤醒或用户发消息时，模型才看到通知
-//   - 收件会话运行中：不打断，下一个请求自动带上通知
-func (l *Local) notifyMail(target *Session) {
-	if target == nil {
+// 分类讨论（这三种情况的处理方式不同，不能混）：
+//
+//	运行中（流式/跑工具） → 什么都不做。它下一个请求会自动带上未读通知
+//	                        （buildRequest 的 MailboxNotice 钩子），
+//	                        打断它没有意义，只会让当前这轮跑得更乱
+//	空闲（Idle）          → **唤醒**：发一条通知消息让它跑起来
+//	忙碌但不可插话        → 不唤醒。等它自己回到 Idle
+//	                        （等回答、压缩中：这两种状态下发消息会失败）
+//
+// 唤醒的代价必须说清：它真的会让那个会话花 token 跑一整轮。所以额外加两道闸：
+//   - 每封邮件只唤醒一次（记在会话的 wokenMails 里）
+//   - 同一个会话短时间内最多唤醒一次（wakeCooldown）
+func (l *Local) wakeForMail(target *Session) {
+	if target == nil || target.Archived() {
 		return
 	}
+	// 通知界面刷新（侧栏徽标）
 	l.emit(Change{SessionID: target.ID, Kind: "mail"})
+
+	// 只看"是否空闲"：运行中的会话不需要唤醒，它自己会看到通知。
+	if target.drv.Busy() != driver.BusyIdle {
+		return
+	}
+	if !target.allowWakeScheduling(time.Now()) {
+		return
+	}
+
+	// **延迟唤醒（去抖）**：连续来信合并成一次。
+	//
+	// 为什么需要：一个 agent 经常连着发好几封（"我发现了 A"、"还有 B"、
+	// "补充一下"）。每封都唤醒的话，收件人要跑好几轮，既慢又费钱。
+	// 等一小段时间让这一批信落定，再一次性告诉它"你有 N 封未读"。
+	//
+	// 延迟期间如果又有新邮件，wakeForMail 会被再次调用：
+	// allowWakeScheduling 发现已有待执行的唤醒就直接返回，定时器不会重置 ——
+	// 也就是说唤醒最多推迟 wakeDelay，不会被连续来信无限拖后。
+	target.wakeTimer = time.AfterFunc(wakeDelay, func() {
+		target.post(func() { l.performWake(target) })
+	})
+}
+
+// wakeDelay 是唤醒前的等待时间（去抖窗口）。
+//
+// 取 3 秒：足够合并"一口气发几封"的常见情形，又不会让人等太久
+// （邮件本来就是异步协作，3 秒几乎无感）。
+const wakeDelay = 3 * time.Second
+
+// allowWakeScheduling 判断是否可以安排一次唤醒（已有待执行的就不再排）。
+func (s *Session) allowWakeScheduling(now time.Time) bool {
+	if s.wakeTimer != nil {
+		return false // 已经有待执行的唤醒，等它跑
+	}
+	return s.allowWake(now)
+}
+
+// performWake 真正执行唤醒（延迟结束后调用）。
+//
+// 放在单独函数里而不是塞进 AfterFunc：需要重新检查状态 ——
+// 延迟期间会话可能已经被用户唤醒、开始跑、或被归档。
+func (l *Local) performWake(target *Session) {
+	target.wakeTimer = nil
+	if target.Archived() || target.drv.Busy() != driver.BusyIdle {
+		return
+	}
+	// 会话可能已被删除（延迟期间用户删掉了它）：确认它还在列表里。
+	if l.sessionByID(target.ID) == nil {
+		return
+	}
+	notice := target.mailboxWakeNotice()
+	if notice == "" {
+		return
+	}
+	effects, err := target.drv.Send(notice)
+	if err != nil {
+		log.Printf("会话 %s：唤醒失败：%v", target.ID, err)
+		return
+	}
+	l.applyEffects(target, effects)
+}
+
+// allowWake 判断现在是否可以唤醒（并记录本次唤醒时间）。
+//
+// 顺带把"已经唤醒过的邮件 ID"清掉一半：只保留最近的一批，
+// 免得这个集合随着会话寿命无限增长。
+func (s *Session) allowWake(now time.Time) bool {
+	if !s.lastWakeAt.IsZero() && now.Sub(s.lastWakeAt) < wakeCooldown {
+		return false
+	}
+	s.lastWakeAt = now
+	return true
+}
+
+// wakeCooldown 是同一会话两次唤醒之间的最小间隔。
+//
+// 取 30 秒：足够覆盖"一次工具调用 + 一次回复"的时间尺度，
+// 又不至于让邮件积压太久。注意它**不阻止邮件投递**，只决定要不要主动叫醒。
+const wakeCooldown = 30 * time.Second
+
+// mailboxWakeNotice 组装唤醒用的那条消息。
+//
+// 与 buildRequest 注入的通知内容一致（都从未读状态算），
+// 但这条**会真的进入对话历史**（它是 Send，不是注入）。
+//
+// 之所以接受它进历史：模型必须有"我为什么被叫醒"的线索，否则它会在
+// 一个空白提示下自由发挥。控制成本的办法是让文本尽量短、且只在
+// 确实有未读时才发（空邮箱根本不唤醒）。
+func (s *Session) mailboxWakeNotice() string {
+	if s.host == nil {
+		return ""
+	}
+	client, ok := s.host.mailboxClient(s).(*mailboxHost)
+	if !ok {
+		return ""
+	}
+	unread, _ := mailbox.Open(client.dir, s.ID).Unread()
+	if unread == 0 {
+		return ""
+	}
+	// 已经因为同一批邮件唤醒过就不再重复（只有新邮件才再叫一次）。
+	if unread <= s.wokenUnread && s.wokenUnread > 0 {
+		return ""
+	}
+	s.wokenUnread = unread
+	return client.mailboxNotice()
 }
 
 // mailboxUnread 返回某会话的未读数（供界面徽标与请求注入共用）。
@@ -300,3 +420,49 @@ func (s *Session) SetTitleForTest(title string) { s.Title = title }
 // 生产路径的归档要落盘（项目档案是权威），这里只改内存标志：
 // 测试关注的是"归档会话能不能收信"，不关心持久化。
 func (s *Session) SetArchivedForTest(archived bool) { s.archived = archived }
+
+// MessageCountForTest 返回会话的消息数（测试用）。
+func (s *Session) MessageCountForTest() int {
+	return len(s.drv.Conversation().Entries())
+}
+
+// UserMessageCountForTest 返回**用户消息**条数（测试用）。
+//
+// 与 MessageCountForTest 的区别：那条数全部条目（含 agent 占位消息），
+// 唤醒一次会产生 1 条 user + 1 条 agent 占位，数全部就看不出"唤醒了几次"。
+func (s *Session) UserMessageCountForTest() int {
+	count := 0
+	for _, entry := range s.drv.Conversation().Entries() {
+		if entry.Message == nil || entry.Message.Message == nil {
+			continue
+		}
+		if entry.Message.Message.Role == message.RoleUser {
+			count++
+		}
+	}
+	return count
+}
+
+// LastUserTextForTest 返回最后一条用户消息的文本（测试用）。
+//
+// 用途：验证唤醒注入的那条消息内容（不含正文、说了什么）。
+func (s *Session) LastUserTextForTest() string {
+	entries := s.drv.Conversation().Entries()
+	for index := len(entries) - 1; index >= 0; index-- {
+		entry := entries[index].Message
+		if entry == nil || entry.Message == nil {
+			continue
+		}
+		if entry.Message.Role != message.RoleUser {
+			continue
+		}
+		var texts []string
+		for _, part := range entry.Message.Parts {
+			if text, ok := part.Content.(message.TextPart); ok {
+				texts = append(texts, text.Text)
+			}
+		}
+		return strings.Join(texts, "\n")
+	}
+	return ""
+}

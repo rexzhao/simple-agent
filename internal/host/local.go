@@ -263,6 +263,12 @@ func (l *Local) Close() error {
 	l.closed = true
 	l.mu.Unlock()
 	for _, session := range l.sessions {
+		// 取消待执行的唤醒：否则关闭后会向已销毁的会话投递消息
+		// （定时器是异步的，不受 l.closed 保护）。
+		if session.wakeTimer != nil {
+			session.wakeTimer.Stop()
+			session.wakeTimer = nil
+		}
 		if session.journal != nil {
 			_ = session.journal.Sync()
 			_ = session.journal.Close()
