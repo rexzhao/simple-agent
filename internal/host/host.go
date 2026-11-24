@@ -270,6 +270,12 @@ type SessionRef struct {
 	ProjectName string
 	// Archived 表示会话已归档（不能再运行，恢复后才能继续）。
 	Archived bool
+	// MailUnread 是未读邮件数（0 表示没有）。
+	//
+	// 放在 SessionRef 而不是 RuntimeView：侧栏要在**没有打开会话**时也显示
+	// 徽标，而 RuntimeView 只有当前会话有。展示端（Android）靠这个字段
+	// 在会话列表上画未读标记。
+	MailUnread int
 }
 
 // OlderEntry 是归档里的一条消息（只用于显示）。

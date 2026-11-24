@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
@@ -798,13 +800,26 @@ private fun SessionRow(
             .padding(start = 30.dp, end = 20.dp, top = 10.dp, bottom = 10.dp),
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        Text(
-            text = session.title.ifEmpty { session.id.take(8) },
-            fontSize = 14.sp,
-            fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
-            color = if (muted) ViewerColors.muted else MaterialTheme.colorScheme.onSurface,
-            maxLines = 2,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = session.title.ifEmpty { session.id.take(8) },
+                fontSize = 14.sp,
+                fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
+                color = if (muted) ViewerColors.muted else MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            // 未读邮件徽标：别的会话发来的消息，不看这个数就不知道谁在等它。
+            // 只在有未读时出现（不占位），与桌面端的侧栏行为一致。
+            if (session.mailUnread > 0) {
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = if (session.mailUnread > 1) "✉${session.mailUnread}" else "✉",
+                    fontSize = 11.sp,
+                    color = ViewerColors.accent,
+                )
+            }
+        }
         if (!muted && session.workspace.isNotEmpty()) {
             Text(session.workspace, fontSize = 11.sp, color = ViewerColors.muted, maxLines = 1)
         }

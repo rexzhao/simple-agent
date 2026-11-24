@@ -1154,7 +1154,12 @@ func (r *Remote) applyCatalog(refs []SessionRef) {
 	seen := map[string]bool{}
 	for _, ref := range refs {
 		seen[ref.ID] = true
-		if _, ok := r.sessions[ref.ID]; ok {
+		if existing, ok := r.sessions[ref.ID]; ok {
+			// 已存在的会话也要刷新 ref：项目、归档、未读邮件数都会变
+			// （未读数尤其频繁）。只更新 Title/Workspace 会让徽标永远停在旧值。
+			existing.ref = ref
+			existing.Title = ref.Title
+			existing.Workspace = ref.Workspace
 			continue
 		}
 		session := newMirrorSession(ref, r.post)
@@ -1342,7 +1347,17 @@ func (r *Remote) Sessions() []SessionRef {
 	out := make([]SessionRef, 0, len(r.order))
 	for _, id := range r.order {
 		session := r.sessions[id]
-		out = append(out, SessionRef{ID: id, Title: session.Title, Workspace: session.Workspace})
+		// **完整返回 ref**，不是只挑三个字段。
+		//
+		// 以前这里只回 ID/Title/Workspace，于是展示端（手机、远程桌面）
+		// 永远拿不到项目、归档、未读邮件数 —— 侧栏分组退回按 workspace、
+		// 归档会话排在正常会话里、未读徽标一直是 0。全部是同一处漏字段
+		// 引起的（真实踩过：Android 上没有项目分组）。
+		ref := session.ref
+		ref.ID = id
+		ref.Title = session.Title
+		ref.Workspace = session.Workspace
+		out = append(out, ref)
 	}
 	return out
 }
@@ -1387,6 +1402,9 @@ func newMirrorSession(ref SessionRef, post func(func())) *Session {
 	replayed, _ := driver.Replay(nil)
 	session := &Session{
 		ID: ref.ID, Title: ref.Title, Workspace: ref.Workspace,
+		// 记住完整 ref：项目/归档/未读数都在里面，Sessions() 要原样回给
+		// 展示端（只留三个字段会让手机侧栏丢掉分组与未读徽标）。
+		ref: ref,
 		// 默认按空闲处理：view 的空串不等于 idle，会让界面以为会话还在跑
 		// （新建会话后 Stop 一直亮着、模型也切不了）。真正的快照到了会覆盖它。
 		view: &ViewState{Busy: string(driver.BusyIdle)},

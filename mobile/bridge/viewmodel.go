@@ -27,6 +27,11 @@ type SessionSummary struct {
 	ProjectName string `json:"project_name,omitempty"`
 	// Archived 表示会话已归档（不能再运行）。
 	Archived bool `json:"archived,omitempty"`
+	// MailUnread 是未读邮件数（侧栏徽标用）。
+	//
+	// 手机端在会话列表上画未读标记：邮件是别的会话主动发来的，
+	// 不看这个数就永远不知道哪个会话在等它处理事情。
+	MailUnread int `json:"mail_unread,omitempty"`
 }
 
 // RuntimeView 是状态条 / 输入卡要用的瞬时状态。

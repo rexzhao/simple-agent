@@ -42,6 +42,11 @@ type Session struct {
 	mirror *driver.Mirror
 	conv   *conversation.Conversation
 	view   *ViewState
+	// ref 是展示端镜像会话的原始列表项（项目/归档/未读数都在里面）。
+	//
+	// 只有 mirror 侧有值：执行端的 Session 不需要它（那些字段本身就散在
+	// 各处），但展示端要原样把它们回给界面。
+	ref SessionRef
 
 	// turnCtx/turnCancel 是回合级生命周期（工具执行、摘要请求都用它）。
 	turnCtx    context.Context

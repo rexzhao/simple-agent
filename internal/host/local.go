@@ -176,6 +176,8 @@ func (l *Local) Sessions() []SessionRef {
 			ProjectID:   projectID,
 			ProjectName: projectName,
 			Archived:    archivedOf[session.ID],
+			// 未读邮件数：侧栏徽标用（展示端也要看到，不只桌面）。
+			MailUnread: l.mailboxUnread(session),
 		})
 	}
 	return out

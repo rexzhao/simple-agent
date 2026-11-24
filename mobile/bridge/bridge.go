@@ -365,6 +365,7 @@ func (c *Client) SessionsJSON() string {
 		summaries = append(summaries, SessionSummary{
 			ID: ref.ID, Title: ref.Title, Workspace: ref.Workspace, UpdatedAt: ref.UpdatedAt,
 			ProjectID: ref.ProjectID, ProjectName: ref.ProjectName, Archived: ref.Archived,
+			MailUnread: ref.MailUnread,
 		})
 	}
 	return encode(summaries)

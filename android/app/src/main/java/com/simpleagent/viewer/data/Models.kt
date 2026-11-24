@@ -29,6 +29,11 @@ data class SessionSummary(
     @SerialName("project_name") val projectName: String = "",
     // 已归档：仍列出但折叠在「已归档」小节里，不能运行。
     val archived: Boolean = false,
+    // 未读邮件数（会话通讯）：侧栏在会话标题旁画未读标记。
+    //
+    // 邮件是**别的会话主动发来的**，不看这个数就永远不知道哪个会话在等它
+    // 处理事情。0 表示没有未读（不画标记）。
+    @SerialName("mail_unread") val mailUnread: Int = 0,
 ) {
     /** 侧栏分组用的 key：有项目档案就按项目，否则按 workspace。 */
     val groupKey: String get() = projectId.ifEmpty { workspace }
