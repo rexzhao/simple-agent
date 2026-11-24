@@ -16,12 +16,19 @@ import (
 // 就主动断开。Rust 阶段就是因为缺这个超时，连接静默死掉后会话一直停在「正在生成」。
 const idleTimeout = 180 * time.Second
 
-// contentTimeout 是"没有任何**事件**输出"的上限。
+// contentTimeout 是"已经开始产出之后，多久没有新事件算卡住"的上限。
 //
 // 只按字节算空闲不够：有些网关会持续发 SSE 注释/心跳行（`: ping`），字节不断，
 // 但一个真正的 chunk 都不来——按字节判断的话会永远挂着（用户看到的"停止按钮还在、
 // 一直没有输出"）。所以按"解析出事件"计时。
-var contentTimeout = 90 * time.Second
+//
+// 取 180s（与 idleTimeout 同量级），不是原来的 90s：
+// 实测这个网关在 effort=high + 大上下文下，`content_block_start` 之后
+// **78 秒**才来第一个 delta（模型思考期）。90s 几乎没有余量，
+// 一次稍慢的思考就被掐断，用户看到的是"每轮都超时"。
+//
+// 再长就不合适了：真卡住时用户要能等到失败并重试，而不是无限转圈。
+var contentTimeout = 180 * time.Second
 
 // firstEventTimeout 是"**首字节之前**"的等待上限，比 contentTimeout 宽松得多。
 //
@@ -56,7 +63,9 @@ var sharedClient = &http.Client{
 		// watchdog 触发，用户看到的错误来自 net/http（"timeout awaiting
 		// response headers"），既没人话解释、也没法区分"首字节慢"和"真卡住"。
 		//
-		// 大上下文 + 慢网关时首字节实测要 41 秒；原来的 120 秒余量太薄。
+		// 大上下文 + 慢网关时，实测响应头要 **95 秒**才回来
+		// （26 条历史的会话；网关在 prefill 阶段就卡了这么久）。
+		// 原来的 120 秒余量太薄，现取 firstEventTimeout+30s = 330s。
 		ResponseHeaderTimeout: firstEventTimeout + 30*time.Second,
 		DisableCompression:    true, // SSE 不压缩，避免中间层缓冲
 		MaxIdleConnsPerHost:   4,
