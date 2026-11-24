@@ -32,7 +32,8 @@ var zhTable = map[string]string{
 	"project.pickFailed": "无法打开文件夹：%s",
 
 	// 通用
-	"skill.pick.title":      "选择技能",
+	"session.childDefault":  "子会话",
+	"sidebar.childCount":    "%d 个子会话",	"skill.pick.title":      "选择技能",
 	"skill.pick.scope":      "项目与他人共享的 .agents/skills",
 	"skill.pick.empty":      "这个项目还没有技能。在 .agents/skills/<名字>/SKILL.md 里写一份即可（~/.agents/skills 也认）。",
 	"skill.pick.hint":       "选中后会把它的完整说明发到当前会话；平时不会加载。",

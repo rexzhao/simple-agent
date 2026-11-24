@@ -26,7 +26,8 @@ var enTable = map[string]string{
 	"project.pickFailed": "Cannot open the folder: %s",
 
 	// Common
-	"skill.pick.title":      "Choose a skill",
+	"session.childDefault":  "Sub-session",
+	"sidebar.childCount":    "%d sub-sessions",	"skill.pick.title":      "Choose a skill",
 	"skill.pick.scope":      "from .agents/skills (project and shared)",
 	"skill.pick.empty":      "No skills in this project yet. Add .agents/skills/<name>/SKILL.md (~/.agents/skills works too).",
 	"skill.pick.hint":       "Picking one sends its full instructions to this session; nothing is loaded otherwise.",

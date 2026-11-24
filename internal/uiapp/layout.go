@@ -1,4 +1,4 @@
-﻿package uiapp
+package uiapp
 
 import (
 	"fmt"
@@ -355,7 +355,7 @@ func (a *App) sidebarRows(c *ui.Context) {
 		if !a.sidebarGroupOpen[g.key] {
 			continue
 		}
-		for _, session := range active {
+		for _, session := range orderSessionsByParent(active, a.childExpanded) {
 			rows = append(rows, sidebarNode{key: session.ID})
 		}
 		// 归档的会话**默认完全不显示**，由项目行菜单的「显示已归档」打开。
@@ -559,6 +559,12 @@ const sidebarArrowSlot = 14
 // 拿到状态点、标题都和项目名错开，视觉上"缩在里面"。
 const sidebarSessionIndent = 12
 
+// sidebarChildIndent 是子会话在会话基础上**再**缩进的距离。
+//
+// 取 10（比会话级缩进略小）：要能看出"这是它的子项"，又不能把标题
+// 挤到右边看不见。
+const sidebarChildIndent = 10
+
 // sidebarSessionRow 渲染一条会话：状态点 + 标题 + 相对时间，右键菜单做改名/复制/删除。
 func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 	theme := c.Theme()
@@ -605,8 +611,16 @@ func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 	// 会话行在项目行基础上**再缩进一档**（左侧多 sidebarSessionIndent），
 	// 让层级一眼可见：项目在上、会话缩在里面。右侧内边距保持不变，
 	// 这样选中背景的右边缘仍与项目行对齐。
+	// 子会话再缩进一档：层级一眼可见（父 → 子）。
+	//
+	// 只按"是不是有父会话"缩进一层，不按深度累加：实际用起来几乎不会
+	// 出现三层，而逐层累加会让深层会话缩到看不见标题。
+	var indentExtra float32
+	if session.parentID != "" {
+		indentExtra = sidebarChildIndent
+	}
 	row := ui.Row(c).FillWidth().Gap(0).
-		Padding(3, 6+sidebarSessionIndent, 3, 6).Radius(6)
+		Padding(3, 6+sidebarSessionIndent+indentExtra, 3, 6).Radius(6)
 	switch {
 	case active:
 		row.Background(dsh.SurfaceActive)
@@ -624,14 +638,27 @@ func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 		// StateDot 的做法）已经能把"忙/空闲/等你回答"分开，比画一个静态
 		// 小图标信息量大，也不必自绘动画。
 		//
-		// 空闲时**不占位**：侧栏里大多数会话都是安静的，全都画一个灰点反而
-		// 让"And others"淹没重点。
+		// 状态点 / 子会话展开三角。共用同一个槽位，优先级：
+		//   有子会话 → 三角（可点，展开/收起）—— 它是可交互的，信息更"重"
+		//   没子会话 → 状态点（有活动才画）
+		//   都没有   → 空白（与项目行的三角槽等宽，让文字起点对齐）
 		//
-		// **不能给这个 Text 设 Label**：mygo 里元素一旦有 Label，a11y 树就用
-		// Label 顶替可见文本，符号会被"正在生成"这类文字替换掉（实测就是这样：
-		// 侧栏里显示的是文字而不是圆点）。状态含义靠颜色和位置表达，
-		// 读屏用户从"上下文 1 轮 1 步"那些信息也能判断，不必为此牺牲视觉。
-		if dot, color := a.sessionStatusDot(session); dot != "" {
+		// 为什么让三角优先于状态点：用户要能点开子会话；而"这个会话还在跑"
+		// 从下面的更新时间、以及打开后的界面也能看出来。
+		if children := a.childSessionsOf(session.ID); len(children) > 0 {
+			open := a.childExpanded(session.ID)
+			glyph := "▸"
+			if open {
+				glyph = "▾"
+			}
+			arrow := ui.Text(c, glyph).FontSize(9).TextColor(theme.TextMuted).
+				Width(sidebarArrowSlot).Shrink(0).Cursor(ui.CursorPointer)
+			// 不能设 Label：mygo 的 a11y 树会用 Label 顶替可见文本
+			// （项目行的三角同理，见 sidebarGroupRow）。
+			if arrow.Clicked() {
+				a.toggleChildren(session.ID)
+			}
+		} else if dot, color := a.sessionStatusDot(session); dot != "" {
 			ui.Text(c, dot).FontSize(10).TextColor(color).
 				Width(sidebarArrowSlot).Shrink(0)
 		} else {

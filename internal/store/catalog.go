@@ -389,7 +389,16 @@ func (c *Catalog) Create(contextID string) (SessionStore, error) {
 // dir 是这个会话目录的绝对路径（由调用方给出，因为日志此时已经打开了）。
 // 档案里存的是**父目录**（相对 project.json），因为会话目录 = 父目录/ID：
 // 一组会话共享同一条路径，档案更短也更清楚。
+// AddSession 登记一个会话（顶层会话）。
 func (c *Catalog) AddSession(contextID, title, workspace, dir string) error {
+	return c.AddSessionUnder(contextID, title, workspace, dir, "")
+}
+
+// AddSessionUnder 登记一个会话，并记录它是从哪个会话派生的（parentID 可为空）。
+//
+// 与 AddSession 分开而不是加参数：现有调用点很多，改签名会牵扯一片；
+// 而且"派生"是一种**少见但明确**的情况，独立的入口更清楚。
+func (c *Catalog) AddSessionUnder(contextID, title, workspace, dir, parentID string) error {
 	projectID, err := c.EnsureProject(workspace)
 	if err != nil {
 		return err
@@ -421,6 +430,12 @@ func (c *Catalog) AddSession(contextID, title, workspace, dir string) error {
 			project.Sessions[i].Title = title
 			changed = true
 		}
+		// 父会话：只在还没有值时补（已有的关系不该被后续登记覆盖 ——
+		// 一个会话只能有一个来源，后来的调用方不该改写它）。
+		if parentID != "" && project.Sessions[i].ParentID == "" {
+			project.Sessions[i].ParentID = parentID
+			changed = true
+		}
 		if changed {
 			return c.SaveProject(project)
 		}
@@ -431,6 +446,7 @@ func (c *Catalog) AddSession(contextID, title, workspace, dir string) error {
 		Dir:       recordDir,
 		Title:     title,
 		CreatedAt: nowRFC3339(),
+		ParentID:  parentID,
 	})
 	return c.SaveProject(project)
 }
@@ -465,18 +481,30 @@ func (c *Catalog) DropSession(contextID string) error {
 
 // SessionArchived 报告某个会话是否已归档（第二个返回值为 false 表示查不到）。
 func (c *Catalog) SessionArchived(contextID string) (bool, bool) {
+	record, ok := c.SessionRecord(contextID)
+	if !ok {
+		return false, false
+	}
+	return record.ArchivedAt != "", true
+}
+
+// SessionRecord 按 ID 查会话记录（ok 为 false 表示档案里没有它）。
+//
+// 与 SessionArchived 合并成一次扫描：恢复流程既要归档状态又要 parent_id，
+// 分两次查就是把同一批 project.json 读两遍。
+func (c *Catalog) SessionRecord(contextID string) (SessionRecord, bool) {
 	projects, err := c.ListProjects()
 	if err != nil {
-		return false, false
+		return SessionRecord{}, false
 	}
 	for _, project := range projects {
 		for _, record := range project.Sessions {
 			if record.ID == contextID {
-				return record.ArchivedAt != "", true
+				return record, true
 			}
 		}
 	}
-	return false, false
+	return SessionRecord{}, false
 }
 
 // SetSessionArchived 归档/恢复一个会话（stamp 为空表示恢复）。

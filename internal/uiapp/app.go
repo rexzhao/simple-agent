@@ -168,11 +168,13 @@ type Session struct {
 	// 空表示没有档案（内存后端），退回按 workspace 分组。
 	projectID   string
 	projectName string
-	// archivedSession 表示会话**已归档**：不能再运行，恢复后才能继续。
-	//
+	// archivedSession 表示会话**已归档**：不能再运行，恢复后才能继续。	//
 	// 注意与上面的 `archived`（更早历史的显示缓存）区分：那个是日志概念，
 	// 这个是会话级状态。
 	archivedSession bool
+	// parentID 非空表示这个会话由另一个会话派生（侧栏折叠在父会话下）。
+	// 来自项目档案的 parent_id；父会话被删时它指向一个不存在的 id。
+	parentID string
 
 	// archived 是按需加载的更早历史：**只用于显示**，永远不进 Conversation、
 	// 也永远不参与请求（用户已确认）。
@@ -600,6 +602,11 @@ type App struct {
 	pickerIndex int
 	// skillPicker 是 /skill 的选择器状态（见 skill.go）。
 	skillPicker skillPickerState
+	// childOpen 记录哪些父会话展开了子会话（key = 父会话 ID）。
+	//
+	// **默认不展开**：没记录过就是收起。这是界面状态，不落盘 ——
+	// 重启后回到默认收起，与本项目其它折叠状态（sidebarGroupOpen）一致。
+	childOpen map[string]bool
 	// executorList 是后台拉来的执行端列表缓存（渲染只读它，绝不发网络请求）。
 	executorList     []ExecutorRef
 	executorErr      string
@@ -938,6 +945,8 @@ func (a *App) syncSessions() {
 		shell.projectID = ref.ProjectID
 		shell.projectName = ref.ProjectName
 		shell.archivedSession = ref.Archived
+		// 父子关系同理（new_session 创建后父会话的"有子会话"标记要立刻出现）
+		shell.parentID = ref.ParentID
 		next = append(next, shell)
 	}
 	a.sessions = next

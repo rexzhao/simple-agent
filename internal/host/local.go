@@ -129,6 +129,8 @@ func (l *Local) Sessions() []SessionRef {
 	projectOf := map[string]string{}   // 会话 id → 项目名
 	projectIDOf := map[string]string{} // 会话 id → 项目 id
 	archivedOf := map[string]bool{}
+	// 会话 id → 父会话 id（派生关系，侧栏折叠用）
+	parentOf := map[string]string{}
 	// 按工作区查项目：留给"还没登记进档案"的新会话用（见下面回退）。
 	byWorkspace := map[string]ProjectRef{}
 	if l.cfg.Catalog != nil {
@@ -142,8 +144,24 @@ func (l *Local) Sessions() []SessionRef {
 					projectOf[record.ID] = project.Name
 					projectIDOf[record.ID] = project.ID
 					archivedOf[record.ID] = record.ArchivedAt != ""
+					parentOf[record.ID] = record.ParentID
 				}
 			}
+		}
+	}
+	// 归档继承：**父会话归档时子会话也算归档**（用户定的规则）。
+	//
+	// 在读完所有记录之后统一算一遍，而不是上面逐个赋值：子会话的父会话
+	// 可能在同一个项目的后面几条，逐个处理时还读不到。
+	//
+	// 不写回档案（用户明确说"不需要子会话本身有归档标记"）：继承是动态的，
+	// 父会话一恢复，子会话自然跟着恢复。
+	for id, parentID := range parentOf {
+		if parentID == "" || archivedOf[id] {
+			continue
+		}
+		if archivedOf[parentID] {
+			archivedOf[id] = true
 		}
 	}
 	for _, session := range l.sessions {
@@ -178,6 +196,7 @@ func (l *Local) Sessions() []SessionRef {
 			Archived:    archivedOf[session.ID],
 			// 未读邮件数：侧栏徽标用（展示端也要看到，不只桌面）。
 			MailUnread: l.mailboxUnread(session),
+			ParentID:   parentOf[session.ID],
 		})
 	}
 	return out
@@ -405,6 +424,18 @@ func (l *Local) dispatch(session *Session, cmd Command) CmdResult {
 	case "newSession":
 		var payload NewSessionPayload
 		_ = json.Unmarshal(cmd.Payload, &payload)
+		// 有 parent 就是派生子会话（继承父会话的工作区与模型）
+		if payload.ParentID != "" {
+			parent := l.Session(payload.ParentID)
+			if parent == nil {
+				return CmdResult{Error: "父会话不存在"}
+			}
+			childID, err := l.NewChildSession(parent, payload.Title, payload.Prompt)
+			if err != nil {
+				return CmdResult{Error: err.Error()}
+			}
+			return CmdResult{OK: true, Data: NewSessionData{SessionID: childID}}
+		}
 		newSession := l.NewSession(payload.Workspace)
 		if payload.Title != "" {
 			newSession.rename(payload.Title)
@@ -456,34 +487,62 @@ func (l *Local) dispatch(session *Session, cmd Command) CmdResult {
 
 // NewSession 新建一个空会话（**先不落盘**：第一条消息才建目录）。
 func (l *Local) NewSession(workspace string) *Session {
-	id := l.cfg.NewID()
-	for l.Session(id) != nil {
-		id = l.cfg.NewID()
+	if workspace == "" {
+		workspace = l.cfg.Workspace
 	}
 	title := l.cfg.Title
 	if title == "" {
 		title = l.cfg.Tr("session.defaultTitle")
 	}
+	return l.newSessionWith(sessionSpec{Workspace: workspace, Title: title})
+}
+
+// newSessionWith 是新建会话的通用实现。
+//
+// NewSession / 新建子会话都走它：两者的差别只有标题、模型来源与
+// parent_id，其余（登记档案、接邮件、通知观察者）必须完全一致 ——
+// 分开写迟早漏一步（这个项目里已经踩过多次同类问题）。
+func (l *Local) newSessionWith(spec sessionSpec) *Session {
+	id := l.cfg.NewID()
+	for l.Session(id) != nil {
+		id = l.cfg.NewID()
+	}
+	workspace := spec.Workspace
 	if workspace == "" {
 		workspace = l.cfg.Workspace
+	}
+	title := spec.Title
+	if title == "" {
+		title = l.cfg.Tr("session.defaultTitle")
+	}
+	// 模型：零值（ProviderID 为空）表示用全局默认
+	selection := spec.Selection
+	if selection.ProviderID == "" {
+		selection = l.cfg.Selection
+	}
+	effort := spec.Effort
+	if effort == "" {
+		effort = l.effortFor(selection)
 	}
 
 	conv := conversation.New(id)
 	toolCtx := tools.NewToolContext(workspace, l.cfg.AllowShell)
-	toolCtx.Vision = l.visionFor(l.cfg.Selection)
+	toolCtx.Vision = l.visionFor(selection)
 	// workspace 按会话传：它会被写进 session.created，决定重放后归到哪个项目
-	drv := driver.New(conv, l.driverOptionsFor(l.cfg.Selection, workspace))
+	// 子会话不注册 new_session（不允许派生孙会话）
+	drv := driver.New(conv, l.driverOptionsSpec(selection, workspace, spec.ParentID != ""))
 	session := &Session{
 		ID:         id,
 		Title:      title,
 		Workspace:  workspace,
 		drv:        drv,
 		toolCtx:    toolCtx,
-		effort:     l.effortFor(l.cfg.Selection),
-		providerID: l.cfg.Selection.ProviderID,
-		model:      l.cfg.Selection.Model,
+		effort:     effort,
+		providerID: selection.ProviderID,
+		model:      selection.Model,
 		cfg:        &l.cfg,
 		host:       l,
+		parentID:   spec.ParentID,
 	}
 	l.sessions = append(l.sessions, session)
 	l.active = len(l.sessions) - 1
@@ -503,10 +562,11 @@ func (l *Local) NewSession(workspace string) *Session {
 	// 不该因为这次改动而变。
 	if l.cfg.Catalog != nil {
 		if dir, err := l.cfg.Catalog.SessionDirFor(session.ID); err == nil {
-			_ = l.cfg.Catalog.AddSession(session.ID, session.Title, workspace, dir)
+			_ = l.cfg.Catalog.AddSessionUnder(session.ID, session.Title, workspace, dir, spec.ParentID)
 		}
 	}
 	l.attachMailbox(session)
+	l.attachSessionTools(session)
 	for _, obs := range l.observersSnapshot() {
 		obs.SessionsChanged()
 	}
@@ -704,7 +764,15 @@ func (l *Local) openSession(contextID, title string) (*Session, error) {
 		_ = l.cfg.Catalog.DropSession(contextID)
 		return nil, errSessionGone
 	}
-	drv, replayed, err := driver.Load(loaded.Events, l.driverOptionsFor(l.cfg.Selection, l.cfg.Workspace))
+	// 先读档案：父子关系要在**构造 driver 之前**知道 ——
+	// 子会话的工具列表里不该有 new_session，而工具列表是 driver 的配置。
+	var record store.SessionRecord
+	var hasRecord bool
+	if l.cfg.Catalog != nil {
+		record, hasRecord = l.cfg.Catalog.SessionRecord(contextID)
+	}
+	drv, replayed, err := driver.Load(loaded.Events,
+		l.driverOptionsSpec(l.cfg.Selection, l.cfg.Workspace, hasRecord && record.ParentID != ""))
 	if err != nil {
 		_ = logStore.Close()
 		return nil, err
@@ -745,12 +813,11 @@ func (l *Local) openSession(contextID, title string) (*Session, error) {
 	// driver 的 Selection 来自重放（可能不是默认模型）：窗口/输出/vision/档位按它同步
 	session.syncModelOptions(drv.Selection())
 
-	// 归档状态来自项目档案：**不读它的话，重启后归档的会话又能跑了**
-	// （档案是唯一权威，日志里没有这个状态）。
-	if l.cfg.Catalog != nil {
-		if archived, ok := l.cfg.Catalog.SessionArchived(contextID); ok {
-			session.archived = archived
-		}
+	// 归档状态与父子关系来自项目档案：**不读它的话，重启后归档的会话
+	// 又能跑了、子会话也变回顶层**（档案是唯一权威，日志里没有这些状态）。
+	if hasRecord {
+		session.archived = record.ArchivedAt != ""
+		session.parentID = record.ParentID
 	}
 
 	// 修复事件必须在接受任何新事件之前写进日志，否则下次加载又会重新计算
@@ -769,6 +836,9 @@ func (l *Local) openSession(contextID, title string) (*Session, error) {
 	// 会话通讯：填项目 ID + 挂工具 + 挂请求注入钩子。
 	// 恢复路径也要挂 —— 否则重启后老会话收不到也发不出邮件（真实会踩）。
 	l.attachMailbox(session)
+	// 新建子会话的能力：同样要在恢复路径挂上，否则重启后老会话
+	// 就调不动 new_session 了。
+	l.attachSessionTools(session)
 	return session, nil
 }
 
@@ -790,6 +860,14 @@ func keptFromSeq(events []store.Event) uint64 {
 // 之前 NewSession(workspace) 只把目录给了 Session 与 toolCtx，driver 仍拿全局
 // 默认值，于是「添加项目」建出来的会话在重放后会掉回默认项目。
 func (l *Local) driverOptionsFor(sel providers.Selection, workspace string) driver.Options {
+	return l.driverOptionsSpec(sel, workspace, false)
+}
+
+// driverOptionsSpec 按"是不是子会话"决定工具集。
+//
+// 单独加一层是因为 driverOptionsFor 有多个调用点，而"子会话不注册
+// new_session"只跟会话类型有关。noSpawn 为真时工具列表里根本不会出现它。
+func (l *Local) driverOptionsSpec(sel providers.Selection, workspace string, noSpawn bool) driver.Options {
 	return driver.Options{
 		Selection:    sel,
 		SystemPrompt: l.cfg.SystemPrompt,
@@ -797,6 +875,8 @@ func (l *Local) driverOptionsFor(sel providers.Selection, workspace string) driv
 			AllowShell: l.cfg.AllowShell,
 			WebFetch:   l.cfg.WebFetch,
 			Searcher:   l.cfg.Searcher,
+			// 子会话不派生孙会话：工具**不注册**，而不只是"调了会失败"。
+			NoSpawn: noSpawn,
 		}),
 		MaxToolRounds:      l.cfg.MaxToolRounds,
 		ContextWindow:      l.cfg.ContextWindow,

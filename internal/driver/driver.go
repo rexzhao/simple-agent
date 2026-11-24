@@ -395,6 +395,12 @@ func (d *Driver) SetReasoningEffort(effort string) []Effect {
 // 传 nil 表示关闭（例如会话被移出项目、或展示端镜像）。
 func (d *Driver) SetMailboxNotice(fn func() string) { d.opts.MailboxNotice = fn }
 
+// Tools 返回当前注册的工具列表。
+//
+// 用途：宿主/测试要确认"某个工具到底在不在列表里"——例如子会话不该有
+// new_session（不注册，而不是注册了报错）。
+func (d *Driver) Tools() []*tools.ToolDef { return d.opts.Tools }
+
 // ReasoningEffort 返回当前思考档位。
 func (d *Driver) ReasoningEffort() string { return d.opts.ReasoningEffort }
 

@@ -276,6 +276,10 @@ type SessionRef struct {
 	// 徽标，而 RuntimeView 只有当前会话有。展示端（Android）靠这个字段
 	// 在会话列表上画未读标记。
 	MailUnread int
+	// ParentID 非空表示这个会话由另一个会话派生（侧栏折叠在父会话下）。
+	//
+	// 指向一个不存在的会话时（父会话被删了），界面按顶层显示。
+	ParentID string
 }
 
 // OlderEntry 是归档里的一条消息（只用于显示）。

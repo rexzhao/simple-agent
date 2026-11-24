@@ -1,4 +1,4 @@
-﻿// Package tools 是本地工具链（对齐 deepseek-harness 的工具名、参数与语义）。
+// Package tools 是本地工具链（对齐 deepseek-harness 的工具名、参数与语义）。
 //
 // 已实现：read / read_image / write / edit / glob / grep / working_directory /
 // todo_write / ask_user_question / web_fetch / bash / pwsh。
@@ -125,6 +125,8 @@ type ToolContext struct {
 	// 用**接口**而不是具体类型：tools 包不能依赖 host（host 依赖 tools，
 	// 会成环）。这里只声明工具需要的最小能力。
 	Mailbox MailboxHost
+	// Sessions 是会话管理能力（新建会话等）。nil 表示不可用。
+	Sessions SessionHost
 
 	mu    sync.Mutex
 	state SessionState
@@ -149,9 +151,18 @@ type MailboxHost interface {
 
 // MailboxPeer 是一个可通讯的会话（发件人/收件人的最小信息）。
 type MailboxPeer struct {
-	ID     string
-	Title  string
+	ID       string
+	Title    string
 	Archived bool
+}
+
+// SessionHost 是 tools 包对"会话管理"的最小要求（由 host 实现）。
+type SessionHost interface {
+	// NewChildSession 在**当前会话所在项目**里新建一个子会话，返回新会话 ID。
+	//
+	// title 建议非空（界面靠它分辨会话）；空则由宿主起默认名。
+	// 实现方负责：标记父子关系、继承工作区与模型、并让新会话立刻可见。
+	NewChildSession(title, prompt string) (string, error)
 }
 
 // MailboxMail 是工具层看到的邮件。
@@ -641,6 +652,13 @@ type Options struct {
 	// 与 WebFetch 分开：抓取是普通 HTTP、不需要任何凭据；搜索要走 DeepSeek
 	// Search API，没 Key 就干脆不注册（注册了每次报"没配 Key"会让模型反复试错）。
 	Searcher *web.Searcher
+	// NoSpawn 为真时**不注册** new_session（子会话用它）。
+	//
+	// 为什么不只是把 SessionHost 置空让工具报错：那样工具仍出现在模型
+	// 的工具列表里，每次请求都白带一段描述，模型也可能试着调用一次；
+	// 更关键的是，子会话派生孙会话本来就不是这个功能的目标 ——
+	// 能力不该出现在选项里，而不只是"调了会失败"。
+	NoSpawn bool
 }
 
 // BuiltinWith 按显式开关构造工具集（生产入口用这个）。
@@ -663,6 +681,11 @@ func BuiltinWith(opts Options) []*ToolDef {
 		mailboxSendTool(),
 		mailboxListTool(),
 		mailboxReadTool(),
+	}
+	// 在同一项目里新建子会话（并行做事，不污染当前上下文）。
+	// **子会话不注册**：不允许派生孙会话（见 Options.NoSpawn）。
+	if !opts.NoSpawn {
+		list = append(list, newSessionTool())
 	}
 	if opts.WebFetch {
 		list = append(list, webFetchTool())

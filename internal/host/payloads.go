@@ -60,6 +60,13 @@ type SelectPayload struct {
 type NewSessionPayload struct {
 	Workspace string `json:"workspace,omitempty"`
 	Title     string `json:"title,omitempty"`
+	// ParentID 非空表示"以这个会话为父建子会话"。
+	//
+	// 让界面也能建子会话（不只是 new_session 工具）：展示端与执行端走
+	// 同一条命令，Android 端将来也能用。空值 = 普通顶层会话。
+	ParentID string `json:"parent_id,omitempty"`
+	// Prompt 非空时新会话立刻收到这条消息（子会话的初始任务）。
+	Prompt string `json:"prompt,omitempty"`
 }
 
 // LoadOlderPayload 是 "loadOlder" 命令的参数：展示端自己的翻页游标。

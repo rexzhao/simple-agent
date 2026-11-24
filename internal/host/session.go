@@ -30,6 +30,11 @@ type Session struct {
 	// 展示端镜像），项目 ID 只有 host 知道，零值表示"不属于任何项目"
 	// —— 那时会话通讯直接不可用。
 	ProjectID string
+	// parentID 非空表示这个会话由另一个会话派生（new_session 创建）。
+	//
+	// 用途：**子会话不再挂 new_session 工具**（不允许无限嵌套，也就不会
+	// 出现"互为父子"的环）；侧栏也靠它折叠显示。
+	parentID string
 
 	drv     *driver.Driver
 	journal store.SessionStore
@@ -107,7 +112,40 @@ type Session struct {
 }
 
 // Archived 报告会话是否已归档。
-func (s *Session) Archived() bool { return s.archived }
+// Archived 报告会话是否已归档。
+//
+// **父会话归档时子会话也算归档**（用户定的规则）：子会话是父会话派出去
+// 干的活，父会话收起来了，它还挂在外面继续跑没有意义。所以这里除了看
+// 自己的标记，还要看父会话。
+//
+// 实现上不把标记写进子会话的档案（用户明确要求"不需要子会话本身有归档
+// 标记"）：继承关系是**动态**的 —— 父会话恢复后，子会话自然也就恢复了，
+// 不必去批量改写每个子会话的记录。
+func (s *Session) Archived() bool {
+	if s.archived {
+		return true
+	}
+	if s.parentID == "" || s.host == nil {
+		return false
+	}
+	// 父会话在内存里（常见情况）直接问它；不在就用档案状态
+	// （父会话可能还没被恢复，或者已经被删掉了）。
+	if parent := s.host.sessionByID(s.parentID); parent != nil {
+		return parent.Archived()
+	}
+	if s.host.cfg.Catalog != nil {
+		if archived, ok := s.host.cfg.Catalog.SessionArchived(s.parentID); ok {
+			return archived
+		}
+	}
+	return false
+}
+
+// OwnArchived 报告会话**自己**的归档标记（不含从父会话继承的部分）。
+//
+// 用途：界面"恢复"操作要判断能不能真的恢复 —— 父会话还归档着的时候，
+// 恢复子会话是无效的（它照样算归档），得先恢复父会话。
+func (s *Session) OwnArchived() bool { return s.archived }
 
 // SetArchived 设置归档状态并落盘。
 //

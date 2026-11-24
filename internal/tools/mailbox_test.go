@@ -77,8 +77,13 @@ func TestResolveRecipient(t *testing.T) {
 
 	t.Run("没有其它会话", func(t *testing.T) {
 		_, _, err := resolveRecipient(nil, "任何人")
-		if err == nil || !strings.Contains(err.Error(), "没有其它会话") {
+		if err == nil || !strings.Contains(err.Error(), "没有可收信的会话") {
 			t.Fatalf("应说明没有可发的会话：%v", err)
+		}
+		// 提示要说清**为什么**（不能自投、归档会话不能收信），
+		// 否则用户会以为功能坏了。
+		if !strings.Contains(err.Error(), "未归档") {
+			t.Fatalf("应说明归档会话不能收信：%v", err)
 		}
 	})
 }

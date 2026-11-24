@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	json "encoding/json/v2"
 	"encoding/json/jsontext"
+	json "encoding/json/v2"
 )
 
 // 项目档案布局：
@@ -98,8 +98,7 @@ type SessionRecord struct {
 	// 用户明确要求"哪些会话是压缩的"要能看出来：压缩过的会话重开时要
 	// 读快照而不是从头重放，用户也需要知道历史被折叠过。
 	Compactions int `json:"compactions,omitempty"`
-	// ArchivedAt 非空表示这个会话**已归档**（RFC3339）。
-	//
+	// ArchivedAt 非空表示这个会话**已归档**（RFC3339）。	//
 	// 归档的语义是"收起来、不能再运行"：界面上仍然列出（灰显），
 	// 但发消息、压缩、改名一律拒绝，必须显式恢复才能继续。
 	// 与项目级的"移除"不同 —— 那个是整块不显示，也说不出它存在过。
@@ -107,6 +106,15 @@ type SessionRecord struct {
 	// **不移动、不删除任何文件**：归档只是状态位，恢复就是清掉它。
 	// 所以这里存的是时间而不是 bool：用户还能看出"什么时候收起来的"。
 	ArchivedAt string `json:"archived_at,omitempty"`
+	// ParentID 非空表示这个会话是**由另一个会话发起创建的**（子会话）。
+	//
+	// 用途：侧栏把子会话折叠在父会话下面（默认不展开），让"一个会话
+	// 派生出几个子任务"的关系一眼可见，而不是平铺成一长串。
+	//
+	// 存在档案里而不是会话日志里：这是**组织关系**，和归档、标题一样
+	// 属于项目档案的职责；日志只记对话事实。父会话被删除时子会话仍然
+	// 存在（parent_id 指向一个不存在的 id，界面按顶层显示）。
+	ParentID string `json:"parent_id,omitempty"`
 }
 
 // projectPath 返回某个项目的档案目录（按 **ID**，不是名字）。

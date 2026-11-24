@@ -415,6 +415,17 @@ func (s *Session) MailboxNoticeForTest() string {
 // SetTitleForTest 改会话标题（测试用）。
 func (s *Session) SetTitleForTest(title string) { s.Title = title }
 
+// ToolsForTest 返回会话当前的工具列表（测试用）。
+//
+// 用途：验证"子会话的工具列表里没有 new_session"——那是**不注册**，
+// 而不是"注册了但调用失败"，所以必须看列表本身。
+func (s *Session) ToolsForTest() []*tools.ToolDef {
+	if s == nil || s.drv == nil {
+		return nil
+	}
+	return s.drv.Tools()
+}
+
 // SetArchivedForTest 设置归档状态（测试用）。
 //
 // 生产路径的归档要落盘（项目档案是权威），这里只改内存标志：
