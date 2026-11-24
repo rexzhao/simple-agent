@@ -46,6 +46,11 @@ type Session struct {
 	askKey    string
 	// autoRetry 是"连接中断后自动继续"的次数（每轮最多 1 次，用户发新消息时清零）。
 	autoRetry int
+	// retryPending 表示"已失败、正在等自动重试"（界面据此显示"重试中"）。
+	//
+	// 为什么需要这个标志：自动重试有退避（最多 8 秒）。如果界面照常显示
+	// 红色失败，用户会看到失败闪一下又变回来，以为程序出毛病了。
+	retryPending bool
 	// keptFromSeq 是快照的归档截断点（更早的归档在界面上只显示、不参与请求）。
 	keptFromSeq uint64
 	// history 是 backfill 补拉进来的**更早**条目（展示端专用）。
@@ -269,6 +274,18 @@ func (s *Session) Busy() driver.Busy {
 	return s.drv.Busy()
 }
 
+// RetryPending 报告"这一轮已经失败，正在等自动重试"。
+//
+// 界面用它把失败行显示成「正在重试…」而不是红色失败 —— 否则用户会看到
+// 失败闪一下又变回来，以为程序出了问题。只有重试用完（或不可重试）时，
+// 才真正停在失败态。
+func (s *Session) RetryPending() bool {
+	if s.view != nil {
+		return s.view.RetryPending
+	}
+	return s.retryPending
+}
+
 func (s *Session) Selection() providers.Selection {
 	if s.view != nil {
 		return s.view.Selection
@@ -449,6 +466,7 @@ func (s *Session) TitleValue() string { return s.Title }
 
 func (s *Session) send(payload SendPayload) CmdResult {
 	s.autoRetry = 0
+	s.retryPending = false
 	s.ensurePersisted(payload.Text)
 	var attachments []message.Part
 	for _, ref := range payload.Attachments {
@@ -475,6 +493,7 @@ func (s *Session) retry() CmdResult {
 		return CmdResult{Error: s.cfg.Tr("session.retryBusy")}
 	}
 	s.autoRetry = 0
+	s.retryPending = false
 	effects, err := s.drv.Retry()
 	if err != nil {
 		return CmdResult{Error: err.Error()}
@@ -770,6 +789,13 @@ func (s *Session) applyEffects(effects []driver.Effect) {
 		case driver.Record:
 			s.recordEffect(e)
 		case driver.Changed:
+		case driver.StreamFailed:
+			// 失败可重试：交给统一的重试入口（带退避与次数上限）。
+			//
+			// 注意这里**不能直接重试**：applyEffects 还在展开 effects 的过程中，
+			// 重试会立刻产生新的一批 effects（重入）。maybeAutoRetry 用
+			// time.AfterFunc 延后执行，天然避开这一点。
+			s.maybeAutoRetry(s.cfg.Tr("session.autoRetryNetwork"))
 		}
 	}
 	if s.drv.Busy() == driver.BusyIdle {
@@ -799,7 +825,12 @@ func (s *Session) startStream(effect driver.StartStream) {
 				s.post(func() { s.applyEffects(s.drv.StreamClosed(mid)) })
 				return
 			}
-			s.post(func() { s.applyEffects(s.drv.FailStreamWith(mid, reason)) })
+			s.post(func() {
+				s.applyEffects(s.drv.FailStreamWith(mid, reason))
+				// 不加显式的 maybeAutoRetry：driver 的 failStream 会在
+				// 原因可重试时发出 StreamFailed effect，applyEffects 统一处理。
+				// 两处都调会重试两次。
+			})
 			return
 		}
 		received := 0
@@ -827,9 +858,7 @@ func (s *Session) startStream(effect driver.StartStream) {
 	}()
 }
 
-// finishInterrupted 处理"流没有结束标记就断了"：先按失败收尾；
-// 如果是**本轮的第一次**中断，自动发起一次"继续"，让会话自己往下走，
-// 而不是把用户晾在失败状态里（用户反馈：理论上应该继续）。
+// finishInterrupted 处理"流没有结束标记就断了"：先按失败收尾，再考虑自动重试。
 func (s *Session) finishInterrupted(messageID string, received int, lastKind string) {
 	// 正常结束（收到 Done）之后通道也会关闭：那时 driver 已经不是本轮流式状态，
 	// 这里什么都不该做——只有"还在流式却关闭了"才算中断。
@@ -838,28 +867,97 @@ func (s *Session) finishInterrupted(messageID string, received int, lastKind str
 	}
 	effects := s.drv.StreamClosed(messageID)
 	s.applyEffects(effects)
-	// 最多自动继续 2 次（网关偶发断流通常重试一次就好；连续两次都断说明不是抖动）
-	if s.drv.Busy() != driver.BusyIdle || s.autoRetry >= 2 {
-		log.Printf("会话 %s：流中断且自动继续已达上限（%d 次），保持失败状态", s.ID, s.autoRetry)
+	log.Printf("会话 %s：流意外结束（收到 %d 个事件，最后是 %s）", s.ID, received, lastKind)
+	// 不在这里调 maybeAutoRetry：StreamClosed → failStream → 发出 StreamFailed
+	// effect，applyEffects 里已经统一处理了。重复调会连点两次自动重试。
+}
+
+// maybeAutoRetry 在失败后自动重发这一轮请求（带指数退避）。
+//
+// 为什么值得做（实测数据）：这个网关波动极大 —— 同一个会话，
+// 响应头 6s～95s、思考期 78～84s，偶发断流。pi 有退避重试，我们原来只有
+// 手动点「重试」。用户每遇到一次抖动就得自己点一下，很烦。
+//
+// 关键：用 **Retry()** 而不是 **Send("继续")**。
+//   - Retry 沿用历史里最后那条用户消息，模型看到的前缀完全一样，
+//     缓存照常命中
+//   - Send("继续") 会在对话里多一条用户消息：弄脏历史，且让缓存前缀
+//     失效（整段缓存作废）
+//   以前这里用的就是 Send("继续")，改掉。
+//
+// 只对**重发有意义**的失败重试（reason 见 isRetryableReason）：
+// 401、上下文超限这些重发一万次也一样，重试只会白等两轮。
+func (s *Session) maybeAutoRetry(notice string) {
+	if s.drv.Busy() != driver.BusyIdle {
+		return
+	}
+	if s.autoRetry >= maxAutoRetry {
+		log.Printf("会话 %s：自动重试已达上限（%d 次），保持失败状态", s.ID, s.autoRetry)
+		s.setRetryPending(false)
 		return
 	}
 	s.autoRetry++
-	log.Printf("会话 %s：流意外结束（收到 %d 个事件，最后是 %s），第 %d 次自动继续",
-		s.ID, received, lastKind, s.autoRetry)
-	_, _ = s.Conversation().AddNotice(conversation.NoticeWarn, s.cfg.Tr("session.autoRetry"))
-	delay := time.Duration(s.autoRetry) * 800 * time.Millisecond
+	// 指数退避：0.8s、1.6s、3.2s… 最多 8s。
+	// 断流往往是网关瞬时抖动，立刻重发容易再撞一次；稍等一下成功率高得多。
+	delay := retryBackoff(s.autoRetry)
+	log.Printf("会话 %s：第 %d 次自动重试（%s 后）", s.ID, s.autoRetry, delay)
+	_, _ = s.Conversation().AddNotice(conversation.NoticeWarn, notice)
+	// 标记"正在重试"：界面把失败行显示成「正在重试…」，不要闪红。
+	s.setRetryPending(true)
 	time.AfterFunc(delay, func() {
 		s.post(func() {
 			if s.drv.Busy() != driver.BusyIdle {
+				s.setRetryPending(false)
 				return
 			}
-			retry, err := s.drv.Send(s.cfg.Tr("session.autoRetryText"))
+			effects, err := s.drv.Retry()
 			if err != nil {
+				log.Printf("会话 %s：自动重试失败：%v", s.ID, err)
+				s.setRetryPending(false)
 				return
 			}
-			s.applyEffects(retry)
+			// 重发成功了：清掉标记，界面回到正常的"运行中"
+			s.setRetryPending(false)
+			s.applyEffects(effects)
 		})
 	})
+}
+
+// setRetryPending 更新"正在重试"标记并通知观察者。
+//
+// 状态变了要主动发通知：界面靠 StateChanged 重绘，不发的话标记变了也不刷新。
+// SetRetryPending 供测试与展示端设置"正在自动重试"标记。
+func (s *Session) SetRetryPending(pending bool) { s.setRetryPending(pending) }
+
+func (s *Session) setRetryPending(pending bool) {
+	if s.retryPending == pending {
+		return
+	}
+	s.retryPending = pending
+	for _, obs := range s.host.observersSnapshot() {
+		obs.StateChanged(s.ID)
+	}
+}
+
+// maxAutoRetry 是一轮里自动重试的最多次数。
+//
+// 2 次的经验依据：网关偶发抖动通常一次就好；连续两次都失败，
+// 多半不是抖动（配置错、额度问题），再自动重试只是让用户多等。
+const maxAutoRetry = 2
+
+// retryBackoff 返回第 n 次重试前的等待时间（0.8s 起，指数增长，上限 8s）。
+func retryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := 800 * time.Millisecond
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if delay >= 8*time.Second {
+			return 8 * time.Second
+		}
+	}
+	return delay
 }
 
 // startSummary 发起摘要请求；完成后由 driver 重建会话并写快照。

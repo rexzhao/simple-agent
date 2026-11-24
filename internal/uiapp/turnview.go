@@ -98,6 +98,16 @@ func (a *App) renderRoundFooter(c *ui.Context, item chatItem) {
 	failed := chat.Status() == conversation.StatusFailed
 	cancelled := chat.Status() == conversation.StatusCancelled
 
+	// 自动重试进行中：显示「正在重试…」而不是红色失败。
+	//
+	// 自动重试有指数退避（0.8s 起，最多 8s）。如果照常渲染失败行，
+	// 用户会看到"失败"闪一下又变回运行中，以为程序出毛病了。
+	// 只有重试用完（或不可重试）才真正停在失败态。
+	if failed && !item.Live && a.Current() != nil && a.Current().RetryPending() {
+		a.renderRetryPending(c, item, theme)
+		return
+	}
+
 	// 标题：失败（带原因摘要）/ 已中止 / 已完成（带耗时）
 	label := a.tr("message.turnProcess.worked")
 	switch {
@@ -184,6 +194,28 @@ func (a *App) renderRoundFooter(c *ui.Context, item chatItem) {
 	}
 	// 注意：这里**不画**分隔线。dsh 的 turn footer 只有一行文字，没有横线；
 	// 之前那条 Box(Height(1)) 是多余的视觉噪音。
+}
+
+// renderRetryPending 渲染"失败了但正在自动重试"的那一行。
+//
+// 用强调色而不是危险色：这不是终态，用户不需要处理它。
+// 文字说清"在重试"，让他们知道程序自己会接着跑，不用手点。
+func (a *App) renderRetryPending(c *ui.Context, item chatItem, theme *ui.Theme) {
+	ui.Row(c).Gap(8).Padding(2, 2).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "●").FontSize(9).TextColor(theme.Accent)
+		ui.Text(c, a.tr("chat.retrying")).FontSize(12).TextColor(theme.Accent)
+		// token / 缓存率仍然显示：这一轮已经产生的数据不该因为重试而消失
+		if tokens := timeline.Tokens(item); tokens > 0 {
+			ui.Text(c, a.tr("turn.usage", compactTokens(tokens))).
+				FontSize(11).TextColor(theme.TextMuted)
+		}
+		if item.Usage != nil {
+			if bp := item.Usage.CacheHitBasisPoints(); bp >= 0 {
+				ui.Text(c, a.tr("composer.cacheHit", formatBasisPoints(bp))).
+					FontSize(11).TextColor(theme.TextMuted)
+			}
+		}
+	})
 }
 
 // renderLiveFooter 渲染**执行中**的回合行：运行时间 + 实时 token + 当前缓存率。

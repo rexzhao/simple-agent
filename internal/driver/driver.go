@@ -453,6 +453,54 @@ func addUsage(total, one Usage) Usage {
 	}
 }
 
+// StreamFailed 表示这一轮因"重发可能就好"的原因失败（网络、超时、5xx）。
+//
+// 决策在 driver（它知道失败原因），执行在宿主层（它管退避与次数上限）。
+// 宿主层收到后用 Retry() 重发 —— **不是** Send("继续")：
+// 后者会多一条用户消息，弄脏历史并让缓存前缀失效。
+type StreamFailed struct {
+	Reason string
+}
+
+func (StreamFailed) effectKind() string { return "streamFailed" }
+
+// retryableFailure 报告这个失败原因**重发有没有意义**。
+//
+// 与界面 isRetryable（uiapp）同一套判断，但放在 driver：
+// 自动重试是执行端行为，不该依赖界面层。两处的关键词保持同步。
+func retryableFailure(reason string) bool {
+	if reason == "" {
+		return false
+	}
+	lower := strings.ToLower(reason)
+	// 先排除"重发无用"的
+	for _, hopeless := range []string{
+		"401", "403", "402", "invalid api key", "unauthorized",
+		"authentication", "permission", "insufficient", "balance",
+		"context_length_exceeded", "maximum context length",
+		"prompt is too long", "too many tokens", "max_tokens",
+		"400", "404", "prefill", // 以 assistant 结尾这类请求构造错误
+	} {
+		if strings.Contains(lower, hopeless) {
+			return false
+		}
+	}
+	for _, retryable := range []string{
+		"timeout", "deadline exceeded", "connection refused",
+		"no such host", "network", "eof", "reset by peer",
+		"broken pipe", "stream", "502", "503", "504", "429",
+		"rate limit", "quota", "unexpected",
+		// 断流：StreamClosed 用的原因文本是"连接意外中断（未收到结束标记）"，
+		// 含中文关键词，不加这条自动重试永远触发不了。
+		"中断", "未收到结束标记",
+	} {
+		if strings.Contains(lower, retryable) {
+			return true
+		}
+	}
+	return false
+}
+
 // toConversationUsage 把用量转成 conversation 包的类型。
 //
 // 两个包各自定义了一份（conversation 更底层，不能依赖 driver），
@@ -1520,6 +1568,12 @@ func (d *Driver) failStream(messageID, reason string) []Effect {
 				effects = append(effects, recordNotice(conversation.NoticeInfo, text))
 				effects = append(effects, compactEffects...)
 			}
+		} else if retryableFailure(reason) {
+			// 网络/超时/5xx 这类"重发就可能好"的失败：告诉宿主层可以自动重试。
+			//
+			// 决策放在 driver（它知道 reason），执行放在宿主层（它管退避与次数）。
+			// 超限走上面的压缩路径，不在这里重试 —— 两者不能同时来。
+			effects = append(effects, StreamFailed{Reason: reason})
 		}
 		return append(effects, Changed{})
 	}
@@ -2077,6 +2131,9 @@ func hasStatus413(reason string) bool {
 
 // IsContextOverflowForTest 暴露溢出判定（测试用）。
 func IsContextOverflowForTest(reason string) bool { return isContextOverflow(reason) }
+
+// RetryableFailureForTest 暴露"这个失败值得自动重试吗"（测试用）。
+func RetryableFailureForTest(reason string) bool { return retryableFailure(reason) }
 
 // WorkspaceForTest 返回 driver 当前记录的工作区（测试用）。
 func (d *Driver) WorkspaceForTest() string { return d.opts.Workspace }

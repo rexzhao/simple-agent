@@ -411,6 +411,9 @@ func (a *App) SwitchToForTest(index int) { a.switchTo(index) }
 // LastSessionForTest 返回从本机偏好读到的"上次打开的会话 ID"（测试用）。
 func (a *App) LastSessionForTest() string { return a.lastSessionID }
 
+// SetRetryPendingForTest 设置"正在自动重试"标记（测试用）。
+func (s *Session) SetRetryPendingForTest(pending bool) { s.SetRetryPending(pending) }
+
 // SetPickDirectoryForTest 替换目录选择器（测试用：模拟用户选了另一个目录）。
 func (a *App) SetPickDirectoryForTest(pick func() (string, error)) {
 	a.opts.PickDirectory = pick

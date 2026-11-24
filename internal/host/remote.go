@@ -88,7 +88,12 @@ type ViewState struct {
 	Generation uint64    `json:"generation"`
 	Seq        uint64    `json:"seq"`
 	Busy       string    `json:"busy"`
-	Queued     []string  `json:"queued"`
+	// RetryPending 表示"这一轮失败了，正在等自动重试"。
+	//
+	// 展示端据此把失败行显示成「正在重试…」而不是红色失败 ——
+	// 否则自动重试的退避期间用户会看到失败闪一下，以为程序坏了。
+	RetryPending bool      `json:"retry_pending,omitzero"`
+	Queued       []string  `json:"queued"`
 	Asks       []AskView `json:"asks"`
 	Usage      UsageView `json:"usage"`
 	// TotalUsage 是会话累计用量（命中率用累计口径，见 driver.TotalUsage）。
@@ -171,6 +176,7 @@ func (l *Local) Snapshot(sessionID string) (ViewState, bool) {
 		Generation: session.generation,
 		Seq:        l.currentStreamSeq(sessionID),
 		Busy:       string(session.Busy()),
+		RetryPending: session.retryPending,
 		Queued:     session.Queued(),
 		Usage: UsageView{
 			Input:      usage.InputTokens,
