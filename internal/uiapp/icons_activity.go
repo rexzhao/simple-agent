@@ -130,6 +130,25 @@ func toolIcon(name string) *ui.SVG {
 	}
 }
 
+// toolDisplayName 返回工具在界面上的名字。
+//
+// 内部工具名是给模型看的（`ask_user_question`、`todo_write`），
+// 直接摆在界面上像调试信息 —— 用户不认识它们是干什么的。
+// 这里把少数几个换成中文短名；其余（read/edit/bash…）本来就是词，
+// 保持了和模型一致，反而好对照。
+func toolDisplayName(name string) string {
+	switch name {
+	case "ask_user_question", "request_user_input":
+		return "提问"
+	case "todo_write":
+		return "清单"
+	case "working_directory":
+		return "目录"
+	default:
+		return name
+	}
+}
+
 // activityIcon 把活动分类映射到 dsh 的图标（对齐 `PROCESS_ICONS`）。
 func activityIcon(kind processActivity) *ui.SVG {
 	switch kind {

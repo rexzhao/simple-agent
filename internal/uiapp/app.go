@@ -2075,7 +2075,69 @@ func (a *App) renderStructuredResult(c *ui.Context, data map[string]any, theme *
 		a.renderTodoResult(c, info, theme)
 		return true
 	}
+	if info := askInfoOfPart(data); info != nil {
+		// 问答**只有界面需要**：Output 是给模型的 JSON
+		// （`{"answers":[{"selected":["SQLite"]}]}`），摊出来用户看不懂。
+		a.renderAskResult(c, info, theme)
+		return true
+	}
 	return false
+}
+
+// renderAskResult 显示一次提问的最终问答：逐题列出问题、选项、用户答案。
+//
+// 为什么要把选项也画出来（而不是只显示选了哪个）：用户回头看这段历史时
+// 想知道的是"当时有哪些选择、我为什么选这个"—— 只给答案就丢了上下文。
+// 选中的用强调色 + 对勾，未选中的用弱化色（一眼看出差别）。
+func (a *App) renderAskResult(c *ui.Context, info *tools.AskInfo, theme *ui.Theme) {
+	if info.Skipped {
+		ui.Text(c, a.tr("ask.skipped")).FontSize(11).TextColor(theme.TextMuted)
+		return
+	}
+	ui.Column(c).FillWidth().Gap(6).Children(func() {
+		for _, item := range info.Items {
+			ui.Column(c).FillWidth().Gap(2).Children(func() {
+				// 问题（带页签短名，若与问题不同）
+				if item.Header != "" && item.Header != item.Question {
+					ui.Text(c, item.Header).FontSize(11).TextColor(theme.TextMuted)
+				}
+				ui.Text(c, item.Question).FontSize(12).TextColor(theme.Text)
+				// 选项：选中的打勾并强调
+				chosen := map[string]bool{}
+				for _, label := range item.Selected {
+					chosen[label] = true
+				}
+				for _, option := range item.Options {
+					picked := chosen[option]
+					glyph := "○"
+					color := theme.TextMuted
+					if picked {
+						glyph = "●"
+						if item.MultiSelect {
+							glyph = "☑"
+						}
+						color = theme.Accent
+					} else if item.MultiSelect {
+						glyph = "☐"
+					}
+					ui.Row(c).Gap(6).Children(func() {
+						ui.Text(c, glyph).FontSize(11).TextColor(color)
+						ui.Text(c, option).FontSize(11).TextColor(color)
+					})
+				}
+				// 用户自己写的答案（填空）
+				if item.Custom != "" {
+					ui.Row(c).Gap(6).Children(func() {
+						ui.Text(c, "✎").FontSize(11).TextColor(theme.Accent)
+						ui.Text(c, item.Custom).FontSize(11).TextColor(theme.Accent)
+					})
+				}
+				if !item.Answered {
+					ui.Text(c, a.tr("ask.unanswered")).FontSize(11).TextColor(theme.TextMuted)
+				}
+			})
+		}
+	})
 }
 
 // renderSearchResult 按文件分组显示检索结果（grep）或文件列表（glob）。
@@ -2290,6 +2352,11 @@ func readInfoOfPart(data map[string]any) *tools.ReadInfo {
 
 func todoInfoOfPart(data map[string]any) *tools.TodoInfo {
 	return decodePartExtra[tools.TodoInfo](data, "todo")
+}
+
+// askInfoOfPart 从工具结果 data 里取出结构化问答。
+func askInfoOfPart(data map[string]any) *tools.AskInfo {
+	return decodePartExtra[tools.AskInfo](data, "ask")
 }
 
 // imageInfoOfPart 从工具结果 data 里取出图片摘要。
@@ -2736,7 +2803,7 @@ func (a *App) partView(c *ui.Context, chat *conversation.ChatEntry, partIndex in
 				toggle = true
 			}
 			ui.Icon(c, toolIcon(name)).Size(13, 13).TextColor(theme.TextMuted)
-			ui.Text(c, name).FontSize(11).
+			ui.Text(c, toolDisplayName(name)).FontSize(11).
 				Padding(1, 5).Radius(4).
 				Background(theme.SurfaceHover).TextColor(theme.Text)
 			// description 优先显示：模型写的描述通常比命令好懂。

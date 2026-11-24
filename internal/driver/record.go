@@ -102,6 +102,11 @@ type AskAnsweredData struct {
 	MessageID string `json:"message_id"`
 	CallID    string `json:"call_id"`
 	Output    string `json:"output"`
+	// Info 是结构化的问答（**只给界面**，不发模型）。
+	//
+	// 没有它的话，重放之后界面只能看到 Output 那段 JSON 文本，
+	// 或者干脆只显示"用户已回答"—— 看不出问了什么、用户选了哪个。
+	Info *tools.AskInfo `json:"info,omitempty"`
 }
 
 // SelectionChangedData 是 selection.changed 的载荷。
@@ -247,11 +252,12 @@ func recordAskRaised(messageID, callID string, questions []tools.QuestionSpec) E
 }
 
 // recordAskAnswered 记录作答/跳过。
-func recordAskAnswered(messageID, callID, output string) Effect {
+func recordAskAnswered(messageID, callID, output string, info *tools.AskInfo) Effect {
 	return record(store.TypeAskAnswered, AskAnsweredData{
 		MessageID: messageID,
 		CallID:    callID,
 		Output:    output,
+		Info:      info,
 	})
 }
 
@@ -362,6 +368,7 @@ const (
 	extraSearch    = "search"
 	extraRead      = "read"
 	extraTodo      = "todo"
+	extraAsk       = "ask"
 )
 
 // attachToolExtras 把 outcome 里的结构化附加字段挂到 part 数据上。

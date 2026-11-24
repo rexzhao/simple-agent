@@ -218,6 +218,8 @@ var zhTable = map[string]string{
 	"ask.answer":            "回答 %d",
 	"ask.answerPlaceholder": "或者直接写下你的回答…",
 	"ask.hint":              "写下的文字会作为该题的回答；改完可以切回前面的页签继续修改",
+	"ask.skipped":           "用户跳过了这个问题",
+	"ask.unanswered":        "（未回答）",
 	"ask.inactive":          "当前按上面的选项作答；修改这段文字即可改回用文字作答。",
 	"ask.skip":              "跳过",
 	"ask.submit":            "提交",

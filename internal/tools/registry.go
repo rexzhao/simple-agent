@@ -310,6 +310,38 @@ type ReadInfo struct {
 	UTF16   bool `json:"utf16,omitempty"`
 }
 
+// AskInfo 是 ask_user_question 的结构化结果，**只给界面**。
+//
+// Output 是给模型的文本（"用户已回答：\n- 存储方案：SQLite"），
+// 界面照搬既看不出"这题有几个选项"，也分不清哪个是用户选的、
+// 哪个是用户自己写的。这里把问答配好对给界面直接画。
+//
+// 折叠行显示"3 个问题 · 已答 3"就够了；展开后按题列出问题、
+// 选项与最终答案。
+type AskInfo struct {
+	// Items 是**逐题**的问答（按模型提问顺序）。
+	Items []AskItem `json:"items,omitempty"`
+	// Skipped 表示用户跳过了（没有作答）。
+	Skipped bool `json:"skipped,omitempty"`
+}
+
+// AskItem 是一道题的问与答。
+type AskItem struct {
+	Question string `json:"question"`
+	// Header 是页签短名（可能为空）。
+	Header string `json:"header,omitempty"`
+	// Options 是模型给出的全部选项（用来画完整的选择列表）。
+	Options []string `json:"options,omitempty"`
+	// Selected 是用户勾选的选项文本（多选时多个）。
+	Selected []string `json:"selected,omitempty"`
+	// Custom 是用户自己写的答案（填空）。
+	Custom string `json:"custom,omitempty"`
+	// MultiSelect 决定界面用勾选框还是单选框的语义。
+	MultiSelect bool `json:"multi_select,omitempty"`
+	// Answered 表示这题有答案（选了或写了）。
+	Answered bool `json:"answered,omitempty"`
+}
+
 // TodoInfo 是 todo_write 的结构化结果，**只给界面**。
 //
 // Output 里是给模型的两行摘要 + 一串 "✓ 内容"。界面本来就有 todo 面板，

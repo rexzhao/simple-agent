@@ -865,7 +865,7 @@ func TestAskCustomAnswerViaComposer(t *testing.T) {
 	clickProcessGroup(t, tester)
 	pump(tester, p)
 	// 结果折进工具行，再点一次才看到作答
-	clickToolRow(t, tester, "ask_user_question")
+	clickToolRow(t, tester, "提问")
 	pump(tester, p)
 	waitFor(t, tester, p, "作答出现在界面", func() bool { return tester.HasText("张三") })
 }
@@ -906,9 +906,12 @@ func TestAskDismiss(t *testing.T) {
 	// 过程默认折叠成一组，展开后再点工具行看结果
 	clickProcessGroup(t, tester)
 	pump(tester, p)
-	clickToolRow(t, tester, "ask_user_question")
+	clickToolRow(t, tester, "提问")
 	pump(tester, p)
-	waitFor(t, tester, p, "dismissed 结果上屏", func() bool { return tester.HasText("dismissed") })
+	// 跳过之后显示**人话**，不是给模型看的 JSON（`{"answers":[],"dismissed":true}`）。
+	waitFor(t, tester, p, "跳过提示上屏", func() bool {
+		return tester.HasText("用户跳过了这个问题")
+	})
 }
 
 // 模型切换器：只列已配置的提供商 + 模拟；只在空闲时可切换；只影响当前会话。

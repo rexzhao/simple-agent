@@ -209,6 +209,8 @@ var enTable = map[string]string{
 	"ask.answer":            "Answer %d",
 	"ask.answerPlaceholder": "Or write your own answer…",
 	"ask.hint":              "Typed text becomes this question's answer; switch back to earlier tabs to edit",
+	"ask.skipped":           "The user skipped this question",
+	"ask.unanswered":        "(not answered)",
 	"ask.inactive":          "Currently answering with the option above; edit this text to answer with it again.",
 	"ask.skip":              "Skip",
 	"ask.submit":            "Submit",

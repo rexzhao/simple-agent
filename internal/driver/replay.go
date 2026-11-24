@@ -555,13 +555,18 @@ func settleAsk(conv *conversation.Conversation, data AskAnsweredData) {
 			continue
 		}
 		name, _ := partDataMap["name"].(string)
+		result := map[string]any{
+			"id":       id,
+			"name":     name,
+			"output":   data.Output,
+			"is_error": false,
+		}
+		// 结构化问答跟着一起恢复：否则重开会话后展开只剩一段 JSON 文本
+		if data.Info != nil {
+			result[extraAsk] = data.Info
+		}
 		entry.Message.Parts[i] = message.Part{
-			Content: message.DataPart{Data: map[string]any{
-				"id":       id,
-				"name":     name,
-				"output":   data.Output,
-				"is_error": false,
-			}},
+			Content:   message.DataPart{Data: result},
 			MediaType: render.MediaToolResult,
 		}
 		return

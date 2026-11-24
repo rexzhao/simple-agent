@@ -247,6 +247,54 @@ func sortByOptionOrder(question tools.QuestionSpec, selected []string) []string 
 //   - 跳过：`{"answers":[],"dismissed":true}`
 //   - 提交：正常的 answers
 //   - 输入文字但所有问题都已选中：文字放进 note（不静默丢弃）
+// Info 生成给界面的结构化问答（**只给界面**，不进模型请求）。
+//
+// 为什么需要它：Output 是给模型的 JSON（`{"answers":[...]}`），
+// 界面要么照搬一串 JSON，要么只能显示"用户已回答"这种废话 ——
+// 看不出问了什么、有哪些选项、用户到底选了哪个。
+//
+// custom 与 Output 的语义一致：非空时作为「第一个既没选也没写的问题」
+// 的答案。**必须和 answers() 用同一套判定**，否则会出现
+// "模型收到了答案、界面却显示未回答"的不一致（踩过）。
+//
+// dismissed 为 true 表示用户跳过了。
+func (g *AskGroup) Info(dismissed bool, custom string) *tools.AskInfo {
+	info := &tools.AskInfo{Skipped: dismissed}
+	pending := strings.TrimSpace(custom)
+	for index, question := range g.Questions {
+		item := tools.AskItem{
+			Question:    question.Question,
+			Header:      question.Header,
+			MultiSelect: question.MultiSelect,
+		}
+		for _, option := range question.Options {
+			item.Options = append(item.Options, option.Label)
+		}
+		if dismissed {
+			info.Items = append(info.Items, item)
+			continue
+		}
+		// 选中项按原始顺序列出（map 遍历无序，直接遍历选项更稳）
+		for optionIndex, option := range question.Options {
+			if g.Selected(index, optionIndex) {
+				item.Selected = append(item.Selected, option.Label)
+			}
+		}
+		// 与 answers() 同样的优先级：先看这题是否以手写作答，
+		// 再看兜底（输入框文字给第一个空题）。
+		switch {
+		case g.CustomActive(index):
+			item.Custom = strings.TrimSpace(g.Custom(index))
+		case len(item.Selected) == 0 && pending != "":
+			item.Custom = pending
+			pending = ""
+		}
+		item.Answered = len(item.Selected) > 0 || item.Custom != ""
+		info.Items = append(info.Items, item)
+	}
+	return info
+}
+
 func (g *AskGroup) Output(action AskAction, custom string) string {
 	switch action {
 	case AskDismiss:

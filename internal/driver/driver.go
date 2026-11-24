@@ -1,4 +1,4 @@
-﻿// Package driver 是会话编排状态机：把用户操作与提供商事件翻译成会话变化，
+// Package driver 是会话编排状态机：把用户操作与提供商事件翻译成会话变化，
 // 并把"接下来该做什么"以 Effect 形式交给调用方（uiapp）。
 //
 // 三条硬约束（方案 §4 / §9）：
@@ -1694,8 +1694,11 @@ func (d *Driver) settleAsks(action AskAction, custom string) ([]Effect, error) {
 	}
 
 	outputs := make(map[string]string, len(d.round.asks))
+	infos := make(map[string]*tools.AskInfo, len(d.round.asks))
 	for _, group := range d.round.asks {
 		outputs[group.CallID] = group.Output(action, custom)
+		// 结构化问答**只给界面**：Output 是 JSON，摊出来用户看不懂。
+		infos[group.CallID] = group.Info(action == AskDismiss, custom)
 	}
 
 	for i, part := range entry.Message.Parts {
@@ -1712,20 +1715,25 @@ func (d *Driver) settleAsks(action AskAction, custom string) ([]Effect, error) {
 			continue
 		}
 		name, _ := data["name"].(string)
+		result := map[string]any{
+			"id":       id,
+			"name":     name,
+			"output":   output,
+			"is_error": action == AskDismiss,
+		}
+		if info := infos[id]; info != nil {
+			result[extraAsk] = info
+		}
 		entry.Message.Parts[i] = message.Part{
-			Content: message.DataPart{Data: map[string]any{
-				"id":       id,
-				"name":     name,
-				"output":   output,
-				"is_error": action == AskDismiss,
-			}},
+			Content:   message.DataPart{Data: result},
 			MediaType: render.MediaToolResult,
 		}
 	}
 
 	var effects []Effect
 	for _, group := range d.round.asks {
-		effects = append(effects, recordAskAnswered(d.round.messageID, group.CallID, group.Output(action, custom)))
+		effects = append(effects, recordAskAnswered(d.round.messageID, group.CallID,
+			group.Output(action, custom), group.Info(action == AskDismiss, custom)))
 	}
 	d.round.asks = nil
 	next, err := d.continueAfterTools()
