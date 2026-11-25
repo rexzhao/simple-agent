@@ -59,14 +59,12 @@ try {
     if (-not $NoRelay) {
         $addr = $Relay
         $token = ""
-        $fingerprint = ""
         $statePath = Join-Path $dataDir "relay.json"
         if (Test-Path $statePath) {
             try {
                 $state = Get-Content $statePath -Raw | ConvertFrom-Json
                 if (-not $addr) { $addr = [string]$state.addr }
                 $token = [string]$state.token
-                $fingerprint = [string]$state.fingerprint
             } catch {
                 Write-Host "relay.json 解析失败：$($_.Exception.Message)" -ForegroundColor Yellow
             }
@@ -78,7 +76,14 @@ try {
             # 界面上看不到也操作不了。
             $relayArgs += @("--relay", $addr)
             if ($token) { $relayArgs += @("--token", $token) }
-            if ($fingerprint) { $relayArgs += @("--tls-fingerprint", $fingerprint) }
+            # **不传 --tls-fingerprint**：指纹交给 TOFU。
+            #
+            # --tls-fingerprint 的语义是"我已经知道对端指纹了"，
+            # 传了它就跳过确认。而首次连接本来就该弹窗问用户
+            # —— 确认一次之后记进 known_hosts，之后自动校验。
+            #
+            # 手抄 64 位指纹很容易错一个字符，然后表现成"连不上"
+            # 且看不出原因（踩过）。让程序自己问、自己记更可靠。
             if ($Name) { $relayArgs += @("--name", $Name) }
         } else {
             Write-Host "没有 relay 地址（也没有 relay.json）：只本地运行" -ForegroundColor Yellow

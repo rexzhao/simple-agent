@@ -361,10 +361,17 @@ func main() {
 	// TLS 握手会阻塞在 peerGate 上等用户决定（见 tls.go）。
 	//
 	// 这里才装通知回调：app 刚创建好，之前 setupTLS 时还拿不到它。
-	// 不用 post：RequestRedraw 本身是线程安全的（内部会 postMain）。
 	if peerGate != nil {
 		peerGate.Notify = func() { app.RequestRedraw() }
 		app.SetPeerConfirmer(gateAdapter{gate: peerGate})
+		// **标记界面就绪**：从这一刻起，未确认的指纹才会真的弹窗。
+		// 在此之前 Gate.Ask 直接返回 false（"暂时无人可问"），
+		// 让注册循环退避重试而不是干等一个不会出现的弹窗。
+		uiReady.Store(true)
+		// 界面就绪前可能已经有"想连但被推回"的连接：主动重试一次。
+		if remote, ok := remoteHost.(*host.Remote); ok && remote != nil {
+			remote.RetryNow()
+		}
 	}
 
 	// 执行端注册到 relay（有界面也可以）：断线自动重连并重新注册

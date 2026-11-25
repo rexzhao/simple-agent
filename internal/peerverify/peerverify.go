@@ -168,6 +168,16 @@ type Gate struct {
 	pending []*Pending
 	// Notify 通知界面"有新的待确认项"（可以为 nil，那界面靠帧循环轮询）。
 	Notify func()
+	// Ready 报告界面是否已经可以弹窗（可以为 nil，表示"随时可以"）。
+	//
+	// 为什么需要：执行端启动时**先装 TLS 再建界面** —— 注册 relay 的
+	// 连接可能比窗口先就绪。那时如果直接登记等待，就没人能点那个弹窗，
+	// 会一直挂到进程结束。
+	//
+	// 所以这里先问 Ready：还没就绪就**立刻返回"暂时无人可问"**，
+	// 由调用方（注册循环的退避重试）稍后再来 —— 等界面起来那一轮
+	// 自然会弹窗。
+	Ready func() bool
 }
 
 // Pending 是一条等待确认的记录。
@@ -210,6 +220,11 @@ func (p *Pending) PeerKnown() string { return p.Req.Known }
 //
 // **不设超时**：见包注释。等待经进程退出或调用方 Cancel 结束。
 func (g *Gate) Ask(req Request) bool {
+	// 界面还没起来：立刻返回 false，别让连接一直挂着等一个不会出现的弹窗。
+	// 调用方（注册循环）会退避重试，等界面就绪那一轮自然会走到弹窗。
+	if g.Ready != nil && !g.Ready() {
+		return false
+	}
 	pending := &Pending{Req: req, decided: make(chan bool, 1)}
 	g.mu.Lock()
 	g.pending = append(g.pending, pending)

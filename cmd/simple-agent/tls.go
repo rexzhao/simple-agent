@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync/atomic"
 
 	"simple-agent/internal/config"
 	"simple-agent/internal/peerverify"
@@ -28,6 +29,15 @@ import (
 var (
 	peerGate       *peerverify.Gate
 	activeVerifier *peerverify.Verifier
+	// uiReady 表示界面已经创建好、可以弹窗了。
+	//
+	// 为什么需要：setupTLS 必须在**任何连接建立之前**执行（它装拨号钩子），
+	// 而界面要更晚才创建。执行端一启动就去注册 relay，那时如果遇到
+	// 未确认指纹，弹窗无处可弹 —— 连接会挂在那儿等到进程结束。
+	//
+	// 所以 Gate.Ready 查这个标志：还没就绪就立刻返回"暂时无人可问"，
+	// 注册循环退避重试，等界面起来那一轮自然弹窗。
+	uiReady atomic.Bool
 )
 
 // setupTLS 按命令行/配置装好 TLS。
@@ -131,7 +141,10 @@ func setupTLS(cfg *config.Config, opts remoteOptions) bool {
 		}
 		// 有新的待确认对端时界面会自动弹窗（帧循环每帧查一次 Pending），
 		// 所以这里不需要额外的通知回调。
-		peerGate = &peerverify.Gate{}
+		peerGate = &peerverify.Gate{
+			// 界面还没起来时不要登记等待（见 uiReady 的注释）
+			Ready: func() bool { return uiReady.Load() },
+		}
 		verifier := &peerverify.Verifier{
 			Store:  store,
 			Role:   trust.RoleRelay,
