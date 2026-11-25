@@ -80,10 +80,12 @@ func setupTLS(cfg *config.Config, opts remoteOptions) bool {
 		// 同一个用户、同一个信任域，"自己连自己"的指纹天然等于本机指纹，
 		// 执行端判定为已知身份、不弹窗。换一台机器 DataDir 不同，证书也就
 		// 不同，那才需要用户确认。
-		if own, fingerprint := viewerCertificate(cfg.DataDir); fingerprint != "" {
-			tlsCfg.CertDir = own.CertDir
-			tlsCfg.CertFile = own.CertFile
-			tlsCfg.KeyFile = own.KeyFile
+		//
+		// **赋值 DataDir 而不是复制各个字段**：own 只是
+		// `tlsx.Config{DataDir: …}`，它的 CertDir/CertFile/KeyFile 都是空的；
+		// 逐个复制等于什么都没设置（踩过）。
+		if fingerprint := viewerCertificate(cfg.DataDir); fingerprint != "" {
+			tlsCfg.DataDir = cfg.DataDir
 			log.Printf("TLS：viewer 身份 %s", describeViewerIdentity(fingerprint))
 		}
 		if _, err := tlsCfg.ClientConfig(); err != nil {
