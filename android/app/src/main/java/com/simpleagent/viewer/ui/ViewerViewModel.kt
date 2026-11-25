@@ -269,11 +269,20 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 记住的会话 id：连上后由 refreshSessions 决定是否还能用它
         restoredSessionId = prefs.getString("activeSessionId", "") ?: ""
         state.update { it.copy(connecting = true, connectError = "") }
+        // 指纹优先用 prefs 里确认过的（state 初始值来自同一处，这里兜一层
+        // 防止将来 state 初始化被改动时悄悄退化成"每次启动都重新确认"）。
+        var fingerprint = current.fingerprint.trim()
+        if (fingerprint.isEmpty()) {
+            val savedAddr = prefs.getString("savedAddr", "") ?: ""
+            if (savedAddr == current.addr.trim()) {
+                fingerprint = prefs.getString("fingerprint", "") ?: ""
+            }
+        }
         core.connectTLS(
             current.addr.trim(),
             current.route.trim(),
             current.token.trim(),
-            current.fingerprint.trim(),
+            fingerprint,
         )
     }
 
@@ -757,26 +766,44 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(connecting = true, reconnecting = false, connectError = "")
         }
         val current = state.value
-        // 记住这次填的全部连接参数：手机输入很麻烦，指纹还是 64 位十六进制。
+        // 记住这次填的连接参数：手机输入很麻烦，指纹还是 64 位十六进制。
         // token/指纹属于凭据，但存在应用私有 SharedPreferences 里（未 root 时
         // 其它应用读不到），比每次手敲安全得多。
+        //
+        // **指纹为空时不要写这一项**：TOFU 流程里这里是"清空"，
+        // 会把之前确认过的指纹抹掉 —— 下次又要重新确认一遍。
+        // 指纹只在两种情况下更新：用户手填、或确认框里点「信任」
+        // （见 confirmFingerprint）。
         prefs.edit()
             .putString("addr", current.addr.trim())
             .putString("route", current.route.trim())
             .putString("token", current.token.trim())
-            .putString("fingerprint", current.fingerprint.trim())
+            // savedAddr 是"确认过的指纹属于哪台 relay"：指纹必须与地址配对
+            // 才有意义，换了 relay 就该重新确认（哪怕指纹恰好相同）。
+            .putString("savedAddr", current.addr.trim())
             .apply()
+        if (current.fingerprint.isNotBlank()) {
+            prefs.edit().putString("fingerprint", current.fingerprint.trim()).apply()
+        }
 
         // **没有指纹就走 TOFU**：先探测、弹窗确认、确认后保存再用。
         //
         // 与桌面端同一套语义（见 internal/uiapp/fingerprint.go）：
         // 用户不该手抄 64 位十六进制，也没必要 —— 展示 + 确认既省事，
         // 又把"你信任的是哪个指纹"摆到台面上。
-        //
-        // 已确认过的指纹存在 prefs 里，下次直接用，不再询问。
         if (current.fingerprint.isBlank()) {
+            // 以前确认过、且还是同一台 relay → 直接用记住的指纹，
+            // **不再询问**（这是"跟 SSH 一样"的关键：正常连接必须一键完成）。
+            val savedAddr = prefs.getString("savedAddr", "") ?: ""
+            val savedFingerprint = prefs.getString("fingerprint", "") ?: ""
+            val addr = current.addr.trim()
+            if (savedFingerprint.isNotEmpty() && savedAddr == addr) {
+                state.update { it.copy(fingerprint = savedFingerprint) }
+                core.connectTLS(addr, current.route.trim(), current.token.trim(), savedFingerprint)
+                return
+            }
             connectWithFingerprintConfirm(
-                current.addr.trim(),
+                addr,
                 current.route.trim(),
                 current.token.trim(),
             )
@@ -917,7 +944,11 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     /** 用户确认了指纹：保存并连接。 */
     fun confirmFingerprint() {
         val pending = state.value.pendingFingerprint ?: return
-        prefs.edit().putString("fingerprint", pending.fingerprint).apply()
+        // 指纹与地址一起存：指纹只有配上"是哪台 relay"才有意义
+        prefs.edit()
+            .putString("fingerprint", pending.fingerprint)
+            .putString("savedAddr", pending.addr)
+            .apply()
         state.update { it.copy(pendingFingerprint = null, fingerprint = pending.fingerprint) }
         core.connectTLS(pending.addr, pending.route, pending.token, pending.fingerprint)
     }
