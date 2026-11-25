@@ -172,10 +172,13 @@ func dialRaw(addr, fingerprint string) (net.Conn, error) {
 		return nil, fmt.Errorf("%s 没有证书指纹，拒绝明文连接", addr)
 	}
 	cfg := tlsx.Config{
-		// **不设 Fingerprint**：lan_addrs 里那个指纹是执行端自己报的，
-		// 不能直接当"已信任"。交给 OnPeerFingerprint 走信任列表/用户确认，
-		// 与连 relay 完全一样的流程（确认过一次就记进 known_hosts）。
+		// **必须显式开启客户端 TLS**。
 		//
+		// ClientTLS() = ClientTLSEnabled || Fingerprint != ""。这里
+		// 两者都不设时它为 false，Dial 会退化成**明文** net.Dial ——
+		// 既不带证书也不握手，执行端只能看到一条明文连接然后拒绝
+		// （日志："没有出示客户端证书"）。真实踩到的坑。
+		ClientTLSEnabled: true,
 		// 自己的证书：执行端要验证我们是谁（mTLS）
 		DataDir: viewerDataDir,
 		// 只有 TCP 建连有超时；握手可能等用户看弹窗，不计时

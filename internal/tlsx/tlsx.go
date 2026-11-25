@@ -215,6 +215,21 @@ func (c Config) Listen(addr string) (net.Listener, error) {
 // Dial 按配置拨号（未启用客户端 TLS 时就是 net.Dial）。
 func (c Config) Dial(addr string) (net.Conn, error) {
 	if !c.ClientTLS() {
+		// **显式要求加密时，绝不静默退化成明文**。
+		//
+		// 这个分支以前是"没配指纹就走明文"。实际踩到的坑：直连执行端时
+		// 只配了 DataDir（自己的证书）和超时，忘了 ClientTLSEnabled ——
+		// ClientTLS() 为 false，于是 net.Dial 发了一条**明文**连接过去，
+		// 执行端只看到"没有出示客户端证书"就拒绝，而调用方完全不知道
+		// 自己发的是明文。
+		//
+		// 现在：配了任何 TLS 相关字段（证书目录/指纹）却走到这里，
+		// 一律报错而不是降级。真正想用明文时这些字段本来就是空的。
+		if c.DataDir != "" || c.CertDir != "" || c.CertFile != "" || c.Fingerprint != "" {
+			return nil, fmt.Errorf(
+				"拒绝以明文连接 %s：已配置证书/指纹但未启用客户端 TLS"+
+					"（加密与明文严格隔离）", addr)
+		}
 		return net.Dial("tcp", addr)
 	}
 	cfg, err := c.ClientConfig()
