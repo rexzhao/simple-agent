@@ -20,6 +20,7 @@ import (
 	"simple-agent/internal/providers"
 	"simple-agent/internal/relay"
 	"simple-agent/internal/store"
+	"simple-agent/internal/trust"
 	"simple-agent/internal/tools"
 	"simple-agent/internal/uiapp"
 	"simple-agent/internal/uistate"
@@ -323,6 +324,22 @@ func main() {
 	//   simple-agent --relay HOST:PORT --token … --listen
 	// （不带地址 = 随机端口，会经 relay 上报给展示端）
 	if listenAddr != "" {
+		// **先装信任体系再监听**：监听一开就可能有人连进来，
+		// 那时 trustStore / viewerGate 必须已就绪，否则未信任的连接会被
+		// 直接放行（admitViewer 里 nil 检查的分支）。
+		//
+		// 信任列表落在数据目录（与 relay.json 同级）：它是本机的
+		// "认识谁"的记忆，换机器就该重新确认。
+		store, trustErr := trust.Open(trust.DefaultPath(cfg.DataDir))
+		if trustErr != nil {
+			log.Printf("信任列表读取失败（将重新询问所有对端）：%v", trustErr)
+		}
+		setViewerTrust(store, newGate(func() {
+			// 有新的待确认 viewer：让界面刷一下，弹确认框
+			post(func() { app.NotifyDisplay("") })
+		}))
+		app.SetViewerTrustUI(gateAdapter{gate: viewerGate})
+
 		stop, port, fingerprint, err := startListener(listenAddr, app, post)
 		if err != nil {
 			showFatal(locale.Tr("dialog.config.title"), err.Error())

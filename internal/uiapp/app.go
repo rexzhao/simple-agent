@@ -609,6 +609,11 @@ type App struct {
 	childOpen map[string]bool
 	// pendingFingerprint 是等待用户确认的 relay 证书指纹（见 fingerprint.go）。
 	pendingFingerprint *pendingFingerprint
+	// viewerTrust 是执行端信任体系的界面适配器（见 viewertrust.go）。
+	//
+	// 为 nil 表示当前进程不是执行端、或者没开 --listen —— 那种情况下
+	// 没有"别人要连进来"这回事。
+	viewerTrust ViewerTrust
 	// skipProbe 让 StartRelayRegistration **跳过指纹探测**（见 fingerprint.go）。
 	//
 	// 只在"探测失败 → 退回明文连接"这一条路径上临时置位。不加它会导致
@@ -1324,6 +1329,7 @@ func (a *App) View(c *ui.Context) {
 	})
 	a.confirmDialogs(c)
 	a.fingerprintDialog(c)
+	a.viewerTrustDialog(c)
 }
 
 // mainPane 渲染右栏：标题 + 消息列表 + 提问面板 + 输入卡。

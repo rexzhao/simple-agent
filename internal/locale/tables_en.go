@@ -27,7 +27,12 @@ var enTable = map[string]string{
 
 	// Common
 	"session.childDefault":  "Sub-session",
-	"sidebar.childCount":    "%d sub-sessions",	"relay.tofu.title":          "Trust this relay?",
+	"sidebar.childCount":    "%d sub-sessions",	"viewer.trust.title":          "A viewer wants to connect",
+	"viewer.trust.message":        "%s is requesting access to this executor.\n\nIts certificate fingerprint is:\n%s\n\nAllow only if this is your own client. It will be remembered and not asked again.",
+	"viewer.trust.changedTitle":   "Viewer certificate fingerprint changed",
+	"viewer.trust.changedMessage": "%s is requesting access, but its certificate fingerprint differs from last time.\n\nPrevious: %s\nCurrent:  %s\n\nThe client may have been reinstalled — or someone is impersonating it.",
+	"viewer.trust.allow":          "Allow",
+	"viewer.trust.deny":           "Deny",	"relay.tofu.title":          "Trust this relay?",
 	"relay.tofu.message":        "First connection to %s.\n\nIts certificate fingerprint is:\n%s\n\nContinue only if this is the machine you meant to reach. It will be remembered and not asked again.",
 	"relay.tofu.changedTitle":   "Certificate fingerprint changed",
 	"relay.tofu.changedMessage": "The certificate fingerprint of %s differs from last time:\n\n%s\n\nEither the certificate was replaced, or someone is impersonating it. Continue only if you are sure.",

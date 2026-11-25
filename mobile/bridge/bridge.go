@@ -368,8 +368,13 @@ func dialLANWith(addr, fingerprint, token string, timeout time.Duration) (wire.C
 	return wire.Prefetch(conn, first), nil
 }
 
-// dialLANRaw 只负责建连（不含握手）。
+// dialLANRaw 只负责建连（**只走 TLS**，不含握手）。
+//
+// 没有明文分支：加密与明文严格隔离（见 dialLANWith 的注释）。
 func dialLANRaw(addr, fingerprint string, timeout time.Duration) (net.Conn, error) {
+	if fingerprint == "" {
+		return nil, fmt.Errorf("%s 没有证书指纹，拒绝明文连接", addr)
+	}
 	type result struct {
 		conn net.Conn
 		err  error
@@ -377,13 +382,6 @@ func dialLANRaw(addr, fingerprint string, timeout time.Duration) (net.Conn, erro
 	done := make(chan result, 1)
 	cfg := tlsx.Config{Fingerprint: fingerprint}
 	go func() {
-		if fingerprint == "" {
-			// 明文：执行端只配了 --tls-fingerprint（客户端方向）、
-			// 没有服务端证书时，它的监听就是明文的
-			raw, err := net.DialTimeout("tcp", addr, timeout)
-			done <- result{conn: raw, err: err}
-			return
-		}
 		raw, err := cfg.Dial(addr)
 		done <- result{conn: raw, err: err}
 	}()

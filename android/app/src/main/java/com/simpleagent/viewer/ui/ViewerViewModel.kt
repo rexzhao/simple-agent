@@ -850,12 +850,24 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 return@launch
             }
-            // 对端是明文 relay：直接连，不弹确认框（明文是合法用法）
-            if (probe.plain) {
-                state.update { it.copy(connecting = false) }
-                core.connectTLS(addr, route, token, "")
-                return@launch
-            }
+            // 对端是明文服务：**拒绝连接**（加密与明文严格隔离）。
+                //
+                // 以前这里会"直接明文连上去"。但那是个降级漏洞：攻击者只要
+                // 让 TLS 握手失败，客户端就自动改用无校验的明文连接，
+                // 指纹体系形同虚设。
+                //
+                // 用户的要求是"用 tls 和不用 tls 的不能互相通讯，完全隔离"，
+                // 所以明文对端直接报错，由用户自己决定要不要改用对的配置。
+                if (probe.plain) {
+                    state.update {
+                        it.copy(
+                            connecting = false,
+                            connectError = "对端 $addr 未启用 TLS。" +
+                                "本端只与加密对端通讯（加密与明文严格隔离）。",
+                        )
+                    }
+                    return@launch
+                }
             if (probe.fingerprint.isEmpty()) {
                 state.update {
                     it.copy(connecting = false, connectError = "没能取到对端的证书指纹")

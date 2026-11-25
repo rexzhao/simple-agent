@@ -33,7 +33,12 @@ var zhTable = map[string]string{
 
 	// 通用
 	"session.childDefault":  "子会话",
-	"sidebar.childCount":    "%d 个子会话",	"relay.tofu.title":          "信任这台 relay？",
+	"sidebar.childCount":    "%d 个子会话",	"viewer.trust.title":          "有 viewer 要连进来",
+	"viewer.trust.message":        "%s 请求连接本执行端。\n\n它的证书指纹是：\n%s\n\n确认这是你自己的客户端后再允许。确认后会记住，以后不再询问。",
+	"viewer.trust.changedTitle":   "viewer 的证书指纹变了",
+	"viewer.trust.changedMessage": "%s 请求连接，但它的证书指纹和上次不一样了。\n\n上次：%s\n现在：%s\n\n可能是重装了客户端，也可能是有人在冒充。确认无误再允许。",
+	"viewer.trust.allow":          "允许",
+	"viewer.trust.deny":           "拒绝",	"relay.tofu.title":          "信任这台 relay？",
 	"relay.tofu.message":        "首次连接 %s。\n\n它的证书指纹是：\n%s\n\n确认这是你要连的那台机器后再继续。确认后会记住，以后不再询问。",
 	"relay.tofu.changedTitle":   "证书指纹变了",
 	"relay.tofu.changedMessage": "%s 的证书指纹和上次不一样了：\n\n%s\n\n可能是换了证书，也可能是有人在冒充。确认无误再继续。",

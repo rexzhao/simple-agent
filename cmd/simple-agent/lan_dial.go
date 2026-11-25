@@ -76,6 +76,18 @@ func tryLAN(target, token string, list []relay.Executor) (wire.Conn, string) {
 
 // dialLAN 拨一条到局域网地址的连接**并完成执行端握手**。
 func dialLAN(addr address, token string) (wire.Conn, error) {
+	// **没有对端指纹就不直连**（TLS 与明文严格隔离）。
+	//
+	// 以前这里会"没有指纹就走明文"——那是个降级漏洞：攻击者只要让 TLS
+	// 握手失败（丢包、伪造证书链），客户端就会自动改用无校验的明文连接，
+	// 指纹体系形同虚设。
+	//
+	// 现在的规则：**加密的和明文的不能互相通讯**。对端没在 lan_addrs 里
+	// 报指纹 = 它是明文执行端 = 本客户端不直连它（走 relay 或干脆连不上，
+	// 由用户自己决定要不要配置）。
+	if addr.TLSFingerprint == "" {
+		return nil, fmt.Errorf("%s 没有上报证书指纹，本端只连加密对端", addr.String())
+	}
 	raw, err := dialRaw(addr.String(), addr.TLSFingerprint)
 	if err != nil {
 		return nil, err
@@ -111,21 +123,19 @@ func dialLAN(addr address, token string) (wire.Conn, error) {
 // address 是 lan.Address 的别名（让 dialLAN 的签名短一点）。
 type address = lan.Address
 
-// dialRaw 只负责建连（明文或 TLS），不做握手。
+// dialRaw 只负责建连（**只走 TLS**），不做握手。
+//
+// 没有明文分支：加密与明文严格隔离，见 dialLAN 的注释。
 func dialRaw(addr, fingerprint string) (net.Conn, error) {
+	if fingerprint == "" {
+		return nil, fmt.Errorf("%s 没有证书指纹，拒绝明文连接", addr)
+	}
 	type result struct {
 		conn net.Conn
 		err  error
 	}
 	done := make(chan result, 1)
 	go func() {
-		if fingerprint == "" {
-			// 明文：执行端只配了 --tls-fingerprint（客户端方向）、
-			// 没有服务端证书时，它的监听就是明文的
-			raw, err := net.DialTimeout("tcp", addr, lanDialTimeout)
-			done <- result{conn: raw, err: err}
-			return
-		}
 		raw, err := tlsx.Config{Fingerprint: fingerprint}.Dial(addr)
 		done <- result{conn: raw, err: err}
 	}()

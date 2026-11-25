@@ -1,6 +1,7 @@
 package uiapp
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -62,17 +63,18 @@ func (a *App) probeThenConnect(addr, token, previous string) string {
 		// 更误导的错误（"连接被拒"之类，用户以为是口令问题）。
 		return "连不上 relay：" + err.Error()
 	}
-	if plain {
-		// 对端是明文 relay：退回明文连接，不打扰用户。
+if plain {
+		// 对端是明文服务：**拒绝**（加密与明文严格隔离）。
 		//
-		// 明文 relay 是完全合法的老用法，探测失败对它是**正常**的，
-		// 不该弹指纹确认框，也不该报错。
+		// 以前这里会"退回明文连接，不打扰用户"。但那是个降级漏洞：
+		// 攻击者只要让 TLS 握手失败，客户端就自动改用无校验的明文连接，
+		// 指纹体系形同虚设。
 		//
-		// skipProbe 必须置位：否则明文连接又会去探测，无限递归。
-		a.skipProbe = true
-		message := a.StartRelayRegistration(addr, token, "")
-		a.skipProbe = false
-		return message
+		// 用户的要求是"用 tls 和不用 tls 的不能互相通讯，完全隔离"，
+		// 所以这里直接报错，让用户自己决定要不要改用正确的配置。
+		return fmt.Sprintf(
+			"对端 %s 未启用 TLS。本端只与加密对端通讯（加密与明文严格隔离）。\n"+
+				"如果这台 relay 确实没开 TLS，请用它自己的配置方式连接。", addr)
 	}
 	fingerprint = normalizedFingerprint(fingerprint)
 

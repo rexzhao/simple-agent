@@ -53,6 +53,14 @@ type Config struct {
 	KeyFile string
 	// DataDir 用来推导默认证书位置（仅当 CertFile/KeyFile 为空时使用）。
 	DataDir string
+	// CertDir 覆盖证书目录（默认 `<DataDir>/tls`）。
+	//
+	// 用途：**同一台机器上的不同角色要有不同身份**。执行端和 viewer 都从
+	// DataDir 派生证书的话，两者会共用同一张证书 —— 那意味着"能证明我是
+	// 这台机器"，而不是"能证明我是哪个角色"，mTLS 里就分不清谁是谁了。
+	//
+	// 所以 viewer 用 `<DataDir>/tls-viewer`，执行端保持 `<DataDir>/tls`。
+	CertDir string
 	// Fingerprint 是客户端侧要校验的服务端证书 SHA-256 指纹（十六进制，可带冒号）。
 	//
 	// 为空表示不启用客户端 TLS。
@@ -64,10 +72,13 @@ func (c Config) resolvedCertPaths() (certFile, keyFile string) {
 	if c.CertFile != "" && c.KeyFile != "" {
 		return c.CertFile, c.KeyFile
 	}
-	if c.DataDir == "" {
-		return c.CertFile, c.KeyFile
+	dir := c.CertDir
+	if dir == "" {
+		if c.DataDir == "" {
+			return c.CertFile, c.KeyFile
+		}
+		dir = filepath.Join(c.DataDir, "tls")
 	}
-	dir := filepath.Join(c.DataDir, "tls")
 	return filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 }
 
@@ -117,23 +128,43 @@ func (c Config) ClientConfig() (*tls.Config, error) {
 		return nil, fmt.Errorf("TLS 指纹长度不对（应为 %d 个十六进制字符，实际 %d）",
 			sha256.Size*2, len(want))
 	}
-	return &tls.Config{
+	cfg := &tls.Config{
 		// 关掉 CA 链校验：我们不用 CA，只认下面的指纹。
 		// 这不是"跳过校验"——VerifyPeerCertificate 里做了更严格的检查。
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return errors.New("对端没有提供证书")
-			}
-			sum := sha256.Sum256(rawCerts[0])
-			got := hex.EncodeToString(sum[:])
-			if got != want {
-				return fmt.Errorf("证书指纹不匹配：收到 %s，期望 %s", got, want)
-			}
-			return nil
-		},
-	}, nil
+		VerifyPeerCertificate: verifyFingerprint(want),
+	}
+	// **自己的证书**：双向认证时要出示给对端（对端会校验我们的指纹）。
+	// 没有自己的证书时保持单向（只验对端）—— 明文/旧配置仍然能用。
+	if cert, err := c.ownCertificate(); err == nil && len(cert.Certificate) > 0 {
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	return cfg, nil
+}
+
+// verifyFingerprint 返回"只认这个指纹"的校验函数。
+func verifyFingerprint(want string) func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("对端没有提供证书")
+		}
+		sum := sha256.Sum256(rawCerts[0])
+		got := hex.EncodeToString(sum[:])
+		if got != want {
+			return fmt.Errorf("证书指纹不匹配：收到 %s，期望 %s", got, want)
+		}
+		return nil
+	}
+}
+
+// ownCertificate 加载本机证书（用于向对端出示）。没有证书时返回空。
+func (c Config) ownCertificate() (tls.Certificate, error) {
+	certFile, keyFile := c.resolvedCertPaths()
+	if certFile == "" || keyFile == "" {
+		return tls.Certificate{}, errors.New("没有配置本机证书")
+	}
+	return tls.LoadX509KeyPair(certFile, keyFile)
 }
 
 // Listen 按配置监听（未启用服务端 TLS 时就是 net.Listen）。

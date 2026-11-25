@@ -74,6 +74,18 @@ func setupTLS(cfg *config.Config, opts remoteOptions) bool {
 
 	// 客户端启用了 TLS：装到 wire 的拨号钩子上
 	if tlsCfg.ClientTLS() {
+		// **viewer 要有自己的证书**（mTLS：执行端也要验证我们）。
+		//
+		// 与服务端共用 `<DataDir>/tls` —— 同一台机器上 viewer 和执行端是
+		// 同一个用户、同一个信任域，"自己连自己"的指纹天然等于本机指纹，
+		// 执行端判定为已知身份、不弹窗。换一台机器 DataDir 不同，证书也就
+		// 不同，那才需要用户确认。
+		if own, fingerprint := viewerCertificate(cfg.DataDir); fingerprint != "" {
+			tlsCfg.CertDir = own.CertDir
+			tlsCfg.CertFile = own.CertFile
+			tlsCfg.KeyFile = own.KeyFile
+			log.Printf("TLS：viewer 身份 %s", describeViewerIdentity(fingerprint))
+		}
 		if _, err := tlsCfg.ClientConfig(); err != nil {
 			log.Printf("TLS：客户端配置有误：%v", err)
 			os.Exit(1)

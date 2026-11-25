@@ -1,4 +1,4 @@
-package uiapp
+﻿package uiapp
 
 import (
 	"strings"
@@ -15,13 +15,13 @@ import (
 // 注册逻辑"，网络细节由 relay 包的测试覆盖。
 func TestConnectCommandRegistersToRelay(t *testing.T) {
 	// 起一个只接受注册的 relay
-	relayServer, addr := startTestRelay(t)
+	relayServer, addr, relayFingerprint := startTestRelayWithFingerprint(t)
 	defer relayServer.Close()
 
 	app := newLocalApp(t)
 
 	// 1) /connect 带 token
-	message, ok := app.ExecSlashCommand("/connect " + addr + " testtoken")
+	message, ok := app.ExecSlashCommand("/connect " + addr + " testtoken " + relayFingerprint)
 	if !ok {
 		t.Fatal("/connect 应当被识别为命令")
 	}
@@ -78,17 +78,17 @@ func TestConnectCommandRegistersToRelay(t *testing.T) {
 // 无脑"先断再连"会让新连接撞上还没清理完的旧连接，被拒绝后无限退避重试 ——
 // 真机日志里就是 30 秒一次的"同名执行端已在线"刷屏。
 func TestConnectCommandIsIdempotent(t *testing.T) {
-	relayServer, addr := startTestRelay(t)
+	relayServer, addr, relayFingerprint := startTestRelayWithFingerprint(t)
 	defer relayServer.Close()
 
 	app := newLocalApp(t)
-	if message, _ := app.ExecSlashCommand("/connect " + addr + " tk"); !strings.Contains(message, "正在连接") {
+	if message, _ := app.ExecSlashCommand("/connect " + addr + " tk " + relayFingerprint); !strings.Contains(message, "正在连接") {
 		t.Fatalf("第一次 /connect 应开始连接：%q", message)
 	}
 	waitRelayOnline(t, app)
 
 	// 等 relay 真正登记上线后再发一次：这一次应当直接返回"无需重连"。
-	if message, _ := app.ExecSlashCommand("/connect " + addr + " tk"); !strings.Contains(message, "无需重连") {
+	if message, _ := app.ExecSlashCommand("/connect " + addr + " tk " + relayFingerprint); !strings.Contains(message, "无需重连") {
 		t.Fatalf("第二次 /connect 应提示无需重连：%q", message)
 	}
 	if !app.Relaying() {

@@ -178,6 +178,13 @@ func startListener(addr string, app *uiapp.App, post func(func())) (func(), int,
 					mu.Unlock()
 					_ = conn.Close()
 				}()
+				// **先验对端指纹再放行**（见 gate.go）。
+				//
+				// 顺序很重要：必须在交给 host.Serve 之前判定，
+				// 否则未信任的连接已经能发 hello/catalog 了。
+				if !admitViewer(conn) {
+					return
+				}
 				// Serve 会一直读到连接关闭；关闭监听器时上面的 stop 也会关掉它
 				_ = host.Serve(wire.NewTCPConn(conn), local, post)
 			}(conn)
