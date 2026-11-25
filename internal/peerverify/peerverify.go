@@ -46,6 +46,16 @@ type Verifier struct {
 	Role trust.Role
 	// Pinned 是命令行显式给的指纹（非空时严格校验，不询问）。
 	Pinned string
+	// ByFingerprint 表示"这个对端的身份就是它的指纹"，信任记录不按地址。
+	//
+	// 用于 viewer（执行端接受连接时）：它的源端口每次连接都不同，
+	// 按地址记录的话每次都查不到已信任记录 —— 表现是执行端每次启动
+	// 都要重新问一遍同一个 viewer（真实踩到：known_hosts 里堆了四条
+	// 同指纹、只有端口不同的 viewer 记录）。
+	//
+	// relay 和执行端不要设它：它们监听固定地址，同一地址换了证书
+	// 必须报"指纹变了"。
+	ByFingerprint bool
 	// Ask 阻塞等待用户对"是否信任这个对端"的决定。
 	//
 	// 返回 (true, nil) 才继续握手（连接成功）；(false, nil) 表示用户拒绝
@@ -100,19 +110,34 @@ func (v *Verifier) VerifyFingerprint(addr, fingerprint string) error {
 	}
 
 	// 2. 查信任列表
+	//
+	// **两种查询方式，按对端性质选**：
+	//   - ByFingerprint：身份就是指纹（viewer）。它每次连接用新的源端口，
+	//     按地址查永远查不到 —— 执行端会每次都重新问一遍（真实踩到：
+	//     known_hosts 里堆了四条同指纹不同端口的 viewer 记录）。
+	//   - 默认（角色+地址）：地址稳定的对端（relay、执行端）。
+	//     同一地址换了证书必须报"变了"。
 	changed, known := false, ""
 	if v.Store != nil {
-		status, err := v.Store.Check(v.Role, addr, got)
-		switch status {
-		case trust.StatusKnown:
-			// 指纹一致：静默通过（"确认过就不再问"）
-			return nil
-		case trust.StatusChanged:
-			// 指纹变了：必须让用户看到"变了"再决定 —— 自动更新的话，
-			// 攻击者第一次拦截之后就一直"合法"。
-			changed = true
-			if changedErr, ok := err.(*trust.ChangedError); ok {
-				known = changedErr.Known
+		if v.ByFingerprint {
+			// 只看指纹：见过就是可信，没见过去问用户
+			switch v.Store.CheckByFingerprint(v.Role, got) {
+			case trust.StatusKnown:
+				return nil
+			}
+		} else {
+			status, err := v.Store.Check(v.Role, addr, got)
+			switch status {
+			case trust.StatusKnown:
+				// 指纹一致：静默通过（"确认过就不再问"）
+				return nil
+			case trust.StatusChanged:
+				// 指纹变了：必须让用户看到"变了"再决定 —— 自动更新的话，
+				// 攻击者第一次拦截之后就一直"合法"。
+				changed = true
+				if changedErr, ok := err.(*trust.ChangedError); ok {
+					known = changedErr.Known
+				}
 			}
 		}
 	}
@@ -138,7 +163,14 @@ func (v *Verifier) VerifyFingerprint(addr, fingerprint string) error {
 	// 写在这个位置而不是连接成功后：握手继续意味着连接即将建立，
 	// 用户确认的是"这台机器可信"，与后续业务是否成功无关。
 	if v.Store != nil {
-		if err := v.Store.Trust(v.Role, addr, got); err != nil {
+		var writeErr error
+		if v.ByFingerprint {
+			// 只记指纹：viewer 的地址每次都不同，记了也没用
+			writeErr = v.Store.TrustByFingerprint(v.Role, got)
+		} else {
+			writeErr = v.Store.Trust(v.Role, addr, got)
+		}
+		if writeErr != nil {
 			// 写入失败不该中断连接：用户已经同意了，这次连接继续。
 			// 代价是下次还会问一遍（比连不上好）。
 			return nil
@@ -198,6 +230,24 @@ type Gate struct {
 	// 由调用方（注册循环的退避重试）稍后再来 —— 等界面起来那一轮
 	// 自然会弹窗。
 	Ready func() bool
+	// byFingerprint 记录"正在等确认的指纹 → 决定通道"。
+	//
+	// 用途：同一个对端的多条连接**共用一次确认**。用户点得慢时 viewer
+	// 会再发起一次拨号，执行端就挂着两条未知指纹的连接，界面上弹两次
+	// 确认框（用户报告"执行端弹了两次"，点得慢时更明显）。
+	//
+	// 值是 *decision：**一个决定要能被多个等待者同时拿到**。用裸
+	// chan bool 的话只有第一个接收者能取到值，其余连接会一直等下去
+	// （真实踩到：三条同指纹连接，点一次只放行一条）。
+	byFingerprint map[string]*decision
+}
+
+// decision 是一次"用户决定"，可被多个等待者同时读取。
+type decision struct {
+	// done 在决定产生后关闭（关闭是广播，所有等待者都会被唤醒）。
+	done chan struct{}
+	// allow 是决定内容（done 关闭后才有意义）。
+	allow bool
 }
 
 // Pending 是一条等待确认的记录。
@@ -205,6 +255,8 @@ type Pending struct {
 	Req Request
 	// decided 接收用户结论。容量 1，不会阻塞 Resolve。
 	decided chan bool
+	// shared 是本次确认的共享决定（同指纹的其他连接也在等它）。
+	shared *decision
 }
 
 // Addr 返回对端地址（实现界面侧的展示接口）。
@@ -248,14 +300,38 @@ func (g *Gate) Ask(req Request) (bool, error) {
 	if g.Ready != nil && !g.Ready() {
 		return false, ErrNotReady
 	}
-	pending := &Pending{Req: req, decided: make(chan bool, 1)}
+
+	// **按指纹去重**：同一个对端可能同时有多条连接在等确认。
+	//
+	// 典型场景：用户看弹窗看得慢，viewer 那边等不及又发起了一次拨号 ——
+	// 执行端于是挂着两条"未知指纹"的连接，界面上就弹两次确认框
+	// （用户报告"执行端弹了两次"，点得慢时更明显）。
+	//
+	// **只按指纹、不按地址**：重试时源端口变了，地址是不同的字符串，
+	// 但指纹相同就意味着"同一台机器" —— 那才是用户真正在回答的问题。
+	key := req.Fingerprint
 	g.mu.Lock()
+	if existing, ok := g.byFingerprint[key]; ok {
+		g.mu.Unlock()
+		// 等同一个决定（done 关闭时所有等待者一起醒）
+		<-existing.done
+		return existing.allow, nil
+	}
+	pending := &Pending{Req: req, decided: make(chan bool, 1)}
+	shared := &decision{done: make(chan struct{})}
+	if g.byFingerprint == nil {
+		g.byFingerprint = map[string]*decision{}
+	}
+	g.byFingerprint[key] = shared
 	g.pending = append(g.pending, pending)
+	pending.shared = shared
 	g.mu.Unlock()
+
 	if g.Notify != nil {
 		g.Notify()
 	}
-	return <-pending.decided, nil
+	allowed := <-pending.decided
+	return allowed, nil
 }
 
 // Pending 返回当前等待确认的列表（界面渲染用）。
@@ -276,6 +352,17 @@ func (g *Gate) Resolve(pending *Pending, allow bool) {
 			break
 		}
 	}
+	// 清掉去重表里的记录：结论已经给了，后来的同指纹连接应当重新问
+	// （那时它对端可能已经换了证书 —— 不能沿用早先的结论）。
+	if g.byFingerprint != nil {
+		delete(g.byFingerprint, pending.Req.Fingerprint)
+	}
+	// **广播结论给所有等待者**（同指纹的其他连接可能还有几条在等）。
+	shared := pending.shared
+	if shared != nil {
+		shared.allow = allow
+		close(shared.done)
+	}
 	g.mu.Unlock()
 	select {
 	case pending.decided <- allow:
@@ -289,8 +376,14 @@ func (g *Gate) CancelAll() {
 	g.mu.Lock()
 	pending := g.pending
 	g.pending = nil
+	g.byFingerprint = nil
 	g.mu.Unlock()
 	for _, item := range pending {
+		// 广播"拒绝"，让同指纹的所有等待者一起醒来
+		if item.shared != nil {
+			item.shared.allow = false
+			close(item.shared.done)
+		}
 		select {
 		case item.decided <- false:
 		default:

@@ -41,7 +41,14 @@ func setupViewerTrust(store *trust.Store, confirmViewer func()) {
 	viewerVerifier = &peerverify.Verifier{
 		Store: store,
 		Role:  trust.RoleViewer,
-		Ask:   viewerGate.Ask,
+		// **viewer 的身份就是它的证书指纹，地址没有意义**。
+		//
+		// 它每次连接用新的源端口（临时端口 + NAT），按"地址"记录的话
+		// 每次都查不到已信任项 —— 表现是执行端每次启动都要重新问一遍
+		// 同一个 viewer（真实踩到：known_hosts 里堆了四条同指纹、
+		// 只有端口不同的 viewer 记录）。
+		ByFingerprint: true,
+		Ask:           viewerGate.Ask,
 	}
 }
 

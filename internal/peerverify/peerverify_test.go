@@ -189,6 +189,58 @@ func TestPinnedFingerprintIsStrict(t *testing.T) {
 // Gate.Ask 没有界面可问，直接返回 false —— 上层把它理解成「用户拒绝」，
 // 于是弹出「配置错误：用户拒绝了对端的证书」并退出。用户什么都没点。
 //
+// 同一个对端的多条连接**只该问用户一次**。
+//
+// 用户报告"执行端弹了两次确认，可能跟我点得慢有关系" —— 机制正是如此：
+// viewer 那边等不及又发起了一次拨号，执行端就挂着两条未知指纹的连接，
+// 界面上弹两次。
+//
+// 指纹相同 = 同一台机器 = 同一个决定，后来的连接等同一个结论即可。
+func TestDuplicateFingerprintAsksOnce(t *testing.T) {
+	store := newStore(t)
+	gate := &peerverify.Gate{}
+	verifier := &peerverify.Verifier{
+		Store: store,
+		Role:  trust.RoleViewer,
+		Ask:   gate.Ask,
+	}
+
+	results := make(chan error, 3)
+	// 三条连接，指纹相同、地址不同（重试时源端口会变）
+	for i := 0; i < 3; i++ {
+		addr := "10.0.0.9:1000" + string(rune('0'+i))
+		go func(a string) {
+			results <- verifier.VerifyFingerprint(a, fingerprintA)
+		}(addr)
+	}
+
+	// 等三条都登记完
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if len(gate.Pending()) > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// 只该有一条待确认
+	if got := len(gate.Pending()); got != 1 {
+		t.Fatalf("同指纹的多条连接只该问一次，实际登记了 %d 条", got)
+	}
+
+	// 用户点一次"允许"，三条都该通过
+	gate.Resolve(gate.Pending()[0], true)
+	for i := 0; i < 3; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatalf("用户同意后应通过：%v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("有连接没被放行")
+		}
+	}
+}
+
 // 现在返回 ErrNotReady，调用方据此稍后重试。
 func TestNotReadyIsNotRejection(t *testing.T) {
 	store := newStore(t)

@@ -360,6 +360,9 @@ func main() {
 		if trustErr != nil {
 			log.Printf("信任列表读取失败（将重新询问所有对端）：%v", trustErr)
 		}
+		// 清掉早期按地址记录的 viewer 条目（同指纹、不同端口堆了好几条，
+		// 而且按地址查永远命中不了）。现在按指纹记，这些历史记录没用。
+		_ = store.CleanupLegacy(trust.RoleViewer)
 		setupViewerTrust(store, func() {
 			// 有新的待确认 viewer：让界面刷一下，弹确认框
 			post(func() { app.NotifyDisplay("") })

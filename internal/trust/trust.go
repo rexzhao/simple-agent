@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,17 +54,42 @@ type Entry struct {
 	Fingerprint string
 	// Since 是首次信任的时间（指纹变化后重新信任会更新它）。
 	Since time.Time
+	// ByFingerprint 表示这条记录按指纹识别，Addr 不参与匹配。
+	//
+	// viewer 就是这种：它的源端口每次连接都不同，地址毫无意义 ——
+	// 用户确认的是"这台机器"，不是"这个临时端口"。
+	// 落盘时用 "fp" 前缀标记，读回时据此还原。
+	ByFingerprint bool
 }
 
-// Key 是条目的唯一标识（角色 + 地址）。
-func (e Entry) Key() string { return string(e.Role) + "\t" + e.Addr }
+// Key 是条目的唯一标识。
+//
+// 按指纹识别的记录只用指纹（否则同一个 viewer 换次端口就多一条）；
+// 其余按"角色 + 地址"（同一地址换了证书要能报出来）。
+func (e Entry) Key() string {
+	if e.ByFingerprint {
+		return string(e.Role) + "\tfp:" + e.Fingerprint
+	}
+	return string(e.Role) + "\t" + e.Addr
+}
 
 // Store 是信任列表（内存 + 落盘）。
 //
 // 零值不可用，用 [Open] 构造。并发安全由调用方保证（本项目的用法是
 // 单一界面线程 + 拨号前查询，没有并发写）。
 type Store struct {
-	path    string
+	path string
+	// mu 保护 entries 与文件写入。
+	//
+	// **必须加锁**：执行端会并发处理多条 viewer 连接，每条连接都在
+	// Verify 里查/写信任列表。不加锁就是 map 并发读写 —— Go 会直接
+	// fatal（"concurrent map writes"），整个进程挂掉。
+	//
+	// 早期注释写的是"并发安全由调用方保证"，那是错的：调用方是
+	// accept 循环里起的 goroutine，天然并发。
+	//
+	// 用 RWMutex：读（每次连接都要查）远多于写（只在用户确认时）。
+	mu      sync.RWMutex
 	entries map[string]Entry
 }
 
@@ -107,8 +133,14 @@ func Open(path string) (*Store, error) {
 		}
 		entry := Entry{
 			Role:        Role(fields[0]),
-			Addr:        fields[1],
 			Fingerprint: fingerprint,
+		}
+		// 地址列带 "fp:" 前缀表示"这条按指纹识别，地址不参与匹配"
+		// （viewer 用）。见 Entry.ByFingerprint。
+		if strings.HasPrefix(fields[1], "fp:") {
+			entry.ByFingerprint = true
+		} else {
+			entry.Addr = fields[1]
 		}
 		if len(fields) >= 4 {
 			if at, err := time.Parse(time.RFC3339, fields[3]); err == nil {
@@ -125,19 +157,24 @@ func Open(path string) (*Store, error) {
 
 // Lookup 查一条信任记录。
 func (s *Store) Lookup(role Role, addr string) (Entry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	entry, ok := s.entries[string(role)+"\t"+addr]
 	return entry, ok
 }
 
-// Check 判断对端指纹是否可信。
+// Check 判断对端指纹是否可信（按"角色 + 地址"查）。
 //
-// 返回三种结果：
-//   - (Known, nil)：指纹与记录一致，可以静默通过
-//   - (Unknown, nil)：从没见过这个对端，调用方应**询问用户**
-//   - (Changed, *ChangedError)：见过但指纹变了，必须让用户明确确认
+// 适用于**地址稳定的对端**（relay、执行端）：它们监听固定端口，
+// 同一地址换了证书必须报"变了"。
+//
+// viewer 这类"身份即指纹"的对端不要用这个 —— 见 [Store.CheckByFingerprint]。
 func (s *Store) Check(role Role, addr, fingerprint string) (Status, error) {
 	want := normalize(fingerprint)
-	entry, ok := s.Lookup(role, addr)
+	// 直接用内部查表（不调 Lookup）：那样会重复加锁，自己锁自己
+	s.mu.RLock()
+	entry, ok := s.entries[string(role)+"\t"+addr]
+	s.mu.RUnlock()
 	if !ok {
 		return StatusUnknown, nil
 	}
@@ -148,6 +185,58 @@ func (s *Store) Check(role Role, addr, fingerprint string) (Status, error) {
 		Role: role, Addr: addr,
 		Known: entry.Fingerprint, Got: want, Since: entry.Since,
 	}
+}
+
+// CheckByFingerprint 判断对端指纹是否可信（**只按指纹，不看地址**）。
+//
+// 用于身份就是指纹的对端，典型是 viewer：它的源端口每次连接都不同，
+// 按地址查永远查不到已信任记录 —— 表现为执行端每次启动都要重新问
+// 一遍同一个 viewer（真实踩到：known_hosts 里堆了四条同指纹、
+// 只有端口不同的记录）。
+func (s *Store) CheckByFingerprint(role Role, fingerprint string) Status {
+	want := normalize(fingerprint)
+	s.mu.RLock()
+	entry, ok := s.entries[string(role)+"\tfp:"+want]
+	s.mu.RUnlock()
+	if ok && entry.Fingerprint == want {
+		return StatusKnown
+	}
+	return StatusUnknown
+}
+
+// TrustByFingerprint 按指纹记录信任（**不记地址**）。
+func (s *Store) TrustByFingerprint(role Role, fingerprint string) error {
+	want := normalize(fingerprint)
+	entry := Entry{
+		Role:          role,
+		Fingerprint:   want,
+		Since:         time.Now(),
+		ByFingerprint: true,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries[entry.Key()] = entry
+	return s.saveLocked()
+}
+
+// CleanupLegacy 删除"按地址记录的 viewer 条目"。
+//
+// 早期版本给 viewer 也按地址记，于是每次重连都多一条（同指纹、
+// 不同端口）。那些记录没有意义，读到就顺手清掉。
+func (s *Store) CleanupLegacy(role Role) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := false
+	for key, entry := range s.entries {
+		if entry.Role == role && !entry.ByFingerprint {
+			delete(s.entries, key)
+			removed = true
+		}
+	}
+	if !removed {
+		return nil
+	}
+	return s.saveLocked()
 }
 
 // Status 是 [Store.Check] 的结论。
@@ -192,18 +281,29 @@ func (s *Store) Trust(role Role, addr, fingerprint string) error {
 		Fingerprint: normalize(fingerprint),
 		Since:       time.Now(),
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.entries[entry.Key()] = entry
-	return s.save()
+	return s.saveLocked()
 }
 
 // Forget 删除一条信任（用户手动清理用）。
 func (s *Store) Forget(role Role, addr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	delete(s.entries, string(role)+"\t"+addr)
-	return s.save()
+	return s.saveLocked()
 }
 
 // Entries 返回全部记录（按角色/地址排序，供界面展示）。
 func (s *Store) Entries() []Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.entriesLocked()
+}
+
+// entriesLocked 是无锁版本的 [Store.Entries]（调用方须持锁）。
+func (s *Store) entriesLocked() []Entry {
 	out := make([]Entry, 0, len(s.entries))
 	for _, entry := range s.entries {
 		out = append(out, entry)
@@ -217,8 +317,11 @@ func (s *Store) Entries() []Entry {
 	return out
 }
 
-// save 全量重写文件（条目很少，增量写没必要且容易写坏）。
-func (s *Store) save() error {
+// saveLocked 全量重写文件（条目很少，增量写没必要且容易写坏）。
+//
+// **调用方必须持有 s.mu 写锁**（名字里的 Locked 就是这个意思）：
+// 写文件要把当前 entries 序列化出去，期间不能有并发修改。
+func (s *Store) saveLocked() error {
 	if s.path == "" {
 		return nil
 	}
@@ -228,10 +331,19 @@ func (s *Store) save() error {
 	var builder strings.Builder
 	builder.WriteString("# simple-agent 信任的对端指纹（首次连接时由用户确认）\n")
 	builder.WriteString("# 角色\t地址\tSHA-256\t首次信任时间\n")
-	for _, entry := range s.Entries() {
+	builder.WriteString("# 地址为 fp:<指纹> 表示「按指纹识别、不看地址」（viewer 这类\n")
+	builder.WriteString("# 每次连接源端口都变的对端，按地址记没有意义）\n")
+	// 用无锁版本：调用方已经持有写锁，这里再调 Entries()（加读锁）
+	// 会死锁 —— 写锁没释放时不可能拿到读锁。
+	for _, entry := range s.entriesLocked() {
 		builder.WriteString(string(entry.Role))
 		builder.WriteByte('\t')
-		builder.WriteString(entry.Addr)
+		if entry.ByFingerprint {
+			builder.WriteString("fp:")
+			builder.WriteString(entry.Fingerprint)
+		} else {
+			builder.WriteString(entry.Addr)
+		}
 		builder.WriteByte('\t')
 		builder.WriteString(entry.Fingerprint)
 		builder.WriteByte('\t')
