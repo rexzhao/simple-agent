@@ -1,6 +1,7 @@
 package peerverify_test
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -33,9 +34,9 @@ func TestKnownPeerPassesWithoutAsking(t *testing.T) {
 	verifier := &peerverify.Verifier{
 		Store: store,
 		Role:  trust.RoleRelay,
-		Ask: func(peerverify.Request) bool {
+		Ask: func(peerverify.Request) (bool, error) {
 			asked = true
-			return true
+			return true, nil
 		},
 	}
 	if err := verifier.VerifyFingerprint("1.2.3.4:7900", fingerprintA); err != nil {
@@ -56,9 +57,9 @@ func TestUnknownPeerAsksUser(t *testing.T) {
 	verifier := &peerverify.Verifier{
 		Store: store,
 		Role:  trust.RoleRelay,
-		Ask: func(req peerverify.Request) bool {
+		Ask: func(req peerverify.Request) (bool, error) {
 			got = req
-			return true
+			return true, nil
 		},
 	}
 	if err := verifier.VerifyFingerprint("1.2.3.4:7900", fingerprintA); err != nil {
@@ -83,7 +84,7 @@ func TestUserRejectsPeer(t *testing.T) {
 	verifier := &peerverify.Verifier{
 		Store: store,
 		Role:  trust.RoleRelay,
-		Ask:   func(peerverify.Request) bool { return false },
+		Ask:   func(peerverify.Request) (bool, error) { return false, nil },
 	}
 	if err := verifier.VerifyFingerprint("1.2.3.4:7900", fingerprintA); err == nil {
 		t.Fatal("用户拒绝时 Verify 必须返回错误（中止握手）")
@@ -105,9 +106,9 @@ func TestChangedFingerprintAsksWithContext(t *testing.T) {
 	verifier := &peerverify.Verifier{
 		Store: store,
 		Role:  trust.RoleRelay,
-		Ask: func(req peerverify.Request) bool {
+		Ask: func(req peerverify.Request) (bool, error) {
 			got = req
-			return true
+			return true, nil
 		},
 	}
 	if err := verifier.VerifyFingerprint("1.2.3.4:7900", fingerprintB); err != nil {
@@ -169,9 +170,9 @@ func TestPinnedFingerprintIsStrict(t *testing.T) {
 		Store:  store,
 		Role:   trust.RoleRelay,
 		Pinned: fingerprintA,
-		Ask: func(peerverify.Request) bool {
+		Ask: func(peerverify.Request) (bool, error) {
 			asked = true
-			return true
+			return true, nil
 		},
 	}
 	if err := verifier.VerifyFingerprint("1.2.3.4:7900", fingerprintB); err == nil {
@@ -179,5 +180,38 @@ func TestPinnedFingerprintIsStrict(t *testing.T) {
 	}
 	if asked {
 		t.Fatal("显式指定指纹时不该询问用户")
+	}
+}
+
+// **界面未就绪不能被当成「用户拒绝」**。
+//
+// 这是真实踩到的 bug：viewer 首次连接发生在窗口创建之前，那时
+// Gate.Ask 没有界面可问，直接返回 false —— 上层把它理解成「用户拒绝」，
+// 于是弹出「配置错误：用户拒绝了对端的证书」并退出。用户什么都没点。
+//
+// 现在返回 ErrNotReady，调用方据此稍后重试。
+func TestNotReadyIsNotRejection(t *testing.T) {
+	store := newStore(t)
+	gate := &peerverify.Gate{
+		Ready: func() bool { return false }, // 界面还没起来
+	}
+	verifier := &peerverify.Verifier{
+		Store: store,
+		Role:  trust.RoleRelay,
+		Ask:   gate.Ask,
+	}
+	err := verifier.VerifyFingerprint("1.2.3.4:7900", fingerprintA)
+	if err == nil {
+		t.Fatal("界面未就绪时不该放行")
+	}
+	if !errors.Is(err, peerverify.ErrNotReady) {
+		t.Fatalf("应返回 ErrNotReady（可重试），实际：%v", err)
+	}
+	status, _ := store.Check(trust.RoleRelay, "1.2.3.4:7900", fingerprintA)
+	if status != trust.StatusUnknown {
+		t.Fatal("未确认的对端不该记入信任列表")
+	}
+	if len(gate.Pending()) != 0 {
+		t.Fatal("界面未就绪时不该登记待确认项")
 	}
 }

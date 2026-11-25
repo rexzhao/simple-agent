@@ -17,6 +17,7 @@ import (
 	"simple-agent/internal/host"
 	"simple-agent/internal/lan"
 	"simple-agent/internal/locale"
+	"simple-agent/internal/peerverify"
 	"simple-agent/internal/providers"
 	"simple-agent/internal/relay"
 	"simple-agent/internal/store"
@@ -271,12 +272,28 @@ func main() {
 			source.remote = remote
 			executors = source
 		default:
-			// 其余错误：没开 TLS（被严格隔离拒掉）、网络不通、口令错等，
-			// 都是真实失败，直接报错。
+			// **界面还没就绪**：不是失败，只是时机不对。
 			//
-			// 注意：**指纹确认不在这里**。它在 TLS 握手内部阻塞完成
-			// （用户同意则握手继续、连接成功；取消则握手失败）。
-			// 所以不会出现"先失败、用户点了确认、又自己重连"这种现象。
+			// viewer 的首次连接发生在窗口创建之前（连接要赶在
+			// NewApp 之前把 remote 准备好），那时弹窗无处可弹。
+			// 如果当成"用户拒绝"就报废了 —— 用户什么都没点。
+			//
+			// 处理：先建一个 deferred remote（连接由 RetryNow 触发），
+			// 界面就绪后再重连，那时才会真正弹窗。
+			if errors.Is(openErr, peerverify.ErrNotReady) {
+				remote, remoteErr := host.NewRemoteDeferredToken(dial, post, opts.relayToken)
+				if remoteErr != nil {
+					showFatal(locale.Tr("dialog.config.title"), remoteErr.Error())
+					return
+				}
+				remoteHost = remote
+				source := &relayExecutors{addr: connectAddr, current: pinned, token: opts.relayToken}
+				source.remote = remote
+				executors = source
+				break
+			}
+			// 其余错误：没开 TLS（被严格隔离拒掉）、网络不通、口令错、
+			// 用户拒绝指纹等，都是真实失败，直接报错。
 			showFatal(locale.Tr("dialog.config.title"), openErr.Error())
 			return
 		}

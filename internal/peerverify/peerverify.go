@@ -25,6 +25,7 @@ package peerverify
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -47,11 +48,14 @@ type Verifier struct {
 	Pinned string
 	// Ask 阻塞等待用户对"是否信任这个对端"的决定。
 	//
-	// 返回 true 才继续握手（连接成功），false 中止（连接失败）。
+	// 返回 (true, nil) 才继续握手（连接成功）；(false, nil) 表示用户拒绝
+	// （连接失败）；**返回 [ErrNotReady] 表示界面还没就绪**，调用方应
+	// 稍后重试而不是当作拒绝。
+	//
 	// 为 nil 时一律拒绝：没人能确认就不该假设可信。
 	//
 	// **实现方不得加超时**（见包注释）。
-	Ask func(req Request) bool
+	Ask func(req Request) (bool, error)
 }
 
 // Request 是一次待确认的对端信息。
@@ -117,9 +121,14 @@ func (v *Verifier) VerifyFingerprint(addr, fingerprint string) error {
 	if v.Ask == nil {
 		return fmt.Errorf("对端 %s 的证书未经确认，且当前没有界面可确认", addr)
 	}
-	allowed := v.Ask(Request{
+	allowed, askErr := v.Ask(Request{
 		Addr: addr, Fingerprint: got, Changed: changed, Known: known, Role: v.Role,
 	})
+	if askErr != nil {
+		// 界面没就绪：**原样传出去**，让调用方决定要不要重试。
+		// 不能变成"用户拒绝"——用户什么都没点。
+		return askErr
+	}
 	if !allowed {
 		return fmt.Errorf("用户拒绝了对端 %s 的证书", addr)
 	}
@@ -154,6 +163,17 @@ func normalize(value string) string {
 	}
 	return string(out)
 }
+
+// ErrNotReady 表示"现在还没有界面可以问用户"。
+//
+// 与"用户拒绝"必须区分：
+//   - 用户拒绝 → 连接失败，报给用户看（明确的决定）
+//   - 界面没就绪 → **稍后重试**（不是决定，只是时机不对）
+//
+// 混成一个 false 的话，启动期（界面还没建好）的首次连接会被当成
+// "用户拒绝"直接退出 —— 用户明明什么都没点，却看到"用户拒绝了对端的
+// 证书"。这是真实踩到的 bug。
+var ErrNotReady = errors.New("界面尚未就绪，无法询问用户")
 
 // Gate 是一次"等待用户确认"的登记（界面据此渲染弹窗）。
 //
@@ -219,11 +239,14 @@ func (p *Pending) PeerKnown() string { return p.Req.Known }
 // Ask 阻塞等待用户决定（实现 [Verifier.Ask] 的签名）。
 //
 // **不设超时**：见包注释。等待经进程退出或调用方 Cancel 结束。
-func (g *Gate) Ask(req Request) bool {
-	// 界面还没起来：立刻返回 false，别让连接一直挂着等一个不会出现的弹窗。
-	// 调用方（注册循环）会退避重试，等界面就绪那一轮自然会走到弹窗。
+func (g *Gate) Ask(req Request) (bool, error) {
+	// 界面还没起来：返回 ErrNotReady，让调用方**稍后重试**。
+	//
+	// 这里不能返回 (false, nil) —— 那会被理解成"用户拒绝"。启动期
+	// （窗口还没建好）的首次连接会因此直接失败，用户什么都没点却看到
+	// "用户拒绝了对端的证书"（真实踩到）。
 	if g.Ready != nil && !g.Ready() {
-		return false
+		return false, ErrNotReady
 	}
 	pending := &Pending{Req: req, decided: make(chan bool, 1)}
 	g.mu.Lock()
@@ -232,7 +255,7 @@ func (g *Gate) Ask(req Request) bool {
 	if g.Notify != nil {
 		g.Notify()
 	}
-	return <-pending.decided
+	return <-pending.decided, nil
 }
 
 // Pending 返回当前等待确认的列表（界面渲染用）。
