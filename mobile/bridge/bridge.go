@@ -296,10 +296,19 @@ func (c *Client) ProbeFingerprint(addr string) string {
 // 结果仍然经 `OnChange("connection", …)` 事件送回去。
 func (c *Client) ConnectTLSAsync(addr, route, token, fingerprint string) string {
 	go func() {
-		if err := c.ConnectTLS(addr, route, token, fingerprint); err != "" {
+		err := c.ConnectTLS(addr, route, token, fingerprint)
+		c.mu.Lock()
+		c.lastError = err
+		c.mu.Unlock()
+		if err != "" {
 			log.Printf("bridge：连接失败：%s", err)
-			c.emit("connection", err)
 		}
+		// **成功也要发事件**。
+		//
+		// 早先只在失败时 emit，成功了界面收不到任何通知，
+		// `connecting` 永远停在 true —— 表现是"已经连上了但界面一直转圈"
+		// （真机上踩到：日志显示"已直连执行端"，界面却在加载中）。
+		c.emit("connection", "")
 	}()
 	return ""
 }

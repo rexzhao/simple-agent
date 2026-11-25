@@ -528,10 +528,26 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             wasOnline = current.connected
             // hasConnectedOnce 在一次成功连接后被置为 true，disconnect() 时清掉
             val reconnecting = !online && current.hasConnectedOnce
-            if (current.connected == online && current.reconnecting == reconnecting) {
+            // **连接这一跳已经有结论了**：置回 connecting=false。
+            //
+            // 不置回的话界面永远转圈（真机踩到：日志显示"已直连执行端"，
+            // 界面却停在加载中）。判断依据是"有结论"：
+            //   - 连上了（online）
+            //   - 或者失败了（lastError 非空）
+            // 两者都没有才是"还在连"。
+            val failed = core.lastError()
+            val settled = online || failed.isNotEmpty()
+            if (current.connected == online && current.reconnecting == reconnecting &&
+                (!settled || !current.connecting)
+            ) {
                 current
             } else {
-                current.copy(connected = online, reconnecting = reconnecting)
+                current.copy(
+                    connected = online,
+                    reconnecting = reconnecting,
+                    connecting = if (settled) false else current.connecting,
+                    connectError = failed,
+                )
             }
         }
         // **刚连上就做一次完整同步**：会话列表 + 当前会话的时间线。
