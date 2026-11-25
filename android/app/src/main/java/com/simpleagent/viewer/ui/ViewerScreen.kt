@@ -606,7 +606,7 @@ private fun ConnectScreen(
                 }
             },
             dismissButton = {
-                androidx.compose.material3.TextButton(onClick = onDismissFingerprint) {
+                androidx.compose.material3.TextButton(onClick = onDismissPeer) {
                     Text("取消")
                 }
             },

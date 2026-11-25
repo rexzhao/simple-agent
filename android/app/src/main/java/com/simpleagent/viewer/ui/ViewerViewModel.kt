@@ -19,6 +19,7 @@ import com.simpleagent.viewer.data.SessionSummary
 import com.simpleagent.viewer.data.TimelinePage
 import com.simpleagent.viewer.data.TimelineView
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -824,7 +825,9 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     private fun pollPendingPeer() {
         pollJob?.cancel()
         pollJob = viewModelScope.launch {
-            repeat(120) { // 最多等 60 秒（用户可能要想一会儿）
+            // 用 for 而不是 repeat(...)：`continue` 只在真循环里可用，
+            // repeat 的 lambda 里写 continue 会编译失败（踩过）。
+            for (attempt in 0 until 120) { // 最多等 60 秒（用户可能要想一会儿）
                 delay(500)
                 if (!state.value.connecting) return@launch
                 val peer = withContext(Dispatchers.IO) { core.pendingPeer() }
