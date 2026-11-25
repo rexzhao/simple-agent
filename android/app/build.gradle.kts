@@ -99,8 +99,13 @@ android {
             // mini 都用它，谁构建都能直接覆盖安装。
             //
             // 仍允许环境变量覆盖（给 CI 或临时用别的签名留口子）。
+            //
+            // 路径基准是 rootProject（= android/ 目录），所以仓库里的那份是
+            // 相对它写的 "debug.keystore"，**不是** "android/debug.keystore"。
+            // 写错的话 file() 找不到文件，会静默退回 AGP 默认签名 ——
+            // 表现就是"配置看着没问题，装上去还是签名冲突"（踩过）。
             val storePath = System.getenv("SIMPLE_AGENT_KEYSTORE")
-                ?: "android/debug.keystore"
+                ?: "debug.keystore"
             val storeFileResolved = rootProject.file(storePath)
             if (storeFileResolved.exists()) {
                 signingConfig = signingConfigs.create("fromEnv") {
