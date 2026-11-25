@@ -196,6 +196,12 @@ func main() {
 		// 一条连接、一次握手分辨执行端/relay；直连时没有额外探测超时。
 		// 自动选中的执行端**固定下来**：重连只连它，绝不悄悄换成另一台机器。
 		pinned := &pinnedHost{hostID: opts.route}
+		// 局域网候选地址：首次连接后从 relay 拿到，重连时复用。
+		//
+		// 用变量而不是每次重查：重连是高频路径（网络抖动时会连着触发），
+		// 每次都问 relay 反而增加延迟。地址变化由执行端定时上报 + 下次
+		// 首连刷新覆盖。
+		var lanList []relay.Executor
 		dial := func() (wire.Conn, error) {
 			pinned.Lock()
 			target := pinned.hostID
@@ -203,7 +209,7 @@ func main() {
 			if target == "" {
 				return nil, errNoExecutorChosen
 			}
-			conn, chosen, dialErr := relay.OpenViewerToken(connectAddr, target, opts.relayToken)
+			conn, chosen, dialErr := openViewer(connectAddr, target, opts.relayToken, "", lanList)
 			if dialErr == nil && chosen != "" {
 				pinned.Lock()
 				pinned.hostID = chosen
@@ -213,10 +219,28 @@ func main() {
 		}
 		// 先亲手连一次：如果对面是 relay 且没指定执行端，就进入"选择执行端"界面，
 		// 而不是 fatal 退出（用户的需求正是在这里选）。
-		conn, chosen, openErr := relay.OpenViewerToken(connectAddr, pinned.hostID, opts.relayToken)
+		//
+		// 用 OpenViewerTokenList 而不是 OpenViewerToken：要把执行端的局域网
+		// 地址一并拿回来，否则直连永远不知道连哪里（这条列表以前解析完就被
+		// 扔了）。
+		relayConn, chosen, openList, openErr := relay.OpenViewerTokenList(connectAddr, pinned.hostID, opts.relayToken)
+		lanList = openList
+		conn, openErr2 := relayConn, openErr
+		// 尝试直连（内部失败会自己回退，那时用上面那条 relay 连接）
+		if openErr == nil && len(openList) > 0 {
+			if lanConn, lanChosen := tryLAN(pinned.hostID, opts.relayToken, openList); lanConn != nil {
+				if relayConn != nil {
+					_ = relayConn.Close()
+				}
+				conn = lanConn
+				if lanChosen != "" {
+					chosen = lanChosen
+				}
+			}
+		}
 		var needsChoice *relay.NeedsChoice
 		switch {
-		case openErr == nil:
+		case openErr2 == nil:
 			if chosen != "" {
 				pinned.Lock()
 				pinned.hostID = chosen
