@@ -19,8 +19,16 @@
 *.iml
 *.hprof
 
-# 签名密钥：绝不能进版本库
+# 签名密钥：发布用的绝不能进版本库
 # （CI 用 GitHub Secrets 里的 ANDROID_DEBUG_KEYSTORE，见 .github/workflows/android.yml）
 *.keystore
 *.jks
 *.b64
+
+# 例外：Android 的**调试**签名。
+#
+# 它的口令是众所周知的 "android"，没有保密价值；而它必须**跨机器一致** ——
+# 每台机器各自的默认 debug.keystore 是随机生成的，签名不同会导致覆盖安装
+# 报 INSTALL_FAILED_UPDATE_INCOMPATIBLE（踩过两次，只能卸载重装丢数据）。
+# 所以这一份随仓库分发，谁构建都用它（见 android/app/build.gradle.kts）。
+!android/debug.keystore

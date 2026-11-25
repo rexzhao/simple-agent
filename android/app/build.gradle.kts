@@ -87,19 +87,24 @@ android {
             isMinifyEnabled = false
         }
         debug {
-            // 用环境里的 keystore 签名（CI / 本机固定签名都用它）。
+            // **固定用仓库里的 debug keystore 签名**。
             //
-            // 为什么需要：AGP 默认用 <用户>/.android/debug.keystore，
-            // 而 GitHub runner 每次都是全新环境，那个文件是随机生成的——
-            // 于是同一个 App 在 CI 与本地构建出来的包签名不同，
-            // 手机上覆盖安装会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
+            // 为什么需要（踩过两次）：AGP 默认用 <用户>/.android/debug.keystore，
+            // 那是一个**每台机器各自随机生成**的文件 —— 于是同一台手机在
+            // 不同机器上构建出来的包签名不同，覆盖安装报
+            // INSTALL_FAILED_UPDATE_INCOMPATIBLE，只能卸载重装（丢数据）。
             //
-            // 这里允许用环境变量指定同一份 keystore，保证任何地方出的包
-            // 签名一致。没有指定时保持 AGP 默认行为（不影响普通开发）。
+            // 仓库里的 android/debug.keystore 是统一的调试签名（口令都是
+            // 众所周知的 android，没有保密价值，所以随仓库分发）。本机与
+            // mini 都用它，谁构建都能直接覆盖安装。
+            //
+            // 仍允许环境变量覆盖（给 CI 或临时用别的签名留口子）。
             val storePath = System.getenv("SIMPLE_AGENT_KEYSTORE")
-            if (!storePath.isNullOrEmpty()) {
+                ?: "android/debug.keystore"
+            val storeFileResolved = rootProject.file(storePath)
+            if (storeFileResolved.exists()) {
                 signingConfig = signingConfigs.create("fromEnv") {
-                    storeFile = rootProject.file(storePath)
+                    storeFile = storeFileResolved
                     storePassword = System.getenv("SIMPLE_AGENT_KEYSTORE_PASSWORD")
                         ?: "android"
                     keyAlias = System.getenv("SIMPLE_AGENT_KEY_ALIAS")
