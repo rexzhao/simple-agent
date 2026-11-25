@@ -39,7 +39,9 @@ import (
 	"simple-agent/internal/providers"
 	"simple-agent/internal/relay"
 	"simple-agent/internal/timeline"
+	"simple-agent/internal/peerverify"
 	"simple-agent/internal/tlsx"
+	"simple-agent/internal/trust"
 	"simple-agent/internal/wire"
 )
 
@@ -97,6 +99,19 @@ type Client struct {
 	// 所以默认按"还有"处理；补拉返回空或 HasMore=false 时记在这里，
 	// 之后就不再谎报"还有更多"。
 	exhausted map[string]bool
+
+	// dataDir 存放 Android 侧的证书与信任列表（`<cacheDir>/tls`、
+	// `<cacheDir>/known_hosts`）。
+	//
+	// 与桌面端同样的结构：自己的身份证书 + 记住确认过的对端指纹。
+	// 首次连接时自动自签生成，用户不用配置任何东西。
+	dataDir string
+	// trustStore 是信任列表（可能为 nil —— 读失败时退化成"每次都问"）。
+	trustStore *trust.Store
+	// peerGate 管理"等待用户确认指纹"的请求（见 peerverify.Gate）。
+	//
+	// Android 上的弹窗是异步的：这里阻塞等 Kotlin 侧调 ResolvePeer。
+	peerGate *peerverify.Gate
 }
 
 // connectParams 是"连到哪个 relay、带什么凭据"（切换执行端时复用）。
@@ -126,7 +141,19 @@ func NewClient(listener ChangeListener, lang string, cacheDir string) *Client {
 		blobDir:     cacheDir,
 		parser:      markdown.NewParser(),
 		flushStop:   make(chan struct{}),
+		dataDir:     cacheDir,
 	}
+	// 信任列表：与桌面端同一个格式（known_hosts 风格），落在 cacheDir 下。
+	//
+	// 读失败不该阻止连接 —— 退化成"每次连接都问一次用户"，
+	// 那仍然是安全的（只是烦），比直接连不上好。
+	if store, err := trust.Open(trust.DefaultPath(cacheDir)); err == nil {
+		client.trustStore = store
+	} else {
+		log.Printf("bridge：信任列表读取失败（将每次重新确认）：%v", err)
+	}
+	// 指纹确认队列。Notify 在下面 ConnectTLS 时接上界面回调。
+	client.peerGate = &peerverify.Gate{}
 	// 高频事件合并器：见 emit 的说明
 	go client.flushLoop()
 	return client
@@ -164,6 +191,75 @@ func (c *Client) Connect(addr, route, token string) string {
 //
 // 为什么放在 bridge 而不是手机上自己算：TLS 握手在 Go 侧
 // （gomobile 的连接逻辑在这里），手机端没有现成的 TLS 客户端栈可用。
+// verifyPeer 是 viewer 侧的指纹确认（TLS 握手时调用）。
+//
+// 与桌面端共用 `internal/peerverify` 的判定逻辑，只是"问用户"这一步
+// 接到 Android 的弹窗上：
+//
+//	已知（信任列表里有）  → 静默通过
+//	首次 / 指纹变了       → 登记到 peerGate，界面弹窗，等用户点
+//
+// **在握手回调里阻塞是安全的**：阻塞的只是这一条连接自己的 goroutine，
+// 不影响界面线程，也不会拖住别的连接。等待**不计入任何网络超时** ——
+// 用户思考的时间不是网络时间。
+func (c *Client) verifyPeer(addr string, certDER []byte) error {
+	verifier := &peerverify.Verifier{
+		Store: c.trustStore,
+		Role:  trust.RoleRelay,
+		Ask:   c.peerGate.Ask,
+	}
+	return verifier.Verify(addr, certDER)
+}
+
+// PendingPeers 返回等待用户确认的对端（Android 轮询此接口来弹窗）。
+//
+// 返回的每条格式是 `地址\n指纹\n是否变化\n旧指纹`（换行分隔）。
+// 用字符串而不是结构体：gomobile 对复杂返回类型的支持有限，
+// 拼串最稳，Kotlin 侧 split 一下就行。
+func (c *Client) PendingPeers() string {
+	if c.peerGate == nil {
+		return ""
+	}
+	pending := c.peerGate.Pending()
+	if len(pending) == 0 {
+		return ""
+	}
+	// 一次只返回一条：同时弹好几个框会让人不知道在确认什么
+	item := pending[0]
+	changed := "0"
+	if item.Changed() {
+		changed = "1"
+	}
+	return item.Addr() + "\n" + item.Fingerprint() + "\n" + changed + "\n" + item.Known()
+}
+
+// ResolvePeer 由 Android 界面调用：回答"要不要信任 address 这个对端"。
+//
+// 按**地址**匹配待确认项（同一时刻同一地址只会有一条 —— Gate 已按
+// 指纹去重）。
+func (c *Client) ResolvePeer(addr string, allow bool) string {
+	if c.peerGate == nil {
+		return "没有待确认的对端"
+	}
+	for _, item := range c.peerGate.Pending() {
+		if item.Addr() == addr {
+			c.peerGate.Resolve(item, allow)
+			return ""
+		}
+	}
+	return "没有待确认的对端：" + addr
+}
+
+// ProbeFingerprint 探测对端的 TLS 证书指纹（**不做校验**）。
+//
+// 返回 JSON：
+//
+//   - fingerprint：对端证书的 SHA-256（小写十六进制）；空表示对端是明文服务
+//   - plain：true 表示对端**不是** TLS（握手被拒）
+//   - error：真的连不上（超时/拒绝）
+//
+// 为什么放在 bridge 而不是手机上自己算：TLS 握手在 Go 侧
+// （gomobile 的连接逻辑在这里），手机端没有现成的 TLS 客户端栈可用。
 func (c *Client) ProbeFingerprint(addr string) string {
 	fingerprint, plain, err := tlsx.ProbeFingerprintOrPlain(addr, 3*time.Second)
 	result := map[string]any{"fingerprint": fingerprint, "plain": plain}
@@ -183,25 +279,40 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 	// （断开在侧边抽屉里），用户会卡在一个点不动也退不出的状态。
 	c.disconnectIfConnected()
 
-	// 连接与**断线重连**都走同一个拨号函数：relay 的 token、route 必须一起带过去，
-	// 否则重连会悄悄变成"未认证/未路由"。
+	// **始终走 TLS**，不再有"有指纹才加密"的分支。
 	//
-	// 注意 OpenViewerToken 返回 (conn, 选中的 hostID, err)：首连时那个 hostID 要
-	// 记下来（relay 上有多个执行端时，重连必须连回同一台，不能随机换一台）。
-	// 传输加密（可选）：有指纹就走 TLS，否则保持明文。
-	// 拨号与重连共用同一个 tlsConfig，所以断线重连也仍然是加密的。
-	tlsConfig := tlsx.Config{Fingerprint: fingerprint}
+	// 加密与明文严格隔离（与桌面端一致）：明文的执行端只能被明文的
+	// 展示端连，反之亦然。以前这里是"指纹为空就明文"，那是个降级漏洞
+	// —— 攻击者只要让握手失败，客户端就退回无校验的明文连接。
+	//
+	// fingerprint 参数保留但语义变了：非空表示"用户已确认过这个指纹，
+	// 严格校验"；空表示"还没确认，交给 TOFU 弹窗"。
+	tlsConfig := tlsx.Config{
+		ClientTLSEnabled: true,
+		// 自己的证书：执行端要验证我们是谁（mTLS）。没有它，执行端会
+		// 以"没有出示客户端证书"拒绝每一条连接。
+		DataDir: c.dataDir,
+	}
 	if fingerprint != "" {
+		tlsConfig.Fingerprint = fingerprint
 		if _, err := tlsConfig.ClientConfig(); err != nil {
 			return "指纹格式不对：" + err.Error()
 		}
 	}
+
+	// **指纹确认（TOFU）**：跑在 net 层（internal/peerverify），与桌面端
+	// 共用同一套信任列表逻辑 —— 只是这里的"界面"是 Android 的弹窗。
+	//
+	// 有已确认的指纹就严格校验，没见过去问用户；确认过的记进信任列表
+	// （Android 上落盘到 cacheDir，重启后仍然有效）。
+	tlsConfig.OnPeerFingerprint = c.verifyPeer
+	// 有新的待确认对端时通知界面去拉 PendingPeers 并弹窗。
+	c.peerGate.Notify = func() { c.emit("peerConfirm", "") }
+
 	// 装到 wire 的拨号钩子上：relay.OpenViewerToken 内部用的是 wire.Dial。
-	// 断开时恢复，避免影响后续以明文连接。
+	// 断开时恢复，避免污染后续连接。
 	previousDial := wire.DialFunc()
-	if fingerprint != "" {
-		wire.SetDialFunc(tlsConfig.Dial)
-	}
+	wire.SetDialFunc(tlsConfig.Dial)
 	c.mu.Lock()
 	c.restoreDial = func() { wire.SetDialFunc(previousDial) }
 	c.mu.Unlock()
@@ -312,7 +423,7 @@ func (c *Client) dialLANFor(hostID, token string) wire.Conn {
 			//
 			// 两者是不同的自签名证书：拿 relay 的指纹去校验执行端，
 			// 结果一定是"证书指纹不匹配"（实测就是这个），直连永远失败。
-			conn, err := dialLANWith(addr.String(), addr.TLSFingerprint, token, lanDialTimeout)
+			conn, err := c.dialLANWith(addr.String(), addr.TLSFingerprint, token, lanDialTimeout)
 			if err != nil {
 				log.Printf("展示端：直连 %s 失败（%v），回退 relay", addr.String(), err)
 				continue
@@ -333,8 +444,8 @@ func (c *Client) dialLANFor(hostID, token string) wire.Conn {
 //     relay 用 MsgRoute 路由，执行端用 hello/welcome 认证。
 //     以前这里只建连不握手，host.NewRemoteWithToken 拿到一条没握手的连接，
 //     必然失败并回退 relay（真机上表现为"直连永远不生效"）。
-func dialLANWith(addr, fingerprint, token string, timeout time.Duration) (wire.Conn, error) {
-	raw, err := dialLANRaw(addr, fingerprint, timeout)
+func (c *Client) dialLANWith(addr, fingerprint, token string, timeout time.Duration) (wire.Conn, error) {
+	raw, err := c.dialLANRaw(addr, fingerprint, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -370,33 +481,35 @@ func dialLANWith(addr, fingerprint, token string, timeout time.Duration) (wire.C
 
 // dialLANRaw 只负责建连（**只走 TLS**，不含握手）。
 //
-// 没有明文分支：加密与明文严格隔离（见 dialLANWith 的注释）。
-func dialLANRaw(addr, fingerprint string, timeout time.Duration) (net.Conn, error) {
+// 与桌面端 cmd/simple-agent/lan_dial.go 的逻辑保持一致 —— 那边踩过的坑
+// 这里一个都不能少：
+//
+//  1. **ClientTLSEnabled 必须显式开**：只设 DataDir 的话 ClientTLS() 为
+//     false，Dial 会退化成明文 TCP，对端只能看到"没有出示客户端证书"。
+//  2. **带自己的证书**（DataDir）：mTLS 下执行端要验证我们是谁。
+//  3. **走 TOFU**（OnPeerFingerprint）：lan_addrs 里的指纹是执行端
+//     **自己报的**，不能直接当"已信任"，仍要经信任列表/用户确认。
+//  4. **超时只管 TCP 建连**：等用户看弹窗的时间不是网络时间，
+//     套在整个 Dial 上会把弹窗"超时吃掉"（表现是直连总失败、回退 relay）。
+func (c *Client) dialLANRaw(addr, fingerprint string, timeout time.Duration) (net.Conn, error) {
 	if fingerprint == "" {
 		return nil, fmt.Errorf("%s 没有证书指纹，拒绝明文连接", addr)
 	}
-	type result struct {
-		conn net.Conn
-		err  error
-	}
-	done := make(chan result, 1)
-	cfg := tlsx.Config{Fingerprint: fingerprint}
-	go func() {
-		raw, err := cfg.Dial(addr)
-		done <- result{conn: raw, err: err}
-	}()
-	select {
-	case r := <-done:
-		return r.conn, r.err
-	case <-time.After(timeout):
-		// 超时后台回收：迟到的连接要关掉，否则泄漏
-		go func() {
-			if r := <-done; r.conn != nil {
-				_ = r.conn.Close()
+	cfg := tlsx.Config{
+		ClientTLSEnabled: true,
+		DataDir:          c.dataDir,
+		DialTimeout:      timeout,
+		OnPeerFingerprint: func(peerAddr string, certDER []byte) error {
+			// 直连执行端：角色按 executor 记账（与 relay 分开）
+			verifier := &peerverify.Verifier{
+				Store: c.trustStore,
+				Role:  trust.RoleExecutor,
+				Ask:   c.peerGate.Ask,
 			}
-		}()
-		return nil, fmt.Errorf("直连 %s 超时", addr)
+			return verifier.Verify(peerAddr, certDER)
+		},
 	}
+	return cfg.Dial(addr)
 }
 
 

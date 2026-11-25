@@ -51,12 +51,13 @@ data class ViewerState(
     val hasConnectedOnce: Boolean = false,
     val connectError: String = "",
     /**
-     * 等待用户确认的 relay 证书指纹（TOFU，见 confirmFingerprint）。
+     * 等待用户确认的对端证书（TOFU，见 confirmPeer）。
      *
-     * 非空时界面弹确认框。确认过的指纹存进 prefs，下次同一台 relay
-     * 直接用它严格校验，不再询问。
+     * 由 bridge 在 TLS 握手期间登记（`pendingPeer()`），界面弹窗展示。
+     * 确认过的指纹由 Go 侧写进信任列表（`<cacheDir>/known_hosts`），
+     * 与桌面端同一份格式 —— 下次连接直接严格校验，不再询问。
      */
-    val pendingFingerprint: PendingFingerprint? = null,
+    val pendingPeer: PendingPeer? = null,
     /**
      * 正在同步（连接刚建立、正在拉会话列表与时间线）。
      *
@@ -150,19 +151,22 @@ data class PendingAttachment(
 )
 
 /**
- * PendingFingerprint 是等待用户确认的 relay 证书指纹（TOFU）。
+ * PendingPeer 是等待用户确认的对端证书（TOFU）。
  *
- * 与桌面端 internal/uiapp/fingerprint.go 的语义一致：
- * 首次连接先展示指纹让用户确认，确认过的存起来，下次不再询问。
+ * 与桌面端 internal/peerverify 同一套语义：首次连接展示指纹让用户确认，
+ * 确认过的记进信任列表，下次不再询问。
  * [changed] 为真表示"以前确认过别的值"——那可能是换证书，也可能是被冒充，
  * 提示要明显不同。
+ *
+ * 注意这里**没有 route/token**：确认只是回答"这个指纹可信吗"，
+ * 与连接参数无关 —— 连接由 bridge 继续推进，界面不需要重新发起。
  */
-data class PendingFingerprint(
+data class PendingPeer(
     val addr: String,
-    val route: String,
-    val token: String,
     val fingerprint: String,
     val changed: Boolean = false,
+    /** 以前确认过的指纹（changed 为真时有意义） */
+    val known: String = "",
 )
 
 /**
@@ -196,6 +200,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     // 流式刷新的节流状态（见 scheduleTimelineRefresh）
     private var timelineRefreshJob: kotlinx.coroutines.Job? = null
+    // pollJob 是"等待用户确认对端指纹"的轮询任务（见 pollPendingPeer）。
+    private var pollJob: kotlinx.coroutines.Job? = null
     private var timelineRefreshPending = false
     private val timelineRefreshIntervalMs = 80L
     /** 上次真正刷新的时间戳（配合 scheduleTimelineRefresh 做节流）。 */
@@ -777,147 +783,69 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(connecting = true, reconnecting = false, connectError = "")
         }
         val current = state.value
-        // 记住这次填的连接参数：手机输入很麻烦，指纹还是 64 位十六进制。
-        // token/指纹属于凭据，但存在应用私有 SharedPreferences 里（未 root 时
-        // 其它应用读不到），比每次手敲安全得多。
+        // 记住连接参数：手机输入很麻烦。
         //
-        // **指纹为空时不要写这一项**：TOFU 流程里这里是"清空"，
-        // 会把之前确认过的指纹抹掉 —— 下次又要重新确认一遍。
-        // 指纹只在两种情况下更新：用户手填、或确认框里点「信任」
-        // （见 confirmFingerprint）。
+        // **指纹不再存这里** —— 改由 Go 侧的信任列表管理
+        // （`<cacheDir>/known_hosts`，与桌面端同一份格式）。
+        // 以前在 SharedPreferences 里存一份，两边各记各的，
+        // 容易出现"桌面端认得了、手机还问一遍"这种不一致。
         prefs.edit()
             .putString("addr", current.addr.trim())
             .putString("route", current.route.trim())
             .putString("token", current.token.trim())
-            // savedAddr 是"确认过的指纹属于哪台 relay"：指纹必须与地址配对
-            // 才有意义，换了 relay 就该重新确认（哪怕指纹恰好相同）。
-            .putString("savedAddr", current.addr.trim())
             .apply()
-        if (current.fingerprint.isNotBlank()) {
-            prefs.edit().putString("fingerprint", current.fingerprint.trim()).apply()
-        }
 
-        // **没有指纹就走 TOFU**：先探测、弹窗确认、确认后保存再用。
+        // **指纹确认交给 bridge**：连上过程中如果需要用户确认对端证书，
+        // bridge 会在握手回调里登记一条待确认项并阻塞那条连接，
+        // 界面通过 refreshPendingPeer() 拿到并弹窗。
         //
-        // 与桌面端同一套语义（见 internal/uiapp/fingerprint.go）：
-        // 用户不该手抄 64 位十六进制，也没必要 —— 展示 + 确认既省事，
-        // 又把"你信任的是哪个指纹"摆到台面上。
-        if (current.fingerprint.isBlank()) {
-            // 以前确认过、且还是同一台 relay → 直接用记住的指纹，
-            // **不再询问**（这是"跟 SSH 一样"的关键：正常连接必须一键完成）。
-            val savedAddr = prefs.getString("savedAddr", "") ?: ""
-            val savedFingerprint = prefs.getString("fingerprint", "") ?: ""
-            val addr = current.addr.trim()
-            if (savedFingerprint.isNotEmpty() && savedAddr == addr) {
-                state.update { it.copy(fingerprint = savedFingerprint) }
-                core.connectTLS(addr, current.route.trim(), current.token.trim(), savedFingerprint)
-                return
-            }
-            connectWithFingerprintConfirm(
-                addr,
-                current.route.trim(),
-                current.token.trim(),
-            )
-            return
-        }
-
+        // 不再"先探测、再弹窗、再连接"：那套流程要把同一件事做两遍
+        // （探测一次握手、连接又一次），而且探测结果和真正握手之间
+        // 有机会窗口 —— 中间被换掉也看不出来。
         core.connectTLS(
             current.addr.trim(),
             current.route.trim(),
             current.token.trim(),
+            // 用户手填过指纹就带上（严格校验）；否则留空走 TOFU
             current.fingerprint.trim(),
         )
+        // 连接是异步的：轮询看看有没有待确认的对端要弹窗
+        pollPendingPeer()
     }
 
     /**
-     * connectWithFingerprintConfirm 探测指纹并请求用户确认（首次连接，或指纹变了）。
+     * pollPendingPeer 轮询 bridge 的待确认对端，有就弹窗。
      *
-     * 与桌面端一致：**探测在校验之外**（还没指纹可校验），拿到之后弹窗，
-     * 用户确认才保存并连接。指纹变了要单独提示 —— 那可能是换证书，
-     * 也可能是被冒充，两种情况都该让用户看清楚再决定。
+     * 为什么用轮询而不是事件回调：指纹确认发生在 Go 的 TLS 握手 goroutine
+     * 里，而 Kotlin 侧的弹窗必须在主线程。bridge 已经有 emit 通知机制，
+     * 但那条路径是给高频事件合帧用的；这里改动最小、最不容易出错的做法
+     * 是短轮询 —— 只有在"连接中"才轮询，连上就停。
      */
-    private fun connectWithFingerprintConfirm(addr: String, route: String, token: String) {
-        state.update { it.copy(connecting = true, connectError = "") }
-        viewModelScope.launch {
-            // 探测会阻塞到 TLS 握手完成（最多 3 秒），放到 IO 线程
-            val raw = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                core.probeFingerprint(addr)
-            }
-            val probe = decodeProbe(raw)
-            if (probe.error.isNotEmpty()) {
+    private fun pollPendingPeer() {
+        pollJob?.cancel()
+        pollJob = viewModelScope.launch {
+            repeat(120) { // 最多等 60 秒（用户可能要想一会儿）
+                delay(500)
+                if (!state.value.connecting) return@launch
+                val peer = withContext(Dispatchers.IO) { core.pendingPeer() }
+                if (peer.isEmpty()) continue
+                val parts = peer.split("\n")
+                if (parts.size < 4) continue
                 state.update {
-                    it.copy(connecting = false, connectError = "连不上 relay：${probe.error}")
+                    it.copy(
+                        pendingPeer = PendingPeer(
+                            addr = parts[0],
+                            fingerprint = parts[1],
+                            changed = parts[2] == "1",
+                            known = parts[3],
+                        ),
+                    )
                 }
                 return@launch
-            }
-            // 对端是明文服务：**拒绝连接**（加密与明文严格隔离）。
-                //
-                // 以前这里会"直接明文连上去"。但那是个降级漏洞：攻击者只要
-                // 让 TLS 握手失败，客户端就自动改用无校验的明文连接，
-                // 指纹体系形同虚设。
-                //
-                // 用户的要求是"用 tls 和不用 tls 的不能互相通讯，完全隔离"，
-                // 所以明文对端直接报错，由用户自己决定要不要改用对的配置。
-                if (probe.plain) {
-                    state.update {
-                        it.copy(
-                            connecting = false,
-                            connectError = "对端 $addr 未启用 TLS。" +
-                                "本端只与加密对端通讯（加密与明文严格隔离）。",
-                        )
-                    }
-                    return@launch
-                }
-            if (probe.fingerprint.isEmpty()) {
-                state.update {
-                    it.copy(connecting = false, connectError = "没能取到对端的证书指纹")
-                }
-                return@launch
-            }
-            val previous = prefs.getString("fingerprint", "").orEmpty()
-            state.update {
-                it.copy(
-                    connecting = false,
-                    // 交给界面弹窗：pendingFingerprint 非空时显示确认框
-                    pendingFingerprint = PendingFingerprint(
-                        addr = addr,
-                        route = route,
-                        token = token,
-                        fingerprint = probe.fingerprint,
-                        changed = previous.isNotEmpty() && previous != probe.fingerprint,
-                    ),
-                )
             }
         }
     }
 
-    /** ProbeResult 是 [CoreClient.probeFingerprint] 的解析结果。 */
-    private data class ProbeResult(
-        val fingerprint: String = "",
-        val plain: Boolean = false,
-        val error: String = "",
-    )
-
-    private fun decodeProbe(raw: String): ProbeResult {
-        if (raw.isEmpty()) return ProbeResult(error = "没有返回结果")
-        return try {
-            val obj = kotlinx.serialization.json.Json.parseToJsonElement(raw)
-                as kotlinx.serialization.json.JsonObject
-            fun str(key: String): String {
-                val value = obj[key] as? kotlinx.serialization.json.JsonPrimitive ?: return ""
-                return if (value is kotlinx.serialization.json.JsonNull) "" else value.content
-            }
-            fun bool(key: String): Boolean =
-                (obj[key] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true"
-            ProbeResult(
-                fingerprint = str("fingerprint"),
-                plain = bool("plain"),
-                error = str("error"),
-            )
-        } catch (e: Throwable) {
-            ProbeResult(error = "解析探测结果失败：${e.message}")
-        }
-    }
 
     /**
      * importRelayConfig 从 JSON 文件导入 relay 配置。
@@ -964,21 +892,25 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         state.update { it.copy(connectError = message) }
     }
 
-    /** 用户确认了指纹：保存并连接。 */
-    fun confirmFingerprint() {
-        val pending = state.value.pendingFingerprint ?: return
-        // 指纹与地址一起存：指纹只有配上"是哪台 relay"才有意义
-        prefs.edit()
-            .putString("fingerprint", pending.fingerprint)
-            .putString("savedAddr", pending.addr)
-            .apply()
-        state.update { it.copy(pendingFingerprint = null, fingerprint = pending.fingerprint) }
-        core.connectTLS(pending.addr, pending.route, pending.token, pending.fingerprint)
+    /**
+     * 用户确认了指纹：告诉 bridge 放行，那条被挂起的连接会继续握手。
+     *
+     * **不需要重新连接** —— 这正是与旧实现的关键区别。以前是"探测→弹窗→
+     * 用指纹重连"，现在是"连接过程中问一句，用户答了连接自己就建好了"。
+     */
+    fun confirmPeer() {
+        val pending = state.value.pendingPeer ?: return
+        state.update { it.copy(pendingPeer = null) }
+        core.resolvePeer(pending.addr, true)
+        // 继续轮询：可能还有别的对端要确认（比如再直连执行端时）
+        pollPendingPeer()
     }
 
-    /** 用户拒绝了指纹：放弃这次连接。 */
-    fun dismissFingerprint() {
-        state.update { it.copy(pendingFingerprint = null, connecting = false) }
+    /** 用户拒绝了指纹：那条连接握手失败，不会建立。 */
+    fun dismissPeer() {
+        val pending = state.value.pendingPeer ?: return
+        state.update { it.copy(pendingPeer = null) }
+        core.resolvePeer(pending.addr, false)
     }
 
     fun disconnect() {

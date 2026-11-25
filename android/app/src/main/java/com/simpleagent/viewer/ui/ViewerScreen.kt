@@ -123,13 +123,11 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
         ConnectScreen(
             state = state,
             onAddr = viewModel::updateAddr,
-            onRoute = viewModel::updateRoute,
             onToken = viewModel::updateToken,
-            onFingerprint = viewModel::updateFingerprint,
             onConnect = viewModel::connect,
             onDisconnect = viewModel::disconnect,
-            onConfirmFingerprint = viewModel::confirmFingerprint,
-            onDismissFingerprint = viewModel::dismissFingerprint,
+            onConfirmPeer = viewModel::confirmPeer,
+            onDismissPeer = viewModel::dismissPeer,
             onImportConfig = viewModel::importRelayConfig,
             onImportError = viewModel::reportImportError,
         )
@@ -533,13 +531,11 @@ private fun formatFingerprint(value: String): String {
 private fun ConnectScreen(
     state: ViewerState,
     onAddr: (String) -> Unit,
-    onRoute: (String) -> Unit,
     onToken: (String) -> Unit,
-    onFingerprint: (String) -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
-    onConfirmFingerprint: () -> Unit,
-    onDismissFingerprint: () -> Unit,
+    onConfirmPeer: () -> Unit,
+    onDismissPeer: () -> Unit,
     onImportConfig: (String) -> Unit,
     onImportError: (String) -> Unit,
 ) {
@@ -568,9 +564,9 @@ private fun ConnectScreen(
         onImportConfig(text)
     }
     // 指纹确认框（TOFU）：第一次连某台 relay 时弹出来，确认过的会记住。
-    state.pendingFingerprint?.let { pending ->
+    state.pendingPeer?.let { pending ->
         androidx.compose.material3.AlertDialog(
-            onDismissRequest = onDismissFingerprint,
+            onDismissRequest = onDismissPeer,
             title = {
                 Text(
                     if (pending.changed) "证书指纹变了" else "信任这台 relay？",
@@ -605,7 +601,7 @@ private fun ConnectScreen(
                 }
             },
             confirmButton = {
-                androidx.compose.material3.TextButton(onClick = onConfirmFingerprint) {
+                androidx.compose.material3.TextButton(onClick = onConfirmPeer) {
                     Text("信任并连接")
                 }
             },
@@ -632,14 +628,7 @@ private fun ConnectScreen(
         OutlinedTextField(
             value = state.addr,
             onValueChange = onAddr,
-            label = { Text("地址（host:port）") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = state.route,
-            onValueChange = onRoute,
-            label = { Text("执行端 host_id（经 relay 时可选）") },
+            label = { Text("relay 地址（host:port）") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
@@ -651,18 +640,14 @@ private fun ConnectScreen(
             visualTransformation = PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth(),
         )
-        // 传输加密：留空走明文；填了则只接受指纹完全一致的 relay 证书。
+        // **不再有"证书指纹"输入框**。
         //
-        // 通常**不用手填**：留空时点连接会先探测对端指纹、弹窗让你确认，
-        // 确认过的会记住（跟 SSH 一样）。只有想重新确认、或连的是明文 relay
-        // 时才需要动这里。
-        OutlinedTextField(
-            value = state.fingerprint,
-            onValueChange = onFingerprint,
-            label = { Text("证书指纹（通常留空，连接时会让你确认）") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
+        // 指纹由程序自己确认（TOFU）：首次连接时弹窗给用户看，确认后记进
+        // 信任列表，之后自动严格校验。让人手抄 64 位十六进制既痛苦又容易
+        // 错一位 —— 而错了的表现是"连不上"，完全看不出是输错了。
+        //
+        // 也不再让用户填执行端 host_id：relay 上有几台执行端时，连接后
+        // 直接进选择列表，比让人记住 ID 去填更直接。
         if (state.connectError.isNotEmpty()) {
             Text(state.connectError, fontSize = 13.sp, color = ViewerColors.danger)
         }

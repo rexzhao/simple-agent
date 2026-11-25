@@ -129,6 +129,18 @@ class CoreClient private constructor(
      */
     fun probeFingerprint(addr: String): String = client.probeFingerprint(addr)
 
+    /**
+     * 取当前等待用户确认的对端（TOFU）。
+     *
+     * 返回 `地址\n指纹\n是否变化(0/1)\n旧指纹`，空串表示没有待确认项。
+     * 连接过程中由 bridge 在 TLS 握手时登记 —— 那时那条连接被挂起，
+     * 等这里返回信息、界面弹窗、用户回答后才会继续。
+     */
+    fun pendingPeer(): String = client.pendingPeers()
+
+    /** 回答"要不要信任 addr 这个对端"。返回空串表示已提交。 */
+    fun resolvePeer(addr: String, allow: Boolean): String = client.resolvePeer(addr, allow)
+
     /** 取一个过程组的完整步骤（用户展开时调；折叠时 Go 侧不传 Steps）。 */
     fun processDetail(sessionId: String, key: String): List<ProcessStep> {
         val page = decode(client.processDetailJSON(sessionId, key), ProcessDetailPage())
