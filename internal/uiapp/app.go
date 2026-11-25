@@ -66,6 +66,14 @@ type Options struct {
 	SidebarAutoCollapseWidth int
 	// Language 是界面语言；空值时跟随系统（见 locale.Detect）。
 	Language locale.Lang
+	// LinkMode 返回"当前到执行端的连接方式"（可为 nil）。
+	//
+	// 用途：侧栏底部在用户名旁标出连接路径 —— 局域网直连显示网线图标，
+	// 经 relay 显示云图标。两者延迟差一到两个数量级，但界面上原本完全
+	// 看不出来，用户只能凭"感觉有点慢"猜是哪一段的问题。
+	//
+	// 取值："direct" / "relay" / ""（未知或单机模式，不显示）。
+	LinkMode func() string
 	// VisionFor 按模型选择返回是否支持图片（切换模型时用；nil 视为不支持）。
 	VisionFor func(providers.Selection) bool
 	// PasteImages 读取剪贴板里的图片（位图或图片文件）。

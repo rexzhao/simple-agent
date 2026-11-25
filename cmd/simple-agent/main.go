@@ -319,6 +319,22 @@ func main() {
 		// 单机模式直接用这份组装好的配置。
 		LocalConfig: localConfigFor(remoteHost, local),
 		Language:    lang,
+		// 侧栏底部标出连接方式（直连=网线图标，经 relay=云图标）。
+		//
+		// 只在展示端模式下有意义（单机模式没有"连接方式"这回事），
+		// 所以 remoteHost 为空时返回空串 —— 界面据此不显示标记。
+		LinkMode: func() string {
+			if remoteHost == nil {
+				return ""
+			}
+			switch currentLinkMode() {
+			case LinkDirect:
+				return "direct"
+			case LinkRelay:
+				return "relay"
+			}
+			return ""
+		},
 		// --token 同时用于"直连执行端的认证"与"注册 relay 的认证"。
 		// 两个场景用同一个口令更方便（用户只记一个），语义上也一致：
 		// 都是"能出示口令的人可以操作这个执行端"。

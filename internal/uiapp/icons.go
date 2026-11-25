@@ -46,6 +46,24 @@ const (
 <path d="M10.2991 10.3933L14.7783 14.8725"/>
 </svg>`
 
+	// iconCloud 是云（经 relay 中转的标记）。
+	//
+	// 描边风格与其它图标一致（fill:none + currentColor），
+	// 这样可以直接用 TextColor 控制颜色。
+	iconCloud = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1" xmlns="http://www.w3.org/2000/svg">
+<path d="M4.5 12.5C2.84 12.5 1.5 11.16 1.5 9.5C1.5 7.99 2.61 6.74 4.05 6.53C4.29 4.46 6.03 2.85 8.15 2.85C10.42 2.85 12.26 4.69 12.26 6.96C13.3 7.2 14.08 8.13 14.08 9.25C14.08 10.55 13.03 11.6 11.73 11.6H4.5Z"/>
+</svg>`
+
+	// iconLan 是网线插头（局域网直连的标记）。
+	//
+	// 与 iconCloud 成对：直连时显示它，经 relay 时显示云。
+	// 两者都常驻，用户一眼就能看出当前走的是哪条路
+	// （延迟差一到两个数量级，但原本界面上完全看不出来）。
+	iconLan = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1" xmlns="http://www.w3.org/2000/svg">
+<path d="M5.5 2.5V5.5M8 2.5V5.5M10.5 2.5V5.5"/>
+<path d="M3.5 5.5H12.5V8.5C12.5 10.99 10.49 13 8 13C5.51 13 3.5 10.99 3.5 8.5V5.5Z"/>
+</svg>`
+
 	// iconPanelLeft 是侧栏开关（dsh IconPanelLeftOutlineRegular）。
 	iconPanelLeft = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1" xmlns="http://www.w3.org/2000/svg">
 <path d="M13.5 1.5H2.5C1.94772 1.5 1.5 1.94772 1.5 2.5V13.5C1.5 14.0523 1.94772 14.5 2.5 14.5H13.5C14.0523 14.5 14.5 14.0523 14.5 13.5V2.5C14.5 1.94772 14.0523 1.5 13.5 1.5Z"/>
@@ -69,6 +87,8 @@ var (
 	iconNewChatSVG     = ui.MustParseSVG([]byte(iconNewChat))
 	iconPanelLeftSVG   = ui.MustParseSVG([]byte(iconPanelLeft))
 	iconSearchSVG      = ui.MustParseSVG([]byte(iconSearch))
+	iconCloudSVG       = ui.MustParseSVG([]byte(iconCloud))
+	iconLanSVG         = ui.MustParseSVG([]byte(iconLan))
 	iconPlusSVG        = ui.MustParseSVG([]byte(iconPlus))
 	iconEllipsisSVG    = ui.MustParseSVG([]byte(iconEllipsis))
 	iconSendSVG        = ui.MustParseSVG([]byte(iconSend))

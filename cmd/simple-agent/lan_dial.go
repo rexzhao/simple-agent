@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"simple-agent/internal/lan"
@@ -71,12 +72,49 @@ func verifierStore() *trust.Store {
 func openViewer(relayAddr, target, token, relayFingerprint string, list []relay.Executor) (wire.Conn, string, error) {
 	// 1. 有局域网地址就试直连
 	if conn, chosen := tryLAN(target, token, list); conn != nil {
+		setLinkMode(LinkDirect)
 		return conn, chosen, nil
 	}
 
 	// 2. 回退 relay（原来的路径，一字未改）
+	setLinkMode(LinkRelay)
 	conn, chosen, err := relay.OpenViewerToken(relayAddr, target, token)
 	return conn, chosen, err
+}
+
+// LinkMode 是展示端到执行端的实际连接方式。
+//
+// 界面据此在侧栏底部标一个云图标：经 relay 时提示"数据要绕公网中转"。
+// 这是用户明确要看的信息 —— 局域网直连和经 relay 的体验差别很大
+// （延迟差一到两个数量级），但界面上原本完全看不出来。
+type LinkMode int
+
+const (
+	// LinkUnknown 还没连上（或连接中）。
+	LinkUnknown LinkMode = iota
+	// LinkDirect 局域网直连。
+	LinkDirect
+	// LinkRelay 经 relay 中转。
+	LinkRelay
+)
+
+var (
+	linkModeMu sync.RWMutex
+	linkMode   = LinkUnknown
+)
+
+// setLinkMode 记录连接方式（拨号线程调用）。
+func setLinkMode(mode LinkMode) {
+	linkModeMu.Lock()
+	linkMode = mode
+	linkModeMu.Unlock()
+}
+
+// currentLinkMode 返回当前连接方式（界面线程读）。
+func currentLinkMode() LinkMode {
+	linkModeMu.RLock()
+	defer linkModeMu.RUnlock()
+	return linkMode
 }
 
 // tryLAN 逐个尝试目标执行端的局域网地址，成功返回已握手的连接。

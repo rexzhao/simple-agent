@@ -248,6 +248,21 @@ func (a *App) sidebarBody(c *ui.Context) {
 		ui.Row(c).Gap(8).Padding(4, 2).Children(func() {
 			ui.Avatar(c, a.userName(), nil).Size(22, 22)
 			ui.Text(c, a.userName()).FontSize(12).TextColor(theme.TextMuted)
+			// **标出当前连接方式**：直连显示网线，经 relay 显示云。
+			//
+			// 局域网直连和经 relay 的延迟差一到两个数量级，但界面上原本
+			// 完全看不出来 —— 用户只能凭"感觉有点慢"猜是哪一段的问题。
+			// 两种都常驻显示（而不是只标异常），因为"现在很快"同样是信息。
+			if label := a.linkLabel(); label != "" {
+				icon := iconCloudSVG
+				if a.linkIsDirect() {
+					icon = iconLanSVG
+				}
+				ui.Row(c).Gap(3).AlignItems(ui.Center).Children(func() {
+					ui.Icon(c, icon).Size(12, 12).TextColor(theme.TextMuted)
+					ui.Text(c, label).FontSize(11).TextColor(theme.TextMuted)
+				})
+			}
 		})
 	})
 }
@@ -803,6 +818,25 @@ func (a *App) setSessionArchived(session *Session, archived bool) {
 		kind = "archiveSession"
 	}
 	_, _ = a.host.Submit(host.Command{SessionID: session.ID, Kind: kind})
+}
+
+// linkLabel 返回连接方式的简短文案（空 = 不显示）。
+func (a *App) linkLabel() string {
+	if a.opts.LinkMode == nil {
+		return ""
+	}
+	switch a.opts.LinkMode() {
+	case "direct":
+		return a.tr("sidebar.link.direct")
+	case "relay":
+		return a.tr("sidebar.link.relay")
+	}
+	return ""
+}
+
+// linkIsDirect 报告当前是否局域网直连（决定用哪个图标）。
+func (a *App) linkIsDirect() bool {
+	return a.opts.LinkMode != nil && a.opts.LinkMode() == "direct"
 }
 
 // userName 返回底部用户区显示的名字。
