@@ -347,6 +347,22 @@ type TimelineView struct {
 	Runtime RuntimeView `json:"runtime"`
 	// Notices 是本次同步里新增的提示（增量，按 id 去重）。
 	Notices []NoticeView `json:"notices,omitempty"`
+	// Sync 是**缓存失效判断**用的游标。
+	//
+	// 手机端把时间线缓存到 SQLite，下次启动先显示缓存再拉增量。
+	// 判断"缓存还能不能用"需要三样东西：
+	//   - Epoch：执行端进程的实例 id，重启会变 —— 变了说明 seq 重新计数，
+	//     缓存必须整体丢弃（否则会按错误的基准算增量，出现错位或漏消息）
+	//   - Generation：压缩代数，压缩后历史被折叠，旧缓存的行数对不上
+	//   - LastSeq：这份时间线覆盖到哪个事件序号 —— 下次只要增量
+	Sync SyncCursor `json:"sync"`
+}
+
+// SyncCursor 是增量同步的游标（见 TimelineView.Sync）。
+type SyncCursor struct {
+	Epoch      string `json:"epoch,omitempty"`
+	Generation uint64 `json:"generation,omitempty"`
+	LastSeq    uint64 `json:"last_seq,omitempty"`
 }
 
 // ItemView 是时间线上的一行（正文 / 过程组 / 提示 / 回合结束行）。

@@ -72,6 +72,27 @@ data class TimelineView(
     val todos: List<TodoView> = emptyList(),
     val asks: List<AskView> = emptyList(),
     val runtime: RuntimeView = RuntimeView(),
+    /**
+     * 同步游标：本地缓存的有效性判断靠它（见 [LocalCache.isCompatible]）。
+     *
+     * 三个字段各有用途：epoch 变了说明执行端重启（seq 重新计数）、
+     * generation 变了说明会话被压缩（行数对不上）、lastSeq 是这份内容
+     * 覆盖到的事件序号（下次只要它之后的部分）。
+     */
+    val sync: SyncCursor? = null,
+)
+
+/**
+ * SyncCursor 是增量同步的游标。
+ *
+ * 为空表示执行端没给（旧版本），此时缓存一律视为不可用 —— 没有游标就
+ * 没法判断，宁可重拉一次也不要用一份可能错位的历史。
+ */
+@Serializable
+data class SyncCursor(
+    val epoch: String = "",
+    val generation: Long = 0,
+    @SerialName("last_seq") val lastSeq: Long = 0,
 )
 
 @Serializable

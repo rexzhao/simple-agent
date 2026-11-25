@@ -74,6 +74,9 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 		view.Items = append(view.Items, c.itemView(item, conv, idle, busy))
 	}
 
+	// 缓存游标：手机端据此判断本地 SQLite 缓存还能不能用、从哪里续。
+	view.Sync = c.syncCursorOf(session, raw...)
+
 	c.mu.Lock()
 	if c.timelineCache == nil {
 		c.timelineCache = map[string]*timelineCacheEntry{}
@@ -83,6 +86,29 @@ func (c *Client) buildTimelineWithRaw(sessionID string) (TimelineView, []timelin
 	}
 	c.mu.Unlock()
 	return view, raw
+}
+
+// syncCursorOf 生成某个会话的同步游标。
+//
+// 三样东西各有用途（缺一个就会错）：
+//   - Epoch：执行端重启后 seq 从 0 重新计数，旧缓存必须整体丢弃
+//   - Generation：压缩会把历史折叠，缓存的行数对不上
+//   - LastSeq：这份内容覆盖到的最大事件序号 —— 下次只要它之后的部分
+//
+// raw 为空时 LastSeq 退化成"当前已知的最大序号"：单独问游标（不构建时间线）
+// 的路径没有条目可反推，那只关心 epoch/generation。
+func (c *Client) syncCursorOf(session *host.Session, raw ...timeline.Item) SyncCursor {
+	var lastSeq uint64
+	for _, item := range raw {
+		if _, last, ok := itemSeqRange(item); ok && last > lastSeq {
+			lastSeq = last
+		}
+	}
+	return SyncCursor{
+		Epoch:      session.SyncEpoch(),
+		Generation: session.Generation(),
+		LastSeq:    lastSeq,
+	}
 }
 
 // timelineCacheEntry 是一次构建结果的缓存。

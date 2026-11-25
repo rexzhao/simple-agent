@@ -376,6 +376,19 @@ func (c *Client) TimelineJSON(sessionID string) string {
 	return encode(c.buildTimeline(sessionID))
 }
 
+// SyncCursorJSON 返回某个会话当前的同步游标（手机端判断缓存是否有效用）。
+//
+// 单独一个入口而不是塞进 TimelinePage：手机端常态是**分页拉**（长会话全量
+// 有几百 KB），分页结果里带游标会让每页都多背一份；而校验缓存只需要
+// 一次调用，单独问最省。
+func (c *Client) SyncCursorJSON(sessionID string) string {
+	session := c.currentSession(sessionID)
+	if session == nil {
+		return encode(SyncCursor{})
+	}
+	return encode(c.syncCursorOf(session))
+}
+
 // itemSeqRange 返回一个渲染条目覆盖的事件序号区间。
 //
 // 条目可能引用多条消息（过程组把同一轮的多个 part 合在一起），

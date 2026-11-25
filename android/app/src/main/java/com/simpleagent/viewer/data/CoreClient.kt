@@ -108,6 +108,19 @@ class CoreClient private constructor(
     fun timelinePage(sessionId: String, beforeSeq: Long, limit: Int): TimelinePage =
         decode(client.timelinePageJSON(sessionId, beforeSeq, limit.toLong()), TimelinePage())
 
+    /**
+     * 取某个会话当前的同步游标（判断本地缓存是否还有效）。
+     *
+     * 单独一次调用：分页结果里不带游标（每页都背一份没必要），
+     * 而校验缓存只需要这一次。
+     */
+    fun syncCursor(sessionId: String): SyncCursor =
+        decode(client.syncCursorJSON(sessionId), SyncCursor())
+
+    /** 取一份完整时间线（含 sync 游标）—— 缓存写入时用。 */
+    fun timeline(sessionId: String): TimelineView =
+        decode(client.timelineJSON(sessionId), TimelineView())
+
     /** 取一个过程组的完整步骤（用户展开时调；折叠时 Go 侧不传 Steps）。 */
     fun processDetail(sessionId: String, key: String): List<ProcessStep> {
         val page = decode(client.processDetailJSON(sessionId, key), ProcessDetailPage())

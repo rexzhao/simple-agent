@@ -220,6 +220,7 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
                     }
                     Composer(
                         runtime = state.timeline.runtime,
+                        syncing = state.syncing,
                         onSend = viewModel::send,
                         onStop = viewModel::stop,
                         onDropQueued = viewModel::dropQueued,
@@ -837,6 +838,13 @@ private fun workspaceLabel(workspace: String): String {
 @Composable
 private fun Composer(
     runtime: com.simpleagent.viewer.data.RuntimeView,
+    /**
+     * 正在同步：禁用发送并显示提示。
+     *
+     * 同步期间界面可能还是缓存内容，此时发消息等于对着旧状态说话，
+     * 所以直接拦住（而不是排队）—— 排队会让用户以为已经发出去了。
+     */
+    syncing: Boolean,
     onSend: (String) -> Unit,
     onStop: () -> Unit,
     onDropQueued: (Int) -> Unit,
@@ -999,6 +1007,7 @@ private fun Composer(
             )
             if (runtime.isIdle) {
                 IconButton(
+                    enabled = !syncing,
                     onClick = {
                         if (text.isNotBlank() || attachments.isNotEmpty()) {
                             onSend(text)
@@ -1009,6 +1018,15 @@ private fun Composer(
             } else {
                 IconButton(onClick = onStop) { Icon(Icons.Filled.Stop, contentDescription = "停止") }
             }
+        }
+        // 同步中明确提示原因：只把按钮置灰而不说话，用户会以为是卡住了
+        if (syncing) {
+            Text(
+                text = "正在同步…",
+                fontSize = 11.sp,
+                color = ViewerColors.muted,
+                modifier = Modifier.padding(start = 4.dp),
+            )
         }
         ModelChip(runtime = runtime, providers = providers, onSelect = onSelectModel)
     }

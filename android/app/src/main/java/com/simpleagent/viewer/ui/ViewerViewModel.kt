@@ -49,6 +49,14 @@ data class ViewerState(
      */
     val hasConnectedOnce: Boolean = false,
     val connectError: String = "",
+    /**
+     * 正在同步（连接刚建立、正在拉会话列表与时间线）。
+     *
+     * 同步期间界面显示的是**缓存**或上一轮的内容，此时禁止发消息：
+     * 用户以为在对着当前内容说话，而执行端状态可能已经变了。
+     * 同步完成后置回 false（见 refreshConnection / syncNow）。
+     */
+    val syncing: Boolean = false,
     // 连接表单（恢复上次输入用）
     val addr: String = "127.0.0.1:7900",
     val route: String = "",
@@ -184,6 +192,14 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
 
     private val core = CoreClient.create(cacheDir.absolutePath) { event -> onCoreEvent(event) }
 
+    /**
+     * 本地缓存：让「打开 App 就能看到上次的内容」成立，不必每次连上都重拉。
+     *
+     * 放在 filesDir 而不是 cacheDir：cacheDir 可能被系统在空间紧张时清掉，
+     * 而这份缓存是我们主动要长期保留的（用户期望"接着上次看"）。
+     */
+    private val cache = LocalCache(File(app.filesDir, "simpleagent-cache").apply { mkdirs() })
+
     // 启动时恢复的最后会话 id（连上后 refreshSessions 会尝试选中它）。
     // **必须声明在 init 之前**：Kotlin 的类体按声明顺序初始化，
     // init 里会用到它，放后面会先看到未初始化值。
@@ -202,6 +218,23 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
      * 断开的，就不该自作主张连回去。
      */
     private fun restoreLastSession() {
+        // **先展示缓存**：不论接下来连不连得上，用户都该立刻看到上次的内容
+        // （这正是"缓存"的意义）。连接成功后 refreshSessions / refreshTimeline
+        // 会用真实数据覆盖它。
+        val cachedSessions = cache.readSessions()
+        if (cachedSessions.isNotEmpty()) {
+            // 记住的会话仍在缓存里就用它，否则回到最后一个（最新的）
+            val remembered = prefs.getString("activeSessionId", "").orEmpty()
+            val active = when {
+                remembered.isNotEmpty() && cachedSessions.any { it.id == remembered } -> remembered
+                else -> cachedSessions.lastOrNull()?.id.orEmpty()
+            }
+            state.update { it.copy(sessions = cachedSessions, activeSessionId = active) }
+            if (active.isNotEmpty()) {
+                applyCachedTimeline(active)
+            }
+        }
+
         if (!prefs.getBoolean("autoConnect", false)) {
             return
         }
@@ -304,8 +337,57 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         core.switchHost(hostId)
     }
 
+    /**
+     * applyCachedTimeline 用本地缓存填充界面（只读，不连后端）。
+     *
+     * 校验规则见 [LocalCache.isCompatible]：拿执行端刚给的游标比。这里只用
+     * 缓存做**首屏占位** —— 随后的 refreshTimeline 会用增量覆盖它，
+     * 所以即使缓存稍旧也不会让人看到错误内容（回合一结束就被替换）。
+     */
+    private fun applyCachedTimeline(sessionId: String) {
+        val cached = cache.readTimeline(sessionId) ?: return
+        // 拿执行端的**当前**游标比：不一致就说明缓存不能用了
+        val cursor = core.syncCursor(sessionId)
+        if (!cache.isCompatible(cached, cursor.epoch, cursor.generation)) {
+            // 执行端重启过、或会话被压缩：缓存必须整体作废，
+            // 否则会按错误基准续，出现错位或漏消息。
+            cache.dropTimeline(sessionId)
+            return
+        }
+        state.update {
+            it.copy(
+                timeline = it.timeline.copy(
+                    sessionId = cached.sessionId,
+                    title = cached.title,
+                    items = cached.items,
+                    todos = cached.todos,
+                    asks = cached.asks,
+                ),
+                asks = cached.asks,
+            )
+        }
+    }
+
+    /**
+     * persistTimeline 把当前时间线写进缓存（供下次启动秒开）。
+     *
+     * 只在**空闲**时写：流式输出期间每 60ms 就要写一次文件，既浪费又没
+     * 必要 —— 一轮结束时的内容才是用户下次真正想看到的。
+     */
+    private fun persistTimeline() {
+        val view = state.value.timeline
+        if (view.sessionId.isEmpty() || view.items.isEmpty()) return
+        if (view.runtime.busy != "idle") return
+        cache.writeTimeline(view)
+    }
+
     private fun refreshSessions() {
         val sessions = core.sessions()
+        // 会话列表与项目分组**只缓存一份**（整表覆盖）：它是当前状态，
+        // 不是历史，增量没有意义。
+        if (sessions.isNotEmpty()) {
+            cache.writeSessions(sessions)
+        }
         state.update { current ->
             // 选哪个会话的顺序：
             // 1. 当前已选的（用户正在看，别打断）
@@ -352,7 +434,9 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 从没连上过（初次连接失败/用户主动断开）时它是 false，界面该回连接页
         // 报错，而不是显示一个永远转圈的重连横幅。
         val online = core.connected()
+        var wasOnline = false
         state.update { current ->
+            wasOnline = current.connected
             // hasConnectedOnce 在一次成功连接后被置为 true，disconnect() 时清掉
             val reconnecting = !online && current.hasConnectedOnce
             if (current.connected == online && current.reconnecting == reconnecting) {
@@ -361,7 +445,36 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 current.copy(connected = online, reconnecting = reconnecting)
             }
         }
-        refreshTimeline()
+        // **刚连上就做一次完整同步**：会话列表 + 当前会话的时间线。
+        //
+        // 这一步的意义是把"缓存/上一轮的内容"换成执行端的真实状态。
+        // 期间置 syncing=true，界面据此禁止发送（见 send 的检查）——
+        // 否则用户可能在同步完成前对着旧内容说话。
+        //
+        // 只在这一跳从"未连接"变成"已连接"时触发：每帧都同步会反复拉数据，
+        // 把流式刷新也堵住。
+        if (online && !wasOnline) {
+            runFullSync()
+        } else {
+            refreshTimeline()
+        }
+    }
+
+    /**
+     * runFullSync 做一次完整同步：会话列表 → 当前会话时间线 → 解除 syncing。
+     *
+     * 顺序不能反：会话列表决定了"当前是哪个会话"，先拉时间线可能拉的是
+     * 已经被删掉的会话。
+     */
+    private fun runFullSync() {
+        state.update { it.copy(syncing = true) }
+        try {
+            refreshSessions()
+            refreshTimeline()
+        } finally {
+            // 无论成功失败都要解除：卡在 syncing=true 会让用户永远发不出消息。
+            state.update { it.copy(syncing = false) }
+        }
     }
 
     /**
@@ -401,6 +514,13 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshTimeline() {
         val id = state.value.activeSessionId
         if (id.isEmpty()) return
+        // **先用缓存顶上**：连接刚建立、或还没连上时，界面不该是空白。
+        //
+        // 只在"当前没有内容"时套用（state.timeline.items 为空）：
+        // 已经有实时内容时再用缓存覆盖会把用户正在看的东西换掉。
+        if (state.value.timeline.items.isEmpty()) {
+            applyCachedTimeline(id)
+        }
         // **加载更早内容的期间跳过刷新**。
         //
         // refreshTimeline 由流式输出高频触发（几十毫秒一次），它会用
@@ -459,6 +579,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 "seq=${page.seqFrom}..${page.seqTo} earlierPart=${keptEarlier.size} " +
                 "pages=${state.value.earlierPagesLoaded} prevItems=${previous.items.size}",
         )
+        // 写缓存：只在空闲时真正落盘（见 persistTimeline 的注释）
+        persistTimeline()
     }
 
     /**
@@ -704,6 +826,18 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         if (text.isBlank() && current.pendingAttachments.isEmpty()) return
+
+        // **同步中不允许发消息**（用户要求）。
+        //
+        // 同步期间界面上的内容可能还是缓存里的旧版本，此时发消息容易让人
+        // 以为"基于当前看到的内容在说话"，而实际上执行端的状态已经变了。
+        // 明确拦住并说明原因，比默默排队更清楚。
+        if (current.syncing) {
+            state.update {
+                it.copy(toast = "正在同步，请稍候再发送")
+            }
+            return
+        }
 
         // 有待发附件时走"带附件发送"：执行端在忙时会拒收并提示
         // 「插话暂不支持附件」，客户端不自己拆成两步。

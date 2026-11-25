@@ -100,7 +100,6 @@ type Session struct {
 	effort     string
 	// generation 是持久状态的"代"（压缩后 +1）：续传游标要带它。
 	generation uint64
-
 	cfg  *Config
 	host *Local
 
@@ -520,6 +519,28 @@ func (s *Session) Vision() bool {
 	return s.drv.Vision()
 }
 func (s *Session) KeptFromSeq() uint64             { return s.keptFromSeq }
+
+// Generation 返回持久状态的"代"（压缩后 +1）。
+//
+// 展示端（手机）用它判断本地缓存是否还有效：压缩会把历史折叠成摘要，
+// 缓存的行数就对不上了，必须整体重拉。
+func (s *Session) Generation() uint64 { return s.generation }
+
+// SyncEpoch 返回执行端实例标识（展示端缓存失效判断用）。
+//
+// 执行端重启后 seq 从 0 重新计数，展示端的本地缓存必须整体丢弃 ——
+// 否则会按错误的基准算增量，出现错位或漏消息。
+//
+// 执行端的 Session 直接给出自己的 epoch；展示端（镜像）从快照里取。
+func (s *Session) SyncEpoch() string {
+	if s.view != nil {
+		return s.view.Epoch
+	}
+	if s.host != nil {
+		return s.host.Epoch()
+	}
+	return ""
+}
 func (s *Session) Persisted() bool                 { return s.journal != nil }
 func (s *Session) ToolContext() *tools.ToolContext { return s.toolCtx }
 
