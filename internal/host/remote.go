@@ -1205,6 +1205,7 @@ func (r *Remote) applyEvents(sessionID string, events []store.Event) {
 	}
 	for _, event := range events {
 		_ = session.mirror.ApplyPersisted(event)
+		r.applyTitleEvent(session, event)
 		if r.fullSync[sessionID] {
 			continue // 全量同步期间不推进游标（见 log.end 的 to_seq）
 		}
@@ -1214,6 +1215,44 @@ func (r *Remote) applyEvents(sessionID string, events []store.Event) {
 			r.cursors[sessionID] = cursor
 		}
 	}
+}
+
+// applyTitleEvent 把会话元信息事件里的标题同步到镜像会话上。
+//
+// 镜像的重放状态（driver.Replayed.Title）与 host.Session.Title 是**两份**：
+// 前者只给 replay 用，界面读的是后者。以前改名事件只更新了前者，于是远端
+// viewer 的侧栏/头部一直显示旧名字。
+//
+// catalog 那条路（执行端改名后重发列表）已经能修好它，这里是**兜底**：
+// 旧版执行端不发 catalog 时，靠这条事件也能跟上。只认明确带标题的两种事件，
+// 其余（含空标题的 session.renamed）不动。
+func (r *Remote) applyTitleEvent(session *Session, event store.Event) {
+	var title string
+	switch event.Type {
+	case store.TypeSessionCreated:
+		var data driver.SessionCreatedData
+		if err := event.Decode(&data); err != nil {
+			return
+		}
+		title = data.Title
+	case store.TypeSessionRenamed:
+		var data driver.SessionRenamedData
+		if err := event.Decode(&data); err != nil {
+			return
+		}
+		title = data.Title
+	default:
+		return
+	}
+	if title == "" {
+		return
+	}
+	r.mu.Lock()
+	if current, ok := r.sessions[session.ID]; ok {
+		current.Title = title
+		current.ref.Title = title
+	}
+	r.mu.Unlock()
 }
 
 func (r *Remote) applyState(sessionID string, state ViewState) {
@@ -1355,7 +1394,15 @@ func (r *Remote) Sessions() []SessionRef {
 		// 引起的（真实踩过：Android 上没有项目分组）。
 		ref := session.ref
 		ref.ID = id
-		ref.Title = session.Title
+		// 标题以会话上的为准，但**镜像会话反过来**：它的 Title 只是 catalog 的
+		// 一份拷贝（改名这类变化由 catalog 带来，镜像里没有别的来源），
+		// 拿它去覆盖 ref.Title 会把刚收到的新标题又改回旧值
+		// —— 真实缺陷：远端 viewer 改名后侧栏一直是旧名字。
+		if session.mirror == nil {
+			ref.Title = session.Title
+		} else if ref.Title == "" {
+			ref.Title = session.Title
+		}
 		ref.Workspace = session.Workspace
 		out = append(out, ref)
 	}

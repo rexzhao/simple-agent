@@ -2329,3 +2329,77 @@ func TestViewerReceivesExecutorModels(t *testing.T) {
 		t.Fatalf("执行端 Providers() 不一致：%+v", local)
 	}
 }
+
+// 远端 viewer 改名后，**展示端自己的标题**要跟着变。
+//
+// 真实缺陷：改名只产生一条 session.renamed 事件，它落在镜像的重放状态里
+// （driver.Replayed.Title），而界面读的是 host.Session.Title —— 于是执行端
+// 已经是新名字，viewer 的侧栏与头部还停在旧名字，直到重启/重连重新拉一次
+// catalog 才"自己好了"（用户就是这么报的）。
+func TestViewerTitleUpdatesAfterRename(t *testing.T) {
+	pair := newP2Pair(t, true)
+	pair.pumpUntil(t, func() bool { return pair.remote.AttachCountForTest(pair.sessID) >= 1 })
+	before := pair.remote.Session(pair.sessID).Title
+	if before == "" {
+		t.Fatal("展示端一开始就没有标题")
+	}
+
+	payload, _ := host.EncodePayload(host.TextPayload{Text: "改过的名字"})
+	if _, err := pair.remote.Submit(host.Command{SessionID: pair.sessID, Kind: "rename", Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	pair.pumpUntil(t, func() bool { return pair.remote.Session(pair.sessID).Title == "改过的名字" })
+
+	// 会话列表（侧栏、手机端 bridge 都读它）也必须是新标题：
+	// Remote.Sessions() 以前会用镜像里的旧 Title 覆盖掉刚收到的 catalog。
+	refs := pair.remote.Sessions()
+	if len(refs) != 1 {
+		t.Fatalf("会话数不对：%d", len(refs))
+	}
+	if refs[0].Title != "改过的名字" {
+		t.Fatalf("会话列表标题没更新：%q", refs[0].Title)
+	}
+	// 执行端自己是权威来源，两边必须一致
+	if got := pair.local.Session(pair.sessID).Title; got != "改过的名字" {
+		t.Fatalf("执行端标题不一致：%q", got)
+	}
+}
+
+// 旧版执行端改名后不发 catalog：只能靠 session.renamed 事件本身把标题带过来。
+//
+// 这条兜底与 catalog 那条路覆盖**不同版本组合**：执行端升级了、viewer 没升级
+// （或反过来）时，界面仍不能停在旧名字。
+func TestViewerTitleFollowsRenameEventWithoutCatalog(t *testing.T) {
+	// 只建展示端：执行端侧什么也不做，等于"旧执行端只发事件、不发 catalog"。
+	conn := newScriptedConn()
+	remote, err := host.NewRemote(conn, func(f func()) { f() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	// 先让展示端有这一个会话
+	catalog, _ := wire.Encode([]host.SessionRef{{ID: "s1", Title: "旧名字", Workspace: "/tmp/ws"}})
+	conn.recv <- wire.Packet{Kind: "catalog", Body: catalog}
+
+	event := store.MustEvent(store.TypeSessionRenamed, driver.SessionRenamedData{Title: "只靠事件"})
+	event.Seq = 5
+	body, _ := wire.Encode(map[string]any{"session_id": "s1", "event": event})
+	conn.recv <- wire.Packet{Kind: "event", Body: body}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		session := remote.Session("s1")
+		if session != nil && session.Title == "只靠事件" {
+			if refs := remote.Sessions(); len(refs) != 1 || refs[0].Title != "只靠事件" {
+				t.Fatalf("会话列表标题没跟上：%+v", refs)
+			}
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	session := remote.Session("s1")
+	if session == nil {
+		t.Fatal("展示端没有这个会话")
+	}
+	t.Fatalf("事件里的标题没有同步到展示端：%q", session.Title)
+}

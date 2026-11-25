@@ -347,6 +347,22 @@ func (l *Local) run(cmd Command) {
 	if session != nil {
 		l.emit(Change{SessionID: session.ID, Kind: "conversation"})
 	}
+	// 改名必须让列表重发一次（catalog）。
+	//
+	// 它不是"会话多了/少了一个"，所以以前没人调 SessionsChanged()——于是展示端
+	// 只收到一条 session.renamed 事件，而那份事件只改镜像里的 replay 状态
+	// （driver.Replayed.Title），界面读的 host.Session.Title 仍是旧值：远端 viewer
+	// （以及手机端）的侧栏与头部一直显示改名前 的名字，直到重启/重连重新拉一次
+	// catalog 才"自己好了"。
+	//
+	// 放在 run 里而不是 case "rename" 分支里：命令执行完要不要刷新列表是"命令结果"
+	// 的一部分，散在各个分支里迟早再漏一个（newSession/deleteSession 都是这么做的）。
+	if result.OK && cmd.Kind == "rename" && session != nil {
+		for _, obs := range l.observersSnapshot() {
+			obs.SessionsChanged()
+		}
+		l.emit(Change{SessionID: session.ID, Kind: "sessions"})
+	}
 }
 
 func (l *Local) newCmdID() string {
