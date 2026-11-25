@@ -117,6 +117,18 @@ class CoreClient private constructor(
     fun syncCursor(sessionId: String): SyncCursor =
         decode(client.syncCursorJSON(sessionId), SyncCursor())
 
+    /**
+     * 探测对端 TLS 证书指纹（TOFU 用，**不做校验**）。
+     *
+     * 返回原始 JSON：`{"fingerprint":"…","plain":bool,"error":"…"}`。
+     * 不在这里解析成 data class —— gomobile 的返回值只能是一个字符串，
+     * 而解析放在调用方（ViewModel）能让它把解析失败也当成一种结果处理。
+     *
+     * 对端是明文服务时 plain=true（应直接明文连接，不弹确认框）；
+     * 连不上时 error 非空。
+     */
+    fun probeFingerprint(addr: String): String = client.probeFingerprint(addr)
+
     /** 取一个过程组的完整步骤（用户展开时调；折叠时 Go 侧不传 Steps）。 */
     fun processDetail(sessionId: String, key: String): List<ProcessStep> {
         val page = decode(client.processDetailJSON(sessionId, key), ProcessDetailPage())

@@ -33,7 +33,12 @@ var zhTable = map[string]string{
 
 	// 通用
 	"session.childDefault":  "子会话",
-	"sidebar.childCount":    "%d 个子会话",	"skill.pick.title":      "选择技能",
+	"sidebar.childCount":    "%d 个子会话",	"relay.tofu.title":          "信任这台 relay？",
+	"relay.tofu.message":        "首次连接 %s。\n\n它的证书指纹是：\n%s\n\n确认这是你要连的那台机器后再继续。确认后会记住，以后不再询问。",
+	"relay.tofu.changedTitle":   "证书指纹变了",
+	"relay.tofu.changedMessage": "%s 的证书指纹和上次不一样了：\n\n%s\n\n可能是换了证书，也可能是有人在冒充。确认无误再继续。",
+	"relay.tofu.trust":          "信任并连接",
+	"relay.tofu.probing":        "正在获取 %s 的证书指纹…",	"skill.pick.title":      "选择技能",
 	"skill.pick.scope":      "项目与他人共享的 .agents/skills",
 	"skill.pick.empty":      "这个项目还没有技能。在 .agents/skills/<名字>/SKILL.md 里写一份即可（~/.agents/skills 也认）。",
 	"skill.pick.hint":       "选中后会把它的完整说明发到当前会话；平时不会加载。",

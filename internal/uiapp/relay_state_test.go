@@ -59,10 +59,14 @@ func TestConnectRemembersLastRelay(t *testing.T) {
 		t.Fatalf("首次无参数应提示用法，实际：%q", message)
 	}
 
-	// 带参数连一次（用一个不存在的地址也行：保存发生在发起注册时）
+	// 带参数连一次。
+	//
+	// 地址是**不存在的**（10.0.0.9）：加了 TOFU 之后会先探测指纹，
+	// 超时后报"连不上"。这里不关心连没连上，只验证**参数仍然落盘** ——
+	// 用户手输的地址与 token 不该因为一次没连上就丢掉。
 	message, _ := app.ExecSlashCommand("/connect 10.0.0.9:7900 mytoken")
-	if !strings.Contains(message, "正在连接") {
-		t.Fatalf("连接应成功发起，实际：%q", message)
+	if message == "" {
+		t.Fatal("连接应给出提示（成功或失败都要说）")
 	}
 	t.Cleanup(func() { app.stopRelayRegistration() })
 

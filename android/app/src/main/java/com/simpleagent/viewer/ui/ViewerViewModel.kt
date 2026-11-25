@@ -51,6 +51,13 @@ data class ViewerState(
     val hasConnectedOnce: Boolean = false,
     val connectError: String = "",
     /**
+     * 等待用户确认的 relay 证书指纹（TOFU，见 confirmFingerprint）。
+     *
+     * 非空时界面弹确认框。确认过的指纹存进 prefs，下次同一台 relay
+     * 直接用它严格校验，不再询问。
+     */
+    val pendingFingerprint: PendingFingerprint? = null,
+    /**
      * 正在同步（连接刚建立、正在拉会话列表与时间线）。
      *
      * 同步期间界面显示的是**缓存**或上一轮的内容，此时禁止发消息：
@@ -140,6 +147,22 @@ data class PendingAttachment(
     val hash: String,
     val name: String,
     val mediaType: String,
+)
+
+/**
+ * PendingFingerprint 是等待用户确认的 relay 证书指纹（TOFU）。
+ *
+ * 与桌面端 internal/uiapp/fingerprint.go 的语义一致：
+ * 首次连接先展示指纹让用户确认，确认过的存起来，下次不再询问。
+ * [changed] 为真表示"以前确认过别的值"——那可能是换证书，也可能是被冒充，
+ * 提示要明显不同。
+ */
+data class PendingFingerprint(
+    val addr: String,
+    val route: String,
+    val token: String,
+    val fingerprint: String,
+    val changed: Boolean = false,
 )
 
 /**
@@ -743,12 +766,165 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             .putString("token", current.token.trim())
             .putString("fingerprint", current.fingerprint.trim())
             .apply()
+
+        // **没有指纹就走 TOFU**：先探测、弹窗确认、确认后保存再用。
+        //
+        // 与桌面端同一套语义（见 internal/uiapp/fingerprint.go）：
+        // 用户不该手抄 64 位十六进制，也没必要 —— 展示 + 确认既省事，
+        // 又把"你信任的是哪个指纹"摆到台面上。
+        //
+        // 已确认过的指纹存在 prefs 里，下次直接用，不再询问。
+        if (current.fingerprint.isBlank()) {
+            connectWithFingerprintConfirm(
+                current.addr.trim(),
+                current.route.trim(),
+                current.token.trim(),
+            )
+            return
+        }
+
         core.connectTLS(
             current.addr.trim(),
             current.route.trim(),
             current.token.trim(),
             current.fingerprint.trim(),
         )
+    }
+
+    /**
+     * connectWithFingerprintConfirm 探测指纹并请求用户确认（首次连接，或指纹变了）。
+     *
+     * 与桌面端一致：**探测在校验之外**（还没指纹可校验），拿到之后弹窗，
+     * 用户确认才保存并连接。指纹变了要单独提示 —— 那可能是换证书，
+     * 也可能是被冒充，两种情况都该让用户看清楚再决定。
+     */
+    private fun connectWithFingerprintConfirm(addr: String, route: String, token: String) {
+        state.update { it.copy(connecting = true, connectError = "") }
+        viewModelScope.launch {
+            // 探测会阻塞到 TLS 握手完成（最多 3 秒），放到 IO 线程
+            val raw = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                core.probeFingerprint(addr)
+            }
+            val probe = decodeProbe(raw)
+            if (probe.error.isNotEmpty()) {
+                state.update {
+                    it.copy(connecting = false, connectError = "连不上 relay：${probe.error}")
+                }
+                return@launch
+            }
+            // 对端是明文 relay：直接连，不弹确认框（明文是合法用法）
+            if (probe.plain) {
+                state.update { it.copy(connecting = false) }
+                core.connectTLS(addr, route, token, "")
+                return@launch
+            }
+            if (probe.fingerprint.isEmpty()) {
+                state.update {
+                    it.copy(connecting = false, connectError = "没能取到对端的证书指纹")
+                }
+                return@launch
+            }
+            val previous = prefs.getString("fingerprint", "").orEmpty()
+            state.update {
+                it.copy(
+                    connecting = false,
+                    // 交给界面弹窗：pendingFingerprint 非空时显示确认框
+                    pendingFingerprint = PendingFingerprint(
+                        addr = addr,
+                        route = route,
+                        token = token,
+                        fingerprint = probe.fingerprint,
+                        changed = previous.isNotEmpty() && previous != probe.fingerprint,
+                    ),
+                )
+            }
+        }
+    }
+
+    /** ProbeResult 是 [CoreClient.probeFingerprint] 的解析结果。 */
+    private data class ProbeResult(
+        val fingerprint: String = "",
+        val plain: Boolean = false,
+        val error: String = "",
+    )
+
+    private fun decodeProbe(raw: String): ProbeResult {
+        if (raw.isEmpty()) return ProbeResult(error = "没有返回结果")
+        return try {
+            val obj = kotlinx.serialization.json.Json.parseToJsonElement(raw)
+                as kotlinx.serialization.json.JsonObject
+            fun str(key: String): String {
+                val value = obj[key] as? kotlinx.serialization.json.JsonPrimitive ?: return ""
+                return if (value is kotlinx.serialization.json.JsonNull) "" else value.content
+            }
+            fun bool(key: String): Boolean =
+                (obj[key] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true"
+            ProbeResult(
+                fingerprint = str("fingerprint"),
+                plain = bool("plain"),
+                error = str("error"),
+            )
+        } catch (e: Throwable) {
+            ProbeResult(error = "解析探测结果失败：${e.message}")
+        }
+    }
+
+    /**
+     * importRelayConfig 从 JSON 文件导入 relay 配置。
+     *
+     * 认的格式就是执行端存的那份 relay.json：
+     *
+     *	{"addr":"129.211.171.158:7900","token":"…","fingerprint":"…"}
+     *
+     * 好处：手机上不用手输地址、token 和 64 位指纹 —— 把执行端那份文件
+     * 传到手机上一选即可。字段都宽松处理（缺 token/指纹也能导入，
+     * 指纹缺了就按 TOFU 走）。
+     */
+    fun importRelayConfig(text: String) {
+        val config = try {
+            val obj = kotlinx.serialization.json.Json.parseToJsonElement(text)
+                as kotlinx.serialization.json.JsonObject
+            fun str(key: String): String {
+                val value = obj[key] as? kotlinx.serialization.json.JsonPrimitive ?: return ""
+                return if (value is kotlinx.serialization.json.JsonNull) "" else value.content
+            }
+            Triple(str("addr"), str("token"), str("fingerprint"))
+        } catch (e: Throwable) {
+            state.update { it.copy(connectError = "配置不是合法 JSON：${e.message}") }
+            return
+        }
+        val (addr, token, fingerprint) = config
+        if (addr.isBlank()) {
+            state.update { it.copy(connectError = "配置里没有 addr 字段") }
+            return
+        }
+        state.update {
+            it.copy(
+                addr = addr,
+                token = token,
+                fingerprint = fingerprint,
+                connectError = "",
+                toast = "已导入配置：$addr",
+            )
+        }
+    }
+
+    /** reportImportError 报告导入失败（读不了文件等）。 */
+    fun reportImportError(message: String) {
+        state.update { it.copy(connectError = message) }
+    }
+
+    /** 用户确认了指纹：保存并连接。 */
+    fun confirmFingerprint() {
+        val pending = state.value.pendingFingerprint ?: return
+        prefs.edit().putString("fingerprint", pending.fingerprint).apply()
+        state.update { it.copy(pendingFingerprint = null, fingerprint = pending.fingerprint) }
+        core.connectTLS(pending.addr, pending.route, pending.token, pending.fingerprint)
+    }
+
+    /** 用户拒绝了指纹：放弃这次连接。 */
+    fun dismissFingerprint() {
+        state.update { it.copy(pendingFingerprint = null, connecting = false) }
     }
 
     fun disconnect() {

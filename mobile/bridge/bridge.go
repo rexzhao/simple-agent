@@ -147,6 +147,31 @@ func (c *Client) Connect(addr, route, token string) string {
 // 非空时只接受**指纹完全一致**的服务端证书，不做 CA 校验（等价于"只信任这一台"）。
 //
 // 十六进制，可带冒号/空格，大小写不敏感。
+// ProbeFingerprint 探测对端的 TLS 证书指纹（**不做校验**）。
+//
+// 手机端首次连接时的 TOFU 用：先拿到指纹展示给用户确认，确认后把
+// 指纹存起来，下次直接用它严格校验（见 ConnectTLS 的 fingerprint 参数）。
+//
+// 返回 JSON（gomobile 只允许"一个值 + 可选 error"，所以打包成一个字符串）：
+//
+//	{"fingerprint":"…", "plain":true, "error":"…"}
+//
+//   - fingerprint：成功时是规范化的小写十六进制（无冒号）
+//   - plain：对端是**明文服务**（不是 TLS）——调用方应直接明文连接，
+//     不弹确认框也不报错（明文 relay 是合法用法）
+//   - error：真的连不上（超时/拒绝）
+//
+// 为什么放在 bridge 而不是手机上自己算：TLS 握手在 Go 侧
+// （gomobile 的连接逻辑在这里），手机端没有现成的 TLS 客户端栈可用。
+func (c *Client) ProbeFingerprint(addr string) string {
+	fingerprint, plain, err := tlsx.ProbeFingerprintOrPlain(addr, 3*time.Second)
+	result := map[string]any{"fingerprint": fingerprint, "plain": plain}
+	if err != nil {
+		result["error"] = err.Error()
+	}
+	return encode(result)
+}
+
 func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 	if addr == "" {
 		return "请填写执行端或 relay 的地址（host:port）"

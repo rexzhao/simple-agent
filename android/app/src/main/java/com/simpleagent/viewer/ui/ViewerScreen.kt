@@ -128,6 +128,10 @@ fun ViewerScreen(viewModel: ViewerViewModel) {
             onFingerprint = viewModel::updateFingerprint,
             onConnect = viewModel::connect,
             onDisconnect = viewModel::disconnect,
+            onConfirmFingerprint = viewModel::confirmFingerprint,
+            onDismissFingerprint = viewModel::dismissFingerprint,
+            onImportConfig = viewModel::importRelayConfig,
+            onImportError = viewModel::reportImportError,
         )
         return
     }
@@ -519,6 +523,12 @@ private fun ZoomableImageOrPlaceholder(
 
 // ---- 连接页 ----
 
+/** formatFingerprint 把 64 位十六进制分成 32 组、每 2 位加冒号。 */
+private fun formatFingerprint(value: String): String {
+    val clean = value.replace(":", "").replace(" ", "").lowercase()
+    return clean.chunked(2).joinToString(":")
+}
+
 @Composable
 private fun ConnectScreen(
     state: ViewerState,
@@ -528,7 +538,84 @@ private fun ConnectScreen(
     onFingerprint: (String) -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onConfirmFingerprint: () -> Unit,
+    onDismissFingerprint: () -> Unit,
+    onImportConfig: (String) -> Unit,
+    onImportError: (String) -> Unit,
 ) {
+    val context = LocalContext.current
+    // 从文件导入 relay 配置：省掉在手机上逐字输入地址/token/64 位指纹。
+    //
+    // 为什么用文件而不是二维码/剪贴板：relay 那边本来就有一份 relay.json
+    // （执行端的 /connect 保存的），直接把它传到手机上一选就行，不需要
+    // 手机有任何额外能力。
+    //
+    // 用 OpenDocument（而不是 GetContent）：配置文件是 .json，
+    // GetContent 的 MIME 过滤在部分机型上会把它藏起来。
+    val importConfig = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val text = try {
+            context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+        } catch (e: Throwable) {
+            null
+        }
+        if (text.isNullOrBlank()) {
+            onImportError("读不了这个文件")
+            return@rememberLauncherForActivityResult
+        }
+        onImportConfig(text)
+    }
+    // 指纹确认框（TOFU）：第一次连某台 relay 时弹出来，确认过的会记住。
+    state.pendingFingerprint?.let { pending ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = onDismissFingerprint,
+            title = {
+                Text(
+                    if (pending.changed) "证书指纹变了" else "信任这台 relay？",
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        if (pending.changed) {
+                            "${pending.addr} 的证书指纹和上次不一样了："
+                        } else {
+                            "首次连接 ${pending.addr}。它的证书指纹是："
+                        },
+                        fontSize = 13.sp,
+                    )
+                    // 指纹分组显示（每 2 位加冒号）：64 个连续十六进制字符
+                    // 人眼根本对不上，与 relay 打印的格式也一致
+                    Text(
+                        text = formatFingerprint(pending.fingerprint),
+                        fontSize = 12.sp,
+                        color = ViewerColors.muted,
+                    )
+                    Text(
+                        if (pending.changed) {
+                            "可能是换了证书，也可能是有人在冒充。确认无误再继续。"
+                        } else {
+                            "确认这是你要连的那台机器后再继续。确认后会记住，以后不再询问。"
+                        },
+                        fontSize = 12.sp,
+                        color = ViewerColors.muted,
+                    )
+                }
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = onConfirmFingerprint) {
+                    Text("信任并连接")
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = onDismissFingerprint) {
+                    Text("取消")
+                }
+            },
+        )
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -565,11 +652,14 @@ private fun ConnectScreen(
             modifier = Modifier.fillMaxWidth(),
         )
         // 传输加密：留空走明文；填了则只接受指纹完全一致的 relay 证书。
-        // 指纹由服务端 `--tls --tls-print-fingerprint` 打印（64 位十六进制，可带冒号）。
+        //
+        // 通常**不用手填**：留空时点连接会先探测对端指纹、弹窗让你确认，
+        // 确认过的会记住（跟 SSH 一样）。只有想重新确认、或连的是明文 relay
+        // 时才需要动这里。
         OutlinedTextField(
             value = state.fingerprint,
             onValueChange = onFingerprint,
-            label = { Text("证书指纹（启用 TLS 时填，留空则明文）") },
+            label = { Text("证书指纹（通常留空，连接时会让你确认）") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
@@ -583,6 +673,13 @@ private fun ConnectScreen(
                 } else {
                     Text("连接")
                 }
+            }
+            // 从文件导入配置：手机上手输地址 + token + 64 位指纹太痛苦，
+            // 直接把执行端那份 relay.json 传过来选一下就行。
+            androidx.compose.material3.OutlinedButton(
+                onClick = { importConfig.launch(arrayOf("*/*")) },
+            ) {
+                Text("导入配置")
             }
             // 兜底：连接页也要能断开。
             // 正常情况下"点连接"就会先断开再重连（bridge 层已处理），

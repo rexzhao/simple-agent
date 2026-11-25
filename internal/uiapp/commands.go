@@ -317,6 +317,46 @@ func (a *App) StartRelayRegistration(addr, token, fingerprint string) string {
 	if addr == "" {
 		return "relay 地址不能为空"
 	}
+
+	// **先把参数记下来**，再走可能的探测/确认。
+	//
+	// 顺序很重要：探测可能要几秒、甚至失败（地址打错、网络不通），
+	// 而用户刚手输的地址与 token 不该因为"这次没连上"就丢掉 ——
+	// 下次 /connect 不带参数还要用它们。
+	//
+	// **保留已有指纹**：saveRelay 是整体覆盖，这里传空会把之前确认过的
+	// 指纹抹掉（下次又要重新确认一遍）。只有确认新指纹时才更新它。
+	//
+	// previousFingerprint 要**先记下来**：下面 saveRelay 会把它覆盖掉，
+	// 而"指纹变了"的提示需要拿旧值比较。
+	previousFingerprint := fingerprint
+	if previousFingerprint == "" {
+		if saved := a.loadSavedRelay(); saved.Addr == addr {
+			previousFingerprint = saved.Fingerprint
+		}
+	}
+	a.saveRelay(savedRelay{Addr: addr, Token: token, Fingerprint: previousFingerprint})
+
+	// **没有显式给指纹**：可能是首次连接，也可能以前确认过。
+	//
+	// 客户端分不清"对端要不要 TLS"（只有连上去才知道），所以统一先探测：
+	//   - 对端是明文 → 直接明文连接，不打扰用户（老用法不受影响）
+	//   - 对端是 TLS、且指纹与已确认的一致 → **直接连**，不再询问
+	//   - 对端是 TLS、但指纹变了 → 弹窗提示"变了"，要用户重新确认
+	//
+	// 为什么"有保存的指纹也要探测"：不探测就发现不了**证书被换**，
+	// 那种情况下连接会失败并报"指纹不匹配"，用户完全不知道该怎么办
+	// （只能自己去改配置）。探测能把它变成一句"它变了，还信任吗"。
+	if fingerprint == "" {
+		if a.skipProbe {
+			// 探测已经失败过（对端是明文），直接走明文连接。
+			// **不加这个标志会无限递归**：明文连接又会进这里、又去探测。
+			fingerprint = ""
+		} else {
+			return a.probeThenConnect(addr, token, previousFingerprint)
+		}
+	}
+
 	tlsConfig := tlsx.Config{Fingerprint: fingerprint}
 	if fingerprint != "" {
 		if _, err := tlsConfig.ClientConfig(); err != nil {

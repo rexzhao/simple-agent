@@ -607,6 +607,13 @@ type App struct {
 	// **默认不展开**：没记录过就是收起。这是界面状态，不落盘 ——
 	// 重启后回到默认收起，与本项目其它折叠状态（sidebarGroupOpen）一致。
 	childOpen map[string]bool
+	// pendingFingerprint 是等待用户确认的 relay 证书指纹（见 fingerprint.go）。
+	pendingFingerprint *pendingFingerprint
+	// skipProbe 让 StartRelayRegistration **跳过指纹探测**（见 fingerprint.go）。
+	//
+	// 只在"探测失败 → 退回明文连接"这一条路径上临时置位。不加它会导致
+	// 无限递归：明文连接又进探测分支、又失败、又退回……
+	skipProbe bool
 	// executorList 是后台拉来的执行端列表缓存（渲染只读它，绝不发网络请求）。
 	executorList     []ExecutorRef
 	executorErr      string
@@ -1316,6 +1323,7 @@ func (a *App) View(c *ui.Context) {
 
 	})
 	a.confirmDialogs(c)
+	a.fingerprintDialog(c)
 }
 
 // mainPane 渲染右栏：标题 + 消息列表 + 提问面板 + 输入卡。

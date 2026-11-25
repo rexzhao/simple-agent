@@ -27,7 +27,12 @@ var enTable = map[string]string{
 
 	// Common
 	"session.childDefault":  "Sub-session",
-	"sidebar.childCount":    "%d sub-sessions",	"skill.pick.title":      "Choose a skill",
+	"sidebar.childCount":    "%d sub-sessions",	"relay.tofu.title":          "Trust this relay?",
+	"relay.tofu.message":        "First connection to %s.\n\nIts certificate fingerprint is:\n%s\n\nContinue only if this is the machine you meant to reach. It will be remembered and not asked again.",
+	"relay.tofu.changedTitle":   "Certificate fingerprint changed",
+	"relay.tofu.changedMessage": "The certificate fingerprint of %s differs from last time:\n\n%s\n\nEither the certificate was replaced, or someone is impersonating it. Continue only if you are sure.",
+	"relay.tofu.trust":          "Trust and connect",
+	"relay.tofu.probing":        "Fetching certificate fingerprint of %s…",	"skill.pick.title":      "Choose a skill",
 	"skill.pick.scope":      "from .agents/skills (project and shared)",
 	"skill.pick.empty":      "No skills in this project yet. Add .agents/skills/<name>/SKILL.md (~/.agents/skills works too).",
 	"skill.pick.hint":       "Picking one sends its full instructions to this session; nothing is loaded otherwise.",

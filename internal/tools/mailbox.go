@@ -167,7 +167,13 @@ func resolveRecipient(peers []MailboxPeer, to string) (*MailboxPeer, []MailboxPe
 	}
 	// 3) 没命中：把可发清单给模型，让它自己修正
 	if len(peers) == 0 {
-		return nil, nil, fmt.Errorf("本项目没有其它会话可以收信")
+		// 说明具体原因，别只丢一句"没有其它会话"——用户会以为功能坏了。
+		// 真实场景：项目里只有两个会话，一个是自己、另一个已归档，
+		// 于是清单为空。说出来用户才知道该去恢复归档会话或新建一个。
+		return nil, nil, fmt.Errorf(
+			"本项目没有可收信的会话。" +
+				"只能发给**同一项目内、未归档**的其它会话；" +
+				"已归档的会话恢复后才能收信。")
 	}
 	var lines []string
 	for _, peer := range peers {

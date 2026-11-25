@@ -166,6 +166,76 @@ func (c Config) Dial(addr string) (net.Conn, error) {
 	return conn, nil
 }
 
+// ProbeFingerprint 连一次对端，**只取证书指纹、不做任何校验**。
+//
+// 用途：首次连接时的 TOFU（trust on first use）——先拿到指纹展示给用户确认，
+// 确认过之后才保存下来，以后用它做严格校验（见 ClientConfig）。
+//
+// 也用来判断"对端到底是不是 TLS 服务"：明文服务收到 TLS 握手包会直接断开
+// 或回垃圾数据，两种都表现为 error，调用方据此退回明文连接。
+//
+// 为什么单独一个函数而不是"拨号失败时顺便拿"：探测阶段必须**不校验**，
+// 而正常拨号必须**严格校验**，两者的 tls.Config 不同，混在一起很容易
+// 写出"校验形同虚设"的实现。
+//
+// 注意它只完成握手就断开，不发任何业务数据。返回的指纹是规范化后的
+// 小写十六进制（无冒号），可直接存进配置。
+func ProbeFingerprint(addr string, timeout time.Duration) (string, error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+		// 探测阶段无法校验（还没指纹），这里必须跳过。
+		// **它不会被用在正式连接上** —— 那一侧由 ClientConfig 严格校验。
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+	})
+	if err != nil {
+		return "", fmt.Errorf("连不上 %s：%w", addr, err)
+	}
+	defer conn.Close()
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return "", fmt.Errorf("对端 %s 没有提供证书", addr)
+	}
+	sum := sha256.Sum256(certs[0].Raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// ProbeFingerprintOrPlain 探测指纹；对端是明文时返回 (\"\", plain=true)。
+//
+// 与 ProbeFingerprint 的区别：把"对端不是 TLS"和"连不上"区分开。
+// 前者是正常情况（明文 relay），后者才是错误 —— 调用方要能分辨，
+// 否则明文 relay 会被当成连接失败。
+//
+// 判据：明文服务收到 TLS 握手（ClientHello）后，要么立刻断开（EOF/reset），
+// 要么回一段不是 TLS 的数据。两种情况都归为"明文"。
+// 超时不算明文 —— 那更像是网络不通，交给调用方报错。
+func ProbeFingerprintOrPlain(addr string, timeout time.Duration) (fingerprint string, plain bool, err error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+	})
+	if err == nil {
+		defer conn.Close()
+		certs := conn.ConnectionState().PeerCertificates
+		if len(certs) == 0 {
+			return "", true, nil
+		}
+		sum := sha256.Sum256(certs[0].Raw)
+		return hex.EncodeToString(sum[:]), false, nil
+	}
+	// 握手失败：分清"对端是明文"和"真的连不上"。
+	//
+	// 明文服务的行为是**立刻**断开或回非 TLS 数据，所以出错很快；
+	// 若是超时，说明包发出去没回应，那是网络问题。
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "", false, fmt.Errorf("连不上 %s：%w", addr, err)
+	}
+	// 非超时的握手失败 = 对端不是 TLS（或证书都不能用），按明文处理。
+	return "", true, nil
+}
+
 // ---- 自签证书生成 ----
 
 // EnsureCert 确保证书文件存在，不存在就用自签方式生成。
