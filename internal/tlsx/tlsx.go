@@ -76,8 +76,11 @@ type Config struct {
 	// OnPeerFingerprint 在**没有预设指纹**时被调用：拿到对端证书 DER，
 	// 由它决定接受还是拒绝（返回 error 即拒绝）。
 	//
-	// 这是 TOFU 的挂载点：调用方据此查信任列表、或记下新指纹并提示用户。
+	// 这是 TOFU 的挂载点：调用方据此查信任列表、必要时问用户。
 	// 有预设指纹时不会被调用（那种情况下 ClientConfig 已装好严格校验）。
+	//
+	// **实现方可以阻塞**（比如等用户点弹窗）：握手期间连接尚未建立，
+	// 阻塞只影响这一条连接，不影响 Accept 循环或界面线程。
 	OnPeerFingerprint func(addr string, certDER []byte) error
 }
 

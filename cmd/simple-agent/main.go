@@ -271,6 +271,12 @@ func main() {
 			source.remote = remote
 			executors = source
 		default:
+			// 其余错误：没开 TLS（被严格隔离拒掉）、网络不通、口令错等，
+			// 都是真实失败，直接报错。
+			//
+			// 注意：**指纹确认不在这里**。它在 TLS 握手内部阻塞完成
+			// （用户同意则握手继续、连接成功；取消则握手失败）。
+			// 所以不会出现"先失败、用户点了确认、又自己重连"这种现象。
 			showFatal(locale.Tr("dialog.config.title"), openErr.Error())
 			return
 		}
@@ -334,10 +340,10 @@ func main() {
 		if trustErr != nil {
 			log.Printf("信任列表读取失败（将重新询问所有对端）：%v", trustErr)
 		}
-		setViewerTrust(store, newGate(func() {
+		setupViewerTrust(store, func() {
 			// 有新的待确认 viewer：让界面刷一下，弹确认框
 			post(func() { app.NotifyDisplay("") })
-		}))
+		})
 		app.SetViewerTrustUI(gateAdapter{gate: viewerGate})
 
 		stop, port, fingerprint, err := startListener(listenAddr, app, post)
@@ -349,6 +355,16 @@ func main() {
 		listenPort = port
 		listenFingerprint = fingerprint
 		defer stopListener()
+	}
+
+	// **viewer 侧的指纹确认界面**：连对端时如果有未确认的证书，
+	// TLS 握手会阻塞在 peerGate 上等用户决定（见 tls.go）。
+	//
+	// 这里才装通知回调：app 刚创建好，之前 setupTLS 时还拿不到它。
+	// 不用 post：RequestRedraw 本身是线程安全的（内部会 postMain）。
+	if peerGate != nil {
+		peerGate.Notify = func() { app.RequestRedraw() }
+		app.SetPeerConfirmer(gateAdapter{gate: peerGate})
 	}
 
 	// 执行端注册到 relay（有界面也可以）：断线自动重连并重新注册

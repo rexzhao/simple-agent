@@ -1,4 +1,4 @@
-﻿package locale
+package locale
 
 // enTable 是英文文案表（key 与 zhTable 必须完全一致，见 locale_test.go）。
 var enTable = map[string]string{
@@ -32,7 +32,11 @@ var enTable = map[string]string{
 	"viewer.trust.changedTitle":   "Viewer certificate fingerprint changed",
 	"viewer.trust.changedMessage": "%s is requesting access, but its certificate fingerprint differs from last time.\n\nPrevious: %s\nCurrent:  %s\n\nThe client may have been reinstalled — or someone is impersonating it.",
 	"viewer.trust.allow":          "Allow",
-	"viewer.trust.deny":           "Deny",	"relay.tofu.title":          "Trust this relay?",
+	"viewer.trust.deny":           "Deny",	"peer.tofu.title":          "Trust this peer?",
+	"peer.tofu.message":        "First connection to %s.\n\nIts certificate fingerprint is:\n%s\n\nContinue only if this is the machine you meant to reach. It will be remembered.",
+	"peer.tofu.changedTitle":   "Peer certificate fingerprint changed",
+	"peer.tofu.changedMessage": "The certificate fingerprint of %s differs from last time.\n\nPrevious: %s\nCurrent:  %s\n\nThe certificate may have been replaced — or someone is impersonating it.",
+	"peer.tofu.trust":          "Trust and connect",	"relay.tofu.title":          "Trust this relay?",
 	"relay.tofu.message":        "First connection to %s.\n\nIts certificate fingerprint is:\n%s\n\nContinue only if this is the machine you meant to reach. It will be remembered and not asked again.",
 	"relay.tofu.changedTitle":   "Certificate fingerprint changed",
 	"relay.tofu.changedMessage": "The certificate fingerprint of %s differs from last time:\n\n%s\n\nEither the certificate was replaced, or someone is impersonating it. Continue only if you are sure.",

@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"simple-agent/internal/config"
+	"simple-agent/internal/peerverify"
 	"simple-agent/internal/tlsx"
 	"simple-agent/internal/trust"
 	"simple-agent/internal/wire"
@@ -19,6 +20,17 @@ import (
 //  2. 客户端侧（--tls-fingerprint）：装到 wire 的拨号钩子上，
 //     所有 wire.Dial 调用点（relay 客户端、执行端直连）自动走 TLS；
 //  3. --tls-print-fingerprint：只打印指纹后退出，方便把指纹填到客户端。
+//
+// viewer 侧的指纹确认（net 层实现见 internal/peerverify）。
+//
+// 全局变量而不是层层传参：`OnPeerFingerprint` 与 `wire.DialFunc` 都是
+// 全局钩子，顺着调用链传会污染一大片签名。
+var (
+	peerGate       *peerverify.Gate
+	activeVerifier *peerverify.Verifier
+)
+
+// setupTLS 按命令行/配置装好 TLS。
 //
 // 返回 false 表示应该直接退出（打印指纹模式）。
 func setupTLS(cfg *config.Config, opts remoteOptions) bool {
@@ -99,28 +111,35 @@ func setupTLS(cfg *config.Config, opts remoteOptions) bool {
 			log.Printf("TLS：客户端配置有误：%v", err)
 			os.Exit(1)
 		}
-		// **TOFU：校验对端指纹**（查信任列表 / 首次记录并提示）。
+		// **TOFU：校验对端指纹**（查信任列表；首次/变了 → 返回待确认错误）。
 		//
 		// 用户要求"viewer 只需要加 --tls 就行，指纹并不是必须参数" ——
 		// 但"不要求指纹"不等于"不校验"，否则谁都能冒充 relay/执行端。
-		// 这里把校验推迟到握手时：有记录就严格比对，没见过就记下来提示。
+		//
+		// 这里**不阻塞、不自动信任**：遇到未确认的对端就返回
+		// 指纹确认（net 层实现，见 internal/peerverify）：
+		//
+		// **握手期间阻塞等用户确认** —— 用户同意则握手继续、连接成功；
+		// 取消则握手失败、连接建立不起来。所以用户看到的是"我同意了就连上"，
+		// 而不是"先失败、又自己重连"。
+		//
+		// 等待**不计入任何超时**：网络 IO 有自己的超时，但人看弹窗的速度
+		// 不是网络速度 —— 给"等用户"设上限的话，去倒杯水回来就被判成取消了。
 		store, trustErr := trust.Open(trust.DefaultPath(cfg.DataDir))
 		if trustErr != nil {
 			log.Printf("TLS：信任列表读取失败（将重新确认所有对端）：%v", trustErr)
 		}
-		tofu := &viewerTOFU{
-			store: store,
-			role:  trust.RoleRelay,
-			pinned: tlsCfg.Fingerprint,
-			callback: func(addr, fingerprint string) {
-				log.Printf("首次连接 %s，证书指纹 %s（已记入信任列表）",
-					addr, trust.Format(fingerprint))
-			},
+		// 有新的待确认对端时界面会自动弹窗（帧循环每帧查一次 Pending），
+		// 所以这里不需要额外的通知回调。
+		peerGate = &peerverify.Gate{}
+		verifier := &peerverify.Verifier{
+			Store:  store,
+			Role:   trust.RoleRelay,
+			Pinned: tlsCfg.Fingerprint,
+			Ask:    peerGate.Ask,
 		}
-		tlsCfg.OnPeerFingerprint = func(addr string, der []byte) error {
-			tofu.addr = addr
-			return tofu.verify([][]byte{der}, nil)
-		}
+		activeVerifier = verifier
+		tlsCfg.OnPeerFingerprint = verifier.Verify
 
 		wire.SetDialFunc(tlsCfg.Dial)
 		if tlsCfg.HasFingerprint() {

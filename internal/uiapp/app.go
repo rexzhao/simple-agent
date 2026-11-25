@@ -614,6 +614,10 @@ type App struct {
 	// 为 nil 表示当前进程不是执行端、或者没开 --listen —— 那种情况下
 	// 没有"别人要连进来"这回事。
 	viewerTrust ViewerTrust
+	// peerConfirmer 是 viewer 连接对端时的指纹确认界面（见 peerconfirm.go）。
+	//
+	// 与上面 viewerTrust 方向相反：那个是"验证来连我的"，这个是"验证我要连的"。
+	peerConfirmer PeerConfirmer
 	// skipProbe 让 StartRelayRegistration **跳过指纹探测**（见 fingerprint.go）。
 	//
 	// 只在"探测失败 → 退回明文连接"这一条路径上临时置位。不加它会导致
@@ -1330,6 +1334,7 @@ func (a *App) View(c *ui.Context) {
 	a.confirmDialogs(c)
 	a.fingerprintDialog(c)
 	a.viewerTrustDialog(c)
+	a.peerConfirmDialog(c)
 }
 
 // mainPane 渲染右栏：标题 + 消息列表 + 提问面板 + 输入卡。

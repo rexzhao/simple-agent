@@ -1,4 +1,4 @@
-﻿package locale
+package locale
 
 // 文案表。约定（见包注释）：
 //   - dsh 里有的 key 直接沿用（`session.new.label`、`time.*`、`message.stepProcess.*`、
@@ -38,7 +38,11 @@ var zhTable = map[string]string{
 	"viewer.trust.changedTitle":   "viewer 的证书指纹变了",
 	"viewer.trust.changedMessage": "%s 请求连接，但它的证书指纹和上次不一样了。\n\n上次：%s\n现在：%s\n\n可能是重装了客户端，也可能是有人在冒充。确认无误再允许。",
 	"viewer.trust.allow":          "允许",
-	"viewer.trust.deny":           "拒绝",	"relay.tofu.title":          "信任这台 relay？",
+	"viewer.trust.deny":           "拒绝",	"peer.tofu.title":          "信任这个对端吗？",
+	"peer.tofu.message":        "首次连接 %s。\n\n它的证书指纹是：\n%s\n\n确认这是你要连的那台机器后再继续。确认后会记住，以后不再询问。",
+	"peer.tofu.changedTitle":   "对端证书指纹变了",
+	"peer.tofu.changedMessage": "%s 的证书指纹和上次不一样了。\n\n上次：%s\n现在：%s\n\n可能是换了证书，也可能是有人在冒充。确认无误再继续。",
+	"peer.tofu.trust":          "信任并连接",	"relay.tofu.title":          "信任这台 relay？",
 	"relay.tofu.message":        "首次连接 %s。\n\n它的证书指纹是：\n%s\n\n确认这是你要连的那台机器后再继续。确认后会记住，以后不再询问。",
 	"relay.tofu.changedTitle":   "证书指纹变了",
 	"relay.tofu.changedMessage": "%s 的证书指纹和上次不一样了：\n\n%s\n\n可能是换了证书，也可能是有人在冒充。确认无误再继续。",
