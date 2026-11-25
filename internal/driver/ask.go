@@ -96,6 +96,47 @@ func (g *AskGroup) Toggle(questionIndex, optionIndex int) {
 	}
 }
 
+// Select 把某题的选中项**直接设为给定集合**（幂等）。
+//
+// # 为什么需要它（而不是用 Toggle）
+//
+// `Toggle` 是切换语义：已选中的再调一次就取消了。所以用它"应用一批选择"
+// 只在目标状态是空白时才正确 —— 而实际场景里两边都可能已经有状态：
+//
+//   - 展示端提交答案时，执行端的 driver 可能已经被本机界面勾过
+//     （同一台机器开着两个界面）
+//   - 重连重发时，同一批选择会被应用第二次
+//
+// 用 Toggle 的后果是"应用两次 = 取消"，模型收到 selected:[]。
+// 这正是「多选没发给 LLM」反复出现的原因。
+//
+// Select 先清空再设置，无论之前什么状态，结果都是给定的集合。
+func (g *AskGroup) Select(questionIndex int, optionIndexes []int) {
+	if questionIndex < 0 || questionIndex >= len(g.Questions) {
+		return
+	}
+	question := g.Questions[questionIndex]
+	clear(g.selected[questionIndex])
+	// 单选只保留最后一个（与界面点击语义一致：后点的覆盖前面的）
+	if !question.MultiSelect && len(optionIndexes) > 1 {
+		optionIndexes = optionIndexes[len(optionIndexes)-1:]
+	}
+	for _, optionIndex := range optionIndexes {
+		if optionIndex < 0 || optionIndex >= len(question.Options) {
+			continue
+		}
+		g.selected[questionIndex][optionIndex] = struct{}{}
+	}
+	// 选了选项就以选项作答；没选任何项时把手写文字重新当成答案
+	if questionIndex < len(g.customActive) {
+		if len(g.selected[questionIndex]) > 0 {
+			g.customActive[questionIndex] = false
+		} else {
+			g.restoreCustom(questionIndex)
+		}
+	}
+}
+
 // SetCustom 记录第 index 题的手写答案。
 //
 // 文字非空时清掉该题的选项：用户写了内容就说明这一题按文字作答，

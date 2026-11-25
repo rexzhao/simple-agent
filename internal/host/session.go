@@ -672,32 +672,37 @@ func (s *Session) submitAsks(payload AnswerPayload) CmdResult {
 	if s.drv.Busy() != driver.BusyAwaitingAnswer {
 		return CmdResult{Notice: s.cfg.Tr("ask.answeredElsewhere")}
 	}
-	// 来自展示端的答案：先把选择应用回执行端自己的提问组，再统一提交。
+	// 把答案里的选择应用回执行端的提问组，再统一提交。
 	//
-	// **只在展示端做**（s.view != nil）。本地界面与执行端共享同一个 driver，
-	// 它勾选的选项已经在 driver 里了；再 Toggle 一遍等于把每项**切换回未选**
-	// —— 模型收到的就是 selected:[]（这正是「多选没发给 LLM」的根因）。
-	if s.view != nil {
+	// # 为什么判断依据是"答案带了选择"，而不是"当前是不是展示端"
+	//
+	// 以前这里写的是 `if s.view != nil`（展示端才应用），思路是"展示端
+	// 要把用户的选择回传执行端"。但**执行端处理远端 viewer 的 answer
+	// 时 s.view 恰好是 nil**（它就是执行端本地会话），于是这段整个被跳过
+	// —— 远端 viewer 勾的选项一个都没落地，模型收到 selected:[]。
+	// 这正是"远端 viewer 的回答没传给执行端"的根因。
+	//
+	// 本地界面提交时同样带着 Answers（见 uiapp 的 submitAsks），所以
+	// 不能用"有没有 Answers"区分两端 —— 两边都要应用，且必须用
+	// **幂等的 Select**（不是 Toggle）：界面上已经勾好的项再 Toggle
+	// 一次就取消了，模型收到 selected:[]（这个坑踩过两次）。
+	if len(payload.Answers) > 0 {
 		for _, answer := range payload.Answers {
 			for _, group := range s.drv.AskGroups() {
 				if group.CallID != answer.CallID {
 					continue
 				}
 				for index, question := range group.Questions {
-					// **顺序不能反：先写文字，再勾选项。**
+					// **顺序不能反：先写文字，再设选项。**
 					//
 					// SetCustom（文字非空时）会清掉该题已选的选项 —— 这是有意的：
-					// 用户开始写文字就说明这题以文字作答，界面上的选中标记也该消失。
-					// 如果先 Toggle 再 SetCustom，刚勾好的选项会被全部清空。
-					//
-					// 反过来先 SetCustom 再 Toggle 就对了：勾选会把 customActive
+					// 用户开始写文字就说明这题以文字作答。
+					// 反过来先 SetCustom 再 Select 就对了：选选项会把 customActive
 					// 置回 false，语义是"以勾选的选项为准"。
 					if text := answer.Custom[question.ID]; text != "" {
 						group.SetCustom(index, text)
 					}
-					for _, option := range answer.Selected[question.ID] {
-						group.Toggle(index, option)
-					}
+					group.Select(index, answer.Selected[question.ID])
 				}
 			}
 		}
