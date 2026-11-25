@@ -1,10 +1,10 @@
 ﻿# 执行端开发循环：反复调用 start-agent.ps1（编译 + 启动 + 等退出）。
 #
 # 用法（在仓库根目录）：
-#   pwsh -File scripts/dev-agent.ps1
-#   pwsh -File scripts/dev-agent.ps1 -Listen                 # 随机端口 + relay
-#   pwsh -File scripts/dev-agent.ps1 -Listen -ListenAddr 0.0.0.0:7900
-#   pwsh -File scripts/dev-agent.ps1 -NoRelay                # 只本地跑
+#   pwsh -File scripts/dev-agent.ps1                        relay + 局域网直连（默认）
+#   pwsh -File scripts/dev-agent.ps1 -ListenAddr 0.0.0.0:7900
+#   pwsh -File scripts/dev-agent.ps1 -Listen:$false          不监听
+#   pwsh -File scripts/dev-agent.ps1 -NoRelay                只本地跑
 #
 # 更新二进制的办法：**杀掉当前的 simple-agent 进程**（任务管理器、
 # `taskkill /IM simple-agent.exe /F`，或在这个窗口按 Ctrl+C 停脚本后重开）。
@@ -23,7 +23,9 @@ param(
     [string]$Relay = "",
     [string]$Name = "",
     [switch]$NoRelay,
-    [switch]$Listen,
+    # **默认为 $true**（与 start-agent.ps1 一致）：局域网直连默认开。
+    # 想关掉用 -Listen:$false。
+    [switch]$Listen = $true,
     [string]$ListenAddr = "",
     # 两次重启之间的等待秒数
     [int]$RestartDelaySeconds = 5,

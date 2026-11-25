@@ -21,9 +21,12 @@ param(
     [string]$Name = "",
     # 只本地跑，不注册 relay
     [switch]$NoRelay,
-    # 监听：局域网直连用。不写就完全不监听（默认对外不开入口）。
-    # 只写 -Listen 表示随机端口，地址经 relay 上报给展示端。
-    [switch]$Listen,
+    # 监听：局域网直连用。
+    #
+    # **默认开启**（随机端口，地址经 relay 上报给展示端）：同一 WiFi 下的
+    # 手机/另一台电脑会优先直连（1~2ms），不在同一网络时自动回退 relay。
+    # 想关掉用 -Listen:$false。
+    [switch]$Listen = $true,
     # 与 -Listen 搭配的监听地址（不给 = 随机端口）
     [string]$ListenAddr = "",
     # 传给执行端的额外参数
