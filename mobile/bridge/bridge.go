@@ -224,7 +224,7 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 			c.saveExecutors(lanList)
 			// 目标已确定才试直连（不知道连谁就无法挑地址）
 			if chosen != "" {
-				if lanConn := c.dialLANFor(chosen); lanConn != nil {
+				if lanConn := c.dialLANFor(chosen, token); lanConn != nil {
 					if conn != nil {
 						_ = conn.Close()
 					}
@@ -279,7 +279,7 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 // 单次超时 800ms：局域网内 RST/不可达通常几十毫秒就返回；800ms 覆盖慢速
 // WiFi，又不至于让"不在同一网络"卡太久（那种情况会走到超时才回退 relay，
 // 用户等的就是这个时间）。
-func (c *Client) dialLANFor(hostID string) wire.Conn {
+func (c *Client) dialLANFor(hostID, token string) wire.Conn {
 	if hostID == "" {
 		return nil
 	}
@@ -303,8 +303,9 @@ func (c *Client) dialLANFor(hostID string) wire.Conn {
 			//
 			// 两者是不同的自签名证书：拿 relay 的指纹去校验执行端，
 			// 结果一定是"证书指纹不匹配"（实测就是这个），直连永远失败。
-			conn, err := dialLANWith(addr.String(), addr.TLSFingerprint, lanDialTimeout)
+			conn, err := dialLANWith(addr.String(), addr.TLSFingerprint, token, lanDialTimeout)
 			if err != nil {
+				log.Printf("展示端：直连 %s 失败（%v），回退 relay", addr.String(), err)
 				continue
 			}
 			log.Printf("展示端：已直连执行端 %s 的局域网地址 %s", hostID, addr.String())
@@ -314,46 +315,72 @@ func (c *Client) dialLANFor(hostID string) wire.Conn {
 	return nil
 }
 
-// dialLANWith 拨一条到局域网地址的连接。
+// dialLANWith 拨一条到局域网地址的连接**并完成执行端握手**。
 //
-// fingerprint 为空 = 明文直连（执行端只配了 --tls-fingerprint 而没有
-// 服务端证书时，它的监听就是明文的）。这与"用户直接 --connect 执行端"
-// 是同一种行为，不额外降低安全性。
+// 两件事都要做，缺一个都连不上：
 //
-// **不复用全局 wire.Dial**：那套钩子挂的是 relay 的指纹。直连执行端时
-// 校验的必须是执行端的证书（两者是不同的自签名证书），否则必然
-// "证书指纹不匹配"（实测踩过，直连永远失败）。
-func dialLANWith(addr, fingerprint string, timeout time.Duration) (wire.Conn, error) {
+//  1. 建连（明文 TCP 或 TLS，取决于执行端监听方式）
+//  2. **发 hello、收 welcome** —— 执行端的握手协议与 relay 完全不同：
+//     relay 用 MsgRoute 路由，执行端用 hello/welcome 认证。
+//     以前这里只建连不握手，host.NewRemoteWithToken 拿到一条没握手的连接，
+//     必然失败并回退 relay（真机上表现为"直连永远不生效"）。
+func dialLANWith(addr, fingerprint, token string, timeout time.Duration) (wire.Conn, error) {
+	raw, err := dialLANRaw(addr, fingerprint, timeout)
+	if err != nil {
+		return nil, err
+	}
+	conn := wire.NewTCPConn(raw)
+	hello, _ := wire.Encode(wire.Hello{
+		Protocol: wire.Protocol, Role: "viewer", Purpose: "control",
+		// **执行端的 token**，不是 relay 的。它们是两套独立的认证：
+		// relay 保护"经过 relay 这一跳"，执行端保护"直连这一跳"。
+		Credentials: wire.Credentials{Kind: "none", Token: token},
+	})
+	if err := conn.Send(wire.Packet{Kind: "hello", Body: hello}); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	first, err := conn.Recv()
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if first.Kind != "welcome" {
+		_ = conn.Close()
+		return nil, fmt.Errorf("对端不是执行端（收到 %s）", first.Kind)
+	}
+	var welcome wire.Welcome
+	_ = wire.Decode(first.Body, &welcome)
+	if welcome.Error != "" {
+		_ = conn.Close()
+		return nil, errors.New(welcome.Error)
+	}
+	// welcome 垫回去：连接已握手，上层不再重复 hello
+	return wire.Prefetch(conn, first), nil
+}
+
+// dialLANRaw 只负责建连（不含握手）。
+func dialLANRaw(addr, fingerprint string, timeout time.Duration) (net.Conn, error) {
 	type result struct {
-		conn wire.Conn
+		conn net.Conn
 		err  error
 	}
 	done := make(chan result, 1)
 	cfg := tlsx.Config{Fingerprint: fingerprint}
 	go func() {
 		if fingerprint == "" {
-			// 明文：直接 TCP，不做 TLS 握手
+			// 明文：执行端只配了 --tls-fingerprint（客户端方向）、
+			// 没有服务端证书时，它的监听就是明文的
 			raw, err := net.DialTimeout("tcp", addr, timeout)
-			if err != nil {
-				done <- result{err: err}
-				return
-			}
-			done <- result{conn: wire.NewTCPConn(raw)}
+			done <- result{conn: raw, err: err}
 			return
 		}
 		raw, err := cfg.Dial(addr)
-		if err != nil {
-			done <- result{err: err}
-			return
-		}
-		done <- result{conn: wire.NewTCPConn(raw)}
+		done <- result{conn: raw, err: err}
 	}()
 	select {
 	case r := <-done:
-		if r.err != nil {
-			return nil, r.err
-		}
-		return r.conn, nil
+		return r.conn, r.err
 	case <-time.After(timeout):
 		// 超时后台回收：迟到的连接要关掉，否则泄漏
 		go func() {
