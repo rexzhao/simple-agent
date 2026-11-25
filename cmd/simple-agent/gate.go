@@ -71,6 +71,17 @@ func peerFingerprint(conn net.Conn) string {
 	if !ok {
 		return ""
 	}
+	// **必须先完成握手**，否则 ConnectionState() 里没有对端证书。
+	//
+	// accept 返回的 *tls.Conn 是"懒握手"的：证书要等第一次 Read/Write
+	// 才会拿到。而我们在交给 host.Serve 之前就要判断"来的是谁"，
+	// 那时还没读过任何字节 —— 直接查 ConnectionState 得到的是空，
+	// 于是每个连接都被判成"没有出示客户端证书"而无条件拒绝
+	// （真实踩到：viewer 用对了证书依然被拒）。
+	if err := tlsConn.Handshake(); err != nil {
+		log.Printf("执行端：TLS 握手失败（%s）：%v", conn.RemoteAddr(), err)
+		return ""
+	}
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		return ""

@@ -148,6 +148,17 @@ func (c Config) ServerConfig() (*tls.Config, error) {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
+		// **要求客户端出示证书**（mTLS）。
+		//
+		// 不设这一项时服务端根本不发 CertificateRequest，客户端也就
+		// 不会发送自己的证书 —— 于是"验证来连的是谁"永远拿不到材料，
+		// 表现为"没有出示客户端证书"然后拒绝每个连接（真实踩到）。
+		//
+		// 用 RequestClientCert 而不是 RequireAndVerifyClientCert：
+		// 后者会用系统 CA 校验链，而我们是自签证书、只认指纹。
+		// 证书验证在应用层做（peerverify 按指纹查信任列表），
+		// 那比 CA 链更符合这个项目的信任模型。
+		ClientAuth: tls.RequestClientCert,
 	}, nil
 }
 
