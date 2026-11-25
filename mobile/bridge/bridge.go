@@ -220,6 +220,15 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 		// host_id 就把列表扔了，于是直连永远不生效（真机上表现为
 		// "明明在同一局域网还是走中转、加载很慢"）。
 		conn, chosen, lanList, err := relay.OpenViewerTokenList(addr, target, token)
+		// 这条日志是排查"为什么没走直连"的第一手材料：它直接显示
+		// 列表有没有拿到、每个执行端有几个局域网地址。
+		//
+		// 直连的失败模式**全都是静默回退 relay**（界面表现和"没有直连功能"
+		// 一模一样），没有日志根本无从下手 —— 这个功能排查时正是靠它定位的。
+		log.Printf("展示端：执行端列表 %d 个（选中 %q）", len(lanList), chosen)
+		for _, e := range lanList {
+			log.Printf("  %s：%d 个局域网地址", e.HostID, len(e.LANAddrs))
+		}
 		if len(lanList) > 0 {
 			c.saveExecutors(lanList)
 			// 目标已确定才试直连（不知道连谁就无法挑地址）
