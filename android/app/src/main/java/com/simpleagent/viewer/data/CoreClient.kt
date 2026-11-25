@@ -117,10 +117,6 @@ class CoreClient private constructor(
     fun syncCursor(sessionId: String): SyncCursor =
         decode(client.syncCursorJSON(sessionId), SyncCursor())
 
-    /** 取一份完整时间线（含 sync 游标）—— 缓存写入时用。 */
-    fun timeline(sessionId: String): TimelineView =
-        decode(client.timelineJSON(sessionId), TimelineView())
-
     /** 取一个过程组的完整步骤（用户展开时调；折叠时 Go 侧不传 Steps）。 */
     fun processDetail(sessionId: String, key: String): List<ProcessStep> {
         val page = decode(client.processDetailJSON(sessionId, key), ProcessDetailPage())

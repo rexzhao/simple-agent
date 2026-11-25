@@ -2,6 +2,7 @@ package com.simpleagent.viewer.data
 
 import com.simpleagent.viewer.data.SessionSummary
 import com.simpleagent.viewer.data.TimelineView
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import java.io.File
 
@@ -52,7 +53,9 @@ class LocalCache(private val root: File) {
     /** writeSessions 整表覆盖（列表很小，没必要做增量）。 */
     fun writeSessions(sessions: List<SessionSummary>) {
         runCatching {
-            sessionsFile.writeText(json.encodeToString(sessions))
+            // 显式类型参数：encodeToString 有多个重载，从 List<T> 推不出
+            // 该用哪个（编译期会报"无法推断类型"）。
+            sessionsFile.writeText(json.encodeToString(ListSerializer(SessionSummary.serializer()), sessions))
         }
     }
 
@@ -76,7 +79,7 @@ class LocalCache(private val root: File) {
     /** writeTimeline 写入某个会话的历史。 */
     fun writeTimeline(view: TimelineView) {
         runCatching {
-            timelineFile(view.sessionId).writeText(json.encodeToString(view))
+            timelineFile(view.sessionId).writeText(json.encodeToString(TimelineView.serializer(), view))
         }
     }
 
