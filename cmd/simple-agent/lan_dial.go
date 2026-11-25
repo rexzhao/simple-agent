@@ -71,9 +71,18 @@ func verifierStore() *trust.Store {
 //     执行端的 token 挡"直连这一跳"，是两套
 func openViewer(relayAddr, target, token, relayFingerprint string, list []relay.Executor) (wire.Conn, string, error) {
 	// 1. 有局域网地址就试直连
-	if conn, chosen := tryLAN(target, token, list); conn != nil {
+	lanConn, lanHost, lanNotReady := tryLAN(target, token, list)
+	if lanConn != nil {
 		setLinkMode(LinkDirect)
-		return conn, chosen, nil
+		return lanConn, lanHost, nil
+	}
+	// **直连因为"界面未就绪"而没试成**：把信号传出去，由上层在界面
+	// 就绪后重连（那时才会真正弹窗确认执行端指纹）。
+	//
+	// 不能在这里静默回退 relay：用户明明在同一局域网，却会一直走中转，
+	// 而且界面上只看到一个云图标，完全不知道为什么。
+	if lanNotReady {
+		return nil, "", peerverify.ErrNotReady
 	}
 
 	// 2. 回退 relay（原来的路径，一字未改）
@@ -118,7 +127,11 @@ func currentLinkMode() LinkMode {
 }
 
 // tryLAN 逐个尝试目标执行端的局域网地址，成功返回已握手的连接。
-func tryLAN(target, token string, list []relay.Executor) (wire.Conn, string) {
+//
+// 第二个返回值是**"界面未就绪"**：表示直连不是失败了，只是此刻没人能
+// 回答指纹确认。调用方应当**稍后重试**，而不是永久回退 relay ——
+// 后者会让用户明明在同一局域网却一直走中转（真实踩到）。
+func tryLAN(target, token string, list []relay.Executor) (conn wire.Conn, hostID string, notReady bool) {
 	for _, executor := range list {
 		if target != "" && executor.HostID != target {
 			continue
@@ -127,17 +140,22 @@ func tryLAN(target, token string, list []relay.Executor) (wire.Conn, string) {
 			if !addr.Dialable() {
 				continue
 			}
-			conn, err := dialLAN(addr, token)
+			lanConn, err := dialLAN(addr, token)
 			if err != nil {
 				// 打出来：以前这里静默 continue，"为什么没走直连"完全看不出
 				log.Printf("展示端：直连 %s 失败（%v），回退 relay", addr.String(), err)
+				// 界面还没起来：不是真失败，别把这条信息丢掉 ——
+				// 调用方据此在界面就绪后重试
+				if errors.Is(err, peerverify.ErrNotReady) {
+					notReady = true
+				}
 				continue
 			}
 			log.Printf("展示端：已直连执行端 %s 的局域网地址 %s", executor.HostID, addr.String())
-			return conn, executor.HostID
+			return lanConn, executor.HostID, false
 		}
 	}
-	return nil, ""
+	return nil, "", notReady
 }
 
 // dialLAN 拨一条到局域网地址的连接**并完成执行端握手**。

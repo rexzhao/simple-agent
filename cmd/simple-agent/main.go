@@ -207,7 +207,13 @@ func main() {
 		// 用变量而不是每次重查：重连是高频路径（网络抖动时会连着触发），
 		// 每次都问 relay 反而增加延迟。地址变化由执行端定时上报 + 下次
 		// 首连刷新覆盖。
+		// 局域网候选地址：每次重连都重新拉一次。
+		//
+		// 为什么不缓存：执行端重启后监听端口会变（`--listen :0` 随机分配），
+		// 缓存的地址会指向一个没人监听的端口 —— 每次直连都要等超时才回退，
+		// 比不直连还慢。而拉一次列表只是问 relay 要个小 JSON，开销可以忽略。
 		var lanList []relay.Executor
+		var lanMu sync.Mutex
 		dial := func() (wire.Conn, error) {
 			pinned.Lock()
 			target := pinned.hostID
@@ -215,7 +221,17 @@ func main() {
 			if target == "" {
 				return nil, errNoExecutorChosen
 			}
-			conn, chosen, dialErr := openViewer(connectAddr, target, opts.relayToken, "", lanList)
+			// 刷新候选地址（失败就用上次的，不阻断连接）
+			if fetched, fetchErr := relay.ListExecutorsToken(connectAddr, opts.relayToken); fetchErr == nil && len(fetched) > 0 {
+				lanMu.Lock()
+				lanList = fetched
+				lanMu.Unlock()
+			}
+			lanMu.Lock()
+			list := lanList
+			lanMu.Unlock()
+
+			conn, chosen, dialErr := openViewer(connectAddr, target, opts.relayToken, "", list)
 			if dialErr == nil && chosen != "" {
 				pinned.Lock()
 				pinned.hostID = chosen
@@ -223,84 +239,51 @@ func main() {
 			}
 			return conn, dialErr
 		}
-		// 先亲手连一次：如果对面是 relay 且没指定执行端，就进入"选择执行端"界面，
-		// 而不是 fatal 退出（用户的需求正是在这里选）。
+		// **连一次探测**，但只为两件事：
+		//   - 需要用户选执行端（relay 上有多台）时弹选择列表
+		//   - 连接参数有硬错误（没开 TLS、口令错、网络不通）时尽早报错
 		//
-		// 用 OpenViewerTokenList 而不是 OpenViewerToken：要把执行端的局域网
-		// 地址一并拿回来，否则直连永远不知道连哪里（这条列表以前解析完就被
-		// 扔了）。
-		relayConn, chosen, openList, openErr := relay.OpenViewerTokenList(connectAddr, pinned.hostID, opts.relayToken)
-		lanList = openList
-		conn, openErr2 := relayConn, openErr
-		// 尝试直连（内部失败会自己回退，那时用上面那条 relay 连接）
-		if openErr == nil && len(openList) > 0 {
-			if lanConn, lanChosen := tryLAN(pinned.hostID, opts.relayToken, openList); lanConn != nil {
-				if relayConn != nil {
-					_ = relayConn.Close()
-				}
-				conn = lanConn
-				if lanChosen != "" {
-					chosen = lanChosen
-				}
-			}
+		// **不用这条连接当最终连接**：连接要在界面就绪后重新建立。
+		// 原因见下面的注释 —— 指纹确认需要界面，而界面还没建。
+		probeConn, chosen, openList, openErr := relay.OpenViewerTokenList(connectAddr, pinned.hostID, opts.relayToken)
+		if probeConn != nil {
+			_ = probeConn.Close()
 		}
+		lanList = openList
+
 		var needsChoice *relay.NeedsChoice
 		switch {
-		case openErr2 == nil:
-			if chosen != "" {
-				pinned.Lock()
-				pinned.hostID = chosen
-				pinned.Unlock()
-				executors = &relayExecutors{addr: connectAddr, current: pinned, token: opts.relayToken}
-			}
-			// 直连执行端时 `--token` 同时是执行端的访问口令：握手要带上，
-			// 否则执行端会拒绝（表现是"连上了但立刻断开"）。
-			remote, remoteErr := host.NewRemoteToken(conn, post, opts.relayToken)
-			if remoteErr != nil {
-				showFatal(locale.Tr("dialog.config.title"), remoteErr.Error())
-				return
-			}
-			remoteHost = remote
-			if source, ok := executors.(*relayExecutors); ok {
-				source.remote = remote
-			}
-		case errors.As(openErr, &needsChoice):
-			// relay（可能 0 个执行端）：界面直接进选择列表，选中后 RetryNow 重连
-			remote, remoteErr := host.NewRemoteDeferredToken(dial, post, opts.relayToken)
-			if remoteErr != nil {
-				showFatal(locale.Tr("dialog.config.title"), remoteErr.Error())
-				return
-			}
-			remoteHost = remote
-			source := &relayExecutors{addr: connectAddr, current: pinned, token: opts.relayToken}
-			source.remote = remote
-			executors = source
-		default:
-			// **界面还没就绪**：不是失败，只是时机不对。
-			//
-			// viewer 的首次连接发生在窗口创建之前（连接要赶在
-			// NewApp 之前把 remote 准备好），那时弹窗无处可弹。
-			// 如果当成"用户拒绝"就报废了 —— 用户什么都没点。
-			//
-			// 处理：先建一个 deferred remote（连接由 RetryNow 触发），
-			// 界面就绪后再重连，那时才会真正弹窗。
-			if errors.Is(openErr, peerverify.ErrNotReady) {
-				remote, remoteErr := host.NewRemoteDeferredToken(dial, post, opts.relayToken)
-				if remoteErr != nil {
-					showFatal(locale.Tr("dialog.config.title"), remoteErr.Error())
-					return
-				}
-				remoteHost = remote
-				source := &relayExecutors{addr: connectAddr, current: pinned, token: opts.relayToken}
-				source.remote = remote
-				executors = source
-				break
-			}
-			// 其余错误：没开 TLS（被严格隔离拒掉）、网络不通、口令错、
-			// 用户拒绝指纹等，都是真实失败，直接报错。
+		case openErr != nil && !errors.As(openErr, &needsChoice) && !errors.Is(openErr, peerverify.ErrNotReady):
+			// 真失败（网络不通、口令错、没开 TLS 被严格隔离拒掉）：
+			// 这会儿报错比等到界面上更清楚。
 			showFatal(locale.Tr("dialog.config.title"), openErr.Error())
 			return
 		}
+
+		// **统一走 deferred**：现在不连接，只把拨号函数交给 Remote。
+		//
+		// 这是本次修正的核心。之前是"先连接、再建界面"，于是连接时如果
+		// 需要对端指纹确认，弹窗无处可弹 —— 表现为"直连失败，回退 relay"
+		// 或者干脆报"用户拒绝了证书"（用户什么都没点）。
+		//
+		// 正确顺序是：**先准备界面，界面就绪后再发起连接**。deferred
+		// Remote 正好支持这个：构造时不连接，界面起来后调 RetryNow()
+		// 才真正拨号，那时指纹弹窗能正常出现。
+		remote, remoteErr := host.NewRemoteDeferredToken(dial, post, opts.relayToken)
+		if remoteErr != nil {
+			showFatal(locale.Tr("dialog.config.title"), remoteErr.Error())
+			return
+		}
+		remoteHost = remote
+		source := &relayExecutors{addr: connectAddr, current: pinned, token: opts.relayToken}
+		source.remote = remote
+		executors = source
+		if chosen != "" {
+			pinned.Lock()
+			pinned.hostID = chosen
+			pinned.Unlock()
+		}
+		_ = needsChoice // 选择列表由界面从 executors 拉（见 relayExecutors）
 	}
 
 	runtime := &appRuntime{
@@ -401,14 +384,25 @@ func main() {
 	if peerGate != nil {
 		peerGate.Notify = func() { app.RequestRedraw() }
 		app.SetPeerConfirmer(gateAdapter{gate: peerGate})
-		// **标记界面就绪**：从这一刻起，未确认的指纹才会真的弹窗。
-		// 在此之前 Gate.Ask 直接返回 false（"暂时无人可问"），
-		// 让注册循环退避重试而不是干等一个不会出现的弹窗。
-		uiReady.Store(true)
-		// 界面就绪前可能已经有"想连但被推回"的连接：主动重试一次。
-		if remote, ok := remoteHost.(*host.Remote); ok && remote != nil {
-			remote.RetryNow()
-		}
+	}
+	// **标记界面就绪**：从这一刻起，未确认的指纹才会真的弹窗
+	// （在此之前 Gate.Ask 返回 ErrNotReady，让调用方稍后重试）。
+	uiReady.Store(true)
+
+	// **界面已经准备好，现在才真正发起连接**。
+	//
+	// 这是本次修正的核心：以前是"先连接、再建界面"，连接时若需要对端
+	// 指纹确认，弹窗无处可弹 —— 表现为"直连失败，回退 relay"，或者
+	// 报"用户拒绝了证书"（用户什么都没点）。
+	//
+	// 现在 Remote 是 deferred 构造的（不连接），到这里才 RetryNow()。
+	// 不依赖 peerGate 是否存在：即使没开 --tls，deferred remote 也需要
+	// 这一次拨号才能连上。
+	//
+	// **必须放后台**：RetryNow 内部会同步拨号，而拨号可能要等用户确认
+	// 指纹（最长到用户点为止）。在界面线程里做会把窗口冻住。
+	if remote, ok := remoteHost.(*host.Remote); ok && remote != nil {
+		go remote.RetryNow()
 	}
 
 	// 执行端注册到 relay（有界面也可以）：断线自动重连并重新注册
