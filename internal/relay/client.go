@@ -35,9 +35,22 @@ func OpenViewer(addr, route string) (wire.Conn, string, error) {
 
 // OpenViewerToken 与 OpenViewer 相同，但带上 relay 的固定 token。
 func OpenViewerToken(addr, route, token string) (wire.Conn, string, error) {
+	conn, chosen, _, err := OpenViewerTokenList(addr, route, token)
+	return conn, chosen, err
+}
+
+// OpenViewerTokenList 与 [OpenViewerToken] 相同，另外返回 relay 上的
+// **执行端列表**（含各自的局域网直连地址）。
+//
+// 为什么单独返回它：首次连接时 relay 本来就会先发一份列表（用来选目标），
+// 以前解析完只取了 host_id 就把列表扔了 —— 于是展示端明明拿到了
+// lan_addrs 却不知道，直连永远不生效（每次都走中转）。
+//
+// 只在"经 relay 连接"时有值；对端是执行端（直接 welcome）时返回 nil。
+func OpenViewerTokenList(addr, route, token string) (wire.Conn, string, []Executor, error) {
 	conn, err := wire.Dial(addr)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	hello, _ := wire.Encode(wire.Hello{
 		Protocol: wire.Protocol, Role: "viewer", Purpose: "control",
@@ -47,38 +60,38 @@ func OpenViewerToken(addr, route, token string) (wire.Conn, string, error) {
 	})
 	if err := conn.Send(wire.Packet{Kind: "hello", Body: hello}); err != nil {
 		_ = conn.Close()
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	first, err := conn.Recv()
 	if err != nil {
 		_ = conn.Close()
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	switch first.Kind {
 	case "welcome":
 		// 直连执行端：welcome 垫回去，连接带 Handshaken 标记，上层不再重复 hello
-		return wire.Prefetch(conn, first), "", nil
+		return wire.Prefetch(conn, first), "", nil, nil
 	case MsgExecutors:
 		var list []Executor
 		_ = wire.Decode(first.Body, &list)
 		if err := relayError(first.Body); err != nil {
 			_ = conn.Close()
-			return nil, "", err
+			return nil, "", nil, err
 		}
 		target := route
 		if target == "" {
 			if len(list) != 1 {
 				_ = conn.Close()
-				return nil, "", &NeedsChoice{Executors: list}
+				return nil, "", list, &NeedsChoice{Executors: list}
 			}
 			target = list[0].HostID
 		}
 		_ = conn.Close()
 		viewerConn, dialErr := DialViewerToken(addr, target, token)
-		return viewerConn, target, dialErr
+		return viewerConn, target, list, dialErr
 	default:
 		_ = conn.Close()
-		return nil, "", fmt.Errorf("无法识别的对端（%s）", first.Kind)
+		return nil, "", nil, fmt.Errorf("无法识别的对端（%s）", first.Kind)
 	}
 }
 

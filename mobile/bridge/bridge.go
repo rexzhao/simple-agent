@@ -212,20 +212,28 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 		target := pinnedRoute
 		pinnedMu.Unlock()
 
-		// **优先试局域网直连**：同一 WiFi 下 1~2ms，比经 relay 中转
-		// （20~40ms，还要绕公网）快一个数量级，且不依赖外网。
+		// 首选：经 relay 拿到执行端列表，然后**优先试局域网直连**。
 		//
-		// 候选地址来自 relay 下发的 Executor.LANAddrs（执行端注册时上报）。
-		// 只试与 target 匹配的那台：relay 上可能挂着多台执行端，
-		// 连到别人的局域网地址毫无意义。
-		//
-		// 失败一律静默回退到 relay —— 直连只是加速，不该因为
-		// "不在同一个 WiFi" 就让用户连不上。
-		if conn := c.tryLAN(target, addr, token); conn != nil {
-			return conn, nil
+		// 顺序很重要：先问 relay 才知道执行端的内网地址（lan_addrs），
+		// 而 relay 本来就会在首个响应里发这份列表 —— 以前解析完只取了
+		// host_id 就把列表扔了，于是直连永远不生效（真机上表现为
+		// "明明在同一局域网还是走中转、加载很慢"）。
+		conn, chosen, lanList, err := relay.OpenViewerTokenList(addr, target, token)
+		if len(lanList) > 0 {
+			c.saveExecutors(lanList)
+			// 目标已确定才试直连（不知道连谁就无法挑地址）
+			if chosen != "" {
+				if lanConn := c.dialLANFor(chosen); lanConn != nil {
+					if conn != nil {
+						_ = conn.Close()
+					}
+					pinnedMu.Lock()
+					pinnedRoute = chosen
+					pinnedMu.Unlock()
+					return lanConn, nil
+				}
+			}
 		}
-
-		conn, chosen, err := relay.OpenViewerToken(addr, target, token)
 		if err == nil && chosen != "" {
 			pinnedMu.Lock()
 			pinnedRoute = chosen
@@ -259,19 +267,19 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 	return ""
 }
 
-// tryLAN 尝试直连执行端的局域网地址，成功返回连接，失败返回 nil。
+// dialLANFor 尝试直连指定执行端的局域网地址，成功返回连接，失败返回 nil。
 //
-// target 是要连的 hostID（空表示"relay 上任意一台"，此时不直连 ——
-// 不知道对方是谁就没法挑地址）。
+// 候选地址来自 c.executors（由 relay 的列表填充，见 dial 里调用的
+// OpenViewerTokenList）。
 //
-// 为什么逐个试而不是并行：候选通常只有 1~2 个（我们在执行端已经过滤掉
-// 虚拟网卡），并行反而要处理"多个连上了关哪个"的问题。
+// 为什么逐个试而不是并行：候选通常只有 1~2 个（执行端已经过滤掉虚拟网卡），
+// 并行反而要处理"多个连上了关哪个"的问题。
 //
-// 超时取 800ms：局域网内一个 RST/不可达通常在几十毫秒内就返回；
-// 800ms 足够覆盖慢速 WiFi，又不至于让"不在同一网络"的情况卡太久
-// （那种情况会走到超时才回退 relay，用户等的是这个时间）。
-func (c *Client) tryLAN(target, relayAddr, token string) wire.Conn {
-	if target == "" || c.plaintext() {
+// 单次超时 800ms：局域网内 RST/不可达通常几十毫秒就返回；800ms 覆盖慢速
+// WiFi，又不至于让"不在同一网络"卡太久（那种情况会走到超时才回退 relay，
+// 用户等的就是这个时间）。
+func (c *Client) dialLANFor(hostID string) wire.Conn {
+	if hostID == "" || c.plaintext() {
 		// 明文模式下不试直连：执行端监听走的是 tlsx.Listen，
 		// 连上去还是要 TLS 握手，而明文模式没有指纹可校验 —— 会握手失败。
 		return nil
@@ -280,21 +288,8 @@ func (c *Client) tryLAN(target, relayAddr, token string) wire.Conn {
 	list := append([]relay.Executor(nil), c.executors...)
 	c.mu.Unlock()
 
-	// **本地没有目标执行端的信息时主动问一次 relay**。
-	//
-	// 首次连接走的是 OpenViewerToken，那条路径不返回执行端列表
-	// （只有"有多台需要选"时才带出来），所以这里通常是空的。
-	// 不问就永远拿不到局域网地址，直连等于没实现。
-	if !containsExecutor(list, target) {
-		fetched, err := relay.ListExecutorsToken(relayAddr, token)
-		if err == nil {
-			c.saveExecutors(fetched)
-			list = fetched
-		}
-	}
-
 	for _, executor := range list {
-		if executor.HostID != target {
+		if executor.HostID != hostID {
 			continue
 		}
 		for _, addr := range executor.LANAddrs {
@@ -305,21 +300,11 @@ func (c *Client) tryLAN(target, relayAddr, token string) wire.Conn {
 			if err != nil {
 				continue
 			}
-			log.Printf("展示端：已直连执行端 %s 的局域网地址 %s", target, addr.String())
+			log.Printf("展示端：已直连执行端 %s 的局域网地址 %s", hostID, addr.String())
 			return conn
 		}
 	}
 	return nil
-}
-
-// containsExecutor 判断列表里有没有这个 hostID。
-func containsExecutor(list []relay.Executor, hostID string) bool {
-	for _, executor := range list {
-		if executor.HostID == hostID {
-			return true
-		}
-	}
-	return false
 }
 
 // dialLAN 拨一条到局域网地址的连接（复用 wire 当前的拨号钩子，
