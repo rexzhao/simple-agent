@@ -18,7 +18,8 @@ func newSessionTool() *ToolDef {
 		Description: "Start a NEW session in the same project, marked as spawned by this one. " +
 			"Use it to hand off independent work that would otherwise clutter this conversation. " +
 			"The new session gets its own context; the parent/child link is visible in the sidebar. " +
-			"This tool does NOT wait for the child to finish — use mailbox_send / mailbox_read to coordinate.",
+			"This tool does NOT wait for the child to finish — use subagent_list / subagent_notify_child " +
+			"to check on it and send it more work.",
 		Parameters: schema(map[string]any{
 			"title": map[string]any{"type": "string",
 				"description": "Short title for the new session (shown in the sidebar). " +
@@ -48,6 +49,7 @@ func newSessionRun(_ context.Context, args Args, tc *ToolContext) (ToolReturn, e
 	if prompt != "" {
 		output += "\n它已经收到你交代的任务，会自己跑起来。"
 	}
-	output += "\n它看不到这个会话的内容；要传更多信息或收结果，用 mailbox_send 发给它。"
+	output += "\n它看不到这个会话的内容；要传更多信息或收结果，用 subagent_notify_child 发给它，" +
+		"用 subagent_list 查看它的进展。"
 	return ToolReturn{Output: output}, nil
 }

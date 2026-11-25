@@ -82,6 +82,12 @@ func init() {
 			Run:  runSkill,
 		},
 		{
+			Name: "subagent",
+			Args: "[model <名称>|off]",
+			Help: "设置本会话派生出去的子会话用哪个模型（默认跟随本会话）",
+			Run:  runSubagent,
+		},
+		{
 			Name: "help",
 			Help: "列出所有命令",
 			Run: func(a *App, args []string) string {

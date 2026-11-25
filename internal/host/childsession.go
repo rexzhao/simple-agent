@@ -41,11 +41,20 @@ func (l *Local) NewChildSession(parent *Session, title, prompt string) (string, 
 
 	// 用父会话的工作区、模型与档位：子会话是"替父会话干活"的，
 	// 换了模型或工作区会让结果对不上。
+	//
+	// **除非父会话用 /subagent 指定了别的模型**：那时按指定值来，
+	// 档位留空交由 newSessionWith 回落到新模型的默认档位
+	// （父会话的档位在新模型上可能不存在）。
+	selection, effort := parent.Selection(), parent.Effort()
+	if model := parent.SubagentModel(); model != "" {
+		selection = providers.Selection{ProviderID: selection.ProviderID, Model: model}
+		effort = parent.SubagentEffort()
+	}
 	child := l.newSessionWith(sessionSpec{
 		Workspace: parent.Workspace,
 		Title:     title,
-		Selection: parent.Selection(),
-		Effort:    parent.Effort(),
+		Selection: selection,
+		Effort:    effort,
 		ParentID:  parent.ID,
 	})
 
@@ -100,7 +109,8 @@ var _ tools.SessionHost = toolsSessionHost{}
 // "子任务再拆子任务"本来就不是这个功能的目标（那属于子会话自己的工作
 // 安排），直接在能力层禁掉更简单，也省掉一整类边界情况。
 //
-// 与 attachMailbox 分开调用：邮件能力只要求有项目，这里还有父会话的限制。
+// 与 attachSubagent 分开调用：父子通讯要求有项目档案（关系记在档案里），
+// 这里还多一条"只有顶层会话能派生"的限制。
 func (l *Local) attachSessionTools(session *Session) {
 	if session == nil || session.toolCtx == nil {
 		return

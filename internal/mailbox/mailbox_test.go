@@ -160,3 +160,82 @@ func fileSize(t *testing.T, path string) int64 {
 	}
 	return info.Size()
 }
+
+// 旧目录（按项目分的）里的信仍要能读出来 —— 否则用户看到"徽标还在、
+// 点开是空的"。
+func TestOpenWithLegacyReadsOldDir(t *testing.T) {
+	global := t.TempDir()
+	legacy := t.TempDir()
+
+	// 先往旧目录写一封（模拟升级前收到的信）
+	old := mailbox.Open(legacy, "target")
+	if _, err := old.Add(mailbox.Mail{From: "a", Subject: "旧信", Body: "正文"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 新代码从全局目录读，同时兼职旧目录
+	box := mailbox.OpenWithLegacy(global, "target", []string{legacy})
+	list := box.List(false, 10)
+	if len(list) != 1 || list[0].Subject != "旧信" {
+		t.Fatalf("应读到旧目录那封，实际 %+v", list)
+	}
+	if unread, _ := box.Unread(); unread != 1 {
+		t.Fatalf("未读应为 1，实际 %d", unread)
+	}
+}
+
+// 新旧目录都有信时：两封都要在，且不重复计数。
+func TestOpenWithLegacyMergesBoth(t *testing.T) {
+	global := t.TempDir()
+	legacy := t.TempDir()
+
+	if _, err := mailbox.Open(legacy, "target").Add(mailbox.Mail{From: "a", Subject: "旧"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mailbox.Open(global, "target").Add(mailbox.Mail{From: "b", Subject: "新"}); err != nil {
+		t.Fatal(err)
+	}
+
+	box := mailbox.OpenWithLegacy(global, "target", []string{legacy})
+	if got := box.Total(); got != 2 {
+		t.Fatalf("应有 2 封，实际 %d", got)
+	}
+}
+
+// 候选目录里把全局目录重复塞进来时，未读不能翻倍。
+func TestOpenWithLegacyDedupesSameDir(t *testing.T) {
+	global := t.TempDir()
+	if _, err := mailbox.Open(global, "target").Add(mailbox.Mail{From: "a", Subject: "一"}); err != nil {
+		t.Fatal(err)
+	}
+	box := mailbox.OpenWithLegacy(global, "target", []string{global, ""})
+	if got := box.Total(); got != 1 {
+		t.Fatalf("重复目录不该重复计数，实际 %d", got)
+	}
+}
+
+// 标记已读只写新目录：旧文件不该被追加事件。
+func TestMarkReadWritesOnlyGlobal(t *testing.T) {
+	global := t.TempDir()
+	legacy := t.TempDir()
+	if _, err := mailbox.Open(legacy, "target").Add(mailbox.Mail{From: "a", Subject: "旧"}); err != nil {
+		t.Fatal(err)
+	}
+	legacyFile := filepath.Join(legacy, "target.jsonl")
+	before := fileSize(t, legacyFile)
+
+	box := mailbox.OpenWithLegacy(global, "target", []string{legacy})
+	list := box.List(true, 10)
+	if len(list) != 1 {
+		t.Fatalf("应有 1 封未读，实际 %d", len(list))
+	}
+	if err := box.MarkRead(list[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if after := fileSize(t, legacyFile); after != before {
+		t.Fatalf("旧目录文件不该被写，大小 %d → %d", before, after)
+	}
+	if unread, _ := box.Unread(); unread != 0 {
+		t.Fatalf("标记后未读应为 0，实际 %d", unread)
+	}
+}

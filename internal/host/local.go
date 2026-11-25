@@ -194,8 +194,9 @@ func (l *Local) Sessions() []SessionRef {
 			ProjectID:   projectID,
 			ProjectName: projectName,
 			Archived:    archivedOf[session.ID],
-			// 未读邮件数：侧栏徽标用（展示端也要看到，不只桌面）。
-			MailUnread: l.mailboxUnread(session),
+			// 未读通知数：侧栏徽标用（展示端也要看到，不只桌面）。
+			// 字段名沿用 MailUnread（wire 协议与 Android 端都在用）。
+			MailUnread: l.subagentUnread(session),
 			ParentID:   parentOf[session.ID],
 		})
 	}
@@ -347,22 +348,38 @@ func (l *Local) run(cmd Command) {
 	if session != nil {
 		l.emit(Change{SessionID: session.ID, Kind: "conversation"})
 	}
-	// 改名必须让列表重发一次（catalog）。
+	// 改了会话元信息的命令要让列表重发一次（catalog）。
 	//
-	// 它不是"会话多了/少了一个"，所以以前没人调 SessionsChanged()——于是展示端
-	// 只收到一条 session.renamed 事件，而那份事件只改镜像里的 replay 状态
-	// （driver.Replayed.Title），界面读的 host.Session.Title 仍是旧值：远端 viewer
-	// （以及手机端）的侧栏与头部一直显示改名前 的名字，直到重启/重连重新拉一次
-	// catalog 才"自己好了"。
+	// 展示端（远端 viewer、手机）没有别的地方能拿到这些状态：标题、归档
+	// 都只出现在 SessionRef 里，而 SessionRef 由 Local.Sessions() 现场从
+	// 档案算。不重发的话展示端永远停在旧状态，直到重启/重连重新拉一次
+	// catalog 才"自己好了" —— 真实踩过两次：
+	//   - 改名：只发 session.renamed 事件，那份事件只改镜像的 replay 状态
+	//     （driver.Replayed.Title），界面读的是 host.Session.Title。
+	//   - 归档/恢复：状态只写在项目档案里，一条事件都不产生。
 	//
-	// 放在 run 里而不是 case "rename" 分支里：命令执行完要不要刷新列表是"命令结果"
-	// 的一部分，散在各个分支里迟早再漏一个（newSession/deleteSession 都是这么做的）。
-	if result.OK && cmd.Kind == "rename" && session != nil {
+	// 放在 run 里而不是各 case 分支里：命令执行完要不要刷新列表是"命令结果"
+	// 的一部分，散在十几个分支里迟早再漏第四个（rename 与 archive 都是这么漏的）。
+	// 新增"会改 SessionRef 字段"的命令时，把它加进 catalogCommand 即可。
+	if result.OK && session != nil && catalogCommand(cmd.Kind) {
 		for _, obs := range l.observersSnapshot() {
 			obs.SessionsChanged()
 		}
 		l.emit(Change{SessionID: session.ID, Kind: "sessions"})
 	}
+}
+
+// catalogCommand 报告这条命令会不会改 SessionRef 里的字段（列表必须重发）。
+//
+// 判据是"Local.Sessions() 的输出会不会变"，不是"命令听起来重不重要"：
+// 新建/删除会话走自己的生命周期（newSessionWith / deleteSession 里已各自
+// 推过列表），这里只管已存在会话的元信息。
+func catalogCommand(kind string) bool {
+	switch kind {
+	case "rename", "archiveSession", "restoreSession":
+		return true
+	}
+	return false
 }
 
 func (l *Local) newCmdID() string {
@@ -431,6 +448,12 @@ func (l *Local) dispatch(session *Session, cmd Command) CmdResult {
 			return CmdResult{Error: err.Error()}
 		}
 		return session.setEffort(payload.Text)
+	case "setSubagentModel":
+		var payload TextPayload
+		if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
+			return CmdResult{Error: err.Error()}
+		}
+		return session.setSubagentModel(payload.Text)
 	case "rename":
 		var payload TextPayload
 		if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
@@ -581,7 +604,7 @@ func (l *Local) newSessionWith(spec sessionSpec) *Session {
 			_ = l.cfg.Catalog.AddSessionUnder(session.ID, session.Title, workspace, dir, spec.ParentID)
 		}
 	}
-	l.attachMailbox(session)
+	l.attachSubagent(session)
 	l.attachSessionTools(session)
 	for _, obs := range l.observersSnapshot() {
 		obs.SessionsChanged()
@@ -631,8 +654,9 @@ func (l *Local) setArchived(id string, archived bool) CmdResult {
 	if err := session.SetArchived(archived); err != nil {
 		return CmdResult{Error: err.Error()}
 	}
-	// 让侧栏重画："sessions" 这类变更会让界面重新同步列表与项目信息
-	l.emit(Change{SessionID: session.ID, Kind: "sessions"})
+	// 列表重发统一由 run 按 catalogCommand 做（见那里的注释）。
+	// 以前这里只发本进程的 "sessions"，展示端拿不到 —— 那正是远端 viewer
+	// 归档后看不到变化的原因。
 	return CmdResult{OK: true}
 }
 
@@ -829,11 +853,14 @@ func (l *Local) openSession(contextID, title string) (*Session, error) {
 	// driver 的 Selection 来自重放（可能不是默认模型）：窗口/输出/vision/档位按它同步
 	session.syncModelOptions(drv.Selection())
 
-	// 归档状态与父子关系来自项目档案：**不读它的话，重启后归档的会话
-	// 又能跑了、子会话也变回顶层**（档案是唯一权威，日志里没有这些状态）。
+	// 归档状态、父子关系与子会话模型设置来自项目档案：**不读它的话，重启后
+	// 归档的会话又能跑了、子会话也变回顶层、/subagent 的设置会丢**（档案是
+	// 唯一权威，日志里没有这些状态）。
 	if hasRecord {
 		session.archived = record.ArchivedAt != ""
 		session.parentID = record.ParentID
+		session.subagentModel = record.ChildModel
+		session.subagentEffort = record.ChildEffort
 	}
 
 	// 修复事件必须在接受任何新事件之前写进日志，否则下次加载又会重新计算
@@ -849,9 +876,9 @@ func (l *Local) openSession(contextID, title string) (*Session, error) {
 		_, _ = drv.Conversation().AddNotice(conversation.NoticeWarn,
 			l.cfg.Tr("session.logCorrupt")+strings.Join(replayed.Warnings, "；"))
 	}
-	// 会话通讯：填项目 ID + 挂工具 + 挂请求注入钩子。
-	// 恢复路径也要挂 —— 否则重启后老会话收不到也发不出邮件（真实会踩）。
-	l.attachMailbox(session)
+	// 父子会话通讯：挂工具 + 挂请求注入钩子。
+	// 恢复路径也要挂 —— 否则重启后老会话收不到也发不出通知（真实会踩）。
+	l.attachSubagent(session)
 	// 新建子会话的能力：同样要在恢复路径挂上，否则重启后老会话
 	// 就调不动 new_session 了。
 	l.attachSessionTools(session)
@@ -882,8 +909,15 @@ func (l *Local) driverOptionsFor(sel providers.Selection, workspace string) driv
 // driverOptionsSpec 按"是不是子会话"决定工具集。
 //
 // 单独加一层是因为 driverOptionsFor 有多个调用点，而"子会话不注册
-// new_session"只跟会话类型有关。noSpawn 为真时工具列表里根本不会出现它。
+// new_session"只跟会话类型有关。noSpawn 为真时工具列表里根本不会出现它，
+// 同时 subagent 工具集切成"子会话那套"（只剩 notify_parent）。
 func (l *Local) driverOptionsSpec(sel providers.Selection, workspace string, noSpawn bool) driver.Options {
+	// 角色**显式**赋值：Role 的零值是 RoleRoot（能力更多的一侧），
+	// 漏设会让子会话多出本不该有的工具。
+	role := tools.RoleRoot
+	if noSpawn {
+		role = tools.RoleChild
+	}
 	return driver.Options{
 		Selection:    sel,
 		SystemPrompt: l.cfg.SystemPrompt,
@@ -893,6 +927,7 @@ func (l *Local) driverOptionsSpec(sel providers.Selection, workspace string, noS
 			Searcher:   l.cfg.Searcher,
 			// 子会话不派生孙会话：工具**不注册**，而不只是"调了会失败"。
 			NoSpawn: noSpawn,
+			Role:    role,
 		}),
 		MaxToolRounds:      l.cfg.MaxToolRounds,
 		ContextWindow:      l.cfg.ContextWindow,
@@ -939,6 +974,54 @@ func (l *Local) effortsFor(sel providers.Selection) []string {
 		return nil
 	}
 	return l.cfg.Efforts(sel)
+}
+
+// modelsFor 返回某个 provider 下可选的模型列表。
+func (l *Local) modelsFor(providerID string) []string {
+	for _, choice := range l.cfg.Models {
+		if choice.ProviderID == providerID {
+			return choice.Models
+		}
+	}
+	return nil
+}
+
+// hasModel 报告某个 provider 下有没有这个模型。
+func (l *Local) hasModel(providerID, model string) bool {
+	if model == "" {
+		return false
+	}
+	for _, candidate := range l.modelsFor(providerID) {
+		if candidate == model {
+			return true
+		}
+	}
+	return false
+}
+
+// modelLabel 返回模型的显示名（没配显示名就用 id 本身）。
+func (l *Local) modelLabel(providerID, model string) string {
+	for _, choice := range l.cfg.Models {
+		if choice.ProviderID != providerID {
+			continue
+		}
+		if label := choice.Labels[model]; label != "" {
+			return label
+		}
+	}
+	return model
+}
+
+// unknownModelMessage 组装"这个模型不存在"的提示（含可选值）。
+//
+// 说清可选值是必须的：只说"模型不存在"，用户还得自己去翻配置，
+// 而他能看到的候选本来就在我们手里。
+func (l *Local) unknownModelMessage(providerID, model string) string {
+	models := l.modelsFor(providerID)
+	if len(models) == 0 {
+		return "当前 provider 没有配置可选模型，无法设置子会话模型"
+	}
+	return "未知模型：" + model + "\n可选：" + strings.Join(models, "、")
 }
 
 // ---- 内部工具 ----

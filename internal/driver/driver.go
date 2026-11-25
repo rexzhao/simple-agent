@@ -107,17 +107,18 @@ type Options struct {
 	// 能跑掉几十轮、烧掉大量 token。达到上限时给一条通知并回到 Idle
 	// （Rust 阶段修过的 P0 就是这么处理的）。
 	MaxToolRounds int
-	// MailboxNotice 在**组装请求前**被调用，返回一条要追加到本次请求末尾的
+	// SubagentNotice 在**组装请求前**被调用，返回一条要追加到本次请求末尾的
 	// 用户消息（空串表示没有）。
 	//
 	// 为什么在组装前而不是走 Enqueue：
 	//   - Enqueue 是"用户插话"的队列，每条都开一个 user 消息并真正落盘；
-	//     邮件通知可能一次来好几封，堆进去会在历史里留下多条噪声消息。
+	//     通知可能一次来好几条，堆进去会在历史里留下多条噪声消息。
 	//   - 这里**不写 Conversation、不落盘**：只在发给模型的 Messages 里追加一条。
 	//     历史不变 ⇒ 缓存前缀不变（除了最后那条通知本身），也不会重复注入。
 	//
-	// 由 host 注入：它知道未读邮件与"哪些已经通知过"。
-	MailboxNotice func() string
+	// 由 host 注入：它知道未读通知与"哪些已经通知过"。父子会话**都要挂**——
+	// 父会话也要能被自己的子会话通知。
+	SubagentNotice func() string
 }
 
 // Usage 是本轮 token 用量。
@@ -390,10 +391,25 @@ func (d *Driver) SetReasoningEffort(effort string) []Effect {
 	return []Effect{recordSelectionWithEffort(d.opts.Selection, effort)}
 }
 
-// SetMailboxNotice 设置"未读邮件通知"的取值函数（见 Options.MailboxNotice）。
+// SetSubagentNotice 设置"未读通知"的取值函数（见 Options.SubagentNotice）。
 //
-// 传 nil 表示关闭（例如会话被移出项目、或展示端镜像）。
-func (d *Driver) SetMailboxNotice(fn func() string) { d.opts.MailboxNotice = fn }
+// 传 nil 表示关闭（例如展示端镜像）。
+func (d *Driver) SetSubagentNotice(fn func() string) { d.opts.SubagentNotice = fn }
+
+// RoundElapsed 返回当前回合已运行时长；空闲时返回 0。
+//
+// 用途：父会话用 subagent_list 看子会话"跑了多久"，判断它是卡住了还是在干活。
+//
+// **口径**：用 Driver.roundStartedAt（Send/Retry/SendWithAttachments 三个入口都设它），
+// 而不是 Round.startedAt（那个只给回合结束行算耗时）。
+//
+// 空闲时必须返回 0：否则界面上会显示成"一直在跑"。
+func (d *Driver) RoundElapsed() time.Duration {
+	if d.busy == BusyIdle || d.roundStartedAt.IsZero() {
+		return 0
+	}
+	return time.Since(d.roundStartedAt)
+}
 
 // Tools 返回当前注册的工具列表。
 //
@@ -981,18 +997,18 @@ func (d *Driver) buildRequest() providers.ChatRequest {
 	if replacedImages > 0 {
 		d.noteVisionImages(replacedImages)
 	}
-	// 未读邮件通知：追加成**最后一条 user 消息**，但不写进 Conversation。
+	// 未读通知：追加成**最后一条 user 消息**，但不写进 Conversation。
 	//
 	// 三个要点：
 	//  1. 只在这里追加 ⇒ 历史不变 ⇒ 下次请求不会重复带上它
-	//     （host 侧还会记录"哪些已通知过"，避免同一封反复提醒）
+	//     （host 侧还会记录"哪些已通知过"，避免同一条反复提醒）
 	//  2. 追加在末尾（user 角色）⇒ 两家协议都接受，不会出现"以 assistant 结尾"
-	//  3. 内容只列清单、不含正文：正文让模型自己用 mailbox_read 取，
-	//     这样邮件正文不会长期占据上下文
-	if d.opts.MailboxNotice != nil {
-		if notice := strings.TrimSpace(d.opts.MailboxNotice()); notice != "" {
+	//  3. 内容只列清单、不含正文：正文让模型自己决定怎么取，
+	//     这样通知正文不会长期占据上下文
+	if d.opts.SubagentNotice != nil {
+		if notice := strings.TrimSpace(d.opts.SubagentNotice()); notice != "" {
 			history = append(history, message.Message{
-				MessageID: "mailbox-notice",
+				MessageID: "subagent-notice",
 				Role:      message.RoleUser,
 				Parts:     []message.Part{message.NewTextPart(notice)},
 			})
@@ -2173,6 +2189,12 @@ func IsContextOverflowForTest(reason string) bool { return isContextOverflow(rea
 
 // RetryableFailureForTest 暴露"这个失败值得自动重试吗"（测试用）。
 func RetryableFailureForTest(reason string) bool { return retryableFailure(reason) }
+
+// SetBusyForTest 强行改变编排状态（测试用）。
+//
+// 用途：造"别的会话看到我正卡在工具里"这种场面 —— 真跑一个慢工具
+// 既慢又不稳。**不要在生产路径里用**：状态由流/工具边界推进。
+func (d *Driver) SetBusyForTest(busy Busy) { d.busy = busy }
 
 // WorkspaceForTest 返回 driver 当前记录的工作区（测试用）。
 func (d *Driver) WorkspaceForTest() string { return d.opts.Workspace }

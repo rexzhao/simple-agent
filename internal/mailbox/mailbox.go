@@ -34,6 +34,12 @@ const (
 	TypeSent = "mail.sent"
 	// TypeRead 标记某封邮件已读（后写的覆盖先写的）。
 	TypeRead = "mail.read"
+	// TypeDropped 表示这封邮件已被处理完、从收件箱里移除。
+	//
+	// 为什么需要它（而不是只标已读）：通知是**一次性**的协作信号 ——
+	// 读过就没了。只标已读的话，邮件会永久堆在收件箱里，列表越来越长，
+	// 而且"已读"与"还需要处理"在界面上分不清。
+	TypeDropped = "mail.dropped"
 )
 
 // 大小上限：与请求体量保持同一量级，避免一封邮件把上下文撑爆。
@@ -76,18 +82,37 @@ type Mail struct {
 //
 // 并发：写入来自工具 goroutine，读取来自界面线程与请求组装，所以内部加锁。
 type Box struct {
-	mu     sync.Mutex
-	dir    string
-	owner  string // 收件会话 ID
-	mails  []Mail // 按写入顺序（旧→新）
-	loaded bool
+	mu    sync.Mutex
+	dir   string
+	owner string // 收件会话 ID
+	// legacyDirs 是**只读**的旧目录（按项目分的 `<项目>/mailbox/`）。
+	//
+	// 为什么需要：邮件曾经按项目存在 projects/<id>/mailbox/ 下，
+	// 改成全局目录后，磁盘上还留着旧信。不读它们的话，用户的侧栏
+	// 还挂着未读徽标、点进去却是空的 —— 比"功能没了"更难解释。
+	//
+	// 只读：MarkRead 只写 b.dir（新目录），旧目录里的信读一次就标记
+	// 在新目录里（Read 事件写到新文件），旧文件从此不再被写。
+	legacyDirs []string
+	mails      []Mail // 按写入顺序（旧→新）
+	loaded     bool
 }
 
 // Open 打开某个收件会话的邮箱（不读盘，首次访问时懒加载）。
 //
-// targetID 是收件会话 ID；dir 是项目下的 mailbox 目录。
+// targetID 是收件会话 ID；dir 是**全局** mailbox 目录（写这里）。
 func Open(dir, targetID string) *Box {
 	return &Box{dir: dir, owner: targetID}
+}
+
+// OpenWithLegacy 在 Open 的基础上，额外从 legacyDirs 里**只读**加载旧信。
+//
+// 顺序：legacyDirs 先读（更早），dir 后读（更新）。同 ID 的邮件以先出现的
+// 那条内容为准（ID 在收件箱内唯一，重复说明是同一条）。
+func OpenWithLegacy(dir, targetID string, legacyDirs []string) *Box {
+	box := Open(dir, targetID)
+	box.legacyDirs = legacyDirs
+	return box
 }
 
 // path 返回某收件会话的邮箱文件路径。
@@ -106,7 +131,33 @@ func (b *Box) ensureLoadedLocked() error {
 		return nil
 	}
 	b.loaded = true
-	file := b.path()
+	// 旧目录先读：它们的时间更早，顺序上要排在前面。
+	for _, dir := range b.legacyDirs {
+		if strings.TrimSpace(dir) == "" || sameFile(dir, b.dir) {
+			continue
+		}
+		if err := b.loadFileLocked(filepath.Join(dir, safeName(b.owner)+".jsonl")); err != nil {
+			return err
+		}
+	}
+	return b.loadFileLocked(b.path())
+}
+
+// sameFile 报告两个目录路径是否指同一个地方（都已清理过）。
+//
+// 防的是"调用方把全局目录重复塞进候选列表"这种低级错误：
+// 真重复的话未读会翻倍，用户会看到"3 封未读"其实只有 1 封。
+func sameFile(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+// loadFileLocked 把**一个**邮箱文件重放进 b.mails。调用方须持有锁。
+//
+// 文件不存在不是错误（绝大多数会话从未收过信）。
+func (b *Box) loadFileLocked(file string) error {
 	raw, err := os.ReadFile(file)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil // 从没收到过信
@@ -134,6 +185,11 @@ func (b *Box) ensureLoadedLocked() error {
 			if mail.To == "" {
 				mail.To = b.owner
 			}
+			// 同 ID 已在（旧目录读过的）：保留先出现的那条，
+			// 免得新旧目录里同一封信被算成两封。
+			if b.hasIDLocked(mail.ID) {
+				continue
+			}
 			b.mails = append(b.mails, mail)
 		case TypeRead:
 			var data struct {
@@ -145,6 +201,19 @@ func (b *Box) ensureLoadedLocked() error {
 			for index := range b.mails {
 				if b.mails[index].ID == data.ID {
 					b.mails[index].Read = true
+				}
+			}
+		case TypeDropped:
+			var data struct {
+				ID string `json:"id"`
+			}
+			if ev.Decode(&data) != nil {
+				continue
+			}
+			for index := range b.mails {
+				if b.mails[index].ID == data.ID {
+					b.mails = append(b.mails[:index], b.mails[index+1:]...)
+					break
 				}
 			}
 		}
@@ -263,6 +332,29 @@ func (b *Box) MarkRead(id string) error {
 			return err
 		}
 		b.mails[index].Read = true
+		return nil
+	}
+	return ErrNotFound
+}
+
+// Drop 把这封邮件从收件箱里移除（读过、处理完了）。
+//
+// 追加一条 TypeDropped 而不是重写文件：与标记已读同一条思路 ——
+// 日志只追加，重放时后写覆盖先写。这样并发读写也不会互相踩。
+func (b *Box) Drop(id string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.ensureLoadedLocked(); err != nil {
+		return err
+	}
+	for index := range b.mails {
+		if b.mails[index].ID != id {
+			continue
+		}
+		if err := b.appendEventLocked(TypeDropped, map[string]string{"id": id}); err != nil {
+			return err
+		}
+		b.mails = append(b.mails[:index], b.mails[index+1:]...)
 		return nil
 	}
 	return ErrNotFound

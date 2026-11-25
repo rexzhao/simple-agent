@@ -360,9 +360,14 @@ func main() {
 		if trustErr != nil {
 			log.Printf("信任列表读取失败（将重新询问所有对端）：%v", trustErr)
 		}
-		// 清掉早期按地址记录的 viewer 条目（同指纹、不同端口堆了好几条，
-		// 而且按地址查永远命中不了）。现在按指纹记，这些历史记录没用。
+		// 清掉早期按地址记录的条目（同指纹、不同端口堆了好几条，
+		// 而且按地址查永远命中不了 —— 结果就是每次重启都重新问一遍）。
+		//
+		// 两个角色都要清：
+		//   - viewer：执行端验 viewer，现在按指纹记
+		//   - executor：viewer 验执行端，现在按 IP 记（端口可变）
 		_ = store.CleanupLegacy(trust.RoleViewer)
+		_ = store.CleanupLegacy(trust.RoleExecutor)
 		setupViewerTrust(store, func() {
 			// 有新的待确认 viewer：让界面刷一下，弹确认框
 			post(func() { app.NotifyDisplay("") })
@@ -564,8 +569,15 @@ func (r *appRuntime) OpenStream(ctx context.Context, sel providers.Selection, re
 // RunTools 执行工具调用。
 //
 // 用 r.toolOptions 构造工具表，**不要在这里临时拼**：它必须和 driver 那份同源。
+//
+// 角色是**按会话**的（子会话没有 new_session / subagent_list），拼不进全局
+// toolOptions，所以从上下文里取：宿主挂工具时已经把它写进 tc。
+// 漏掉这一步的表现是"模型看到 subagent_notify_parent，调用却报未知工具"
+// —— 真实踩过（子会话自检时发现的）。
 func (r *appRuntime) RunTools(ctx context.Context, tc *tools.ToolContext, calls []tools.Call) []tools.ToolOutcome {
-	return tools.ExecuteAll(ctx, tools.BuiltinWith(r.toolOptions), tc, calls)
+	options := r.toolOptions
+	options.Role = tc.RoleOf()
+	return tools.ExecuteAll(ctx, tools.BuiltinWith(options), tc, calls)
 }
 
 // windowFor 返回某模型配置的上下文窗口（0 表示未知，driver 会按 32k 处理）。

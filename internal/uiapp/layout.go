@@ -703,14 +703,14 @@ func (a *App) sidebarSessionRow(c *ui.Context, id string) {
 		// 所以按钮常驻，只在悬停时显示文字颜色。
 		a.copyButtonIdle(c, "session-ids:"+session.ID, sessionIDsText(session),
 			a.tr("sidebar.copyIds"), row.Hovered())
-		// 未读邮件徽标：放在时间左边。
+		// 未读通知徽标：放在时间左边。
 		//
-		// 为什么必须显示：邮件是**别的会话主动发来的**，用户的当前会话可能
+		// 为什么必须显示：通知是**父/子会话主动发来的**，用户的当前会话可能
 		// 完全没察觉到；没有徽标就永远不知道侧栏里某个会话在等它处理事情。
 		//
-		// 只在有未读时出现（不占位）：大多数会话没有邮件，常驻一个灰色 0
+		// 只在有未读时出现（不占位）：大多数会话没有通知，常驻一个灰色 0
 		// 只会让侧栏变吵。
-		if unread := session.MailboxUnread(); unread > 0 {
+		if unread := session.MailUnread(); unread > 0 {
 			label := "✉"
 			if unread > 1 {
 				label = fmt.Sprintf("✉%d", unread)

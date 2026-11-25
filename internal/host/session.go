@@ -77,6 +77,15 @@ type Session struct {
 	// 用途：只有未读**变多**才再次唤醒。否则同一批邮件会被反复叫醒
 	// （比如用户手动点了一下会话又回来）。
 	wokenUnread int
+	// notifiedIDs 是**已经注入过通知**的邮件 id。
+	//
+	// 用途：buildRequest 每轮都会问"有没有未读要通知"，而"未读"在模型真正
+	// 读掉之前不会变。记住通知过谁，才不会每轮重复注入同一段清单
+	// （真实踩过：一条通知连续出现七八轮）。
+	//
+	// 用 id 集合而不是计数：读掉一封又来一封时，未读数可能刚好相同。
+	notifiedMu  sync.Mutex
+	notifiedIDs map[string]bool
 	// wakeTimer 是已排队的唤醒（去抖窗口内）。
 	//
 	// 用途：连续来信只唤醒一次 —— 已有待执行的唤醒时，新来信不再排新的。
@@ -95,6 +104,20 @@ type Session struct {
 	// summaryCancel 是当前摘要请求的取消函数（停止/解压时用）。
 	summaryCancel context.CancelFunc
 
+	// runningTool 是本批**正在执行**的工具名（空表示没在跑工具）。
+	//
+	// 只有一个执行点（runTools），由它在串行循环前后设置与清空，
+	// 但读取方是别的会话的工具调用（subagent_list）—— 所以单独一把锁，
+	// **不复用 driver 的任何锁**（driver 本身不线程安全）。
+	runningToolMu sync.Mutex
+	runningTool   string
+	// subagentModel/subagentEffort 是"派生出去的子会话用什么模型"（空 = 跟随本会话）。
+	//
+	// 与 store.SessionRecord.ChildModel 一一对应：这里是内存副本，
+	// 改设置时同时更新档案（重启后要靠档案恢复）。
+	subagentModel  string
+	subagentEffort string
+
 	providerID string
 	model      string
 	effort     string
@@ -110,7 +133,6 @@ type Session struct {
 	archived bool
 }
 
-// Archived 报告会话是否已归档。
 // Archived 报告会话是否已归档。
 //
 // **父会话归档时子会话也算归档**（用户定的规则）：子会话是父会话派出去
@@ -347,6 +369,81 @@ func (s *Session) RetryPending() bool {
 		return s.view.RetryPending
 	}
 	return s.retryPending
+}
+
+// RunningTool 返回当前正在执行的工具名（空表示没在跑工具）。
+//
+// 用途：父会话用 subagent_list 看子会话"卡在哪个工具里"。
+// 通常只有一个名字（工具是串行执行的），一批多个时用 ", " 连接。
+func (s *Session) RunningTool() string {
+	if s == nil {
+		return ""
+	}
+	if s.view != nil {
+		// 展示端：快照里没有工具名（刻意不下发，见文档 §3.7）。
+		return ""
+	}
+	s.runningToolMu.Lock()
+	defer s.runningToolMu.Unlock()
+	return s.runningTool
+}
+
+// setRunningTool 记下"当前在跑哪个工具"（空串表示清空）。
+//
+// **必须在执行端主线程调用**：它是给别的会话读的状态快照，
+// 而在后台 goroutine 里写会和 driver 的状态打架。
+func (s *Session) setRunningTool(name string) {
+	if s == nil {
+		return
+	}
+	s.runningToolMu.Lock()
+	s.runningTool = name
+	s.runningToolMu.Unlock()
+}
+
+// SubagentModel 返回"派生子会话时用的模型"（空 = 跟随本会话）。
+func (s *Session) SubagentModel() string {
+	if s == nil {
+		return ""
+	}
+	return s.subagentModel
+}
+
+// SubagentEffort 返回"派生子会话时用的思考档位"（空 = 用模型默认档位）。
+func (s *Session) SubagentEffort() string {
+	if s == nil {
+		return ""
+	}
+	return s.subagentEffort
+}
+
+// setSubagentModel 设置"派生子会话时用的模型"。
+//
+// model 为空表示清除设置、回到"跟随本会话"。空串**也不会**清空档位以外的东西：
+// 档位与模型是配套的，换模型时档位一律交回模型默认值。
+//
+// 只改**将来**派生的子会话：已经存在的子会话模型在创建那一刻就定死了
+// （改它们的模型会在运行中途换模型，语义混乱且会破坏缓存前缀）。
+func (s *Session) setSubagentModel(model string) CmdResult {
+	model = strings.TrimSpace(model)
+	if model != "" {
+		if !s.host.hasModel(s.providerID, model) {
+			return CmdResult{Error: s.host.unknownModelMessage(s.providerID, model)}
+		}
+	}
+	s.subagentModel = model
+	s.subagentEffort = ""
+	if s.cfg.Catalog != nil {
+		_ = s.cfg.Catalog.UpdateSession(s.ID, func(record *store.SessionRecord) {
+			record.ChildModel = model
+			record.ChildEffort = ""
+		})
+	}
+	s.host.emit(Change{SessionID: s.ID, Kind: "runtime"})
+	if model == "" {
+		return CmdResult{OK: true, Notice: "子会话模型已恢复为跟随本会话"}
+	}
+	return CmdResult{OK: true, Notice: "子会话将使用模型 " + s.host.modelLabel(s.providerID, model)}
 }
 
 func (s *Session) Selection() providers.Selection {
@@ -1101,7 +1198,19 @@ func (s *Session) runTools(effect driver.RunTools) {
 	toolCtx := s.toolCtx
 	runtime := s.cfg.Runtime
 
+	// **在跑哪个工具**是给别的会话（subagent_list）看的快照。
+	//
+	// 主线程设置、主线程清空：工具本体跑在后台 goroutine 里，
+	// 但 driver 不线程安全，不能在那里碰会话状态。
+	// 名字取整批的（通常只有一个，串行执行时逐个更新意义不大）。
+	//
+	// **清空必须在 goroutine 里**：runTools 自己启动 goroutine 后就返回了，
+	// 在这里 defer 会立刻把刚设进去的名字抹掉 —— 表现是活动明细永远显示
+	// "正在执行 工具"（名字为空）。真实踩过。
+	s.setRunningTool(toolNames(calls))
+
 	go func() {
+		defer s.setRunningTool("")
 		for _, call := range calls {
 			outcomes := runtime.RunTools(ctx, toolCtx, []tools.Call{call})
 			outcome := tools.ToolOutcome{ID: call.ID, Name: call.Name, Output: s.cfg.Tr("tools.emptyOutput")}
@@ -1138,6 +1247,20 @@ func (s *Session) runTools(effect driver.RunTools) {
 		}
 		s.post(func() { s.applyEffects(s.drv.ToolBatchDone(mid)) })
 	}()
+}
+
+// toolNames 把一批工具调用压成一个展示用的名字串。
+//
+// 通常只有一个名字（模型一条消息里一般只调一个工具）；批量调用时
+// 用 ", " 连起来，足够表达"它在跑什么"。
+func toolNames(calls []tools.Call) string {
+	names := make([]string, 0, len(calls))
+	for _, call := range calls {
+		if call.Name != "" {
+			names = append(names, call.Name)
+		}
+	}
+	return strings.Join(names, ", ")
 }
 
 // toConversationTodos 把工具层的清单转成会话层的形态。

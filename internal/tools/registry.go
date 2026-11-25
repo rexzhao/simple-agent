@@ -28,7 +28,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"simple-agent/internal/message"
 	"simple-agent/internal/web"
@@ -120,40 +119,125 @@ type ToolContext struct {
 	AllowShell bool
 	// Vision 表示当前模型是否接受图片输入（read_image 据此决定能否工作）。
 	Vision bool
-	// Mailbox 是会话通讯的宿主能力（nil 表示不可用，例如测试或未接入）。
+	// Subagent 是父子会话通讯的宿主能力（nil 表示不可用，例如测试或未接入）。
 	//
 	// 用**接口**而不是具体类型：tools 包不能依赖 host（host 依赖 tools，
 	// 会成环）。这里只声明工具需要的最小能力。
-	Mailbox MailboxHost
+	Subagent SubagentHost
 	// Sessions 是会话管理能力（新建会话等）。nil 表示不可用。
 	Sessions SessionHost
+	// Role 是当前会话在父子关系里的角色。
+	//
+	// **为什么要存在这里**：工具集有两份使用者 —— driver 生成给模型的清单，
+	// 和执行端真正执行调用时的清单（见 tools.BuiltinWith）。两份必须同源，
+	// 否则会出现"清单里有、调用说未知工具"（web_search 就这么翻过车）。
+	// 角色按会话而定，拼不进全局 Options，所以由宿主写进上下文，
+	// 执行端从上下文里读（见 RoleOf）。
+	Role SubagentRole
 
 	mu    sync.Mutex
 	state SessionState
 }
 
-// MailboxHost 是 tools 包对"会话通讯"的最小要求（由 host 实现）。
-//
-// 只暴露工具真正用得上的三件事：列出可收信会话、投递一封邮件、查/读自己的邮箱。
-// 具体存储、归档判断、唤醒策略都在 host 侧 —— 工具只管"用户/模型要发了什么"。
-type MailboxHost interface {
-	// MailboxPeers 返回本项目内**可收信**的会话（已归档的不在列表里）。
-	MailboxPeers() []MailboxPeer
-	// MailboxSelf 返回当前会话的 ID 与标题（发件人信息）。
-	MailboxSelf() MailboxPeer
-	// MailboxDeliver 投递一封邮件；返回错误表示投递失败（收件人不存在等）。
-	MailboxDeliver(to string, subject, body string, refs []string) (string, error)
-	// MailboxInbox 返回当前会话的邮件（新→旧）。
-	MailboxInbox(unreadOnly bool, limit int) []MailboxMail
-	// MailboxReadMail 读一封邮件并标记已读。
-	MailboxReadMail(id string) (MailboxMail, error)
+// SetRole 设置会话角色（宿主在挂工具时调用）。
+func (tc *ToolContext) SetRole(role SubagentRole) {
+	if tc == nil {
+		return
+	}
+	tc.Role = role
 }
 
-// MailboxPeer 是一个可通讯的会话（发件人/收件人的最小信息）。
-type MailboxPeer struct {
+// RoleOf 返回上下文的角色；nil 上下文按顶层处理。
+//
+// 为什么 nil 退回 RoleRoot 是安全的：RoleRoot 是"多几个工具"的一侧，
+// 但没接宿主时那几个工具调用会明确报"不可用"，不会静默做错事。
+func (tc *ToolContext) RoleOf() SubagentRole {
+	if tc == nil {
+		return RoleRoot
+	}
+	return tc.Role
+}
+
+// SubagentHost 是 tools 包对"父子会话通讯"的最小要求（由 host 实现）。
+//
+// 刻意**没有** Parent()：子会话不需要知道父会话的状态 —— 通知目标由 host
+// 按自己的 parentID 解析，工具层不参与（子会话也没有"要不要先查一下"的犹豫）。
+type SubagentHost interface {
+	// Children 返回自己的子会话（父会话才有；子会话调用返回空）。
+	Children(includeArchived bool) []SubagentPeer
+	// NotifyParent 给自己父会话发一条通知（子会话才有）。
+	NotifyParent(subject, body string) (SubagentDelivery, error)
+	// NotifyChild 给**一个**指定子会话发通知（父会话才有）。
+	NotifyChild(to, subject, body string) (SubagentDelivery, error)
+	// Inbox 返回**发给自己**的通知（新→旧）。
+	//
+	// 收发必须成对：少了读取，通知就变成"能看到有几条、正文永远读不出来"的黑洞
+	// （早期版本就是这样，子会话的汇报全丢在正文里）。
+	Inbox(unreadOnly bool, limit int) []SubagentNotice
+	// ReadNotice 读一条通知的正文并标记已读。
+	//
+	// 只认**自己收件箱里**的 id：不接受"别人的通知"，否则又变成"读任意会话"。
+	ReadNotice(id string) (SubagentNotice, error)
+}
+
+// SubagentPeer 是一个子会话在工具层的最小视图。
+type SubagentPeer struct {
 	ID       string
 	Title    string
 	Archived bool
+	// Activity 是活动明细（档案兜底来的会话只有零值 = 未知）。
+	Activity SubagentActivity
+}
+
+// SubagentNotice 是一条收到的通知（工具层视图）。
+type SubagentNotice struct {
+	ID        string
+	From      string
+	FromTitle string
+	Subject   string
+	Body      string
+	Read      bool
+}
+
+// SubagentActivity 是"这个会话现在在干什么"。
+//
+// 为什么要细分到工具名：父会话最常见的决策是"它到底卡住了还是在干活"。
+// 只说"忙"回答不了这个 —— 跑了 4 分钟的 bash 可能正常，跑了 4 分钟的
+// streaming 大概率是模型或网络出了问题。
+type SubagentActivity struct {
+	// Busy 取值见 SubagentBusy* 常量。
+	Busy string
+	// Tool 是 runningTool 时正在执行的工具名（其余情况为空）。
+	Tool string
+	// ElapsedMS 是本轮已运行时长（idle 时为 0）。
+	ElapsedMS int64
+	// Queued 是排队中的用户插话条数。
+	Queued int
+}
+
+// 活动状态取值（对应 driver.Busy，但 tools 不能依赖 driver）。
+const (
+	SubagentBusyIdle        = "idle"
+	SubagentBusyStreaming   = "streaming"
+	SubagentBusyRunningTool = "runningTool"
+	SubagentBusyAwaiting    = "awaiting"
+	SubagentBusyCompacting  = "compacting"
+)
+
+// SubagentDelivery 是一次通知的投递结果。
+type SubagentDelivery struct {
+	ID     string
+	Title  string
+	MailID string
+	// Woken 表示真的把它叫起来了（会花钱）。
+	Woken bool
+	// Skipped 是没唤醒的原因（运行中、等待回答等），只用于展示。
+	Skipped string
+	// Activity 是**投递那一刻**对方的活动明细。
+	//
+	// 只有 NotifyChild 会填（父会话据此理解"为什么没唤醒"）；
+	// NotifyParent 不填 —— 子会话拿不到也不该依赖父会话的状态。
+	Activity *SubagentActivity
 }
 
 // SessionHost 是 tools 包对"会话管理"的最小要求（由 host 实现）。
@@ -163,18 +247,6 @@ type SessionHost interface {
 	// title 建议非空（界面靠它分辨会话）；空则由宿主起默认名。
 	// 实现方负责：标记父子关系、继承工作区与模型、并让新会话立刻可见。
 	NewChildSession(title, prompt string) (string, error)
-}
-
-// MailboxMail 是工具层看到的邮件。
-type MailboxMail struct {
-	ID        string
-	From      string
-	FromTitle string
-	Subject   string
-	Body      string
-	At        time.Time
-	Read      bool
-	Refs      []string
 }
 
 // NewToolContext 构造上下文（cwd 初始为工作区根）。
@@ -658,8 +730,27 @@ type Options struct {
 	// 的工具列表里，每次请求都白带一段描述，模型也可能试着调用一次；
 	// 更关键的是，子会话派生孙会话本来就不是这个功能的目标 ——
 	// 能力不该出现在选项里，而不只是"调了会失败"。
+	//
+	// **注意**：这个开关与 Role 表达的是同一件事（子会话没有 new_session），
+	// 保留它是为了不动已有的调用点；新代码应当只设 Role。
 	NoSpawn bool
+	// Role 决定注册哪几个 subagent 工具。
+	//
+	// **不信任零值**：零值是 RoleRoot（能力更多的一侧）。所以生产入口
+	// 必须显式赋值 —— host 在 driverOptionsSpec 里按 spec.ParentID 给出。
+	Role SubagentRole
 }
+
+// SubagentRole 是会话在父子关系里的角色，决定 subagent 工具集。
+type SubagentRole int
+
+const (
+	// RoleRoot 是顶层会话：可 new_session + subagent_list + subagent_notify_child。
+	RoleRoot SubagentRole = iota
+	// RoleChild 是子会话：只可 subagent_notify_parent，
+	// 且**不注册** new_session（不允许派生孙会话，规则不变）。
+	RoleChild
+)
 
 // BuiltinWith 按显式开关构造工具集（生产入口用这个）。
 func BuiltinWith(opts Options) []*ToolDef {
@@ -676,15 +767,20 @@ func BuiltinWith(opts Options) []*ToolDef {
 		todoWriteTool(),
 		workingDirectoryTool(opts.AllowShell),
 		askUserQuestionTool(),
-		// 会话通讯：只在本项目内、且宿主接入了 Mailbox 时才真正可用
-		// （tools 注册不区分——没有 Mailbox 时工具会明确报错，而不是静默消失）。
-		mailboxSendTool(),
-		mailboxListTool(),
-		mailboxReadTool(),
+	}
+	// 父子会话通讯：**按角色**只注册该有的那几个。
+	//
+	// 不注册而不是"注册了报错"：模型不该看到自己用不了的接口，
+	// 否则每轮请求都白带一段描述、还可能试错一次。
+	if opts.Role == RoleChild {
+		// 子会话只需要"通知父会话"——它不需要知道父会话的状态（见 SubagentHost）。
+		list = append(list, subagentNotifyParentTool(), subagentReadTool())
+	} else {
+		list = append(list, subagentListTool(), subagentNotifyChildTool(), subagentReadTool())
 	}
 	// 在同一项目里新建子会话（并行做事，不污染当前上下文）。
-	// **子会话不注册**：不允许派生孙会话（见 Options.NoSpawn）。
-	if !opts.NoSpawn {
+	// **子会话不注册**：不允许派生孙会话（见 Options.NoSpawn / Role）。
+	if !opts.NoSpawn && opts.Role != RoleChild {
 		list = append(list, newSessionTool())
 	}
 	if opts.WebFetch {

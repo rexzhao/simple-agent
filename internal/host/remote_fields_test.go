@@ -32,31 +32,31 @@ func TestRemoteSessionsKeepAllFields(t *testing.T) {
 
 // 本地模式的会话列表要带未读数（桌面与 Android 直连都走它）。
 func TestSessionsReportMailUnread(t *testing.T) {
-	l, first, second := newMailboxPair(t)
+	l, parent, child := newSubagentPair(t)
 
 	// 一开始没有未读
 	for _, ref := range l.Sessions() {
-		if ref.ID == second.ID && ref.MailUnread != 0 {
+		if ref.ID == child.ID && ref.MailUnread != 0 {
 			t.Fatalf("初始未读应为 0，实际 %d", ref.MailUnread)
 		}
 	}
 
-	// 发一封给 second
-	if _, err := mailboxOf(t, first).MailboxDeliver(second.ID, "主题", "正文", nil); err != nil {
+	// 子会话给父会话发一条通知
+	if _, err := subagentOf(t, child).NotifyParent("主题", "正文"); err != nil {
 		t.Fatal(err)
 	}
 
 	found := false
 	for _, ref := range l.Sessions() {
-		if ref.ID != second.ID {
+		if ref.ID != parent.ID {
 			continue
 		}
 		found = true
 		if ref.MailUnread != 1 {
-			t.Fatalf("second 的未读应为 1，实际 %d", ref.MailUnread)
+			t.Fatalf("父会话的未读应为 1，实际 %d", ref.MailUnread)
 		}
 	}
 	if !found {
-		t.Fatal("会话列表里应包含 second")
+		t.Fatal("会话列表里应包含父会话")
 	}
 }

@@ -182,6 +182,57 @@ func names(list []*tools.ToolDef) string {
 	return strings.Join(out, ",")
 }
 
+// 回归：**按会话变化的**工具（subagent 组）也必须在"清单"与"执行"两侧同源。
+//
+// 真实事故（subagent 组第一次上线）：Role 只传给了 driver 的清单，而
+// appRuntime.RunTools 用全局 toolOptions（Role 零值 = 顶层）构造执行表 ——
+// 于是子会话看到 subagent_notify_parent，一调用就回「未知工具」。
+// 比上面那个 web_search 的 bug 更隐蔽：顶层会话完全正常，只有子会话坏。
+//
+// 关键是**子会话**这条路径：Role 必须从 ToolContext 里取出并参与构造。
+func TestRuntimeToolsFollowSessionRole(t *testing.T) {
+	cfg := config.Config{Workspace: "/ws"}
+	runtime := &appRuntime{}
+	executorConfig(&cfg, runtime, providers.Selection{ProviderID: "p", Model: "m"},
+		nil, nil, func(func()) {}, "", "")
+
+	// 子会话该有的工具：清单里有，执行端也必须认得。
+	childTools := tools.BuiltinWith(tools.Options{Role: tools.RoleChild})
+	if !strings.Contains(names(childTools), "subagent_notify_parent") {
+		t.Fatalf("子会话清单里该有 subagent_notify_parent：%v", names(childTools))
+	}
+
+	tc := tools.NewToolContext(t.TempDir(), false)
+	tc.SetRole(tools.RoleChild)
+	calls := make([]tools.Call, 0, len(childTools))
+	for index, tool := range childTools {
+		calls = append(calls, tools.Call{
+			ID:   fmt.Sprintf("c%d", index),
+			Name: tool.Name,
+			// 参数留空：会因缺参数报错，但**不会**报「未知工具」。
+			Args: tools.Args{},
+		})
+	}
+	outcomes := runtime.RunTools(context.Background(), tc, calls)
+	for index, outcome := range outcomes {
+		if strings.Contains(outcome.Output, "未知工具") {
+			t.Fatalf("子会话清单里有 %s，但执行端不认识它：%s",
+				childTools[index].Name, outcome.Output)
+		}
+	}
+
+	// 反过来：顶层会话不该能把子会话专属工具执行成功（它也拿不到清单，
+	// 这里是防"执行端比清单更宽"的反向泄漏）。
+	rootTC := tools.NewToolContext(t.TempDir(), false)
+	rootTC.SetRole(tools.RoleRoot)
+	leaked := runtime.RunTools(context.Background(), rootTC, []tools.Call{
+		{ID: "x", Name: "subagent_notify_parent", Args: tools.Args{"subject": "s", "body": "b"}},
+	})
+	if len(leaked) != 1 || !strings.Contains(leaked[0].Output, "未知工具") {
+		t.Fatalf("顶层会话不该能执行 subagent_notify_parent，实际：%+v", leaked)
+	}
+}
+
 // sameExecutorShape 比较配置里与"入口选择"无关的字段（函数字段比指针太脆，
 // nil 与 nil 视为相同）。
 func sameExecutorShape(a, b host.Config) bool {

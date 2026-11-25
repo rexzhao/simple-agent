@@ -35,6 +35,8 @@ const (
 	projectFileName = "project.json"
 	// projectsIndexName 是项目索引文件名（放在 data_dir 下）。
 	projectsIndexName = "projects.json"
+	// mailboxDirName 是全局会话邮箱目录名（放在 data_dir 下）。
+	mailboxDirName = "mailbox"
 )
 
 // projectsIndex 是 `projects.json` 的内容。
@@ -115,6 +117,20 @@ type SessionRecord struct {
 	// 属于项目档案的职责；日志只记对话事实。父会话被删除时子会话仍然
 	// 存在（parent_id 指向一个不存在的 id，界面按顶层显示）。
 	ParentID string `json:"parent_id,omitempty"`
+	// ChildModel 是**派生出去的子会话**使用的模型 id（空 = 跟随本会话）。
+	//
+	// 归属父会话而不是子会话：语义是"我派出去的子任务用什么模型干活"。
+	// 子会话自己的模型在创建那一刻就定死了，之后再改这里不影响已经
+	// 存在的子会话。
+	//
+	// 与下面 ChildEffort 一起由 `/subagent` 命令写入；旧档案读出来是零值，
+	// 也就是"跟随父会话"——这正是默认行为，不需要迁移。
+	ChildModel string `json:"child_model,omitempty"`
+	// ChildEffort 是派生出去的子会话的思考档位（空 = 用该模型的默认档位）。
+	//
+	// 不能跟着 ChildModel 一起继承父会话的档位：档位是**按模型**给的
+	// （见 host.effortsFor），父会话的档位在新模型上可能不存在。
+	ChildEffort string `json:"child_effort,omitempty"`
 }
 
 // projectPath 返回某个项目的档案目录（按 **ID**，不是名字）。
@@ -124,13 +140,56 @@ func (c *Catalog) projectPath(id string) string {
 
 // MailboxDir 返回某个项目的会话邮箱目录（`<项目>/mailbox/`）。
 //
-// 放在项目目录下而不是全局：邮件本来就是项目内的协作产物，
-// 与会话日志同源，删项目时一并消失，也不会和别的项目串味。
+// **已废弃（仅用于只读兼容旧数据）**：新的邮件一律写全局目录，见
+// GlobalMailboxDir。这里保留是因为磁盘上还有旧目录的信，丢弃会让
+// "侧栏徽标还在、点开却没有"变成新 bug。
 func (c *Catalog) MailboxDir(projectID string) string {
 	if projectID == "" {
 		return ""
 	}
 	return filepath.Join(c.projectPath(projectID), "mailbox")
+}
+
+// GlobalMailboxDir 返回**全局**会话邮箱目录（`<data_dir>/mailbox/`）。
+//
+// 为什么不再是"每项目一个"：会话通讯（subagent 组）只服务于父子会话，
+// 而父子关系**不受项目限制** —— 一个会话可以在任何目录里派生任务。
+// 按项目分目录会让跨项目的父子根本收不到彼此的消息，与功能的语义冲突。
+//
+// 代价：删项目不再连带删掉它的信。这是可接受的——邮件本来就是短生命周期
+// 的协作数据，而"删了项目还留下几封信"比"跨项目通信不通"轻得多。
+func (c *Catalog) GlobalMailboxDir() string {
+	if c == nil || c.dataDir == "" {
+		return ""
+	}
+	return filepath.Join(c.dataDir, mailboxDirName)
+}
+
+// ChildSessions 返回**所有项目里**以 parentID 为父的会话档案。
+//
+// 不按项目过滤：父子关系可以跨项目（见 GlobalMailboxDir 的说明）。
+// 顺序按项目顺序 + 档案顺序，稳定可复现。
+//
+// 只读档案、不碰会话日志：调用方（subagent_list）在内存里已有运行中的
+// 会话时应当优先用内存对象（那里才有忙碌状态），这里只兜住"档案里有、
+// 但当前进程没加载"的会话。
+func (c *Catalog) ChildSessions(parentID string) []SessionRecord {
+	if c == nil || parentID == "" {
+		return nil
+	}
+	projects, err := c.ListProjects()
+	if err != nil {
+		return nil
+	}
+	var out []SessionRecord
+	for _, project := range projects {
+		for _, record := range project.Sessions {
+			if record.ParentID == parentID {
+				out = append(out, record)
+			}
+		}
+	}
+	return out
 }
 
 // ProjectOfSession 反查某个会话属于哪个项目（找不到返回空串）。
