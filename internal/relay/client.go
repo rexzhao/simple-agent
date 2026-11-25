@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"simple-agent/internal/lan"
 	"simple-agent/internal/wire"
 )
 
@@ -228,12 +229,30 @@ func RunExecutorNotify(
 	addr string, info Executor, stop <-chan struct{},
 	serve func(wire.Conn), onRegistered func(),
 ) {
+	RunExecutorRefresh(addr, info, stop, serve, onRegistered, nil)
+}
+
+// RunExecutorRefresh 与 [RunExecutorNotify] 相同，另外在**每次注册前**
+// 回调 refresh 拿最新的 info。
+//
+// 用途：执行端上报的局域网地址会变（WiFi 切换、DHCP 续约、笔记本换网络）。
+// 只在启动时算一次的话，换了网络之后上报的就成了过期地址 —— 展示端会去
+// 连一个已经不存在的 IP，每次都要等超时才回退 relay，比没有直连还慢。
+//
+// refresh 为 nil 时行为与 RunExecutorNotify 完全一致。
+func RunExecutorRefresh(
+	addr string, info Executor, stop <-chan struct{},
+	serve func(wire.Conn), onRegistered func(), refresh func(Executor) Executor,
+) {
 	delay := time.Second
 	for {
 		select {
 		case <-stop:
 			return
 		default:
+		}
+		if refresh != nil {
+			info = refresh(info)
 		}
 		conn, err := wire.Dial(addr)
 		if err != nil {
@@ -282,6 +301,17 @@ func RunExecutorNotify(
 			case <-stopped:
 			}
 		}()
+		// **在线期间定期复查地址变化并重新上报**。
+		//
+		// 为什么不能只在重连时刷新：连接一直好好的，地址却可能已经变了
+		// （换 WiFi、DHCP 续约）。那时展示端会去连一个不存在的 IP，
+		// 每次等超时才回退 relay —— 比没有直连还慢。
+		//
+		// 轮询而不是监听网卡事件：Go 标准库没有跨平台的网络变化通知，
+		// 而枚举一次网卡是微秒级的（每 30 秒一次毫无负担）。
+		if refresh != nil {
+			go watchExecutorInfo(conn, info, refresh, stopped)
+		}
 		for {
 			accepted, acceptErr := mux.Accept()
 			if acceptErr != nil {
@@ -293,6 +323,77 @@ func RunExecutorNotify(
 		mux.Close()
 		sleep(time.Second, stop)
 	}
+}
+
+// watchExecutorInfo 定期复查执行端信息，变化了就经 relay 连接重新上报。
+//
+// 只发**非 mux 帧**（MsgUpdate 没有 Conn 字段），relay 的 serveExecutor
+// 循环能直接识别它 —— 不需要占用一条逻辑通道，也不会和展示端的通道 id 冲突。
+//
+// 只在内容真的变了时才发：无脑重发会让 relay 频繁刷新列表，进而让展示端
+// 收到多余的 executors 更新（界面会跟着抖动）。
+func watchExecutorInfo(conn wire.Conn, current Executor, refresh func(Executor) Executor, stopped <-chan struct{}) {
+	ticker := time.NewTicker(executorInfoInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopped:
+			return
+		case <-ticker.C:
+		}
+		next := refresh(current)
+		if sameLANAddrs(current.LANAddrs, next.LANAddrs) {
+			continue
+		}
+		current = next
+		body, err := wire.Encode(next)
+		if err != nil {
+			continue
+		}
+		// Conn 留空（0）：这是控制帧，不是某条逻辑通道的数据。
+		if err := conn.Send(wire.Packet{Kind: MsgUpdate, Body: body}); err != nil {
+			return
+		}
+		log.Printf("relay：已重新上报执行端信息（%d 个局域网地址）", len(next.LANAddrs))
+	}
+}
+
+// executorInfoInterval 是复查局域网地址的间隔。
+//
+// 30 秒：换网络后最多半分钟展示端就能拿到新地址。太短没必要
+// （枚举网卡虽然便宜，但每次变化都会让 relay 广播一次列表）；
+// 太长则换网后有较长时间会去试过期地址。
+//
+// 是变量而不是常量：测试需要把它调小验证"在线重新上报"这条路径，
+// 否则要等 30 秒（生产代码里没人改它）。
+var executorInfoInterval = 30 * time.Second
+
+// SetExecutorInfoIntervalForTest 调整复查间隔（仅测试用）。
+//
+// 在线重新上报的验证必须把 30 秒缩短，否则一条测试要跑半分钟。
+// 返回一个恢复原值的函数，用 defer 调用。
+func SetExecutorInfoIntervalForTest(interval time.Duration) func() {
+	previous := executorInfoInterval
+	executorInfoInterval = interval
+	return func() { executorInfoInterval = previous }
+}
+
+// sameLANAddrs 判断两组地址是否完全一致（顺序无关）。
+func sameLANAddrs(a, b []lan.Address) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	key := func(addr lan.Address) string { return addr.String() }
+	set := make(map[string]bool, len(a))
+	for _, addr := range a {
+		set[key(addr)] = true
+	}
+	for _, addr := range b {
+		if !set[key(addr)] {
+			return false
+		}
+	}
+	return true
 }
 
 func nextBackoff(current time.Duration) time.Duration {

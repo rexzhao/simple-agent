@@ -15,6 +15,7 @@ import (
 
 	"simple-agent/internal/config"
 	"simple-agent/internal/host"
+	"simple-agent/internal/lan"
 	"simple-agent/internal/locale"
 	"simple-agent/internal/providers"
 	"simple-agent/internal/relay"
@@ -286,13 +287,22 @@ func main() {
 	})
 
 	var stopListener func()
+	// 实际监听端口（--listen 不带地址时是 :0，必须从 listener 反查出来再上报）
+	listenPort := 0
+	// **监听只在用户显式给了 --listen 时才开**（不做"自动开启"）：
+	// 监听端口等于对外暴露一个入口，这种事不该在用户没要求时发生。
+	//
+	// 想让手机在同一 WiFi 下直连时，用：
+	//   simple-agent --relay HOST:PORT --token … --listen
+	// （不带地址 = 随机端口，会经 relay 上报给展示端）
 	if listenAddr != "" {
-		stop, err := startListener(listenAddr, app, post)
+		stop, port, err := startListener(listenAddr, app, post)
 		if err != nil {
 			showFatal(locale.Tr("dialog.config.title"), err.Error())
 			return
 		}
 		stopListener = stop
+		listenPort = port
 		defer stopListener()
 	}
 
@@ -300,11 +310,24 @@ func main() {
 	stopRelay := make(chan struct{})
 	if opts.relay != "" {
 		if local, ok := app.Host().(*host.Local); ok {
-			go relay.RunExecutor(opts.relay, relay.Executor{
+			// 局域网候选地址（relay 只当地址簿，展示端连上后仍要过
+			// 同一套 token + TLS 指纹校验）。
+			//
+			// 用 RunExecutorRefresh 而不是 RunExecutor：地址会变
+			// （换 WiFi、DHCP 续约），重连时和在线期间都要能更新，
+			// 否则展示端会一直去连过期地址。
+			initial := relay.Executor{
 				HostID: hostID(opts.name), Token: opts.relayToken,
-			}, stopRelay, func(conn wire.Conn) {
-				_ = host.Serve(conn, local, post)
-			})
+				LANAddrs: lan.Addresses(listenPort),
+			}
+			refresh := func(base relay.Executor) relay.Executor {
+				base.LANAddrs = lan.Addresses(listenPort)
+				return base
+			}
+			go relay.RunExecutorRefresh(opts.relay, initial, stopRelay,
+				func(conn wire.Conn) {
+					_ = host.Serve(conn, local, post)
+				}, nil, refresh)
 			defer close(stopRelay)
 		}
 	}

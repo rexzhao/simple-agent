@@ -23,6 +23,12 @@ param(
     [string]$Name = "",
     # 只本地跑，不注册 relay
     [switch]$NoRelay,
+    # 监听地址：给了就同时监听（局域网直连用）。
+    # 不给地址（只写 -Listen）表示随机端口，会经 relay 上报给展示端。
+    # 不写这个开关就完全不监听（默认对外不开入口）。
+    [switch]$Listen,
+    # 与 -Listen 搭配的监听地址（不给 = 随机端口）
+    [string]$ListenAddr = "",
     # 两次重启之间的等待秒数
     [int]$RestartDelaySeconds = 5,
     # 传给执行端的额外参数
@@ -67,6 +73,27 @@ try {
         }
     }
     $allArgs = $relayArgs + $ExtraArgs
+
+    # ---- 局域网直连监听 ----
+    #
+    # 只在显式给了 -Listen 时才加 --listen（监听 = 对外开一个入口，
+    # 不该在用户没要求时发生）。
+    #
+    #   -Listen                    随机端口（:0），地址经 relay 上报
+    #   -Listen -ListenAddr 0.0.0.0:7900   指定地址和端口
+    #
+    # 同一 WiFi 下的手机会优先直连这个端口（1~2ms），
+    # 不在同一网络时自动回退到 relay。
+    if ($Listen) {
+        $listenAddr = $ListenAddr
+        if ([string]::IsNullOrWhiteSpace($listenAddr)) {
+            $listenAddr = ":0"
+            Write-Host "局域网直连：随机端口（地址会经 relay 上报）" -ForegroundColor Cyan
+        } else {
+            Write-Host "局域网直连：监听 $listenAddr" -ForegroundColor Cyan
+        }
+        $allArgs += @("--listen", $listenAddr)
+    }
 
     function Invoke-Build {
         Write-Host ""

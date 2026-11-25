@@ -253,6 +253,11 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 remembered.isNotEmpty() && cachedSessions.any { it.id == remembered } -> remembered
                 else -> cachedSessions.lastOrNull()?.id.orEmpty()
             }
+            android.util.Log.d(
+                "SimpleAgent",
+                "restore：remembered=$remembered 缓存会话数=${cachedSessions.size} " +
+                    "命中=${cachedSessions.any { it.id == remembered }} 选定=$active",
+            )
             state.update { it.copy(sessions = cachedSessions, activeSessionId = active) }
             if (active.isNotEmpty()) {
                 applyCachedTimeline(active)
@@ -429,7 +434,8 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         }
         android.util.Log.d(
             "SimpleAgent",
-            "applyCachedTimeline：填入 ${cached.items.size} 条",
+            "applyCachedTimeline：填入 ${cached.items.size} 条 session=${cached.sessionId} " +
+                "active=${state.value.activeSessionId}",
         )
     }
 
@@ -628,14 +634,19 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // LazyColumn 对重复 key 的行为未定义，会导致条目错位、数量抖动。
         val merged = mergeProcessDetails(dedupeByKey(keptEarlier + page.items), previous.items)
 
-        // **空页不能覆盖已有内容**（最后一道保险）。
+        // **空页不能覆盖同一会话已有的内容**（最后一道保险）。
         //
         // 空页有两种来源：这个会话本来就空，或"现在拿不到数据"
         // （未连接、镜像还没同步完）。后者用空结果覆盖，就会把刚从缓存
         // 恢复出来的内容清掉 —— 界面表现为"打开就空白"，而缓存其实好着。
         //
-        // 判断"本来就空"很容易：本地一条都没有时才允许写空。
-        if (merged.isEmpty() && previous.items.isNotEmpty()) {
+        // **但必须区分是不是同一个会话**：切换会话后 previous 里是
+        // 上一个会话的残留内容，此时"保留"就大错特错 —— 界面会一直显示
+        // 别的会话的消息，直到这个会话真的加载出来（真机上切到长会话
+        // "很久都没内容，显示的还是刚才那个"就是这么来的）。
+        // 换会话时宁可先显示空白 + 加载中，也不能张冠李戴。
+        val sameSession = previous.sessionId == page.sessionId && page.sessionId.isNotEmpty()
+        if (merged.isEmpty() && previous.items.isNotEmpty() && sameSession) {
             android.util.Log.d(
                 "SimpleAgent",
                 "refreshTimeline：空页，保留已有的 ${previous.items.size} 条",

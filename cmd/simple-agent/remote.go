@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 
 	"simple-agent/internal/host"
+	"simple-agent/internal/lan"
 	"simple-agent/internal/tlsx"
 	"simple-agent/internal/uiapp"
 	"simple-agent/internal/wire"
@@ -44,6 +46,14 @@ type remoteOptions struct {
 	printFingerprint bool
 }
 
+// isFlag 判断一个参数是不是另一个开关（而不是上一个开关的取值）。
+//
+// 用途：`--listen --relay host:port` 这种写法里，--listen 后面跟的
+// 不是地址而是下一个开关，不能把它当成地址吃掉。
+func isFlag(arg string) bool {
+	return strings.HasPrefix(arg, "-")
+}
+
 // parseRemoteOptions 解析 --listen/--connect/--relay/--route/--headless，
 // 并把它们从 args 里摘掉（config.Load 不认这些参数）。
 func parseRemoteOptions(args *[]string) remoteOptions {
@@ -59,11 +69,18 @@ func parseRemoteOptions(args *[]string) remoteOptions {
 				rest = append(rest, (*args)[i])
 			}
 		case "--listen":
-			if i+1 < len(*args) {
+			// --listen 是**显式开关**：不给就一直不监听。
+			if i+1 < len(*args) && !isFlag((*args)[i+1]) {
 				opts.listen = (*args)[i+1]
 				i++
 			} else {
-				opts.listen = "127.0.0.1:7801"
+				// 只写了 --listen 没给地址：用随机端口（":0" 系统分配）。
+				//
+				// 为什么不是固定端口：固定端口在端口被占（有别的实例、
+				// 或别的软件占了 7801）时会直接启动失败，而随机端口反正
+				// 要通过 relay 上报给展示端，对方不需要预先知道它。
+				// 监听所有网卡（不写 127.0.0.1），否则局域网里的手机连不上。
+				opts.listen = ":0"
 			}
 		case "--connect":
 			if i+1 < len(*args) {
@@ -124,14 +141,14 @@ func parseRemoteOptions(args *[]string) remoteOptions {
 // startListener 让当前进程同时作为执行端对外服务（默认只监听回环）。
 //
 // 每条连接一个 goroutine；协议层不关心底层是直连还是 relay。
-func startListener(addr string, app *uiapp.App, post func(func())) (func(), error) {
+func startListener(addr string, app *uiapp.App, post func(func())) (func(), int, error) {
 	local, ok := app.Host().(*host.Local)
 	if !ok {
-		return nil, fmt.Errorf("当前进程不是执行端，无法监听")
+		return nil, 0, fmt.Errorf("当前进程不是执行端，无法监听")
 	}
 	listener, err := tlsx.Listen(addr)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	log.Printf("执行端已监听 %s（展示端可用 --connect %s 连接）", addr, listener.Addr())
 	warnIfUnprotected(listener.Addr().String())
@@ -166,5 +183,5 @@ func startListener(addr string, app *uiapp.App, post func(func())) (func(), erro
 			}(conn)
 		}
 	}()
-	return stop, nil
+	return stop, lan.ListenPort(listener), nil
 }

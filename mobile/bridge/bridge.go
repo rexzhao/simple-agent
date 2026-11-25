@@ -211,6 +211,20 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 		pinnedMu.Lock()
 		target := pinnedRoute
 		pinnedMu.Unlock()
+
+		// **优先试局域网直连**：同一 WiFi 下 1~2ms，比经 relay 中转
+		// （20~40ms，还要绕公网）快一个数量级，且不依赖外网。
+		//
+		// 候选地址来自 relay 下发的 Executor.LANAddrs（执行端注册时上报）。
+		// 只试与 target 匹配的那台：relay 上可能挂着多台执行端，
+		// 连到别人的局域网地址毫无意义。
+		//
+		// 失败一律静默回退到 relay —— 直连只是加速，不该因为
+		// "不在同一个 WiFi" 就让用户连不上。
+		if conn := c.tryLAN(target, addr, token); conn != nil {
+			return conn, nil
+		}
+
 		conn, chosen, err := relay.OpenViewerToken(addr, target, token)
 		if err == nil && chosen != "" {
 			pinnedMu.Lock()
@@ -244,6 +258,109 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 	c.post.submit(func() { c.emit("sessions", "") })
 	return ""
 }
+
+// tryLAN 尝试直连执行端的局域网地址，成功返回连接，失败返回 nil。
+//
+// target 是要连的 hostID（空表示"relay 上任意一台"，此时不直连 ——
+// 不知道对方是谁就没法挑地址）。
+//
+// 为什么逐个试而不是并行：候选通常只有 1~2 个（我们在执行端已经过滤掉
+// 虚拟网卡），并行反而要处理"多个连上了关哪个"的问题。
+//
+// 超时取 800ms：局域网内一个 RST/不可达通常在几十毫秒内就返回；
+// 800ms 足够覆盖慢速 WiFi，又不至于让"不在同一网络"的情况卡太久
+// （那种情况会走到超时才回退 relay，用户等的是这个时间）。
+func (c *Client) tryLAN(target, relayAddr, token string) wire.Conn {
+	if target == "" || c.plaintext() {
+		// 明文模式下不试直连：执行端监听走的是 tlsx.Listen，
+		// 连上去还是要 TLS 握手，而明文模式没有指纹可校验 —— 会握手失败。
+		return nil
+	}
+	c.mu.Lock()
+	list := append([]relay.Executor(nil), c.executors...)
+	c.mu.Unlock()
+
+	// **本地没有目标执行端的信息时主动问一次 relay**。
+	//
+	// 首次连接走的是 OpenViewerToken，那条路径不返回执行端列表
+	// （只有"有多台需要选"时才带出来），所以这里通常是空的。
+	// 不问就永远拿不到局域网地址，直连等于没实现。
+	if !containsExecutor(list, target) {
+		fetched, err := relay.ListExecutorsToken(relayAddr, token)
+		if err == nil {
+			c.saveExecutors(fetched)
+			list = fetched
+		}
+	}
+
+	for _, executor := range list {
+		if executor.HostID != target {
+			continue
+		}
+		for _, addr := range executor.LANAddrs {
+			if !addr.Dialable() {
+				continue
+			}
+			conn, err := dialLAN(addr.String(), lanDialTimeout)
+			if err != nil {
+				continue
+			}
+			log.Printf("展示端：已直连执行端 %s 的局域网地址 %s", target, addr.String())
+			return conn
+		}
+	}
+	return nil
+}
+
+// containsExecutor 判断列表里有没有这个 hostID。
+func containsExecutor(list []relay.Executor, hostID string) bool {
+	for _, executor := range list {
+		if executor.HostID == hostID {
+			return true
+		}
+	}
+	return false
+}
+
+// dialLAN 拨一条到局域网地址的连接（复用 wire 当前的拨号钩子，
+// 所以 TLS 指纹校验等设置自动生效）。
+func dialLAN(addr string, timeout time.Duration) (wire.Conn, error) {
+	type result struct {
+		conn wire.Conn
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		conn, err := wire.Dial(addr)
+		done <- result{conn: conn, err: err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return nil, r.err
+		}
+		return r.conn, nil
+	case <-time.After(timeout):
+		// 超时后不关连接：它可能稍后才建成（那样会泄漏一条）。
+		// 这里用带缓冲的 channel + 后台回收来避免泄漏。
+		go func() {
+			if r := <-done; r.conn != nil {
+				_ = r.conn.Close()
+			}
+		}()
+		return nil, fmt.Errorf("直连 %s 超时", addr)
+	}
+}
+
+// plaintext 报告当前是否明连接（没有配置 TLS 指纹）。
+func (c *Client) plaintext() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.fingerprint == ""
+}
+
+// lanDialTimeout 是单次局域网直连尝试的超时（见 tryLAN 的注释）。
+const lanDialTimeout = 800 * time.Millisecond
 
 // AttachForTest 直接挂一个已经建好的展示端（测试用：跳过 TCP 拨号，
 // 用进程内管道验证视图模型与回调）。
@@ -620,13 +737,26 @@ func (c *Client) TimelinePageJSON(sessionID string, beforeSeq int64, limit int) 
 		}
 	}
 	if !ok {
-		// 补拉也拿不到 = 真的到最早了
+		// 切不出页。两种完全不同的情况，**不能都报"到底了"**：
+		//
+		//   - before > 0：用户往上翻，确实翻到最早了
+		//   - before == 0：要最后一页却什么都没有 —— 这不是"内容为空"，
+		//     而是**这个会话还没同步过来**（展示端刚切过去，镜像里还没有它，
+		//     或者 attach 还没完成）
+		//
+		// 以前两种情况都返回 has_more=false 的空页，于是切换到一个长会话时
+		// 界面一直是空的，直到某次刷新恰好赶上数据到达 —— 真机上表现就是
+		// "切过去很久都没内容"（桌面端正常，因为它是本地执行端）。
+		//
+		// 现在 before==0 时带 retry，界面据此继续轮询而不是停止刷新。
+		retry := before == 0
 		return encode(map[string]any{
 			"session_id": sessionID,
 			"items":      []ItemView{},
-			"has_more":   false,
+			"has_more":   retry,
 			"seq_from":   before,
 			"seq_to":     before,
+			"retry":      retry,
 		})
 	}
 	return page
@@ -1285,6 +1415,16 @@ func (c *Client) currentSession(sessionID string) *host.Session {
 		if session := remote.Session(sessionID); session != nil {
 			return session
 		}
+		// **指定了会话但找不到 —— 返回 nil，不要回退到 Active()**。
+		//
+		// 以前这里 `return remote.Active()`，想法是"没指定就用当前的"，
+		// 但那把"这个会话还不存在（切过去还没 attach 上）"和"没指定会话"
+		// 混成了一件事：调用方要 A 的内容，拿到的却是 B 的 ——
+		// 界面上表现为"切过去显示的是上一个会话的内容"或者莫名其妙空着
+		// （真机上切到长会话时"很久都没内容"就是这个）。
+		//
+		// 空串才是"用当前活动会话"的合法请求，那种情况走下面的 Active()。
+		return nil
 	}
 	return remote.Active()
 }

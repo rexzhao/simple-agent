@@ -14,6 +14,7 @@ import (
 	"log"
 	"sync"
 
+	"simple-agent/internal/lan"
 	"simple-agent/internal/wire"
 )
 
@@ -28,6 +29,15 @@ const (
 	MsgPong      = "relay.pong"
 	// MsgRegistered 是注册结果（失败时带 error；同名/超限都拒绝后来的那个）
 	MsgRegistered = "relay.registered"
+	// MsgUpdate 是执行端**在线期间**重新上报自己的信息（目前用于局域网地址）。
+	//
+	// 为什么需要：上报的地址会变 —— WiFi 切换、DHCP 续约、笔记本换网络。
+	// 只靠"重连时刷新"不够：连接一直好好的，地址却已经失效，展示端会去连
+	// 一个不存在的 IP，每次都要等超时才回退 relay，比没有直连还慢。
+	//
+	// relay 收到后只更新保存的 Executor 信息，不回包（这是单向通知）；
+	// 旧版 relay 不认识这个消息会直接忽略，不影响注册本身。
+	MsgUpdate = "relay.update"
 	// MsgClose 通知对端"这条逻辑通道关了"（与 wire.MuxCloseKind 同义）
 	MsgClose = wire.MuxCloseKind
 )
@@ -40,6 +50,18 @@ type Executor struct {
 	// 放在注册/路由帧里而不是握手层，是因为 relay 本来就不解析会话协议，
 	// 加一个字段比给 wire.Hello 增加一种"relay 专用凭据"更简单。
 	Token string `json:"token,omitempty"`
+	// LANAddrs 是执行端的**局域网直连候选**（见 internal/lan）。
+	//
+	// 执行端注册时上报，relay 原样保存并在列表里返回给展示端。展示端优先
+	// 尝试这些地址直连（同一 WiFi 下延迟 1~2ms），全失败再走 relay。
+	//
+	// relay 只当"地址簿"，不参与直连，也不校验这些地址 —— 展示端连上之后
+	// 仍然要过同一套 token + TLS 指纹校验，所以伪造地址没有安全收益
+	// （最坏是多花几秒尝试一个不通的地址）。
+	//
+	// 字段可空：旧版执行端不上报，旧版 relay 不认识也会忽略，
+	// 两边都能正常工作（只是没有直连加速）。
+	LANAddrs []lan.Address `json:"lan_addrs,omitempty"`
 }
 
 // tokenPayload 是"首包里带 token"的最小视图（注册 / 路由 / 列表查询共用）。
@@ -334,6 +356,31 @@ func (r *Relay) serveExecutor(conn wire.Conn, info Executor) {
 		}
 		if packet.Kind == MsgPing {
 			_ = conn.Send(wire.Packet{Kind: MsgPong})
+			continue
+		}
+		// **在线重新上报**（局域网地址变了）：只更新保存的信息，然后
+		// 广播一次执行端列表，让展示端立刻拿到新地址。
+		//
+		// 必须在按 packet.Conn 找观众**之前**处理：这是控制帧，
+		// Conn 是 0，找不到观众，会被下面当成"无关帧"丢掉。
+		if packet.Kind == MsgUpdate {
+			var updated Executor
+			if err := wire.Decode(packet.Body, &updated); err != nil {
+				continue
+			}
+			// 不信任传来的 HostID：以注册时确认的那个为准，
+			// 否则执行端可以顺手把别人的地址改掉。
+			updated.HostID = info.HostID
+			updated.Token = ""
+			r.mu.Lock()
+			if current, ok := r.executors[info.HostID]; ok && current == link {
+				link.mu.Lock()
+				link.info = updated
+				link.mu.Unlock()
+				r.mu.Unlock()
+			} else {
+				r.mu.Unlock()
+			}
 			continue
 		}
 		link.mu.Lock()
