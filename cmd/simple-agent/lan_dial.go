@@ -8,17 +8,45 @@ import (
 	"time"
 
 	"simple-agent/internal/lan"
+	"simple-agent/internal/peerverify"
 	"simple-agent/internal/relay"
 	"simple-agent/internal/tlsx"
+	"simple-agent/internal/trust"
 	"simple-agent/internal/wire"
 )
 
-// lanDialTimeout 是单次局域网直连尝试的超时。
+// lanDialTimeout 是单次局域网直连尝试的**网络**超时。
 //
 // 800ms：局域网内 RST/不可达通常几十毫秒就返回；这个值覆盖慢速 WiFi，
 // 又不至于让"不在同一网络"卡太久（那种情况会走到超时才回退 relay，
 // 用户等的就是这个时间）。
+//
+// **它只管网络，不管等用户**（见 dialRaw 的实现）：指纹确认在 TLS
+// 握手内部阻塞，那是人的速度 —— 把这个计时套在整条 `cfg.Dial` 上，
+// 用户看弹窗超过 800ms 就会被判成"直连失败、回退 relay"。
 const lanDialTimeout = 800 * time.Millisecond
+
+// viewerDataDir 是本进程的数据目录（证书与信任列表都在这下面）。
+//
+// 用全局变量而不是层层传参：它被 dialRaw → tlsx.Config 这条深处的
+// 调用链用到，而那条链上每一层都只是转发。进程级配置这样更清楚。
+var viewerDataDir string
+
+// verifierStore 返回信任列表（与 relay 校验共用同一份）。
+//
+// 懒加载：setupTLS 里已经打开过一份，但那条路径在 main 的早期，
+// 且不保证只执行一次；这里按需再打开（Open 是只读的，重复打开无害）。
+func verifierStore() *trust.Store {
+	if viewerTrustStore != nil {
+		return viewerTrustStore
+	}
+	store, err := trust.Open(trust.DefaultPath(viewerDataDir))
+	if err != nil {
+		log.Printf("信任列表读取失败（将每次重新确认）：%v", err)
+		return nil
+	}
+	return store
+}
 
 // openViewer 连到目标执行端：**优先局域网直连**，失败回退 relay。
 //
@@ -123,32 +151,44 @@ func dialLAN(addr address, token string) (wire.Conn, error) {
 // address 是 lan.Address 的别名（让 dialLAN 的签名短一点）。
 type address = lan.Address
 
-// dialRaw 只负责建连（**只走 TLS**），不做握手。
+// dialRaw 建连（只走 TLS），并走与 relay 相同的指纹确认流程。
 //
-// 没有明文分支：加密与明文严格隔离，见 dialLAN 的注释。
+// # 三处必须和 relay 拨号一致
+//
+//  1. **挂 OnPeerFingerprint**：直连时对端是执行端，它的指纹同样要经过
+//     TOFU（没确认过就弹窗）。之前这里用裸 tlsx.Config 直接校验，跳过了
+//     确认流程 —— 用户看到的是"直连悄悄失败、回退 relay"，而弹窗里显示的
+//     还是 relay 的指纹（同一条待确认项被重复渲染）。
+//
+//  2. **带上自己的证书**（DataDir）：mTLS 下执行端要验证我们是谁。
+//     不带证书时执行端直接拒绝（"没有出示客户端证书"），直连必失败。
+//
+//  3. **超时只管网络**：等用户在弹窗上做决定的时间不能算进 dialTimeout。
+//     所以这里的超时只包住"TCP+TLS 握手"，握手内部的 TOFU 阻塞不受
+//     这个计时器影响（计时器只决定"要不要放弃等待结果"，而结果由
+//     Gate 的 channel 给出 —— 见下面的实现说明）。
 func dialRaw(addr, fingerprint string) (net.Conn, error) {
 	if fingerprint == "" {
 		return nil, fmt.Errorf("%s 没有证书指纹，拒绝明文连接", addr)
 	}
-	type result struct {
-		conn net.Conn
-		err  error
+	cfg := tlsx.Config{
+		// **不设 Fingerprint**：lan_addrs 里那个指纹是执行端自己报的，
+		// 不能直接当"已信任"。交给 OnPeerFingerprint 走信任列表/用户确认，
+		// 与连 relay 完全一样的流程（确认过一次就记进 known_hosts）。
+		//
+		// 自己的证书：执行端要验证我们是谁（mTLS）
+		DataDir: viewerDataDir,
+		// 只有 TCP 建连有超时；握手可能等用户看弹窗，不计时
+		DialTimeout: lanDialTimeout,
 	}
-	done := make(chan result, 1)
-	go func() {
-		raw, err := tlsx.Config{Fingerprint: fingerprint}.Dial(addr)
-		done <- result{conn: raw, err: err}
-	}()
-	select {
-	case r := <-done:
-		return r.conn, r.err
-	case <-time.After(lanDialTimeout):
-		// 超时后台回收：迟到的连接要关掉，否则泄漏
-		go func() {
-			if r := <-done; r.conn != nil {
-				_ = r.conn.Close()
-			}
-		}()
-		return nil, fmt.Errorf("直连 %s 超时", addr)
+	if peerGate != nil {
+		// 直连执行端时按 executor 记账（与 relay 分开）
+		verifier := &peerverify.Verifier{
+			Store: verifierStore(),
+			Role:  trust.RoleExecutor,
+			Ask:   peerGate.Ask,
+		}
+		cfg.OnPeerFingerprint = verifier.Verify
 	}
+	return cfg.Dial(addr)
 }

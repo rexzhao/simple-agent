@@ -82,6 +82,13 @@ type Config struct {
 	// **实现方可以阻塞**（比如等用户点弹窗）：握手期间连接尚未建立，
 	// 阻塞只影响这一条连接，不影响 Accept 循环或界面线程。
 	OnPeerFingerprint func(addr string, certDER []byte) error
+	// DialTimeout 只限制**建立 TCP 连接**的时间（0 = 不限）。
+	//
+	// 为什么不限制整个握手：握手期间可能要等用户确认指纹，那是人的
+	// 速度。把超时套在整条 Dial 上，用户看弹窗超过这个时间就会被判成
+	// "连接失败"（真实的坑：直连时 800ms 超时把弹窗吃掉了，表现为
+	// "直连总是失败、回退 relay"）。
+	DialTimeout time.Duration
 }
 
 // resolvedCertPaths 返回实际使用的证书路径（未显式指定时落到 DataDir 下）。
@@ -214,29 +221,41 @@ func (c Config) Dial(addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	// **TOFU 校验**：没有预先指定的指纹时，把对端证书交给 OnPeerFingerprint
-	// 决定"信不信"，而不是一律拒绝。
+	// **TOFU 校验**：把对端证书交给 OnPeerFingerprint 决定"信不信"。
 	//
-	// 为什么不能"没指纹就直接连"：那等于谁都行 —— 伪造者只要把证书一换，
-	// 客户端照样连上。所以这里把见过的指纹交出去（调用方据此记进信任
-	// 列表并提示用户），下次再连就用它严格校验。
+	// 挂载条件是"调用方提供了回调"，**不是**"没有预设指纹"：
+	//   - 没有预设指纹（连 relay 首次）→ 由回调查信任列表/问用户
+	//   - 有预设指纹（直连执行端的 lan_addrs 里带了它自己的指纹）→
+	//     那个指纹是**对端自己说的**，同样要经信任列表/用户确认，
+	//     不能直接拿来当"已信任"。
+	//
+	// 以前这里只在"没有指纹"时挂回调，于是直连执行端时完全跳过了确认 ——
+	// 用户看到的行为是"直连悄悄失败、回退 relay"（真实踩到）。
 	if c.OnPeerFingerprint != nil {
 		callback := c.OnPeerFingerprint
-		// 有明确指纹时 ClientConfig 已经装了严格校验，这里不重复
-		if !c.HasFingerprint() {
-			cfg.VerifyPeerCertificate = func(rawCerts [][]byte, chains [][]*x509.Certificate) error {
-				if len(rawCerts) == 0 {
-					return fmt.Errorf("对端 %s 没有提供证书", addr)
-				}
-				if err := callback(addr, rawCerts[0]); err != nil {
-					return err
-				}
-				return nil
+		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("对端 %s 没有提供证书", addr)
 			}
+			return callback(addr, rawCerts[0])
 		}
 	}
-	conn, err := tls.Dial("tcp", addr, cfg)
+	// **只有 TCP 建连带超时**（c.DialTimeout）：
+	//
+	// TLS 握手期间可能要等用户确认指纹，那是人的速度，不该被网络超时
+	// 打断。所以超时卡在"建立 TCP 连接"这一步，握手另外进行。
+	var raw net.Conn
+	if c.DialTimeout > 0 {
+		raw, err = net.DialTimeout("tcp", addr, c.DialTimeout)
+	} else {
+		raw, err = net.Dial("tcp", addr)
+	}
 	if err != nil {
+		return nil, fmt.Errorf("连接 %s 失败：%w", addr, err)
+	}
+	conn := tls.Client(raw, cfg)
+	if err := conn.Handshake(); err != nil {
+		_ = raw.Close()
 		// 指纹不匹配时底层可能是 "connection aborted" 之类的通用错误，
 		// 用户看不出是证书问题。这里统一包一层可读的说明。
 		return nil, fmt.Errorf("TLS 连接 %s 失败（可能是证书指纹不匹配，或对端没开 TLS）：%w", addr, err)

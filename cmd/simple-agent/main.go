@@ -118,6 +118,10 @@ func main() {
 	}
 	locale.SetCurrent(lang)
 
+	// 数据目录：证书、信任列表都在它下面。直连执行端时要用它带证书、
+	// 查信任列表（见 lan_dial.go 的 dialRaw）。
+	viewerDataDir = cfg.DataDir
+
 	// 传输加密（默认关闭）。必须在**任何连接建立之前**装配：
 	// 它要装 wire 的拨号钩子，晚了第一条连接就已经是明文了。
 	// 返回 false 表示只打印了指纹、该退出。
