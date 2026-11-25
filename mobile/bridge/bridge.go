@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"runtime/debug"
 	"sort"
 	"sync"
@@ -279,11 +280,13 @@ func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {
 // WiFi，又不至于让"不在同一网络"卡太久（那种情况会走到超时才回退 relay，
 // 用户等的就是这个时间）。
 func (c *Client) dialLANFor(hostID string) wire.Conn {
-	if hostID == "" || c.plaintext() {
-		// 明文模式下不试直连：执行端监听走的是 tlsx.Listen，
-		// 连上去还是要 TLS 握手，而明文模式没有指纹可校验 —— 会握手失败。
+	if hostID == "" {
 		return nil
 	}
+	// **不看 plaintext()**：直连校验的是**执行端自己的**证书指纹
+	// （来自 lan_addrs 里的 tls_fingerprint），与"连 relay 时配没配指纹"
+	// 完全无关。以前这里用 plaintext() 做门禁，导致没给 viewer 配
+	// relay 指纹时直连永远不生效（实测踩到）。
 	c.mu.Lock()
 	list := append([]relay.Executor(nil), c.executors...)
 	c.mu.Unlock()
@@ -296,7 +299,11 @@ func (c *Client) dialLANFor(hostID string) wire.Conn {
 			if !addr.Dialable() {
 				continue
 			}
-			conn, err := dialLAN(addr.String(), lanDialTimeout)
+			// **用执行端自己的证书指纹拨号**，不是 relay 的。
+			//
+			// 两者是不同的自签名证书：拿 relay 的指纹去校验执行端，
+			// 结果一定是"证书指纹不匹配"（实测就是这个），直连永远失败。
+			conn, err := dialLANWith(addr.String(), addr.TLSFingerprint, lanDialTimeout)
 			if err != nil {
 				continue
 			}
@@ -307,17 +314,39 @@ func (c *Client) dialLANFor(hostID string) wire.Conn {
 	return nil
 }
 
-// dialLAN 拨一条到局域网地址的连接（复用 wire 当前的拨号钩子，
-// 所以 TLS 指纹校验等设置自动生效）。
-func dialLAN(addr string, timeout time.Duration) (wire.Conn, error) {
+// dialLANWith 拨一条到局域网地址的连接。
+//
+// fingerprint 为空 = 明文直连（执行端只配了 --tls-fingerprint 而没有
+// 服务端证书时，它的监听就是明文的）。这与"用户直接 --connect 执行端"
+// 是同一种行为，不额外降低安全性。
+//
+// **不复用全局 wire.Dial**：那套钩子挂的是 relay 的指纹。直连执行端时
+// 校验的必须是执行端的证书（两者是不同的自签名证书），否则必然
+// "证书指纹不匹配"（实测踩过，直连永远失败）。
+func dialLANWith(addr, fingerprint string, timeout time.Duration) (wire.Conn, error) {
 	type result struct {
 		conn wire.Conn
 		err  error
 	}
 	done := make(chan result, 1)
+	cfg := tlsx.Config{Fingerprint: fingerprint}
 	go func() {
-		conn, err := wire.Dial(addr)
-		done <- result{conn: conn, err: err}
+		if fingerprint == "" {
+			// 明文：直接 TCP，不做 TLS 握手
+			raw, err := net.DialTimeout("tcp", addr, timeout)
+			if err != nil {
+				done <- result{err: err}
+				return
+			}
+			done <- result{conn: wire.NewTCPConn(raw)}
+			return
+		}
+		raw, err := cfg.Dial(addr)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		done <- result{conn: wire.NewTCPConn(raw)}
 	}()
 	select {
 	case r := <-done:
@@ -326,8 +355,7 @@ func dialLAN(addr string, timeout time.Duration) (wire.Conn, error) {
 		}
 		return r.conn, nil
 	case <-time.After(timeout):
-		// 超时后不关连接：它可能稍后才建成（那样会泄漏一条）。
-		// 这里用带缓冲的 channel + 后台回收来避免泄漏。
+		// 超时后台回收：迟到的连接要关掉，否则泄漏
 		go func() {
 			if r := <-done; r.conn != nil {
 				_ = r.conn.Close()
@@ -336,6 +364,7 @@ func dialLAN(addr string, timeout time.Duration) (wire.Conn, error) {
 		return nil, fmt.Errorf("直连 %s 超时", addr)
 	}
 }
+
 
 // plaintext 报告当前是否明连接（没有配置 TLS 指纹）。
 func (c *Client) plaintext() bool {

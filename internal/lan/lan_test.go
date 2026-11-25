@@ -10,7 +10,7 @@ import (
 // 端口没监听时不该上报候选：没有端口就直连不了，展示端据此判断
 // "这台执行端不支持直连"。
 func TestAddressesWithoutPort(t *testing.T) {
-	if got := lan.Addresses(0); got != nil {
+	if got := lan.Addresses(0, "ab"); got != nil {
 		t.Fatalf("port=0 应返回空，实际 %v", got)
 	}
 }
@@ -35,7 +35,7 @@ func TestLocalAddressesAreDialable(t *testing.T) {
 
 // Addresses 填上端口后必须全部可拨（展示端直接拿去拨号）。
 func TestAddressesAreDialable(t *testing.T) {
-	for _, addr := range lan.Addresses(7900) {
+	for _, addr := range lan.Addresses(7900, "cd") {
 		if !addr.Dialable() {
 			t.Fatalf("Addresses 的结果必须可拨：%+v", addr)
 		}
@@ -76,7 +76,7 @@ func TestListenPort(t *testing.T) {
 
 // Address.String 要能直接用于拨号。
 func TestAddressString(t *testing.T) {
-	addr := lan.Address{IP: "10.10.110.196", Port: 7900}
+	addr := lan.Address{IP: "10.10.110.196", Port: 7900, TLSFingerprint: "ab"}
 	if got := addr.String(); got != "10.10.110.196:7900" {
 		t.Fatalf("host:port 格式不对：%q", got)
 	}

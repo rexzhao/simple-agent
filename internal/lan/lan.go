@@ -39,6 +39,14 @@ type Address struct {
 	Port int `json:"port"`
 	// Name 是网卡名（仅用于界面/日志可读性，选路时不参与判断）。
 	Name string `json:"name,omitempty"`
+	// TLSFingerprint 是**执行端自己**的证书指纹（不是 relay 的）。
+	//
+	// 直连时校验的是执行端的证书，而展示端连 relay 用 relay 的指纹 ——
+	// 两者是不同的自签名证书。不带上这一项，直连必然握手失败
+	// （实测：TLS 连接失败"证书指纹不匹配"），整个加速等于没做。
+	//
+	// 为空表示执行端没开 TLS（-Listen 但没配证书），此时不该直连。
+	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
 }
 
 // String 返回 host:port 形式（直接可用于拨号）。
@@ -50,6 +58,13 @@ func (a Address) String() string {
 }
 
 // Dialable 报告这个地址是否值得尝试。
+//
+// 不要求 TLSFingerprint：执行端可能以**明文**监听（只配了 --tls-fingerprint
+// 而没有服务端证书时就是这样，此时 tlsx.Listen 走的是明文 net.Listen）。
+// 那种情况下展示端也用明文直连 —— 与"用户直接用 --connect 连执行端"是
+// 同一种行为，安全等级一致。
+//
+// fingerprint 为空 = 明文；非空 = 用该指纹做 TLS 校验。
 func (a Address) Dialable() bool {
 	if a.IP == "" || a.Port <= 0 {
 		return false
@@ -58,17 +73,22 @@ func (a Address) Dialable() bool {
 	return ip != nil && ip.To4() != nil
 }
 
-// Addresses 返回可上报的局域网直连候选（全部带上监听端口）。
+// Addresses 返回可上报的局域网直连候选（全部带上监听端口与执行端证书指纹）。
 //
 // port <= 0（没在监听）时返回空：没有端口就没有直连的意义，
 // 展示端据此判断"这个执行端不支持直连"。
-func Addresses(port int) []Address {
+//
+// fingerprint 可以为空 —— 那表示执行端以明文监听（只配了
+// --tls-fingerprint 而没有服务端证书）。明文直连与"用户直接
+// --connect 执行端"是同一种行为，不额外降低安全性。
+func Addresses(port int, fingerprint string) []Address {
 	if port <= 0 {
 		return nil
 	}
 	addresses := LocalAddresses()
 	for i := range addresses {
 		addresses[i].Port = port
+		addresses[i].TLSFingerprint = fingerprint
 	}
 	// 过滤掉拼装后仍然不可用的（防御：LocalAddresses 已保证 IP 合法）
 	usable := addresses[:0]

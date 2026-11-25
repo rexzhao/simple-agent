@@ -289,6 +289,9 @@ func main() {
 	var stopListener func()
 	// 实际监听端口（--listen 不带地址时是 :0，必须从 listener 反查出来再上报）
 	listenPort := 0
+	// 执行端**自己**的证书指纹：直连时展示端校验的是它（不是 relay 的）。
+	// 两者是不同的自签名证书，用 relay 的指纹去连执行端必然握手失败。
+	listenFingerprint := ""
 	// **监听只在用户显式给了 --listen 时才开**（不做"自动开启"）：
 	// 监听端口等于对外暴露一个入口，这种事不该在用户没要求时发生。
 	//
@@ -296,13 +299,14 @@ func main() {
 	//   simple-agent --relay HOST:PORT --token … --listen
 	// （不带地址 = 随机端口，会经 relay 上报给展示端）
 	if listenAddr != "" {
-		stop, port, err := startListener(listenAddr, app, post)
+		stop, port, fingerprint, err := startListener(listenAddr, app, post)
 		if err != nil {
 			showFatal(locale.Tr("dialog.config.title"), err.Error())
 			return
 		}
 		stopListener = stop
 		listenPort = port
+		listenFingerprint = fingerprint
 		defer stopListener()
 	}
 
@@ -318,10 +322,10 @@ func main() {
 			// 否则展示端会一直去连过期地址。
 			initial := relay.Executor{
 				HostID: hostID(opts.name), Token: opts.relayToken,
-				LANAddrs: lan.Addresses(listenPort),
+				LANAddrs: lan.Addresses(listenPort, listenFingerprint),
 			}
 			refresh := func(base relay.Executor) relay.Executor {
-				base.LANAddrs = lan.Addresses(listenPort)
+				base.LANAddrs = lan.Addresses(listenPort, listenFingerprint)
 				return base
 			}
 			go relay.RunExecutorRefresh(opts.relay, initial, stopRelay,

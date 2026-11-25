@@ -141,14 +141,14 @@ func parseRemoteOptions(args *[]string) remoteOptions {
 // startListener 让当前进程同时作为执行端对外服务（默认只监听回环）。
 //
 // 每条连接一个 goroutine；协议层不关心底层是直连还是 relay。
-func startListener(addr string, app *uiapp.App, post func(func())) (func(), int, error) {
+func startListener(addr string, app *uiapp.App, post func(func())) (func(), int, string, error) {
 	local, ok := app.Host().(*host.Local)
 	if !ok {
-		return nil, 0, fmt.Errorf("当前进程不是执行端，无法监听")
+		return nil, 0, "", fmt.Errorf("当前进程不是执行端，无法监听")
 	}
 	listener, err := tlsx.Listen(addr)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	log.Printf("执行端已监听 %s（展示端可用 --connect %s 连接）", addr, listener.Addr())
 	warnIfUnprotected(listener.Addr().String())
@@ -183,5 +183,5 @@ func startListener(addr string, app *uiapp.App, post func(func())) (func(), int,
 			}(conn)
 		}
 	}()
-	return stop, lan.ListenPort(listener), nil
+	return stop, lan.ListenPort(listener), tlsx.ActiveServerFingerprint(), nil
 }

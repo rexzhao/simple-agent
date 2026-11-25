@@ -377,5 +377,25 @@ func Active() Config {
 // Dial 用当前生效配置拨号。
 func Dial(addr string) (net.Conn, error) { return Active().Dial(addr) }
 
+// ActiveServerFingerprint 返回**当前生效的服务端证书**指纹（小写十六进制）。
+//
+// 用途：执行端把局域网直连地址上报给 relay 时，要一并带上自己的证书指纹
+// —— 展示端直连时校验的是执行端的证书，而连 relay 时校验的是 relay 的，
+// 两者是不同的自签名证书。不带这一项，直连必然握手失败。
+//
+// 没配服务端证书（明文模式）时返回空串。
+func ActiveServerFingerprint() string {
+	cfg := Active()
+	if !cfg.ServerTLS() {
+		return ""
+	}
+	certFile, _ := cfg.resolvedCertPaths()
+	fingerprint, err := CertFingerprintFile(certFile)
+	if err != nil {
+		return ""
+	}
+	return normalizedFingerprint(fingerprint)
+}
+
 // Listen 用当前生效配置监听。
 func Listen(addr string) (net.Listener, error) { return Active().Listen(addr) }
