@@ -346,15 +346,43 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
      * 所以即使缓存稍旧也不会让人看到错误内容（回合一结束就被替换）。
      */
     private fun applyCachedTimeline(sessionId: String) {
+        // **已经有内容就直接返回**：缓存只是首屏占位，不该反复覆盖。
+        //
+        // 这条防的是一个真实 bug：启动时 restoreLastSession 会用缓存填一次
+        // （未连接，无条件信任），紧接着 streamConnected 又调到这里 ——
+        // 那时还没连上、core.syncCursor() 返回空游标，isCompatible 判 false，
+        // 于是**刚填好的缓存被删掉**，界面变回空白（201ms 后的事）。
+        val existing = state.value.timeline
+        if (existing.items.isNotEmpty() && existing.sessionId == sessionId) {
+            return
+        }
         val cached = cache.readTimeline(sessionId) ?: return
-        // 拿执行端的**当前**游标比：不一致就说明缓存不能用了
+        // **判断依据是"拿不拿得到游标"，不是 connected 标志位**。
+        //
+        // connected 可能已经是 true，但此刻镜像还没同步完（syncCursor 返回
+        // 空 epoch）。那种情况下判"不兼容"并把缓存删掉，就又变空白了。
+        // 空游标只说明"现在没法判断"，不等于"缓存坏了" —— 先信它。
         val cursor = core.syncCursor(sessionId)
+        if (cursor.epoch.isEmpty()) {
+            android.util.Log.d("SimpleAgent", "applyCached：游标还没就绪，先用缓存")
+            applyCachedIntoState(cached)
+            return
+        }
         if (!cache.isCompatible(cached, cursor.epoch, cursor.generation)) {
             // 执行端重启过、或会话被压缩：缓存必须整体作废，
             // 否则会按错误基准续，出现错位或漏消息。
+            android.util.Log.d(
+                "SimpleAgent",
+                "applyCached：不兼容，丢弃（cached=${cached.sync} cursor=$cursor）",
+            )
             cache.dropTimeline(sessionId)
             return
         }
+        applyCachedIntoState(cached)
+    }
+
+    /** applyCachedIntoState 把缓存内容填进界面状态。 */
+    private fun applyCachedIntoState(cached: TimelineView) {
         state.update {
             it.copy(
                 timeline = it.timeline.copy(
@@ -367,6 +395,10 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 asks = cached.asks,
             )
         }
+        android.util.Log.d(
+            "SimpleAgent",
+            "applyCachedTimeline：填入 ${cached.items.size} 条",
+        )
     }
 
     /**
@@ -379,7 +411,12 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         val view = state.value.timeline
         if (view.sessionId.isEmpty() || view.items.isEmpty()) return
         if (view.runtime.busy != "idle") return
-        cache.writeTimeline(view)
+        // **游标必须单独取**：界面用的是分页接口（timelinePage），它不带 sync
+        // （每页都背一份没必要）。不补这一步，写进缓存的 sync 就是 null，
+        // 下次读回来 isCompatible 直接判 false → 缓存被删 → 永远是空的
+        // （这就是"重新打开还是空白"的根因）。
+        val cursor = core.syncCursor(view.sessionId)
+        cache.writeTimeline(view.copy(sync = cursor))
     }
 
     private fun refreshSessions() {
@@ -456,7 +493,13 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 把流式刷新也堵住。
         if (online && !wasOnline) {
             runFullSync()
-        } else {
+        } else if (online) {
+            // **未连接时不要刷新时间线**：core.timelinePage 拿不到数据、返回空页，
+            // 而 refreshTimeline 会拿这个空结果去覆盖 state —— 刚才从缓存
+            // 填进去的 25 条瞬间被清成 0，界面变空白。
+            //
+            // 这正是"重新打开还是空白"的最后一环：缓存读对了、也填进去了，
+            // 但紧接着被一个空刷新覆盖掉。未连接时保持现状（显示缓存）。
             refreshTimeline()
         }
     }
@@ -517,9 +560,12 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         if (id.isEmpty()) return
         // **先用缓存顶上**：连接刚建立、或还没连上时，界面不该是空白。
         //
-        // 只在"当前没有内容"时套用（state.timeline.items 为空）：
-        // 已经有实时内容时再用缓存覆盖会把用户正在看的东西换掉。
-        if (state.value.timeline.items.isEmpty()) {
+        // 只在"当前没有内容"时套用：已经有实时内容时再用缓存覆盖会把
+        // 用户正在看的东西换掉。
+        //
+        // **未连接时不要套**：那会把刚恢复出来的缓存又覆盖成空
+        // （refreshTimeline 在未连接时拿到的就是空页）。
+        if (state.value.timeline.items.isEmpty() && state.value.connected) {
             applyCachedTimeline(id)
         }
         // **加载更早内容的期间跳过刷新**。
@@ -549,6 +595,21 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
         // 有重叠条目，不去重的话列表里会出现两条一样的 key ——
         // LazyColumn 对重复 key 的行为未定义，会导致条目错位、数量抖动。
         val merged = mergeProcessDetails(dedupeByKey(keptEarlier + page.items), previous.items)
+
+        // **空页不能覆盖已有内容**（最后一道保险）。
+        //
+        // 空页有两种来源：这个会话本来就空，或"现在拿不到数据"
+        // （未连接、镜像还没同步完）。后者用空结果覆盖，就会把刚从缓存
+        // 恢复出来的内容清掉 —— 界面表现为"打开就空白"，而缓存其实好着。
+        //
+        // 判断"本来就空"很容易：本地一条都没有时才允许写空。
+        if (merged.isEmpty() && previous.items.isNotEmpty()) {
+            android.util.Log.d(
+                "SimpleAgent",
+                "refreshTimeline：空页，保留已有的 ${previous.items.size} 条",
+            )
+            return
+        }
 
         state.update {
             // 分页游标：只要用户往上翻过，就保持用户翻到的位置不动。

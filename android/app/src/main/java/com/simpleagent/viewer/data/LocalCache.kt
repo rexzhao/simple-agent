@@ -67,10 +67,20 @@ class LocalCache(private val root: File) {
     /** readTimeline 读某个会话的缓存历史（没有则返回 null）。 */
     fun readTimeline(sessionId: String): TimelineView? {
         val file = timelineFile(sessionId)
-        if (!file.exists()) return null
-        return runCatching {
-            json.decodeFromString<TimelineView>(file.readText())
-        }.getOrElse {
+        if (!file.exists()) {
+            android.util.Log.d("SimpleAgent", "cache: ${file.name} 不存在")
+            return null
+        }
+        return try {
+            val text = file.readText()
+            val view = json.decodeFromString(TimelineView.serializer(), text)
+            android.util.Log.d(
+                "SimpleAgent",
+                "cache: read ${file.name} items=${view.items.size} sync=${view.sync}",
+            )
+            view
+        } catch (e: Throwable) {
+            android.util.Log.e("SimpleAgent", "cache: read ${file.name} failed", e)
             file.delete()
             null
         }
@@ -78,8 +88,14 @@ class LocalCache(private val root: File) {
 
     /** writeTimeline 写入某个会话的历史。 */
     fun writeTimeline(view: TimelineView) {
-        runCatching {
-            timelineFile(view.sessionId).writeText(json.encodeToString(TimelineView.serializer(), view))
+        val file = timelineFile(view.sessionId)
+        try {
+            file.writeText(json.encodeToString(TimelineView.serializer(), view))
+            android.util.Log.d("SimpleAgent", "cache: wrote ${file.name} (${file.length()} bytes)")
+        } catch (e: Throwable) {
+            // **不能静默吞掉**：写失败等于缓存永远没有内容，而界面表现是
+            // "重新打开还是空白"，完全看不出是序列化/写盘出错（踩过）。
+            android.util.Log.e("SimpleAgent", "cache: write ${file.name} failed", e)
         }
     }
 
