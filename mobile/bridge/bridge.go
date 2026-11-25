@@ -154,6 +154,18 @@ func NewClient(listener ChangeListener, lang string, cacheDir string) *Client {
 	}
 	// 指纹确认队列。Notify 在下面 ConnectTLS 时接上界面回调。
 	client.peerGate = &peerverify.Gate{}
+
+	// **预生成自己的证书**（mTLS 的身份）。
+	//
+	// 这一步不能省：`tlsx.ClientConfig` 里的 ownCertificate() 只**加载**
+	// 证书，不存在就跳过 —— 结果是一条"没有客户端证书"的 TLS 连接，
+	// 执行端会以"没有出示客户端证书"拒绝。
+	//
+	// 桌面端在 setupTLS 里调 EnsureCert()，bridge 之前漏了这一步
+	// （真机表现：连上了 relay，但直连执行端永远失败）。
+	if _, err := (tlsx.Config{DataDir: cacheDir}).EnsureCert(); err != nil {
+		log.Printf("bridge：本机证书准备失败（mTLS 将不可用）：%v", err)
+	}
 	// 高频事件合并器：见 emit 的说明
 	go client.flushLoop()
 	return client
@@ -267,6 +279,29 @@ func (c *Client) ProbeFingerprint(addr string) string {
 		result["error"] = err.Error()
 	}
 	return encode(result)
+}
+
+// ConnectTLSAsync 与 [Client.ConnectTLS] 相同，但**立即返回**，拨号在后台跑。
+//
+// # 为什么 Android 必须用这个
+//
+// gomobile 的 JNI 调用会串行化：一次 `connectTLS()` 调用在 Go 里阻塞多久，
+// 那条 JNI 线程就被占多久。而 TOFU 需要在握手期间**等用户点弹窗** ——
+// 于是整个调用卡住，Kotlin 侧再想调 `pendingPeers()` 询问"要确认什么"
+// 就排在后面永远进不来。
+//
+// 表现是：界面一直转圈、弹窗从不出现、Go 日志停在 verifyPeer 那一行。
+//
+// 所以 Android 走这个：拨号交给后台 goroutine，JNI 立刻返回，
+// 结果仍然经 `OnChange("connection", …)` 事件送回去。
+func (c *Client) ConnectTLSAsync(addr, route, token, fingerprint string) string {
+	go func() {
+		if err := c.ConnectTLS(addr, route, token, fingerprint); err != "" {
+			log.Printf("bridge：连接失败：%s", err)
+			c.emit("connection", err)
+		}
+	}()
+	return ""
 }
 
 func (c *Client) ConnectTLS(addr, route, token, fingerprint string) string {

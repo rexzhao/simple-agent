@@ -53,11 +53,14 @@ class CoreClient private constructor(
      * fingerprint 为空表示不启用 TLS；非空时只接受指纹完全一致的证书。
      */
     fun connectTLS(addr: String, route: String, token: String, fingerprint: String) {
-        io.execute {
-            val error = client.connectTLS(addr, route, token, fingerprint)
-            main.post {
-                if (!closed.get()) onEvent(CoreEvent.Connected(error))
-            }
+        // **用异步版**（Go 侧后台拨号，JNI 立刻返回）。
+        //
+        // 同步版会在 TOFU 等用户确认时阻塞整条 JNI 线程 —— gomobile 的
+        // 调用是串行化的，于是 Kotlin 再想调 pendingPeer() 询问"要确认什么"
+        // 就永远进不来。表现是界面一直转圈、弹窗从不出现。
+        val error = client.connectTLSAsync(addr, route, token, fingerprint)
+        if (error.isNotEmpty()) {
+            main.post { if (!closed.get()) onEvent(CoreEvent.Connected(error)) }
         }
     }
 

@@ -342,6 +342,12 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
                 "sessions" -> refreshSessions()
                 "providers" -> refreshProviders()
                 "connection" -> refreshConnection()
+                // **有对端证书待确认**：Go 侧在 TLS 握手中登记了一条。
+                //
+                // 这是主路径 —— 比轮询可靠得多：Go 一登记就通知，
+                // 不依赖 Kotlin 定时任务有没有活着（踩过：轮询没跑，
+                // 界面永远转圈而弹窗从不出现）。
+                "peerConfirm" -> pullPendingPeer()
                 "cmdResult" -> {
                     // 命令结果：统一刷新（草稿还原之类由界面按提示处理）
                     refreshTimeline()
@@ -829,23 +835,41 @@ class ViewerViewModel(app: Application) : AndroidViewModel(app) {
             // repeat 的 lambda 里写 continue 会编译失败（踩过）。
             for (attempt in 0 until 120) { // 最多等 60 秒（用户可能要想一会儿）
                 delay(500)
-                if (!state.value.connecting) return@launch
-                val peer = withContext(Dispatchers.IO) { core.pendingPeer() }
-                if (peer.isEmpty()) continue
-                val parts = peer.split("\n")
-                if (parts.size < 4) continue
-                state.update {
-                    it.copy(
-                        pendingPeer = PendingPeer(
-                            addr = parts[0],
-                            fingerprint = parts[1],
-                            changed = parts[2] == "1",
-                            known = parts[3],
-                        ),
-                    )
+                pullPendingPeer()
+                // **连上且没有待确认项就停**：主路径是 peerConfirm 事件，
+                // 轮询只是兜底。连上之后还一直问就是白耗电（每 500ms 一次 JNI）。
+                if (state.value.connected && state.value.pendingPeer == null) {
+                    return@launch
                 }
-                return@launch
             }
+        }
+    }
+
+    /**
+     * pullPendingPeer 立刻问一次 Go 侧"有没有对端要确认"，有就弹窗。
+     *
+     * 两条路径都会调它：
+     *  1. `peerConfirm` 事件（Go 主动推，**主路径**）
+     *  2. 轮询（兜底：事件丢了/漏了时仍能弹出来）
+     *
+     * 它本身很快（只读内存里的队列），不需要放后台线程。
+     */
+    private fun pullPendingPeer() {
+        val peer = core.pendingPeer()
+        if (peer.isEmpty()) return
+        val parts = peer.split("\n")
+        if (parts.size < 4) return
+        // 已经在问同一个了就别重复弹窗
+        if (state.value.pendingPeer?.addr == parts[0]) return
+        state.update {
+            it.copy(
+                pendingPeer = PendingPeer(
+                    addr = parts[0],
+                    fingerprint = parts[1],
+                    changed = parts[2] == "1",
+                    known = parts[3],
+                ),
+            )
         }
     }
 
