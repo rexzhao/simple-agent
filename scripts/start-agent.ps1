@@ -10,9 +10,11 @@
 #
 # 用法（在仓库根目录）：
 #   pwsh -File scripts/start-agent.ps1
-#   pwsh -File scripts/start-agent.ps1 -Listen                    # 随机端口
-#   pwsh -File scripts/start-agent.ps1 -Listen -ListenAddr 0.0.0.0:7900
+#   pwsh -File scripts/start-agent.ps1 -ListenAddr 0.0.0.0:7900
 #   pwsh -File scripts/start-agent.ps1 -NoRelay                   # 只本地跑
+#   pwsh -File scripts/start-agent.ps1 -TLS:$false                # 退回明文
+#
+# 默认：注册 relay + 局域网直连（随机端口）+ TLS（mTLS）。
 
 param(
     # relay 地址；留空表示从 relay.json 读（没读过就只本地跑）
@@ -29,6 +31,14 @@ param(
     [switch]$Listen = $true,
     # 与 -Listen 搭配的监听地址（不给 = 随机端口）
     [string]$ListenAddr = "",
+    # 监听时是否启用 TLS（**默认开**）。
+    #
+    # 这是 mTLS（双向证书校验）的前提：没有 TLS 就没有证书，也就没有
+    # "验证对端是谁"这回事。首次启动自动自签生成证书，不用手工配置。
+    #
+    # 想退回明文用 -TLS:$false —— 但注意加密与明文**严格隔离**：
+    # 明文的执行端只能被明文的 viewer 连，反之亦然。
+    [switch]$TLS = $true,
     # 传给执行端的额外参数
     [string[]]$ExtraArgs = @()
 )
@@ -98,6 +108,23 @@ try {
         # cmd 风格的参数解析都会把"末尾那个没有值的 --listen"当成开关吃掉，
         # 结果程序收不到 --listen，静默地不监听（踩过）。
         $listenArgs += @("--listen", $bindAddr)
+    }
+
+    # **--tls：mTLS 的前提**（独立于 -Listen）。
+    #
+    # 没有它就没有证书，也就没有"验证对端是谁"这回事：
+    #   - 展示端无法校验"这是不是执行端"
+    #   - 执行端无法验证来访的 viewer 是谁
+    # 也就是说整个指纹体系不生效。
+    #
+    # 首次启动自动自签生成证书（`<DataDir>/tls`），不用手工配置。
+    #
+    # 注意**加密与明文严格隔离**：开了 --tls 的执行端只接受出示证书的
+    # viewer；没开 --tls 的 viewer 连不上它。这是刻意的 —— 否则攻击者
+    # 只要让握手失败，就能把连接降级成无校验的明文。
+    if ($TLS) {
+        $listenArgs += "--tls"
+        Write-Host "加密：已启用 TLS（首次会自签生成证书）" -ForegroundColor Cyan
     }
 
     $allArgs = $relayArgs + $listenArgs + $ExtraArgs

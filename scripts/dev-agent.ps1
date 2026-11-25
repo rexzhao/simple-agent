@@ -27,6 +27,8 @@ param(
     # 想关掉用 -Listen:$false。
     [switch]$Listen = $true,
     [string]$ListenAddr = "",
+    # 是否启用 TLS（mTLS 的前提）。**默认开**，想退回明文用 -TLS:$false。
+    [switch]$TLS = $true,
     # 两次重启之间的等待秒数
     [int]$RestartDelaySeconds = 5,
     # 传给执行端的额外参数
@@ -67,8 +69,12 @@ while ($true) {
     if ($Relay) { $childArgs += @("-Relay", $Relay) }
     if ($Name) { $childArgs += @("-Name", $Name) }
     if ($NoRelay) { $childArgs += "-NoRelay" }
-    if ($Listen) { $childArgs += "-Listen" }
+    # **bool 开关要显式传值**：写成 `if ($Listen) { "-Listen" }` 只能表达
+    # "开"，用户在循环上写 -Listen:$false 会被静默忽略（子脚本用默认值 $true
+    # 又打开了）。传 "-Listen:$false" 才能覆盖子脚本的默认值。
+    $childArgs += "-Listen:`$$($Listen.ToString().ToLower())"
     if ($ListenAddr) { $childArgs += @("-ListenAddr", $ListenAddr) }
+    $childArgs += "-TLS:`$$($TLS.ToString().ToLower())"
     if ($ExtraArgs) { $childArgs += @("-ExtraArgs", ($ExtraArgs -join ",")) }
 
     $startedAt = Get-Date
