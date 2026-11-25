@@ -62,8 +62,23 @@ type Config struct {
 	CertDir string
 	// Fingerprint 是客户端侧要校验的服务端证书 SHA-256 指纹（十六进制，可带冒号）。
 	//
-	// 为空表示不启用客户端 TLS。
+	// 为空表示**还不知道对端指纹**（首次连接）。这时如果 ClientTLSEnabled
+	// 为真，仍然会走 TLS，只是校验推迟到 TOFU 确认之后。
 	Fingerprint string
+	// ClientTLSEnabled 表示"拨号时要用 TLS"，**与是否已知指纹无关**。
+	//
+	// 为什么要把两件事分开：以前 `ClientTLS() = Fingerprint != ""`，
+	// 于是"我想加密连"必须先手抄对方指纹 —— 用户的要求是
+	// "viewer 只需要加 --tls 就行，指纹并不是必须参数，连上 relay
+	// 之后提示即可"。所以"用不用 TLS"是用户的开关，"信任哪个指纹"
+	// 是连接过程中确认的东西，不能混成一个条件。
+	ClientTLSEnabled bool
+	// OnPeerFingerprint 在**没有预设指纹**时被调用：拿到对端证书 DER，
+	// 由它决定接受还是拒绝（返回 error 即拒绝）。
+	//
+	// 这是 TOFU 的挂载点：调用方据此查信任列表、或记下新指纹并提示用户。
+	// 有预设指纹时不会被调用（那种情况下 ClientConfig 已装好严格校验）。
+	OnPeerFingerprint func(addr string, certDER []byte) error
 }
 
 // resolvedCertPaths 返回实际使用的证书路径（未显式指定时落到 DataDir 下）。
@@ -96,7 +111,16 @@ func (c Config) ServerTLS() bool {
 }
 
 // ClientTLS 报告是否应该用 TLS 拨号。
-func (c Config) ClientTLS() bool { return c.Fingerprint != "" }
+// ClientTLS 报告拨号时是否要走 TLS。
+//
+// **不要求已知指纹**：指纹留空表示"首次连接、还没确认过对端"，
+// 此时走 TOFU（探测 → 弹窗 → 记住）。要区分"用不用 TLS"和
+// "信任哪个指纹"—— 以前把两者混成一个条件，导致不带指纹就完全
+// 不走加密（用户要的是 `--tls` 一个开关就够）。
+func (c Config) ClientTLS() bool { return c.ClientTLSEnabled || c.Fingerprint != "" }
+
+// HasFingerprint 报告是否已经知道对端指纹（决定拨号时能不能严格校验）。
+func (c Config) HasFingerprint() bool { return c.Fingerprint != "" }
 
 // normalizedFingerprint 去掉冒号/空格并转小写，便于人工输入。
 func normalizedFingerprint(value string) string {
@@ -120,19 +144,19 @@ func (c Config) ServerConfig() (*tls.Config, error) {
 // ClientConfig 构造客户端 TLS 配置：**只认写死的指纹**，不走 CA。
 func (c Config) ClientConfig() (*tls.Config, error) {
 	want := normalizedFingerprint(c.Fingerprint)
-	if want == "" {
-		return nil, errors.New("没有配置 TLS 指纹")
-	}
-	if len(want) != sha256.Size*2 {
+	if want != "" && len(want) != sha256.Size*2 {
 		return nil, fmt.Errorf("TLS 指纹长度不对（应为 %d 个十六进制字符，实际 %d）",
 			sha256.Size*2, len(want))
 	}
 	cfg := &tls.Config{
-		// 关掉 CA 链校验：我们不用 CA，只认下面的指纹。
-		// 这不是"跳过校验"——VerifyPeerCertificate 里做了更严格的检查。
+		// 关掉 CA 链校验：我们不用 CA，只认指纹。
+		// 这不是"跳过校验"——下面 VerifyPeerCertificate 会做更严格的检查
+		// （有指纹时）或把证书留给调用方确认（没有指纹时）。
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
-		VerifyPeerCertificate: verifyFingerprint(want),
+	}
+	if want != "" {
+		cfg.VerifyPeerCertificate = verifyFingerprint(want)
 	}
 	// **自己的证书**：双向认证时要出示给对端（对端会校验我们的指纹）。
 	// 没有自己的证书时保持单向（只验对端）—— 明文/旧配置仍然能用。
@@ -186,6 +210,27 @@ func (c Config) Dial(addr string) (net.Conn, error) {
 	cfg, err := c.ClientConfig()
 	if err != nil {
 		return nil, err
+	}
+	// **TOFU 校验**：没有预先指定的指纹时，把对端证书交给 OnPeerFingerprint
+	// 决定"信不信"，而不是一律拒绝。
+	//
+	// 为什么不能"没指纹就直接连"：那等于谁都行 —— 伪造者只要把证书一换，
+	// 客户端照样连上。所以这里把见过的指纹交出去（调用方据此记进信任
+	// 列表并提示用户），下次再连就用它严格校验。
+	if c.OnPeerFingerprint != nil {
+		callback := c.OnPeerFingerprint
+		// 有明确指纹时 ClientConfig 已经装了严格校验，这里不重复
+		if !c.HasFingerprint() {
+			cfg.VerifyPeerCertificate = func(rawCerts [][]byte, chains [][]*x509.Certificate) error {
+				if len(rawCerts) == 0 {
+					return fmt.Errorf("对端 %s 没有提供证书", addr)
+				}
+				if err := callback(addr, rawCerts[0]); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
 	}
 	conn, err := tls.Dial("tcp", addr, cfg)
 	if err != nil {
